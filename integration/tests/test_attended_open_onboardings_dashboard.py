@@ -19,6 +19,7 @@ from tools.serve_attended_open_onboardings_dashboard import (
     page_salesforce_unavailable,
     page_salesforce_login_opened,
     page_comment_update_confirmation,
+    salesforce_cli_command,
     start_attended_salesforce_login,
     CommentUpdateEvaluation,
     consume_comment_update_ack,
@@ -159,6 +160,18 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_salesforce_login_launcher_discards_cli_streams(self):
         dashboard._salesforce_login_process = None
+
+    def test_dashboard_uses_configured_salesforce_cli_without_hard_coding_windows(self):
+        with patch.dict(dashboard.os.environ, {"SURFACE_SF_CLI": "sf"}, clear=False):
+            self.assertEqual(salesforce_cli_command(), "sf")
+
+    def test_vm_runtime_refuses_to_launch_a_local_browser_or_mfa_flow(self):
+        with patch.object(dashboard.os, "name", "posix"), patch.dict(
+            dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "vm"}, clear=False
+        ):
+            self.assertFalse(start_attended_salesforce_login())
+            self.assertFalse(open_attended_leonardo_tenant_management())
+            self.assertFalse(open_attended_production_backoffice_login())
         process = unittest.mock.Mock()
         process.poll.return_value = None
         with patch("tools.serve_attended_open_onboardings_dashboard.subprocess.Popen", return_value=process) as launcher:

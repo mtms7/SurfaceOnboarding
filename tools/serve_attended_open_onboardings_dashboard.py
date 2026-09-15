@@ -13,6 +13,7 @@ from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import re
 from secrets import token_urlsafe
@@ -83,6 +84,23 @@ class ReadUnavailable(RuntimeError): pass
 class WriteUnavailable(ReadUnavailable): pass
 
 
+def salesforce_cli_command() -> str:
+    """Resolve the platform CLI without copying a user session between hosts."""
+    configured = os.environ.get("SURFACE_SF_CLI")
+    if configured:
+        return configured
+    return "sf.cmd" if os.name == "nt" else "sf"
+
+
+def local_browser_launch_allowed() -> bool:
+    """Only the Windows attended pilot may launch a local operator browser.
+
+    The Ubuntu service is deliberately unable to launch SSO/MFA or BackOffice
+    pages. A future separately approved browser runner owns that interaction.
+    """
+    return os.name == "nt" and os.environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop").casefold() == "desktop"
+
+
 def start_attended_salesforce_login() -> bool:
     """Launch the standard Salesforce CLI browser sign-in without handling secrets.
 
@@ -91,12 +109,14 @@ def start_attended_salesforce_login() -> bool:
     dashboard cannot duplicate browser-login prompts.
     """
     global _salesforce_login_process
+    if not local_browser_launch_allowed():
+        return False
     with _salesforce_login_lock:
         if _salesforce_login_process is not None and _salesforce_login_process.poll() is None:
             return True
         try:
             _salesforce_login_process = subprocess.Popen(
-                ["sf.cmd", "org", "login", "web", "--alias", "surface-onboarding", "--set-default"],
+                [salesforce_cli_command(), "org", "login", "web", "--alias", "surface-onboarding", "--set-default"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -137,6 +157,8 @@ def open_attended_leonardo_tenant_management(*, opener: object = webbrowser.open
     authenticated or redirects to its login flow when it is not. This dashboard
     deliberately does not inspect VPN state, browser cookies, or credentials.
     """
+    if not local_browser_launch_allowed():
+        return False
     try:
         return bool(opener(LEONARDO_DEVELOPMENT_TENANT_MANAGEMENT))  # type: ignore[operator]
     except webbrowser.Error:
@@ -145,6 +167,8 @@ def open_attended_leonardo_tenant_management(*, opener: object = webbrowser.open
 
 def open_attended_production_backoffice_login(*, opener: object = webbrowser.open_new_tab) -> bool:
     """Open only the production login page for a human renewal preflight."""
+    if not local_browser_launch_allowed():
+        return False
     try:
         return bool(opener(PRODUCTION_BACKOFFICE_LOGIN))  # type: ignore[operator]
     except webbrowser.Error:
@@ -213,7 +237,7 @@ def consume_manual_start_ack(reference: str, row: dict[str, str | None], nonce: 
 
 def sf_json(args: list[str]) -> object:
     try:
-        done = subprocess.run(["sf.cmd", *args], capture_output=True, text=True, timeout=35, check=False)
+        done = subprocess.run([salesforce_cli_command(), *args], capture_output=True, text=True, timeout=35, check=False)
         if done.returncode or len(done.stdout.encode()) > 512 * 1024:
             raise ReadUnavailable()
         return json.loads(done.stdout)
@@ -224,7 +248,7 @@ def sf_json(args: list[str]) -> object:
 def sf_write_json(args: list[str]) -> object:
     """Run the sole attended write command without retaining CLI output."""
     try:
-        done = subprocess.run(["sf.cmd", *args], capture_output=True, text=True, timeout=35, check=False)
+        done = subprocess.run([salesforce_cli_command(), *args], capture_output=True, text=True, timeout=35, check=False)
         if done.returncode or len(done.stdout.encode()) > 512 * 1024:
             raise WriteUnavailable()
         return json.loads(done.stdout)
