@@ -84,6 +84,25 @@ class ReadUnavailable(RuntimeError): pass
 class WriteUnavailable(ReadUnavailable): pass
 
 
+def listener_address() -> tuple[str, int]:
+    """Return the one permitted loopback listener for the selected runtime."""
+    runtime = os.environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop").casefold()
+    default_port = "8000" if runtime == "vm" else "8012"
+    host = os.environ.get("SURFACE_ONBOARDING_HOST", "127.0.0.1")
+    raw_port = os.environ.get("SURFACE_ONBOARDING_PORT", default_port)
+    if runtime not in {"desktop", "vm"} or host != "127.0.0.1":
+        raise RuntimeError("invalid_dashboard_listener_configuration")
+    try:
+        port = int(raw_port)
+    except ValueError as exc:
+        raise RuntimeError("invalid_dashboard_listener_configuration") from exc
+    if not 1024 <= port <= 65535:
+        raise RuntimeError("invalid_dashboard_listener_configuration")
+    if runtime == "vm" and os.environ.get("SURFACE_ONBOARDING_WEB_IDENTITY_APPROVED") != "1":
+        raise RuntimeError("vm_web_identity_approval_required")
+    return host, port
+
+
 def salesforce_cli_command() -> str:
     """Resolve the platform CLI without copying a user session between hosts."""
     configured = os.environ.get("SURFACE_SF_CLI")
@@ -829,5 +848,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"attended_open_onboardings_dashboard_listening_on_{HOST}:{PORT}")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    listener_host, listener_port = listener_address()
+    print(f"attended_open_onboardings_dashboard_listening_on_{listener_host}:{listener_port}")
+    ThreadingHTTPServer((listener_host, listener_port), Handler).serve_forever()

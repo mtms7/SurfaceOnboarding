@@ -15,6 +15,7 @@ from tools.serve_attended_open_onboardings_dashboard import (
     open_attended_production_backoffice_login,
     open_onboardings_view_id,
     page_detail,
+    listener_address,
     page_queue,
     page_salesforce_unavailable,
     page_salesforce_login_opened,
@@ -160,6 +161,16 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_salesforce_login_launcher_discards_cli_streams(self):
         dashboard._salesforce_login_process = None
+        process = unittest.mock.Mock()
+        process.poll.return_value = None
+        with patch("tools.serve_attended_open_onboardings_dashboard.subprocess.Popen", return_value=process) as launcher:
+            self.assertTrue(start_attended_salesforce_login())
+        args, kwargs = launcher.call_args
+        self.assertEqual(args[0][:4], ["sf.cmd", "org", "login", "web"])
+        self.assertIs(kwargs["stdin"], dashboard.subprocess.DEVNULL)
+        self.assertIs(kwargs["stdout"], dashboard.subprocess.DEVNULL)
+        self.assertIs(kwargs["stderr"], dashboard.subprocess.DEVNULL)
+        dashboard._salesforce_login_process = None
 
     def test_dashboard_uses_configured_salesforce_cli_without_hard_coding_windows(self):
         with patch.dict(dashboard.os.environ, {"SURFACE_SF_CLI": "sf"}, clear=False):
@@ -172,16 +183,16 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
             self.assertFalse(start_attended_salesforce_login())
             self.assertFalse(open_attended_leonardo_tenant_management())
             self.assertFalse(open_attended_production_backoffice_login())
-        process = unittest.mock.Mock()
-        process.poll.return_value = None
-        with patch("tools.serve_attended_open_onboardings_dashboard.subprocess.Popen", return_value=process) as launcher:
-            self.assertTrue(start_attended_salesforce_login())
-        args, kwargs = launcher.call_args
-        self.assertEqual(args[0][:4], ["sf.cmd", "org", "login", "web"])
-        self.assertIs(kwargs["stdin"], dashboard.subprocess.DEVNULL)
-        self.assertIs(kwargs["stdout"], dashboard.subprocess.DEVNULL)
-        self.assertIs(kwargs["stderr"], dashboard.subprocess.DEVNULL)
-        dashboard._salesforce_login_process = None
+
+    def test_vm_listener_requires_identity_marker_and_remains_loopback_only(self):
+        with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "vm"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "vm_web_identity_approval_required"):
+                listener_address()
+        with patch.dict(dashboard.os.environ, {
+            "SURFACE_ONBOARDING_RUNTIME": "vm",
+            "SURFACE_ONBOARDING_WEB_IDENTITY_APPROVED": "1",
+        }, clear=False):
+            self.assertEqual(listener_address(), ("127.0.0.1", 8000))
 
     def test_co0741_detail_offers_a_read_only_comment_rerun(self):
         page = page_detail("CO-0741", {
