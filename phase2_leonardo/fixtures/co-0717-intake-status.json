@@ -1,0 +1,320 @@
+{
+  "recorded_at": "2026-08-27",
+  "classification": "restricted intake status; not an execution manifest",
+  "fixture_classification": "owner-created Customer Onboarding clone",
+  "target_environment": "leonardo-development",
+  "co_number": "CO-0717",
+  "record_match_count": 1,
+  "source_revision": "2026-08-27T01:41:01.000+0000",
+  "onboarding_product": "Surface & Credential Exposure",
+  "onboarding_type": "New Product Onboarding",
+  "onboarding_stage": "New",
+  "approval_status": "Approved",
+  "submission_date": "2026-07-08",
+  "surface_account_id_present": false,
+  "account_uuid_present": false,
+  "contains_customer_contact_or_domain_data": false,
+  "raw_account_and_subscription_identifiers_persisted": false,
+  "dealhub_evidence": {
+    "total_record_count": 12,
+    "status_counts": {
+      "active": 3,
+      "expired": 9
+    },
+    "active_opportunity_count": 1,
+    "active_rows_share_one_opportunity": true,
+    "active_term": {
+      "start": "2026-07-01",
+      "end": "2029-06-30",
+      "duration_months": 36
+    },
+    "active_product_classes": [
+      {
+        "class": "remaining_usage_value",
+        "pricing_type": "New Pricing",
+        "quantity_present": true
+      },
+      {
+        "class": "surface_go_500_subdomains",
+        "pricing_type": "New Pricing",
+        "quantity_present": false
+      },
+      {
+        "class": "core_plus_commercial_500_endpoints_with_sva_essentials",
+        "pricing_type": "New Pricing",
+        "quantity_present": false
+      }
+    ],
+    "selected_subscription_identity_bound": true,
+    "selected_subscription_revision_bound": true,
+    "validation_source": "Customer Onboarding DealHub Subscriptions related list",
+    "commercial_validation_status": "approved_for_review",
+    "product_semantics_approved": true,
+    "quantity_mapping_complete": true
+  },
+  "workato_router_test": {
+    "recorded_at": "2026-08-26T18:32:11-07:00",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 21,
+    "test_job_id": "j-AbMcKpGX-waeoLn-CD",
+    "outcome": "failed_closed_as_expected",
+    "failure_category": "ambiguous_subscription_selection",
+    "data_masked": true,
+    "co_number_format_gate_passed": true,
+    "exact_one_co_gate_passed": true,
+    "dealhub_search_executed": true,
+    "classification_completed": false,
+    "external_source_or_leonardo_writes_performed": false,
+    "recipe_verified_inactive_after_test": true,
+    "recipe_job_counts_after_test": {
+      "successful": 11,
+      "failed": 2
+    },
+    "webhook_address_persisted": false
+  },
+  "workato_router_retry_after_stage_correction": {
+    "recorded_at": "2026-08-26T18:46:28-07:00",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 22,
+    "test_job_id": "j-AbMcYsXm-8AtzDs-CD",
+    "source_revision": "2026-08-27T01:41:01.000+0000",
+    "source_stage": "New",
+    "outcome": "failed_closed_as_expected",
+    "failure_category": "ambiguous_subscription_selection",
+    "data_masked": true,
+    "co_number_format_gate_passed": true,
+    "exact_one_co_gate_passed": true,
+    "dealhub_search_executed": true,
+    "classification_completed": false,
+    "external_source_or_leonardo_writes_performed": false,
+    "recipe_verified_inactive_after_test": true,
+    "recipe_job_counts_after_test": {
+      "successful": 11,
+      "failed": 3
+    },
+    "webhook_address_persisted": false
+  },
+  "post_test_security_rotation": {
+    "completed": true,
+    "final_recipe_version": 23,
+    "event_name_verified_clean": true,
+    "test_endpoint_invalidated": true,
+    "final_webhook_address_persisted": false,
+    "recipe_verified_inactive": true
+  },
+  "workato_selector_revision_after_owner_scope": {
+    "recorded_at": "2026-08-26",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "previous_verified_recipe_version": 23,
+    "expected_saved_recipe_version": 24,
+    "numeric_version_visible_in_verification_view": false,
+    "save_confirmation_observed": true,
+    "latest_edit_observed": true,
+    "recipe_verified_inactive": true,
+    "test_executed_after_revision": true,
+    "co_identifier_transmitted_after_revision": true,
+    "selected_additional_fields": [
+      "product_code",
+      "opportunity_id",
+      "sva_type",
+      "quantity",
+      "system_modstamp"
+    ],
+    "selection_policy": {
+      "allowed_product_groups": [
+        "pentera_surface",
+        "pentera_core",
+        "explicit_add_on"
+      ],
+      "ignored_rows": [
+        "expired",
+        "remaining_usage_value"
+      ],
+      "shared_opportunity_required": true,
+      "same_group_equal_best_duplicate_rejected": true,
+      "cross_group_equal_rank_allowed": true,
+      "unknown_current_product_rejected": true,
+      "unsupported_current_status_rejected": true
+    },
+    "add_on_taxonomy_authoritatively_verified": false,
+    "guru_read_only_connector_available": false,
+    "external_source_or_leonardo_writes_performed": false
+  },
+  "workato_selector_retest_2026_08_27": {
+    "recorded_at": "2026-08-27T13:20:57-07:00",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 26,
+    "test_job_id": "j-AbN4NsKH-oHT4Bh-CD",
+    "outcome": "successful_guarded_selector_execution",
+    "duration_seconds": 1.06,
+    "payload_contained_only_co_number": true,
+    "one_time_deduplication_header_used": true,
+    "trigger_data_masked": true,
+    "co_number_format_gate_passed": true,
+    "exact_one_co_gate_passed": true,
+    "dealhub_search_executed": true,
+    "classification_step_completed": true,
+    "classification_output_observable": false,
+    "classification_output_visibility_reason": "data_masked",
+    "external_source_or_leonardo_writes_performed": false,
+    "recipe_job_counts_after_test": {
+      "successful": 12,
+      "failed": 3
+    },
+    "recipe_level_data_retention_control_visible": false,
+    "recipe_level_data_retention_change_claimed": false,
+    "post_test_endpoint_invalidated": true,
+    "final_recipe_version": 27,
+    "final_webhook_address_persisted": false,
+    "recipe_verified_inactive_after_test": true
+  },
+  "workato_core_entitlement_mapping_retest_2026_08_27": {
+    "recorded_at": "2026-08-27T15:45:54-07:00",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 28,
+    "test_job_id": "j-AbN8h3EN-pNRABL-CD",
+    "outcome": "successful_guarded_core_entitlement_mapping_execution",
+    "duration_seconds": 1.31,
+    "repeated_masked_co_0717_event": true,
+    "trigger_data_masked": true,
+    "co_number_format_gate_passed": true,
+    "exact_one_co_gate_passed": true,
+    "dealhub_search_executed": true,
+    "classification_step_completed": true,
+    "mapping_rule": "prefer an explicit supported add-on; otherwise use the selected Pentera Core subscription as Credential Exposure entitlement evidence",
+    "administrative_remaining_usage_value_ignored": true,
+    "classification_output_observable": false,
+    "classification_output_visibility_reason": "data_masked",
+    "salesforce_or_dealhub_write_performed_by_test": false,
+    "opa_or_leonardo_action_performed": false,
+    "recipe_verified_inactive_after_test": true,
+    "webhook_address_persisted": false
+  },
+  "salesforce_audit_comment_update_2026_08_27": {
+    "field": "Onboarding_Comments__c",
+    "outcome": "temporary_date_only_value_saved_and_rendered_value_verified",
+    "temporary_value": "2026-07-01 - 2029-06-30",
+    "surface_subscription_information_in_comment": false,
+    "credential_exposure_subscription_information_in_comment": false,
+    "future_design_note": "Surface Subscription Information and CE Subscription Information will be added by a later approved design",
+    "previous_raw_value_persisted": false
+  },
+  "workato_date_only_comment_rule_retest_2026_08_27": {
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "output_field": "onboarding_comments",
+    "output_contract": "YYYY-MM-DD - YYYY-MM-DD only",
+    "surface_and_ce_details_remain_separate": true,
+    "missing_term_fails_closed": true,
+    "mismatched_surface_and_ce_terms_fail_closed": true,
+    "version_29_fail_closed_job": {
+      "job_id": "j-AbN8rfnn-ETzrP9-CD",
+      "outcome": "failed_closed_as_expected",
+      "failure_category": "missing_subscription_term",
+      "cause": "Ruby used start/end instead of configured start_date/end_date input names"
+    },
+    "version_30_successful_job": {
+      "job_id": "j-AbN8tKRe-zxrGaH-CD",
+      "started_at": "2026-08-27T15:57:44-07:00",
+      "duration_seconds": 1.14,
+      "outcome": "successful_guarded_date_only_output_execution",
+      "configured_date_keys": [
+        "start_date",
+        "end_date"
+      ],
+      "classification_output_observable": false,
+      "classification_output_visibility_reason": "data_masked"
+    },
+    "salesforce_write_action_added": false,
+    "opa_or_leonardo_action_added": false,
+    "recipe_verified_inactive_after_test": true
+  },
+  "workato_subscription_identity_binding_retest_2026_08_27": {
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 31,
+    "test_job_id": "j-AbN99CCz-mQc384-CD",
+    "started_at": "2026-08-27T16:08:51-07:00",
+    "duration_seconds": 1.13,
+    "outcome": "successful_guarded_identity_and_revision_binding_execution",
+    "repeated_masked_co_0717_event": true,
+    "selected_output_groups": [
+      "surface_subscription",
+      "credential_exposure_subscription",
+      "core_subscription"
+    ],
+    "bound_fields": [
+      "record_id",
+      "system_modstamp"
+    ],
+    "missing_identity_or_revision_fails_closed": true,
+    "failure_category": "missing_subscription_identity_or_revision",
+    "raw_identity_or_revision_values_persisted": false,
+    "classification_output_observable": false,
+    "classification_output_visibility_reason": "data_masked",
+    "salesforce_or_dealhub_write_performed_by_test": false,
+    "opa_or_leonardo_action_performed": false,
+    "recipe_verified_inactive_after_test": true
+  },
+  "leonardo_read_only_form_reverification_2026_08_27": {
+    "target_origin": "https://leonardo.dev.app.pentera.io",
+    "authenticated_tenant_management_visible": true,
+    "add_account_form_opened": true,
+    "advanced_sections_expanded": true,
+    "form_values_entered": false,
+    "confirm_clicked": false,
+    "form_closed_with_cancel": true,
+    "account_created_or_updated": false,
+    "tenant_row_data_persisted": false,
+    "observed_defaults_are_authoritative": false,
+    "case_3_mapping_approved": false,
+    "material_ui_defaults": {
+      "mfa_required": true,
+      "scan_now": true,
+      "scanning_interval": "NONE",
+      "maximum_scan_duration_hours": 24,
+      "automated_discovery": true,
+      "recon_subdomains": true,
+      "multiple_attack_stacks": false,
+      "web_dictionary_brute_force": true,
+      "web_dorking": false,
+      "nuclei": false,
+      "authenticated_testing": false,
+      "static_outbound_ip": false,
+      "ai": false,
+      "notifications": true,
+      "multiple_users": true,
+      "api_access": true,
+      "phishing": false,
+      "leaked_credentials": false,
+      "leaked_credentials_interval": "NONE",
+      "spycloud_enabled_and_not_editable": true,
+      "include_provisioning": true,
+      "include_subdomains": true,
+      "license_type": "Evaluation",
+      "number_of_assets": 50000
+    }
+  },
+  "routing": {
+    "candidate_engine_value": "case_3_combined_baseline",
+    "candidate_basis": "CO requests new combined Surface and Credential Exposure",
+    "commercial_validation_status": "approved_for_review",
+    "route_approved": false,
+    "route_status": "manual_review_required"
+  },
+  "decision": "blocked",
+  "proceed": false,
+  "eligible_for_automation": false,
+  "leonardo_request_allowed": false,
+  "reasons": [
+    "case_3_leonardo_mapping_not_approved",
+    "no_leonardo_duplicate_or_readback_evidence",
+    "no_separated_hash_bound_one_run_approval"
+  ],
+  "security_follow_up": "Version 31 bound each selected subscription output to its DealHub record identity and SystemModstamp, failed closed if either value was absent, and passed by repeating the already masked CO-0717 event. No raw identity or revision value was persisted, no downstream write was present, and the recipe was verified inactive after the run."
+}

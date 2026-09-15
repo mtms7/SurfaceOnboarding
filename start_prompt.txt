@@ -1,0 +1,34 @@
+Our goal: to create an end-to-end workflow that reads salesforce (salesforce cli) and onboards onto our surface platform (a web platform). It may require automation of browser activity (into the surface platform), due to not having an api, with manual mfa validation/authorization required. The end result should be fully automated without needing interaction (i.e. a .sh, .py, some type of caller to automation, preferably py)
+leonardo (mentioned below) is our development environment. We can use this for any testing.
+Target web interface VM / Server information (where I want the final web UI to end up, details are not currently sensitive): 
+name: workato
+Server name: workato-opa-01
+Username: workato
+Password: P@ssw0rd
+This web UI should display:
+* A queue of the COs
+* Pending / Ready / Complete / Appropriate statuses and filtering
+* Successful creation of tenant, other relevant fields/information
+* Current status: scanning, finished
+
+We should only store information that is not available elsewhere; if it is stored in salesforce, or in surface, we should store it there. For data from surface that required browser automation to retrieve, we can store this information locally (until an update is needed, may have a last-updated field too, manual update button)
+
+Note: we may need to remake the VM to remove workato/work around it for now/ignore it.
+
+Business logic can be read via wget/playwrite/chrome: https://app.getguru.com/card/idrRoyMT/Surface-Credential-Exposure-Onboarding-Guide
+Some settings that go in: https://app.getguru.com/folders/T9EqA9gc/IT-Pentera-Surface?activeCard=fcdea5ef-2295-4999-85aa-54ac04a0232e
+
+Here are the reference docs in Surface/Workato
+* docs/ -> contains the validation rules in Workato
+* phase1_validato/ -> contains workflow python scripts, may be used in automation
+* phase2_leonardo/ -> a test / sandbox environment we can use to confirm
+* scripts/ -> helpful scripts
+* please inventory remaining items here and find useful tools from before here: Surface\Onboardingtest\BO Onboarding
+
+Note:
+* We are abandoning Workato and will be integrating directly.
+* All data should be managed with sensitivity, and assumed to be sensitive. Encrypt/secure/lock down/firewall appropriately. Ask if unsure.
+
+Some cases require special onboarding, such as over 60 domains. This is one example to start with (more than 60 domains or subdomains), so we can establish a "manual review" workflow. We may add more triggers later.
+
+To start: Please analyze the repo and ensure you understand the scope. Ask me questions if you need clarity on anything rather than assuming. You will ask questions and then develop a plan .md document. Create all of your new work/docs in a subfolder "integration"

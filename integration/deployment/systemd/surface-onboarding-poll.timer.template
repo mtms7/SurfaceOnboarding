@@ -1,0 +1,11 @@
+# Template only. Schedule is intentionally absent until operations approves it.
+[Unit]
+Description=Disabled placeholder for Surface onboarding twice-daily reconciliation
+
+[Timer]
+# No OnCalendar value is permitted in this template.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

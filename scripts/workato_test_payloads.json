@@ -1,0 +1,30 @@
+{
+  "router_manual_test_case2": {
+    "co_number": "CO-0000"
+  },
+  "case2_callable_shape_example": {
+    "co_number": "CO-0000",
+    "sf_record_id": "a5K000000000000AAA",
+    "account_name": "Example Holdings",
+    "account_country_code": "US",
+    "main_domain": "example.com",
+    "email_domains": ["example.com"],
+    "alternate_domains": [],
+    "ce_subscription_start_date": "2026-04-28",
+    "ce_subscription_end_date": "2027-04-27",
+    "operator_email": "owner.user@example.invalid",
+    "environment": "donatello-dev",
+    "router_job_id": "<workato-router-job-id>"
+  },
+  "expected_case_result_shape": {
+    "status": "success",
+    "case_type": "case_2_new_ce_only",
+    "co_number": "CO-0000",
+    "sf_record_id": "a5K000000000000AAA",
+    "target_environment": "donatello-dev",
+    "account_uuid": "<accountUuid>",
+    "created_account_name": "<created-account-name>",
+    "verified": true,
+    "failure_category": null
+  }
+}

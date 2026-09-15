@@ -1,0 +1,15 @@
+[project]
+name = "surface-onboarding-integration"
+version = "0.1.0"
+description = "Fail-closed local scaffold for direct Surface onboarding"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi==0.141.1",
+  "uvicorn[standard]==0.52.4",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[tool.unittest]
+start-directory = "tests"

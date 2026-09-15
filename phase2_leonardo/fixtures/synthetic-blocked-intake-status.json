@@ -1,0 +1,33 @@
+{
+  "fixture_version": "synthetic-blocked-intake-v1",
+  "recorded_at": "2000-01-01",
+  "scope": "local policy regression only; no external lookup",
+  "fixture_classification": "fully synthetic blocked intake regression",
+  "data_origin": "fully_synthetic",
+  "data_sensitivity": "synthetic; contains no customer, employee, or environment-derived data",
+  "co_number": "CO-000000",
+  "sf_record_id": "a00000000000000AAA",
+  "source_revision": "2000-01-01T00:00:00Z",
+  "record_match_count": 1,
+  "onboarding_product": "synthetic_unmapped_product",
+  "onboarding_type": "synthetic_new_onboarding",
+  "onboarding_stage": "synthetic_new",
+  "approval_status": null,
+  "submission_date": null,
+  "surface_account_id_present": false,
+  "account_uuid_present": false,
+  "decision": "blocked",
+  "proceed": false,
+  "eligible_for_automation": false,
+  "leonardo_request_allowed": false,
+  "reasons": [
+    "approval_missing",
+    "submission_date_missing",
+    "dealhub_and_contract_evidence_not_verified",
+    "case_mapping_not_approved",
+    "leonardo_duplicate_check_not_performed",
+    "leonardo_execution_not_authorized"
+  ],
+  "contains_customer_contact_or_domain_data": false,
+  "contains_internal_or_customer_derived_identifiers": false
+}

@@ -1,0 +1,113 @@
+{
+  "recorded_at": "2026-08-26",
+  "classification": "restricted intake status; not an execution manifest",
+  "fixture_classification": "owner-created Customer Onboarding clone",
+  "data_sensitivity": "restricted; clone may derive from real customer data",
+  "target_environment": "leonardo-development",
+  "co_number": "CO-0701",
+  "sf_record_id": "a5KR500000lYGNVMA4",
+  "source_revision": "2026-08-26T21:00:12.000+0000",
+  "record_match_count": 1,
+  "onboarding_product": "Surface & Credential Exposure",
+  "onboarding_type": "New Product Onboarding",
+  "onboarding_stage": "Request Approved",
+  "approval_status": "Approved",
+  "submission_date": "2026-08-13",
+  "surface_account_id_present": false,
+  "account_uuid_present": false,
+  "contains_customer_contact_or_domain_data": false,
+  "dealhub_evidence": {
+    "relevant_record_count": 2,
+    "equal_rank_active_count": 2,
+    "single_opportunity": false,
+    "all_required_dates_present": false,
+    "all_quantities_present": false,
+    "rows": [
+      {
+        "id": "a2ZR5000000VMPFMA4",
+        "revision": "2026-07-21T12:52:42.000+0000",
+        "opportunity_id": "006R500000PhGJIIA3",
+        "product_code": "PCP-C-500",
+        "product_full_name": "Pentera Core Plus Commercial - 500 End Points",
+        "pricing_type": "New Pricing",
+        "sva_type": "SVA Essentials",
+        "quantity": null,
+        "status": "Active",
+        "duration_months": 36,
+        "start_date": "2026-04-01",
+        "end_date": "2029-03-31"
+      },
+      {
+        "id": "a2ZR5000000XbK9MAK",
+        "revision": "2026-07-21T23:00:03.000+0000",
+        "opportunity_id": "006R500000Pm7VTIAZ",
+        "product_code": "11212",
+        "product_full_name": "test",
+        "pricing_type": "Old Pricing",
+        "sva_type": null,
+        "quantity": null,
+        "status": "Active",
+        "duration_months": 24,
+        "start_date": "2026-07-22",
+        "end_date": null
+      }
+    ]
+  },
+  "workato_router_test": {
+    "recorded_at": "2026-08-26T14:08:16-07:00",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 20,
+    "test_job_id": "j-AbMX9wte-sLGPcr-CD",
+    "outcome": "successful",
+    "data_masked": true,
+    "co_number_format_gate_passed": true,
+    "exact_one_co_gate_passed": true,
+    "dealhub_search_executed": true,
+    "classification_executed": true,
+    "ambiguous_subscription_gate_present": false,
+    "external_writes_performed": false,
+    "recipe_verified_inactive_after_test": true
+  },
+  "workato_router_hardening_test": {
+    "recorded_at": "2026-08-26T14:18:36-07:00",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 21,
+    "test_job_id": "j-AbMXHEz8-3dTWtP-CD",
+    "outcome": "failed_closed_as_expected",
+    "failure_category": "ambiguous_subscription_selection",
+    "data_masked": true,
+    "co_number_format_gate_passed": true,
+    "exact_one_co_gate_passed": true,
+    "dealhub_search_executed": true,
+    "ambiguity_gate_executed": true,
+    "classification_completed": false,
+    "external_writes_performed": false,
+    "recipe_verified_inactive_after_test": true,
+    "recipe_job_counts_after_test": {
+      "successful": 11,
+      "failed": 1
+    }
+  },
+  "routing": {
+    "candidate_engine_value": "case_3_combined_baseline",
+    "candidate_basis": "CO requests new combined Surface and Credential Exposure",
+    "route_approved": false,
+    "route_status": "manual_review_required"
+  },
+  "decision": "blocked",
+  "proceed": false,
+  "eligible_for_automation": false,
+  "leonardo_request_allowed": false,
+  "reasons": [
+    "multiple_equal_rank_active_subscriptions",
+    "subscriptions_span_multiple_opportunities",
+    "malformed_test_subscription_missing_end_date",
+    "required_quantities_missing",
+    "router_version_21_now_fails_closed_but_source_ambiguity_remains",
+    "case_3_leonardo_mapping_not_approved",
+    "no_duplicate_or_uuid_readback_evidence",
+    "no_separated_hash_bound_one_run_approval"
+  ]
+}

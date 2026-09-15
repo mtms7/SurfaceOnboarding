@@ -1,0 +1,123 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="900" viewBox="0 0 1500 900" role="img" aria-label="Surface Workato OPA onboarding workflow">
+  <defs>
+    <style>
+      .title { font: 700 28px Arial, sans-serif; fill: #172033; }
+      .label { font: 600 15px Arial, sans-serif; fill: #172033; }
+      .small { font: 13px Arial, sans-serif; fill: #3a4458; }
+      .box { fill: #f8fbff; stroke: #5b7bb2; stroke-width: 2; rx: 8; }
+      .decision { fill: #fff9e8; stroke: #c88a00; stroke-width: 2; }
+      .secure { fill: #ecfff5; stroke: #24945f; stroke-width: 2; rx: 8; }
+      .stop { fill: #fff0f0; stroke: #c23b3b; stroke-width: 2; rx: 8; }
+      .pending { fill: #f3f0ff; stroke: #7357c8; stroke-width: 2; rx: 8; }
+      .arrow { stroke: #546077; stroke-width: 2.2; fill: none; marker-end: url(#arrowhead); }
+      .dash { stroke-dasharray: 8 6; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#546077" />
+    </marker>
+  </defs>
+
+  <text x="40" y="50" class="title">Surface Customer Onboarding: Workato + OPA Secure Flow</text>
+  <text x="40" y="78" class="small">Donatello dev first; final BO implementation only after Cybersecurity and stakeholder approval.</text>
+
+  <rect x="40" y="125" width="210" height="82" class="box"/>
+  <text x="62" y="157" class="label">Salesforce CO</text>
+  <text x="62" y="181" class="small">CSM creates or updates</text>
+  <text x="62" y="199" class="small">Customer Onboarding record</text>
+
+  <rect x="315" y="125" width="230" height="82" class="box"/>
+  <text x="337" y="157" class="label">Workato Router</text>
+  <text x="337" y="181" class="small">Review CO-XXX</text>
+  <text x="337" y="199" class="small">Salesforce + DealHub review</text>
+
+  <polygon points="650,120 760,166 650,212 540,166" class="decision"/>
+  <text x="605" y="162" class="label">Valid source</text>
+  <text x="618" y="181" class="small">and motion?</text>
+
+  <rect x="835" y="125" width="230" height="82" class="box"/>
+  <text x="857" y="157" class="label">Human Approval</text>
+  <text x="857" y="181" class="small">Workato Workflow App</text>
+  <text x="857" y="199" class="small">No write before approval</text>
+
+  <polygon points="1190,120 1300,166 1190,212 1080,166" class="decision"/>
+  <text x="1148" y="162" class="label">Case type</text>
+  <text x="1128" y="181" class="small">1-6 route decision</text>
+
+  <rect x="40" y="315" width="245" height="92" class="stop"/>
+  <text x="62" y="348" class="label">Reject / Block</text>
+  <text x="62" y="372" class="small">Mismatch, missing data,</text>
+  <text x="62" y="390" class="small">unsupported case, timeout</text>
+
+  <rect x="405" y="315" width="210" height="92" class="pending"/>
+  <text x="427" y="348" class="label">Case 1</text>
+  <text x="427" y="372" class="small">Surface only</text>
+  <text x="427" y="390" class="small">New Surface</text>
+
+  <rect x="650" y="315" width="210" height="92" class="secure"/>
+  <text x="672" y="348" class="label">Case 2</text>
+  <text x="672" y="372" class="small">Credential Exposure only</text>
+  <text x="672" y="390" class="small">New CE</text>
+
+  <rect x="895" y="315" width="250" height="92" class="pending"/>
+  <text x="917" y="348" class="label">Cases 3-6</text>
+  <text x="917" y="372" class="small">Combined / renewal flows</text>
+  <text x="917" y="390" class="small">Blocked until mapped</text>
+
+  <rect x="1235" y="315" width="225" height="92" class="secure"/>
+  <text x="1257" y="348" class="label">Ubuntu 22 OPA VM</text>
+  <text x="1257" y="372" class="small">RND VPN path</text>
+  <text x="1257" y="390" class="small">Outbound-only to Workato</text>
+
+  <rect x="390" y="520" width="260" height="95" class="secure"/>
+  <text x="412" y="552" class="label">OPA-backed HTTP</text>
+  <text x="412" y="576" class="small">Donatello dev / BO calls</text>
+  <text x="412" y="594" class="small">No shared Workato egress path</text>
+
+  <rect x="720" y="520" width="225" height="95" class="box"/>
+  <text x="742" y="552" class="label">Duplicate Check</text>
+  <text x="742" y="576" class="small">Account name / domain</text>
+  <text x="742" y="594" class="small">Fail closed</text>
+
+  <rect x="1015" y="520" width="215" height="95" class="box"/>
+  <text x="1037" y="552" class="label">Create / Update</text>
+  <text x="1037" y="576" class="small">Only after approval</text>
+  <text x="1037" y="594" class="small">and duplicate pass</text>
+
+  <rect x="390" y="705" width="240" height="92" class="box"/>
+  <text x="412" y="738" class="label">Verify Result</text>
+  <text x="412" y="762" class="small">Read after write</text>
+  <text x="412" y="780" class="small">Retrieve accountUuid</text>
+
+  <rect x="705" y="705" width="245" height="92" class="box"/>
+  <text x="727" y="738" class="label">Update Salesforce</text>
+  <text x="727" y="762" class="small">Surface Account ID</text>
+  <text x="727" y="780" class="small">after verification only</text>
+
+  <rect x="1025" y="705" width="255" height="92" class="secure"/>
+  <text x="1047" y="738" class="label">Masked Audit</text>
+  <text x="1047" y="762" class="small">Idempotency table</text>
+  <text x="1047" y="780" class="small">No secrets or full payloads</text>
+
+  <path d="M250 166 H315" class="arrow"/>
+  <path d="M545 166 H540" class="arrow"/>
+  <path d="M760 166 H835" class="arrow"/>
+  <path d="M1065 166 H1080" class="arrow"/>
+  <path d="M650 212 C650 255 165 255 165 315" class="arrow"/>
+  <path d="M950 207 C950 250 165 250 165 315" class="arrow"/>
+  <path d="M1190 212 C1190 255 510 255 510 315" class="arrow"/>
+  <path d="M1190 212 C1190 255 755 255 755 315" class="arrow"/>
+  <path d="M1190 212 C1190 255 1020 255 1020 315" class="arrow"/>
+  <path d="M1235 361 H1145" class="arrow"/>
+  <path d="M755 407 C755 455 520 455 520 520" class="arrow"/>
+  <path d="M510 407 C510 455 520 455 520 520" class="arrow"/>
+  <path d="M650 568 H720" class="arrow"/>
+  <path d="M945 568 H1015" class="arrow"/>
+  <path d="M1123 615 C1123 665 510 655 510 705" class="arrow"/>
+  <path d="M630 751 H705" class="arrow"/>
+  <path d="M950 751 H1025" class="arrow"/>
+  <path d="M285 361 C340 361 340 751 390 751" class="arrow dash"/>
+
+  <text x="1238" y="438" class="small">Workato OPA gateway: sg3/sg4 over TCP 443 + mTLS</text>
+  <text x="390" y="642" class="small">Security gate: MFA preserved, secrets in Workato env properties, logs masked.</text>
+</svg>
+

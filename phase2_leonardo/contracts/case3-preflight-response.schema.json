@@ -1,0 +1,198 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://internal.pentera.invalid/surface/case3-preflight-v2.schema.json",
+  "title": "Surface Case 3 OPA preflight response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version", "target_environment", "decision", "proceed",
+    "leonardo_request_allowed", "action_required", "mapping_authority",
+    "execution_mapping_status", "unapproved_field_groups",
+    "mapping_policy_version", "public_suffix_list_sha256", "evidence_hash",
+    "onboarding_comments", "alternate_domains_csv", "subdomains_csv",
+    "source_bindings", "draft_manifest_sections"
+  ],
+  "properties": {
+    "contract_version": {"const": "surface-case3-preflight-v2"},
+    "target_environment": {"const": "leonardo-development"},
+    "decision": {"const": "candidate_mapping_requires_owner_review"},
+    "proceed": {"const": false},
+    "leonardo_request_allowed": {"const": false},
+    "action_required": {"const": "hash_bound_owner_approval"},
+    "mapping_authority": {"const": "partial_owner_recorded_normalization_only"},
+    "execution_mapping_status": {"const": "unapproved"},
+    "unapproved_field_groups": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "account_enums_and_collision_rules", "settings", "attack_modules",
+          "license_semantics", "addon_taxonomy", "duplicate_and_readback_rules"
+        ]
+      }
+    },
+    "mapping_policy_version": {"const": "surface-case3-partial-owner-mapping-2026-08-31-v5"},
+    "public_suffix_list_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "evidence_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "onboarding_comments": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2} - [0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+    "alternate_domains_csv": {"type": "string"},
+    "subdomains_csv": {"type": "string"},
+    "source_bindings": {"$ref": "#/$defs/source_bindings"},
+    "draft_manifest_sections": {"$ref": "#/$defs/draft"}
+  },
+  "$defs": {
+    "sf_id": {"type": "string", "pattern": "^[A-Za-z0-9]{15}([A-Za-z0-9]{3})?$"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["co_number", "sf_record_id", "source_revision"],
+      "properties": {
+        "co_number": {"type": "string", "pattern": "^CO-[0-9]+$"},
+        "sf_record_id": {"$ref": "#/$defs/sf_id"},
+        "source_revision": {"type": "string", "format": "date-time"}
+      }
+    },
+    "addon": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["record_id", "system_modstamp", "product_full_name", "effect"],
+      "properties": {
+        "record_id": {"$ref": "#/$defs/sf_id"},
+        "system_modstamp": {"type": "string", "format": "date-time"},
+        "product_full_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "effect": {"const": "credential_exposure_entitlement"}
+      }
+    },
+    "source_bindings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surface_record_id", "surface_system_modstamp", "core_record_id",
+        "core_system_modstamp", "opportunity_id", "add_ons"
+      ],
+      "properties": {
+        "surface_record_id": {"$ref": "#/$defs/sf_id"},
+        "surface_system_modstamp": {"type": "string", "format": "date-time"},
+        "core_record_id": {"$ref": "#/$defs/sf_id"},
+        "core_system_modstamp": {"type": "string", "format": "date-time"},
+        "opportunity_id": {"$ref": "#/$defs/sf_id"},
+        "add_ons": {"type": "array", "maxItems": 100, "items": {"$ref": "#/$defs/addon"}}
+      }
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_value", "policy_version"],
+      "properties": {
+        "engine_value": {"const": "case_3_combined_baseline"},
+        "policy_version": {"const": "surface-case3-partial-owner-mapping-2026-08-31-v5"}
+      }
+    },
+    "account": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "company_name", "account_type", "primary_domain", "alternate_domains",
+        "subdomains", "email_domains", "networks", "country"
+      ],
+      "properties": {
+        "company_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "account_type": {"const": "Customer"},
+        "primary_domain": {"type": "string", "minLength": 1, "maxLength": 512},
+        "alternate_domains": {"type": "array", "maxItems": 1000, "items": {"type": "string"}},
+        "subdomains": {"type": "array", "maxItems": 1000, "items": {"type": "string"}},
+        "email_domains": {"type": "array", "maxItems": 1000, "items": {"type": "string"}},
+        "networks": {"type": "array", "maxItems": 1000, "items": {"type": "string"}},
+        "country": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    },
+    "primary_user": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["first_name", "last_name", "email", "phone", "job_title", "mfa_enabled", "operator_account"],
+      "properties": {
+        "first_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "last_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "email": {"type": "string", "minLength": 3, "maxLength": 512},
+        "phone": {"type": "string", "maxLength": 512},
+        "job_title": {"type": "string", "maxLength": 512},
+        "mfa_enabled": {"const": true},
+        "operator_account": {"oneOf": [{"type": "string", "maxLength": 512}, {"type": "null"}]}
+      }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scanning_interval", "scan_now", "maximum_scan_duration_hours",
+        "automated_discovery", "recon_subdomains", "multiple_attack_stacks",
+        "mas_for_subdomains", "web_dictionary_brute_force", "web_dorking",
+        "nuclei", "authenticated_testing", "static_outbound_ip", "ai",
+        "notifications", "multiple_users", "api_access"
+      ],
+      "properties": {
+        "scanning_interval": {"const": "Monthly"},
+        "scan_now": {"type": "boolean"},
+        "maximum_scan_duration_hours": {"type": "integer", "minimum": 1},
+        "automated_discovery": {"type": "boolean"},
+        "recon_subdomains": {"type": "boolean"},
+        "multiple_attack_stacks": {"type": "boolean"},
+        "mas_for_subdomains": {"type": "boolean"},
+        "web_dictionary_brute_force": {"type": "boolean"},
+        "web_dorking": {"type": "boolean"},
+        "nuclei": {"type": "boolean"},
+        "authenticated_testing": {"type": "boolean"},
+        "static_outbound_ip": {"type": "boolean"},
+        "ai": {"type": "boolean"},
+        "notifications": {"type": "boolean"},
+        "multiple_users": {"type": "boolean"},
+        "api_access": {"type": "boolean"}
+      }
+    },
+    "attack_modules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phishing", "leaked_credentials", "leaked_credentials_interval", "leaked_credentials_domains"],
+      "properties": {
+        "phishing": {"type": "boolean"},
+        "leaked_credentials": {"type": "boolean"},
+        "leaked_credentials_interval": {"const": "Weekly"},
+        "leaked_credentials_domains": {"type": "array", "maxItems": 1000, "items": {"type": "string"}}
+      }
+    },
+    "license": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "include_provisioning", "include_subdomains", "type", "number_of_assets",
+        "number_of_domains", "number_of_subdomains", "start_date", "expiration_date"
+      ],
+      "properties": {
+        "include_provisioning": {"type": "boolean"},
+        "include_subdomains": {"type": "boolean"},
+        "type": {"const": "Prepaid annual subscription"},
+        "number_of_assets": {"type": "integer", "minimum": 1},
+        "number_of_domains": {"type": "integer", "minimum": 1},
+        "number_of_subdomains": {"type": "integer", "minimum": 1},
+        "start_date": {"type": "string", "format": "date"},
+        "expiration_date": {"type": "string", "format": "date"}
+      }
+    },
+    "draft": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "routing", "account", "primary_user", "settings", "attack_modules", "license"],
+      "properties": {
+        "source": {"$ref": "#/$defs/source"},
+        "routing": {"$ref": "#/$defs/routing"},
+        "account": {"$ref": "#/$defs/account"},
+        "primary_user": {"$ref": "#/$defs/primary_user"},
+        "settings": {"$ref": "#/$defs/settings"},
+        "attack_modules": {"$ref": "#/$defs/attack_modules"},
+        "license": {"$ref": "#/$defs/license"}
+      }
+    }
+  }
+}

@@ -1,0 +1,158 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1220" viewBox="0 0 1800 1220" role="img" aria-labelledby="title desc">
+  <title id="title">Current Surface Workato OPA onboarding workflow</title>
+  <desc id="desc">A guarded Salesforce to Workato onboarding flow. Case 2 uses a controlled RND OPA path; all unapproved, unsupported, duplicate, or unverified flows stop safely.</desc>
+  <defs>
+    <style>
+      .title { font: 700 32px Arial, sans-serif; fill: #172033; }
+      .subtitle { font: 16px Arial, sans-serif; fill: #3a4458; }
+      .label { font: 700 16px Arial, sans-serif; fill: #172033; }
+      .small { font: 14px Arial, sans-serif; fill: #3a4458; }
+      .box { fill: #f8fbff; stroke: #5b7bb2; stroke-width: 2; rx: 10; }
+      .secure { fill: #ecfff5; stroke: #24945f; stroke-width: 2; rx: 10; }
+      .govern { fill: #f3f0ff; stroke: #7357c8; stroke-width: 2; rx: 10; }
+      .stop { fill: #fff0f0; stroke: #c23b3b; stroke-width: 2; rx: 10; }
+      .pending { fill: #fff9e8; stroke: #c88a00; stroke-width: 2; rx: 10; }
+      .decision { fill: #fff9e8; stroke: #c88a00; stroke-width: 2; }
+      .arrow { stroke: #546077; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 8 6; }
+      .edge { font: 12px Arial, sans-serif; fill: #3a4458; }
+      .lane { font: 700 14px Arial, sans-serif; fill: #546077; letter-spacing: 1px; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0,10 3.5,0 7" fill="#546077"/>
+    </marker>
+  </defs>
+
+  <text x="48" y="52" class="title">Surface Customer Onboarding — Current Workato + OPA Flow</text>
+  <text x="48" y="82" class="subtitle">Donatello dev only. Production BackOffice writes remain blocked until Cybersecurity and stakeholder approval.</text>
+
+  <text x="48" y="130" class="lane">GOVERNANCE</text>
+  <rect x="560" y="106" width="660" height="72" class="govern"/>
+  <text x="585" y="136" class="label">Security-review prerequisite</text>
+  <text x="585" y="160" class="small">Or / Ran / Elad approve the controlled Donatello-dev OPA test scope</text>
+
+  <text x="48" y="237" class="lane">INTAKE AND REVIEW</text>
+  <rect x="48" y="260" width="215" height="86" class="box"/>
+  <text x="72" y="292" class="label">Development trigger</text>
+  <text x="72" y="316" class="small">Manual/API request</text>
+  <text x="72" y="336" class="small">with CO number</text>
+
+  <rect x="48" y="382" width="215" height="86" class="box"/>
+  <text x="72" y="414" class="label">Production trigger</text>
+  <text x="72" y="438" class="small">Salesforce CO create</text>
+  <text x="72" y="458" class="small">or update</text>
+
+  <rect x="352" y="310" width="270" height="100" class="box"/>
+  <text x="376" y="343" class="label">Workato Router</text>
+  <text x="376" y="367" class="small">Salesforce CO + DealHub review</text>
+  <text x="376" y="387" class="small">Normalize and classify</text>
+
+  <polygon points="750,300 865,360 750,420 635,360" class="decision"/>
+  <text x="693" y="353" class="label">Source valid, motion</text>
+  <text x="700" y="374" class="small">matched, supported?</text>
+
+  <rect x="962" y="310" width="255" height="100" class="secure"/>
+  <text x="986" y="343" class="label">Human approval</text>
+  <text x="986" y="367" class="small">Workato Workflow App</text>
+  <text x="986" y="387" class="small">No write before approval</text>
+
+  <polygon points="1350,300 1450,360 1350,420 1250,360" class="decision"/>
+  <text x="1310" y="353" class="label">Engine value</text>
+  <text x="1290" y="374" class="small">case route 1–6</text>
+
+  <rect x="1515" y="310" width="235" height="100" class="stop"/>
+  <text x="1540" y="343" class="label">Reject / block</text>
+  <text x="1540" y="367" class="small">Masked reason to Salesforce</text>
+  <text x="1540" y="387" class="small">Audit and stop</text>
+
+  <text x="48" y="530" class="lane">CASE ROUTING AND TRUSTED-NETWORK PATH</text>
+  <rect x="250" y="555" width="260" height="98" class="pending"/>
+  <text x="274" y="588" class="label">Case 1 — New Surface</text>
+  <text x="274" y="612" class="small">Callable scaffold only</text>
+  <text x="274" y="632" class="small">Dry run until mapped</text>
+
+  <rect x="660" y="555" width="290" height="98" class="secure"/>
+  <text x="684" y="588" class="label">Case 2 — New CE</text>
+  <text x="684" y="612" class="small">Current Donatello-dev focus</text>
+  <text x="684" y="632" class="small">Only active API proof of concept</text>
+
+  <rect x="1095" y="555" width="290" height="98" class="pending"/>
+  <text x="1119" y="588" class="label">Cases 3–6</text>
+  <text x="1119" y="612" class="small">Combined and renewal flows</text>
+  <text x="1119" y="632" class="small">Block: case_not_mapped_yet</text>
+
+  <rect x="660" y="715" width="290" height="108" class="secure"/>
+  <text x="684" y="748" class="label">RND OPA HTTP connection</text>
+  <text x="684" y="772" class="small">workato-opa-01 · 172.26.37.20</text>
+  <text x="684" y="792" class="small">NAT 199.203.203.177 · sg3/sg4 mTLS</text>
+
+  <rect x="1065" y="715" width="275" height="108" class="box"/>
+  <text x="1089" y="748" class="label">Donatello dev API</text>
+  <text x="1089" y="772" class="small">Login, MFA, authority check</text>
+  <text x="1089" y="792" class="small">No direct cloud HTTP path</text>
+
+  <text x="48" y="900" class="lane">CONTROLLED CASE 2 EXECUTION</text>
+  <rect x="48" y="925" width="215" height="92" class="box"/>
+  <text x="72" y="958" class="label">Duplicate check</text>
+  <text x="72" y="982" class="small">Account name and domain</text>
+  <text x="72" y="1002" class="small">Fail closed</text>
+
+  <rect x="332" y="925" width="215" height="92" class="box"/>
+  <text x="356" y="958" class="label">Masked dry run</text>
+  <text x="356" y="982" class="small">Payload built and reviewed</text>
+  <text x="356" y="1002" class="small">No submit by default</text>
+
+  <polygon points="675,920 790,971 675,1022 560,971" class="decision"/>
+  <text x="622" y="965" class="label">Separate create</text>
+  <text x="627" y="986" class="small">approval?</text>
+
+  <rect x="890" y="925" width="220" height="92" class="secure"/>
+  <text x="914" y="958" class="label">Create / update</text>
+  <text x="914" y="982" class="small">Donatello dev only</text>
+  <text x="914" y="1002" class="small">Controlled action</text>
+
+  <rect x="1180" y="925" width="220" height="92" class="box"/>
+  <text x="1204" y="958" class="label">Verify result</text>
+  <text x="1204" y="982" class="small">Read after write</text>
+  <text x="1204" y="1002" class="small">Return accountUuid</text>
+
+  <rect x="1470" y="925" width="280" height="92" class="secure"/>
+  <text x="1494" y="958" class="label">Writeback and audit</text>
+  <text x="1494" y="982" class="small">Approved Salesforce UUID field</text>
+  <text x="1494" y="1002" class="small">Masked idempotency record</text>
+
+  <rect x="1470" y="1080" width="280" height="72" class="box"/>
+  <text x="1494" y="1110" class="label">Optional Slack status</text>
+  <text x="1494" y="1134" class="small">Masked notification only</text>
+
+  <rect x="560" y="1080" width="230" height="72" class="stop"/>
+  <text x="584" y="1110" class="label">Stop after dry run</text>
+  <text x="584" y="1134" class="small">or on any failed gate</text>
+
+  <path d="M263 303 H352" class="arrow"/>
+  <path d="M263 425 H320 V360 H352" class="arrow"/>
+  <path d="M622 360 H635" class="arrow"/>
+  <path d="M865 360 H962" class="arrow"/>
+  <path d="M1217 360 H1250" class="arrow"/>
+  <path d="M750 420 V490 H1630 V410" class="arrow"/>
+  <path d="M1217 360 H1515" class="arrow"/>
+  <path d="M1350 420 V500 H380 V555" class="arrow"/>
+  <path d="M1350 420 V500 H805 V555" class="arrow"/>
+  <path d="M1350 420 V500 H1240 V555" class="arrow"/>
+  <path d="M805 653 V715" class="arrow"/>
+  <path d="M1220 178 V660 H805 V715" class="arrow dash"/>
+  <path d="M950 769 H1065" class="arrow"/>
+  <path d="M1065 769 H500 V925 H263" class="arrow"/>
+  <path d="M263 971 H332" class="arrow"/>
+  <path d="M547 971 H560" class="arrow"/>
+  <path d="M790 971 H890" class="arrow"/>
+  <path d="M675 1022 V1080" class="arrow"/>
+  <path d="M1110 971 H1180" class="arrow"/>
+  <path d="M1400 971 H1470" class="arrow"/>
+  <path d="M1610 1017 V1080" class="arrow dash"/>
+
+  <text x="891" y="348" class="edge">invalid / mismatch</text>
+  <text x="1234" y="348" class="edge">approved</text>
+  <text x="801" y="950" class="edge">yes</text>
+  <text x="703" y="1060" class="edge">no</text>
+</svg>

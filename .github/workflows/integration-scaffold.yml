@@ -1,0 +1,21 @@
+name: Integration scaffold checks
+
+on:
+  pull_request:
+  push:
+    paths:
+      - 'integration/**'
+      - 'tools/check_integration_artifacts.py'
+      - 'tools/check_integration_offline_boundary.py'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s integration/tests -t . -v
+      - run: python tools/check_integration_artifacts.py
+      - run: python tools/check_integration_offline_boundary.py

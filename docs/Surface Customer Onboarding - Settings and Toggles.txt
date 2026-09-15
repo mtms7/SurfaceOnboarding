@@ -1,0 +1,182 @@
+WHY
+
+The below document outlines the common settings used when onboarding / modifying a surface tenant. Default values and considerations listed below, but should some use case be unclear please reach out to a senior resource to assist.
+
+
+SETTINGS
+
+
+ACCOUNT DETAILS
+
+ * Company Name
+    * Name of the company as it appears in Salesforce.
+    * If customer only has CE then should have " - CE Only" appended.
+
+ * Account Type
+    * Customer
+
+ * Company Primary Domain
+    * Primary domain of the company.
+    * In cases where a customer wants to scan ONLY a set of subdomains then a "fake" domain should be used.
+       * Engage a senior resource when such a request is made.
+
+ * Alternate Domains
+    * Any additional domains (not subdomains) that a customer wishes to have scanned.
+
+ * SubDomains
+    * Used when some specific subdomains are failing to be discovered via subdomain recon.
+    * Used when some specific subdomains either not under the primary / alternate domains are requested to be scanned.
+
+ * User email domains
+    * Any email domain that is desired to be used for tenant login that are NOT part of the primary or alternate domains.
+
+ * Networks
+    * Used when a customer requests some specific IP(s) or network range(s) are scanned that are not discovered during the regular discovery.
+
+ * Country
+    * The customer's address of operation as seen in Salesforce.
+
+
+PRIMARY USER
+
+ * First name
+    * First name of the primary user.
+
+ * Last name
+    * Last name of the primary user.
+
+ * Organization Email
+    * Email of the primary user.
+    * When primary user is a Pentera employee such as when configuring a CE Only account then the email should use an identifier like "+CustomerName".
+       * "User.Name+CustomerName@pentera.io"
+
+ * Phone number
+    * Optional phone number of the user.
+
+ * Job title
+    * Optional job title of the user.
+
+ * Multi-factor authentication
+    * Always on
+
+
+OPERATOR ACCOUNT
+
+Select Operator Accounts
+
+
+ACCOUNT SETTINGS
+
+ * Scan now
+    * Always on for a new surface account.
+    * Always off for a new CE Only account.
+    * Leave as set for a renewal.
+
+ * Maximum scan Duration
+    * Defaults to 24 hours, but should be set to 90 hours.
+
+ * Automated discovery
+    * For now disable by default.
+    * Enable only on special cases following discussion with account and product team.
+
+ * Recon Subdomains
+    * Enable by default.
+    * Disable when:
+       * Customer wants specific subdomains configured, but no further downstream subdomains.
+       * Customer does not have ownership of some downstream subdomains.
+
+ * Multiple attack stacks
+    * Disable by default.
+    * If ((scanning takes > 24 hours) AND (domains >6)) then enable Multiple attack stacks
+    * If ((scanning takes > 24 hours) AND (domains >2 AND domains <6)) then also enable MAS for subdomains.
+
+ * MAS for subdomains
+    * Disabled by default.
+    * MAS for subdomains sane default value is 500
+
+ * Web dictionary brute force
+    * Enabled by default.
+    * Disable when:
+       * Customer complaining about too much traffic.
+       * Customer complaining about lockout.
+
+ * Web dorking
+    * Disabled by default.
+    * As of this writing this is non-functional and should never be enabled.
+
+ * Nuclei
+    * Enabled by default.
+    * Disable as advised by product / research via SI.
+
+ * Authenticated Testing
+    * Disabled by default.
+    * Enable on request from account team.
+
+ * Static outbound IP
+    * Disabled by default.
+    * Enabled by request from customer. See the below gurus.
+       * Configure Static IP [https://app.getguru.com/card/i5AEnRKT/Configure-Static-IP-]
+       * Limitations about Static IP [https://app.getguru.com/card/TpApRo6c/Limitations-about-Static-IP]
+
+ * AI
+    * Disabled by default.
+    * Do not enable manually, customer opts in via their WebUI.
+
+ * Notifications
+    * Enabled by default.
+    * Only disable on request from customer after they confirm their entire team agrees.
+
+ * Multiple users
+    * Enable by default with new license model.
+
+ * API access
+    * Enable by default.
+
+
+ATTACK MODULES
+
+ * Phishing
+    * Disable by default
+    * Enable on request from account team after discussing with product.
+
+ * Leaked Credentials
+    * Enable if the customer has CE entitlements.
+
+ * Leaked Credentials scanning interval
+    * Generally weekly, discuss with account team / product for any other cadence requests.
+
+ * Leaked Credentials scanned domains
+    * Email domain(s) to be scanned for leaked credentials.
+    * Core + includes 1 domain entitlement.
+    * Ensure the customer has adequate license entitlement add on domains for any additional domains.
+
+
+LICENSE
+
+ * Include Provisioning
+    * Enable by default.
+
+ * Include subdomains
+    * Enable by default.
+
+ * Type
+    * Depends on license model. Generally prepaid annual.
+
+ * Number of assets
+    * Depends on license model.
+       * For older model based on license entitlements.
+       * For newer model set high to something like 50000.
+
+ * Number of domains
+    * Depends on license entitlements and special use cases.
+    * For newer license model can generally set high (number of subdomains).
+       * In some special cases if no further domains are desired to be discovered then can set explicitly to the number of domains configured.
+
+ * Number of subdomains
+    * Set based on license entitlements.
+
+ * Start date
+    * Start date of entitlements.
+
+ * Expiration date
+    * End date of entitlements.

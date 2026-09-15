@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="980" viewBox="0 0 1600 980" role="img" aria-label="Surface onboarding current implementation and approved next steps">
+  <defs>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #14213d; }
+      .subtitle { font: 16px Arial, sans-serif; fill: #4a5568; }
+      .heading { font: 700 19px Arial, sans-serif; fill: #14213d; }
+      .label { font: 700 16px Arial, sans-serif; fill: #14213d; }
+      .small { font: 14px Arial, sans-serif; fill: #39465b; }
+      .tiny { font: 12px Arial, sans-serif; fill: #39465b; }
+      .current { fill: #edf5ff; stroke: #3478c5; stroke-width: 2; rx: 10; }
+      .control { fill: #effcf5; stroke: #26855b; stroke-width: 2; rx: 10; }
+      .pending { fill: #f7f1ff; stroke: #7954be; stroke-width: 2; rx: 10; }
+      .stop { fill: #fff1f1; stroke: #c83d3d; stroke-width: 2; rx: 10; }
+      .decision { fill: #fff9e6; stroke: #bd8500; stroke-width: 2; }
+      .line { stroke: #53627a; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 8 6; }
+    </style>
+    <marker id="arrow" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto"><polygon points="0 0,10 3.5,0 7" fill="#53627a"/></marker>
+  </defs>
+  <rect width="1600" height="980" fill="#ffffff"/>
+  <text x="45" y="50" class="title">Surface Onboarding Integration: Current Guarded Flow and Next Phase</text>
+  <text x="45" y="78" class="subtitle">Current implementation is development-safe and fail-closed. Account creation requires explicit owner approval.</text>
+
+  <rect x="40" y="115" width="1520" height="395" fill="#f8fbff" stroke="#c7d9ee" stroke-width="2" rx="14"/>
+  <text x="70" y="150" class="heading">1. Current implementation — validated components and controls</text>
+  <rect x="75" y="190" width="195" height="94" class="current"/>
+  <text x="95" y="224" class="label">Salesforce CO</text><text x="95" y="249" class="small">Customer Onboarding</text><text x="95" y="269" class="small">record / subscriptions</text>
+  <rect x="325" y="190" width="215" height="94" class="current"/>
+  <text x="345" y="224" class="label">Workato Router</text><text x="345" y="249" class="small">Review, normalize,</text><text x="345" y="269" class="small">classify cases 1–6</text>
+  <polygon points="670,183 775,237 670,291 565,237" class="decision"/>
+  <text x="620" y="234" class="label">Valid, mapped,</text><text x="623" y="255" class="small">complete source?</text>
+  <rect x="875" y="190" width="220" height="94" class="control"/>
+  <text x="895" y="224" class="label">CSE Approval Gate</text><text x="895" y="249" class="small">Workflow App +</text><text x="895" y="269" class="small">masked control record</text>
+  <rect x="1175" y="190" width="280" height="94" class="control"/>
+  <text x="1195" y="224" class="label">Workato Queue / Audit</text><text x="1195" y="249" class="small">Idempotency, safe dashboard,</text><text x="1195" y="269" class="small">read-only pilot controls</text>
+  <rect x="75" y="355" width="250" height="100" class="stop"/>
+  <text x="95" y="389" class="label">Fail closed / manual review</text><text x="95" y="414" class="small">Mismatch, missing field, duplicate,</text><text x="95" y="434" class="small">unsupported route, expired approval</text>
+  <rect x="495" y="355" width="265" height="100" class="current"/>
+  <text x="515" y="389" class="label">OPA-ready dev path</text><text x="515" y="414" class="small">Ubuntu 22 VM → outbound tunnel</text><text x="515" y="434" class="small">to Workato gateways only</text>
+  <rect x="910" y="355" width="280" height="100" class="pending"/>
+  <text x="930" y="389" class="label">Leonardo development</text><text x="930" y="414" class="small">Access available; integration</text><text x="930" y="434" class="small">implementation in progress</text>
+  <rect x="1275" y="355" width="220" height="100" class="stop"/>
+  <text x="1295" y="389" class="label">Production BackOffice</text><text x="1295" y="414" class="small">No writes approved</text><text x="1295" y="434" class="small">separate release gate</text>
+  <path d="M270 237 H325 M540 237 H565 M775 237 H875 M1095 237 H1175" class="line"/>
+  <path d="M670 291 C670 330 200 320 200 355" class="line"/>
+  <path d="M985 284 C985 325 627 320 627 355" class="line"/>
+  <path d="M760 405 H910" class="line"/>
+  <path d="M1190 405 H1275" class="line dash"/>
+
+  <rect x="40" y="550" width="1520" height="370" fill="#fcfbff" stroke="#d8cbed" stroke-width="2" rx="14"/>
+  <text x="70" y="585" class="heading">2. Next phase — approved architecture decision required before account creation</text>
+  <rect x="85" y="630" width="270" height="110" class="pending"/>
+  <text x="105" y="664" class="label">Platform-owned automation identity</text><text x="105" y="689" class="small">Dedicated Salesforce/BackOffice</text><text x="105" y="709" class="small">service principal; least privilege</text><text x="105" y="729" class="small">not a personal user account</text>
+  <polygon points="545,620 665,685 545,750 425,685" class="decision"/>
+  <text x="483" y="682" class="label">Supported machine auth</text><text x="496" y="703" class="small">and required scopes?</text>
+  <rect x="790" y="630" width="255" height="110" class="control"/>
+  <text x="810" y="664" class="label">Security / owner approvals</text><text x="810" y="689" class="small">Dev target, OPA scope, secret</text><text x="810" y="709" class="small">manager, token rotation, audit</text><text x="810" y="729" class="small">and Salesforce UUID field</text>
+  <rect x="1175" y="630" width="275" height="110" class="control"/>
+  <text x="1195" y="664" class="label">Controlled dev execution</text><text x="1195" y="689" class="small">Authority + duplicate check →</text><text x="1195" y="709" class="small">approved create → read-after-write</text><text x="1195" y="729" class="small">→ verified Salesforce update</text>
+  <rect x="425" y="800" width="520" height="70" class="stop"/>
+  <text x="447" y="831" class="label">If no supported service identity: keep a time-boxed, dev-only personal/MFA proof of concept</text><text x="447" y="853" class="small">Manual approval for every action; no production, Presales, or unattended credential reuse.</text>
+  <path d="M355 685 H425 M665 685 H790 M1045 685 H1175" class="line"/>
+  <path d="M545 750 V800" class="line"/>
+  <text x="85" y="895" class="tiny">Open owners: Surface/BackOffice (supported API and scopes), Security (architecture), Salesforce (integration user and writeback field), Workato (OPA connector entitlement).</text>
+</svg>

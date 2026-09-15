@@ -1,0 +1,159 @@
+{
+  "template_version": "co-0715-intake-v1",
+  "classification": "restricted intake template; not an execution manifest",
+  "target_environment": "leonardo-development",
+  "co_number": "CO-0715",
+  "sf_record_id": "a5KR500000lzBXAMA2",
+  "source_revision": "2026-08-26T16:41:21.000+0000",
+  "sf_account_id": "001R500000NJnMNIA1",
+  "record_match_count": 1,
+  "source_read_only_verified": true,
+  "source_revisions_reread_unchanged": true,
+  "approval_status": "Approved",
+  "submission_date": "2026-08-20",
+  "surface_account_id_present": false,
+  "account_uuid_present": false,
+  "data_sensitivity": "restricted",
+  "contains_customer_contact_or_domain_data": false,
+  "workato_router_test": {
+    "recorded_at": "2026-08-26T12:45:05-07:00",
+    "environment": "Development",
+    "recipe_id": "73688657",
+    "recipe_version": 20,
+    "test_job_id": "j-AbMTmLdn-H6zC9z-CD",
+    "outcome": "successful",
+    "data_masked": true,
+    "co_number_format_gate_passed": true,
+    "exact_one_co_gate_passed": true,
+    "dealhub_search_executed": true,
+    "classification_executed": true,
+    "source_values_retained": false,
+    "external_writes_performed": false
+  },
+  "test_fixture": {
+    "classification": null,
+    "attested_by": null,
+    "attested_at": null,
+    "retention_cleanup_owner": null,
+    "automatic_cleanup_allowed": false
+  },
+  "normalized_evidence": {
+    "onboarding_product": "Surface & Credential Exposure",
+    "onboarding_type": "New Product Onboarding",
+    "stage": "Request Approved",
+    "selected_subscription_ids": [
+      "a2ZR5000000Ut8lMAC",
+      "a2ZR5000000Ut8kMAC",
+      "a2ZR5000000Ut8jMAC"
+    ],
+    "selected_subscription_revisions": [
+      "2026-04-28T11:47:49.000+0000",
+      "2026-04-28T11:47:49.000+0000",
+      "2026-04-28T11:47:49.000+0000"
+    ],
+    "product_semantics_verified": false,
+    "license_semantics_verified": false,
+    "quantity_verified": false,
+    "dates_verified": true,
+    "source_motion_match": false
+  },
+  "dealhub_evidence": {
+    "record_match_count": 3,
+    "subscription_revisions_reread_unchanged": true,
+    "single_opportunity_id": "006R500000DcN7NIAV",
+    "common_status": "Pending",
+    "common_start_date": "2026-09-01",
+    "common_end_date": "2029-08-31",
+    "common_duration_months": 36,
+    "date_comment_policy": "onboarding-comment-dates-v1",
+    "date_comment_validation": "ready_for_cse_review",
+    "rows": [
+      {
+        "id": "a2ZR5000000Ut8lMAC",
+        "revision": "2026-04-28T11:47:49.000+0000",
+        "product_code": "PCB-500",
+        "product_full_name": "Pentera Core Plus Bulk - Additional 500 End Points",
+        "pricing_type": "New Pricing",
+        "sva_type": null,
+        "quantity": 2
+      },
+      {
+        "id": "a2ZR5000000Ut8kMAC",
+        "revision": "2026-04-28T11:47:49.000+0000",
+        "product_code": "PCP-C-500",
+        "product_full_name": "Pentera Core Plus Commercial - 500 End Points",
+        "pricing_type": "New Pricing",
+        "sva_type": "SVA Essentials",
+        "quantity": null
+      },
+      {
+        "id": "a2ZR5000000Ut8jMAC",
+        "revision": "2026-04-28T11:47:49.000+0000",
+        "product_code": "PSG-500",
+        "product_full_name": "Pentera Surface Go - 500 Subdomains",
+        "pricing_type": "New Pricing",
+        "sva_type": null,
+        "quantity": null
+      }
+    ]
+  },
+  "routing": {
+    "engine_value": "case_3_combined_baseline",
+    "route_status": "inferred_candidate_not_approved",
+    "policy_version": "phase2-local-v1",
+    "mapping_approved": false,
+    "all_form_fields_explicitly_mapped": false,
+    "all_settings_toggles_explicitly_mapped": false,
+    "all_license_values_explicitly_mapped": false,
+    "default_values_prohibited": true
+  },
+  "leonardo_preflight": {
+    "supported_integration_contract_confirmed": false,
+    "duplicate_rules_owner_confirmed": false,
+    "duplicate_evidence_method": null,
+    "duplicate_outcome": "not_performed",
+    "uuid_readback_method": null,
+    "audit_evidence_method": null
+  },
+  "approval": {
+    "requested_by": null,
+    "approved_by": null,
+    "approver_group_verified": false,
+    "requester_approver_separated": false,
+    "approval_revision": null,
+    "manifest_sha256": null,
+    "approved_at": null,
+    "expires_at": null,
+    "operation": null,
+    "one_run_development_authorized": false
+  },
+  "idempotency": {
+    "idempotency_key": null,
+    "atomic_lock_acquired": false,
+    "prior_state": null,
+    "prior_attempt_reconciled": false
+  },
+  "required_owners": {
+    "salesforce": null,
+    "dealhub_commercial": null,
+    "cse_process": null,
+    "leonardo": null,
+    "workato": null,
+    "secops": null,
+    "automation": null
+  },
+  "decision": "blocked",
+  "proceed": false,
+  "leonardo_request_allowed": false,
+  "reasons": [
+    "case_3_candidate_requires_authoritative_guru_mapping_and_owner_approval",
+    "guru_readonly_connector_not_configured",
+    "credential_exposure_commercial_entitlement_not_verified",
+    "dealhub_quantity_missing_for_two_selected_rows",
+    "no_supported_leonardo_api_or_authorized_ui_automation_contract",
+    "no_approved_case_mapping",
+    "no_duplicate_or_uuid_readback_evidence",
+    "no_hash_bound_separated_approval",
+    "no_one_run_development_authorization"
+  ]
+}

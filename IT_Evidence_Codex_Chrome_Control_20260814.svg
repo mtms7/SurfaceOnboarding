@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">
+  <title id="title">Codex Chrome-control validation failure</title>
+  <desc id="desc">Rendered evidence capture of raw Codex diagnostic output from 14 August 2026. It is not a native desktop screenshot.</desc>
+  <rect width="1600" height="900" fill="#0d1117"/>
+  <rect x="55" y="50" width="1490" height="800" rx="16" fill="#161b22" stroke="#30363d" stroke-width="2"/>
+  <text x="100" y="125" fill="#f0f6fc" font-family="Segoe UI, Arial, sans-serif" font-size="38" font-weight="700">Codex Chrome-control validation — failure evidence</text>
+  <text x="100" y="178" fill="#8b949e" font-family="Segoe UI, Arial, sans-serif" font-size="25">Validation run: 14 August 2026 · Source: raw Codex diagnostic output</text>
+  <rect x="100" y="225" width="1400" height="500" rx="8" fill="#010409" stroke="#30363d"/>
+  <text x="140" y="300" fill="#f0f6fc" font-family="Cascadia Mono, Consolas, monospace" font-size="29">node_repl kernel exited unexpectedly</text>
+  <text x="140" y="375" fill="#8b949e" font-family="Cascadia Mono, Consolas, monospace" font-size="27">node_repl diagnostics: {</text>
+  <text x="185" y="425" fill="#8b949e" font-family="Cascadia Mono, Consolas, monospace" font-size="27">&quot;kernel_pid&quot;: 27780,</text>
+  <text x="185" y="475" fill="#8b949e" font-family="Cascadia Mono, Consolas, monospace" font-size="27">&quot;kernel_status&quot;: &quot;exited(code=1)&quot;,</text>
+  <text x="185" y="525" fill="#ff7b72" font-family="Cascadia Mono, Consolas, monospace" font-size="27">&quot;kernel_stderr_tail&quot;: &quot;windows sandbox failed:</text>
+  <text x="185" y="565" fill="#ff7b72" font-family="Cascadia Mono, Consolas, monospace" font-size="27">CryptUnprotectData failed: 2148073483&quot;,</text>
+  <text x="185" y="615" fill="#8b949e" font-family="Cascadia Mono, Consolas, monospace" font-size="27">&quot;reason&quot;: &quot;stdout_eof&quot;,</text>
+  <text x="185" y="665" fill="#8b949e" font-family="Cascadia Mono, Consolas, monospace" font-size="27">&quot;stream_error&quot;: null }</text>
+  <text x="100" y="790" fill="#d29922" font-family="Segoe UI, Arial, sans-serif" font-size="23">Note: This is a rendered evidence capture of the raw diagnostic, not a native desktop or Chrome screenshot.</text>
+</svg>

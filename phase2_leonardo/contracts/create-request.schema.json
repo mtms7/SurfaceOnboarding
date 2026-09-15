@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://internal.pentera.invalid/surface/leonardo-dev-create-v2.schema.json",
+  "title": "Leonardo Development attended execution manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version", "target_environment", "correlation_id", "idempotency_key",
+    "source", "routing", "approval", "account", "primary_user", "settings",
+    "attack_modules", "license"
+  ],
+  "properties": {
+    "contract_version": {"const": "leonardo-dev-create-v2"},
+    "target_environment": {"const": "leonardo-development"},
+    "correlation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "idempotency_key": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["sf_record_id", "co_number", "source_revision"],
+      "properties": {
+        "sf_record_id": {"type": "string", "minLength": 1},
+        "co_number": {"type": "string", "pattern": "^CO-[0-9]+$"},
+        "source_revision": {"type": "string", "minLength": 1}
+      }
+    },
+    "routing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["engine_value", "policy_version"],
+      "properties": {
+        "engine_value": {"enum": ["case_1_new_surface_only", "case_2_new_ce_only", "case_3_combined_baseline", "case_4_renew_surface_new_ce", "case_5_renew_ce_new_surface", "case_6_renew_both"]},
+        "policy_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "approval": {
+      "type": "object", "additionalProperties": false,
+      "required": ["request_key", "requested_by", "approved_by", "approver_group", "attestation_id", "decision", "approval_revision", "approved_at", "expires_at", "operation", "manifest_sha256"],
+      "properties": {
+        "request_key": {"type": "string", "minLength": 1},
+        "requested_by": {"type": "string", "minLength": 1},
+        "approved_by": {"type": "string", "minLength": 1},
+        "approver_group": {"type": "string", "minLength": 1},
+        "attestation_id": {"type": "string", "minLength": 1},
+        "decision": {"const": "approved"},
+        "approval_revision": {"type": "integer", "minimum": 1},
+        "approved_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "operation": {"enum": ["validate_only", "read_only_preflight", "fill_and_pause", "read_only_verify"]},
+        "manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "account": {
+      "type": "object", "additionalProperties": false,
+      "required": ["company_name", "account_type", "primary_domain", "alternate_domains", "subdomains", "email_domains", "networks", "country"],
+      "properties": {
+        "company_name": {"type": "string", "minLength": 1},
+        "account_type": {"enum": ["Customer", "Demo"]},
+        "primary_domain": {"type": "string", "minLength": 1},
+        "alternate_domains": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "subdomains": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "email_domains": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "networks": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "country": {"type": "string", "minLength": 1}
+      }
+    },
+    "primary_user": {
+      "type": "object", "additionalProperties": false,
+      "required": ["first_name", "last_name", "email", "phone", "job_title", "mfa_enabled", "operator_account"],
+      "properties": {
+        "first_name": {"type": "string", "minLength": 1},
+        "last_name": {"type": "string", "minLength": 1},
+        "email": {"type": "string", "minLength": 1},
+        "phone": {"type": "string"},
+        "job_title": {"type": "string"},
+        "mfa_enabled": {"const": true},
+        "operator_account": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "settings": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scanning_interval", "scan_now", "maximum_scan_duration_hours", "automated_discovery", "recon_subdomains", "multiple_attack_stacks", "mas_for_subdomains", "web_dictionary_brute_force", "web_dorking", "nuclei", "authenticated_testing", "static_outbound_ip", "ai", "notifications", "multiple_users", "api_access"],
+      "properties": {
+        "scanning_interval": {"enum": ["None", "Daily", "Weekly", "Monthly"]},
+        "scan_now": {"type": "boolean"}, "maximum_scan_duration_hours": {"type": "integer", "minimum": 1},
+        "automated_discovery": {"type": "boolean"}, "recon_subdomains": {"type": "boolean"},
+        "multiple_attack_stacks": {"type": "boolean"}, "mas_for_subdomains": {"type": "boolean"},
+        "web_dictionary_brute_force": {"type": "boolean"}, "web_dorking": {"type": "boolean"},
+        "nuclei": {"type": "boolean"}, "authenticated_testing": {"type": "boolean"},
+        "static_outbound_ip": {"type": "boolean"}, "ai": {"type": "boolean"},
+        "notifications": {"type": "boolean"}, "multiple_users": {"type": "boolean"}, "api_access": {"type": "boolean"}
+      }
+    },
+    "attack_modules": {
+      "type": "object", "additionalProperties": false,
+      "required": ["phishing", "leaked_credentials", "leaked_credentials_interval", "leaked_credentials_domains"],
+      "properties": {
+        "phishing": {"type": "boolean"}, "leaked_credentials": {"type": "boolean"},
+        "leaked_credentials_interval": {"enum": ["None", "Daily", "Weekly", "Monthly"]},
+        "leaked_credentials_domains": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "license": {
+      "type": "object", "additionalProperties": false,
+      "required": ["include_provisioning", "include_subdomains", "type", "number_of_assets", "number_of_domains", "number_of_subdomains", "start_date", "expiration_date"],
+      "properties": {
+        "include_provisioning": {"type": "boolean"}, "include_subdomains": {"type": "boolean"},
+        "type": {"enum": ["Evaluation", "Trial", "Prepaid monthly subscription", "Prepaid annual subscription", "PAYG monthly subscription"]},
+        "number_of_assets": {"type": "integer", "minimum": 0}, "number_of_domains": {"type": "integer", "minimum": 0},
+        "number_of_subdomains": {"type": "integer", "minimum": 0}, "start_date": {"type": "string", "format": "date"},
+        "expiration_date": {"type": "string", "format": "date"}
+      }
+    }
+  }
+}

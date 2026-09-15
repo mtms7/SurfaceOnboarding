@@ -1,0 +1,31 @@
+flowchart TB
+  DEV["Development: manual/API trigger with CO number"] --> ROUTER
+  SF["Production: Salesforce Customer Onboarding record"] --> ROUTER["Workato Router: Salesforce + DealHub review"]
+  ROUTER --> VALID{"Exactly one CO, valid motion, required data, and supported case?"}
+  VALID -- "No" --> REJECT["Reject or block in Salesforce\nmasked reason and audit"]
+  VALID -- "Yes" --> APPROVAL["Workato Workflow App\nhuman approval"]
+  APPROVAL -- "Denied or timeout" --> REJECT
+  APPROVAL -- "Approved" --> CASE{"Engine value"}
+
+  CASE --> C1["Case 1: callable scaffold\ndry run only until mapped"]
+  CASE --> C2["Case 2: New Credential Exposure\ncurrent Donatello-dev focus"]
+  CASE --> C36["Cases 3-6: block\ncase_not_mapped_yet"]
+  C1 --> REJECT
+  C36 --> REJECT
+
+  C2 --> OPA["Donatello Dev HTTP via RND OPA\nworkato-opa-01 / 172.26.37.20\nNAT 199.203.203.177"]
+  GOV["Governance prerequisite\nOr / Ran / Elad approve controlled\nDonatello-dev OPA test scope"] -. "gates OPA test" .-> OPA
+  OPA --> AUTH["Login and MFA if required\nMFA remains enabled"]
+  AUTH --> AUTHZ{"Required authorities present?"}
+  AUTHZ -- "No" --> REJECT
+  AUTHZ -- "Yes" --> DUP{"Duplicate check passes?"}
+  DUP -- "No" --> REJECT
+  DUP -- "Yes" --> DRY["Build masked dry-run payload"]
+  DRY --> CREATE{"Separate create approval?"}
+  CREATE -- "No" --> STOP["Stop after dry run"]
+  CREATE -- "Yes" --> WRITE["Donatello-dev create or update"]
+  WRITE --> VERIFY{"Read-after-write verification passes?"}
+  VERIFY -- "No" --> STOP
+  VERIFY -- "Yes" --> SFWRITE["Update approved Salesforce UUID field"]
+  SFWRITE --> AUDIT["Workato lookup table\nmasked audit + idempotency"]
+  AUDIT -. "optional masked status" .-> SLACK["Slack status notification"]

@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://internal.pentera.invalid/surface/leonardo-dev-result-v1.schema.json",
+  "title": "Leonardo Development redacted execution result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "correlation_id", "idempotency_key", "manifest_sha256", "runner_job_id", "target_environment", "outcome", "leonardo_account_uuid", "verification", "error"],
+  "properties": {
+    "contract_version": {"const": "leonardo-dev-result-v1"},
+    "correlation_id": {"type": "string", "minLength": 1},
+    "idempotency_key": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "manifest_sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "runner_job_id": {"type": ["string", "null"]},
+    "target_environment": {"const": "leonardo-development"},
+    "outcome": {"enum": ["verified", "blocked", "failed", "uncertain"]},
+    "leonardo_account_uuid": {"type": ["string", "null"]},
+    "verification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method", "all_fields_match", "all_settings_match", "verified_at"],
+      "properties": {
+        "method": {"type": ["string", "null"]},
+        "all_fields_match": {"type": "boolean"},
+        "all_settings_match": {"type": "boolean"},
+        "verified_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "error": {
+      "type": "object", "additionalProperties": false,
+      "required": ["category", "retry_allowed"],
+      "properties": {"category": {"type": ["string", "null"]}, "retry_allowed": {"const": false}}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"outcome": {"const": "verified"}}, "required": ["outcome"]},
+      "then": {
+        "properties": {
+          "runner_job_id": {"type": "string", "minLength": 1},
+          "leonardo_account_uuid": {"type": "string", "format": "uuid"},
+          "verification": {
+            "properties": {
+              "method": {"enum": ["owner-approved-read-only-ui", "supported-service-readback"]},
+              "all_fields_match": {"const": true},
+              "all_settings_match": {"const": true},
+              "verified_at": {"type": "string", "format": "date-time"}
+            }
+          },
+          "error": {"properties": {"category": {"type": "null"}, "retry_allowed": {"const": false}}}
+        }
+      },
+      "else": {
+        "properties": {
+          "leonardo_account_uuid": {"type": "null"},
+          "error": {
+            "properties": {
+              "category": {"enum": ["approval_blocked", "authentication_failed", "authorization_failed", "ambiguous_submit", "contract_invalid", "duplicate_blocked", "environment_blocked", "preflight_blocked", "readback_failed", "schema_drift", "timeout", "unexpected_response"]},
+              "retry_allowed": {"const": false}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

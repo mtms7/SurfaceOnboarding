@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://internal.pentera.invalid/surface/case3-intake-v2.schema.json",
+  "title": "Surface Case 3 OPA intake request",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "target_environment", "source", "routing", "account", "primary_user", "entitlements"],
+  "properties": {
+    "contract_version": {"const": "surface-case3-intake-v2"},
+    "target_environment": {"const": "leonardo-development"},
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["co_number", "sf_record_id", "source_revision"],
+      "properties": {
+        "co_number": {"type": "string", "pattern": "^CO-[0-9]+$"},
+        "sf_record_id": {"type": "string", "pattern": "^[A-Za-z0-9]{15}([A-Za-z0-9]{3})?$"},
+        "source_revision": {"type": "string", "format": "date-time"}
+      }
+    },
+    "routing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["engine_value", "special_requirements"],
+      "properties": {
+        "engine_value": {"const": "case_3_combined_baseline"},
+        "special_requirements": {"const": false}
+      }
+    },
+    "account": {
+      "type": "object", "additionalProperties": false,
+      "required": ["company_name", "primary_domain", "domain_candidates", "ce_email_domains", "country"],
+      "properties": {
+        "company_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "primary_domain": {"type": "string", "minLength": 1, "maxLength": 512},
+        "domain_candidates": {
+          "oneOf": [
+            {"type": "string", "maxLength": 65536},
+            {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+          ]
+        },
+        "ce_email_domains": {
+          "oneOf": [
+            {"type": "string", "maxLength": 65536},
+            {"type": "array", "maxItems": 1000, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+          ]
+        },
+        "country": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    },
+    "primary_user": {
+      "type": "object", "additionalProperties": false,
+      "required": ["first_name", "last_name", "email", "phone", "job_title", "operator_account"],
+      "properties": {
+        "first_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "last_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "email": {"type": "string", "minLength": 3, "maxLength": 512},
+        "phone": {"type": "string", "maxLength": 512},
+        "job_title": {"type": "string", "maxLength": 512},
+        "operator_account": {
+          "oneOf": [
+            {"type": "string", "maxLength": 512},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "entitlements": {
+      "type": "object", "additionalProperties": false,
+      "required": ["surface", "core", "add_ons"],
+      "properties": {
+        "surface": {"$ref": "#/$defs/subscription"},
+        "core": {"$ref": "#/$defs/subscription"},
+        "add_ons": {
+          "type": "array", "maxItems": 100,
+          "items": {"$ref": "#/$defs/addon"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "subscription": {
+      "type": "object", "additionalProperties": false,
+      "required": ["record_id", "system_modstamp", "opportunity_id", "product_full_name", "status", "quantity", "quantity_source", "unit", "start_date", "end_date"],
+      "properties": {
+        "record_id": {"type": "string", "pattern": "^[A-Za-z0-9]{15}([A-Za-z0-9]{3})?$"},
+        "system_modstamp": {"type": "string", "format": "date-time"},
+        "opportunity_id": {"type": "string", "pattern": "^[A-Za-z0-9]{15}([A-Za-z0-9]{3})?$"},
+        "product_full_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "status": {"type": "string", "minLength": 1, "maxLength": 512},
+        "quantity": {"type": "integer", "minimum": 1},
+        "quantity_source": {"enum": ["dealhub_quantity", "owner_approved_product_tier"]},
+        "unit": {"enum": ["Subdomains", "End Points"]},
+        "start_date": {"type": "string", "format": "date"},
+        "end_date": {"type": "string", "format": "date"}
+      }
+    },
+    "addon": {
+      "type": "object", "additionalProperties": false,
+      "required": ["record_id", "system_modstamp", "product_full_name", "status"],
+      "properties": {
+        "record_id": {"type": "string", "pattern": "^[A-Za-z0-9]{15}([A-Za-z0-9]{3})?$"},
+        "system_modstamp": {"type": "string", "format": "date-time"},
+        "product_full_name": {"type": "string", "minLength": 1, "maxLength": 512},
+        "status": {"type": "string", "minLength": 1, "maxLength": 512}
+      }
+    }
+  }
+}

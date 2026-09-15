@@ -1,0 +1,24 @@
+flowchart LR
+  A["CSM creates or updates CO in Salesforce"] --> B["Workato Router: Review CO-XXX"]
+  B --> C{"Source data valid?"}
+  C -- "No" --> D["Reject or block CO in Salesforce"]
+  C -- "Yes" --> E["Human approval task"]
+  E -- "Denied or timeout" --> D
+  E -- "Approved" --> F{"Case type"}
+  F --> G["Case 1: New Surface"]
+  F --> H["Case 2: New CE"]
+  F --> I["Cases 3-6: combined/renewal"]
+  G --> J["OPA-backed BO/Donatello API"]
+  H --> J
+  I --> K["Blocked until mapped"]
+  J --> L["Duplicate check"]
+  L --> M{"Duplicate or mismatch?"}
+  M -- "Yes" --> D
+  M -- "No" --> N["Create/update account"]
+  N --> O["Read-after-write verification"]
+  O --> P{"Verified?"}
+  P -- "No" --> Q["Stop and alert"]
+  P -- "Yes" --> R["Return accountUuid"]
+  R --> S["Update Salesforce Surface Account ID"]
+  S --> T["Masked audit log and idempotency table"]
+
