@@ -147,7 +147,7 @@ def start_attended_salesforce_login() -> bool:
 
 
 def attended_leonardo_readbacks() -> dict[str, dict[str, str]]:
-    """Load explicit local Leonardo Development evidence; never write Salesforce."""
+    """Load optional local evidence; absence means no evidence, never a source failure."""
     try:
         raw = json.loads(ATTENDED_LEONARDO_READBACK_PATH.read_text(encoding="utf-8"))
         if not isinstance(raw, dict): raise ValueError()
@@ -165,6 +165,8 @@ def attended_leonardo_readbacks() -> dict[str, dict[str, str]]:
             readbacks[reference] = {"surface_account_id": account_id, "account_uuid": account_uuid,
                                     "leonardo_state": state, "observed_on": observed, "source": source}
         return readbacks
+    except FileNotFoundError:
+        return {}
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise ReadUnavailable() from exc
 

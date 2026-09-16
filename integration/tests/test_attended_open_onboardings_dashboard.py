@@ -42,7 +42,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_session_check_opens_only_the_exact_development_tenant_route(self):
         opened: list[str] = []
-        self.assertTrue(open_attended_leonardo_tenant_management(opener=lambda url: opened.append(url) or True))
+        with patch("tools.serve_attended_open_onboardings_dashboard.local_browser_launch_allowed", return_value=True):
+            self.assertTrue(open_attended_leonardo_tenant_management(opener=lambda url: opened.append(url) or True))
         self.assertEqual(opened, [LEONARDO_DEVELOPMENT_TENANT_MANAGEMENT])
 
     def test_session_check_fails_closed_when_browser_rejects_launch(self):
@@ -50,7 +51,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_production_renewal_preflight_opens_only_the_login_page(self):
         opened: list[str] = []
-        self.assertTrue(open_attended_production_backoffice_login(opener=lambda url: opened.append(url) or True))
+        with patch("tools.serve_attended_open_onboardings_dashboard.local_browser_launch_allowed", return_value=True):
+            self.assertTrue(open_attended_production_backoffice_login(opener=lambda url: opened.append(url) or True))
         self.assertEqual(opened, [PRODUCTION_BACKOFFICE_LOGIN])
 
     def test_renewal_detail_offers_production_preflight_without_tenant_action(self):
@@ -118,9 +120,18 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("will not be overwritten automatically", page)
 
     def test_co0740_detail_labels_local_readback_as_not_salesforce(self):
-        page = page_detail("CO-0740", {"Onboarding_Approval_Status__c": "Approved"})
+        evidence = {"CO-0740": {"surface_account_id": "a" * 16, "account_uuid": "b" * 32,
+                                  "leonardo_state": "Account Scanning", "observed_on": "2026-09-13",
+                                  "source": "Leonardo Development Details readback"}}
+        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks", return_value=evidence):
+            page = page_detail("CO-0740", {"Onboarding_Approval_Status__c": "Approved"})
         self.assertIn("Leonardo Development readback", page)
         self.assertIn("Local operator evidence only; Salesforce remains unchanged.", page)
+
+    def test_absent_local_readback_file_means_no_evidence_not_a_dashboard_error(self):
+        with patch.object(dashboard, "ATTENDED_LEONARDO_READBACK_PATH") as path:
+            path.read_text.side_effect = FileNotFoundError()
+            self.assertEqual(dashboard.attended_leonardo_readbacks(), {})
 
     def test_list_view_identifier_is_the_only_process_cached_salesforce_value(self):
         dashboard._open_onboardings_view_id = None
