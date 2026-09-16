@@ -1,9 +1,109 @@
 # Direct Salesforce-to-Surface Onboarding Integration Plan
 
-**Date:** 2026-09-09  
-**Status:** Planning baseline; no external system changes authorized or performed  
+**Date:** 2026-09-15
+**Status:** Planning baseline plus verified VM portability/session handoff. No Salesforce, Leonardo, Workato, OPA, or production account action occurred in the 2026-09-15 work.
 **Initial execution target:** Leonardo Development only  
 **Production target:** Permanently blocked until a separate, recorded approval
+
+## 0. 2026-09-15 VM portability session handoff
+
+This section is the authoritative handoff for continuing tomorrow. Earlier
+references in this document to a five-user, fully unattended target remain
+future-state planning; the current pilot is **Milton-only and attended**.
+
+### Verified outcomes
+
+- A sanitized project baseline is versioned at
+  `https://github.com/mtms7/SurfaceOnboarding`.
+- Latest UI commit: `cd21f18` (`Show runner requirement in VM dashboard`).
+  Its GitHub Actions Ubuntu run #9 passed.
+- Latest runner-contract documentation commit: `04e18c0`.
+- Local full suite passed: **137 tests** (one Windows-only POSIX file-mode
+  assertion skipped as intended). Artifact and offline-boundary guards passed.
+- VM identity and capacity were checked read-only:
+  - Host: `workato-opa-01` / `172.26.37.20`
+  - Ubuntu 22.04 LTS; 101 GB free
+  - application identity: `surface-onboarding` (UID/GID 998)
+  - active and historical application directories were preserved.
+- Existing managed runtime was located and verified:
+  `/opt/surface-onboarding/runtime/python-3.12.14/bin/python3.12`.
+  Ubuntu's default `python3` is 3.10 and cannot run this project because the
+  project requires Python 3.12.
+- The VM launcher now selects that managed Python 3.12 runtime, rejects a
+  missing/wrong interpreter, requires a loopback listener, and requires the
+  explicit web-identity marker before activation.
+- Git now preserves `scripts/run_vm_dashboard.sh` as executable. Ubuntu CI
+  verifies that mode; a Windows-created checkout cannot silently regress it.
+- Non-active, versioned VM snapshots were created without overwriting the
+  active application:
+  - `app-r14-staged-20260915` at `8f2da13`
+  - `app-r15-staged-20260915` at `39de9c4`
+  - `app-r16-staged-20260915` at `08ab674`
+  - `app-r17-staged-20260915` at `cd21f18`
+- `r15` ran the complete VM suite successfully with Python 3.12.14:
+  135 tests, artifact guard passed, offline-boundary guard passed.
+- `r16` directly executed the launcher and correctly refused to activate
+  without `SURFACE_ONBOARDING_WEB_IDENTITY_APPROVED=1` (expected exit status
+  2). No listener started.
+- The VM has no Salesforce CLI, Node.js, or browser runtime installed for the
+  `surface-onboarding` identity. No authentication state was inspected.
+- `r17` provides a VM-specific connection page: **Manual Salesforce runner is
+  unavailable**. It contains no local Salesforce sign-in action in VM mode.
+- A temporary, static, loopback-only preview of that page was started on
+  `127.0.0.1:8013` and viewed through a MobaXterm local SSH tunnel. It has no
+  Salesforce data by design; it proves the fail-closed UI only.
+
+### Important boundaries preserved
+
+- No service unit, proxy, firewall rule, VM package, OPA setting, Salesforce
+  login, Salesforce read/write, Leonardo action, browser profile, cookie,
+  token, password, MFA value, or production target was changed.
+- The active legacy path `/opt/surface-onboarding/app` was not replaced.
+- Browser/MFA state must not be placed on the dashboard VM or the Workato OPA
+  host. The dashboard is loopback-only and cannot launch a browser in VM mode.
+- The dashboard's static preview must not be interpreted as a live Salesforce
+  test. It deliberately contains no queue data.
+
+### Manual Salesforce runner design recorded
+
+The non-executable design is documented in
+`docs/36_MANUAL_SALESFORCE_RUNNER_CONTRACT.md`. It requires a separate,
+ephemeral, Milton-only runner host. The runner keeps browser/CLI session
+material local and returns only short-lived, schema-limited readiness or
+allowlisted read results. It does not copy credentials, cookies, tokens, or MFA
+values to the dashboard, OPA, Git, logs, or backups.
+
+Required approvals before implementing or activating that runner:
+
+1. Identity/SecOps: separate runner host, Milton-only access, lifecycle, and
+   cleanup.
+2. Salesforce: approved CLI/app identity, exact read scopes, and allowlisted
+   query contract.
+3. Security: mutual-TLS identity, forwarding/proxy topology, audit retention,
+   monitoring, and incident handling.
+4. Automation owner: exact first read-only pilot and rollback path.
+
+### First steps tomorrow
+
+1. Stop the current static preview with `Ctrl+C` in its VM terminal after UI
+   review; verify the port is no longer listening. This is a temporary preview,
+   not a service.
+2. Decide and obtain approval for the separate, Milton-only runner host. Do
+   not install a browser, Salesforce CLI, Node.js, or Playwright on
+   `workato-opa-01`/the OPA host.
+3. Implement the runner interface only as a typed, fixed-operation,
+   fail-closed contract in the repository. It must not issue generic SOQL,
+   arbitrary shell commands, or transfer CLI/browser session material.
+4. Add dashboard handling for three attested runner states: `unavailable`,
+   `ready`, and `failed`; continue to show no cached Salesforce data unless a
+   fresh runner result is valid.
+5. After the security approvals exist, provision the runner separately and
+   perform one read-only, user-attended Salesforce session-health test. Do not
+   start automated polling, Salesforce writeback, Leonardo interaction, or
+   OPA changes.
+6. Only after a separate web-identity/proxy approval may a temporary live
+   dashboard listener be considered. Keep it at `127.0.0.1` and use explicit
+   SSH forwarding for any pilot review.
 
 ## 1. Outcome
 
