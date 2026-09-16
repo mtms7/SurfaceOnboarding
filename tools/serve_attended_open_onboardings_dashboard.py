@@ -712,14 +712,33 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
 
 def page_salesforce_unavailable() -> str:
     """Render the attended connection section using the dashboard shell."""
+    vm_mode = os.environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop").casefold() == "vm"
+    if vm_mode:
+        connection_copy = (
+            "<p>Connect the approved manual Salesforce runner, then return to the queues.</p>"
+            "<section class='panel'><span class='status'>RUNNER REQUIRED</span>"
+            "<h2>Manual Salesforce runner is unavailable</h2>"
+            "<p>The VM dashboard cannot launch a browser or hold a Salesforce session. "
+            "No queue data is cached or shown until the separately approved runner is ready.</p>"
+            "<p class='note'>Complete SSO/MFA only in the approved runner. This VM and the Workato OPA "
+            "do not receive or store credentials, cookies, MFA codes, or CLI output.</p></section>"
+        )
+    else:
+        connection_copy = (
+            "<p>Reconnect the attended source session, then return to the queues.</p>"
+            "<section class='panel'><span class='status'>CONNECTION REQUIRED</span><h2>Salesforce data is unavailable</h2>"
+            "<p>The dashboard could not complete its attended Salesforce read. No queue data is cached or shown while the session is unavailable.</p>"
+            "<form method='post' action='/attended/salesforce-login'><button type='submit'>Sign in to Salesforce</button></form>"
+            "<p class='note'>This opens the standard Salesforce CLI browser sign-in. Complete SSO/MFA in that browser, then select <strong>Return to queues</strong>. "
+            "The dashboard never receives or stores credentials, cookies, MFA codes, or CLI output.</p></section>"
+        )
     return (
         "<!doctype html><title>Salesforce connection</title><style>"
         "*{box-sizing:border-box}body{margin:0;background:#f4f6f9;color:#162031;font:14px/1.45 system-ui,sans-serif}.shell{display:grid;grid-template-columns:210px 1fr;min-height:100vh}.rail{padding:28px 20px;background:#02081e;color:#dbe5f5}.brand{font-size:19px;font-weight:750;color:#fff}.brand small{display:block;margin-top:4px;color:#8fa4c4;font-size:11px;font-weight:500}.rail nav{display:grid;gap:8px;margin-top:36px}.rail a{padding:9px 10px;border-radius:7px;color:#b9c8df;text-decoration:none}.rail a.active{background:#102446;color:#fff}.rail b{display:block;color:#fff;font-size:19px}.content{max-width:920px;padding:34px 42px}.eyebrow{margin:0;color:#72839a;font-size:11px;letter-spacing:.08em}h1{margin:4px 0 8px;font-size:29px}.panel{max-width:700px;margin-top:24px;padding:22px;border:1px solid #d9e3f0;border-left:4px solid #3678c5;border-radius:9px;background:#fff;box-shadow:0 2px 8px #1a2d4a0a}.status{display:inline-block;padding:3px 8px;border-radius:20px;background:#fff3d9;color:#805b09;font-size:11px;font-weight:750}.panel h2{margin:14px 0 5px;font-size:19px}.panel p{color:#526174}.panel button{margin-top:10px;padding:9px 13px;border:1px solid #2869c7;border-radius:6px;background:#2869c7;color:#fff;font:inherit;font-weight:700;cursor:pointer}.panel button:hover{background:#1554a2}.note{font-size:12px}@media(max-width:800px){.shell{grid-template-columns:1fr}.rail{padding:16px}.rail nav{grid-template-columns:repeat(2,1fr);margin-top:14px}.content{padding:24px 18px}}</style>"
         "<div class='shell'><aside class='rail'><div class='brand'>PENTERA<small>Surface onboarding</small></div><nav>"
         "<a href='/'><b>—</b>All queues</a><a href='/?queue=scanning'><b>—</b>Account Scanning</a><a href='/?queue=ready'><b>—</b>Ready to onboard</a><a href='/?queue=validation'><b>—</b>Needs validation</a><a href='/?queue=review'><b>—</b>Manual review</a><a class='active' href='/connection'><b>!</b>Salesforce connection</a>"
-        "</nav></aside><main class='content'><p class='eyebrow'>ATTENDED · LOCALHOST ONLY</p><h1>Salesforce connection</h1><p>Reconnect the attended source session, then return to the queues.</p><section class='panel'><span class='status'>CONNECTION REQUIRED</span><h2>Salesforce data is unavailable</h2><p>The dashboard could not complete its attended Salesforce read. No queue data is cached or shown while the session is unavailable.</p>"
-        "<form method='post' action='/attended/salesforce-login'><button type='submit'>Sign in to Salesforce</button></form>"
-        "<p class='note'>This opens the standard Salesforce CLI browser sign-in. Complete SSO/MFA in that browser, then select <strong>Return to queues</strong>. The dashboard never receives or stores credentials, cookies, MFA codes, or CLI output.</p></section></main></div>"
+        "</nav></aside><main class='content'><p class='eyebrow'>ATTENDED · LOCALHOST ONLY</p><h1>Salesforce connection</h1>"
+        + connection_copy + "</main></div>"
     )
 
 
@@ -773,7 +792,10 @@ class Handler(BaseHTTPRequestHandler):
             if start_attended_salesforce_login():
                 self.send_page(HTTPStatus.OK, page_salesforce_login_opened())
             else:
-                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Salesforce sign-in unavailable</title><p>Salesforce CLI could not be started. Use the approved desktop launcher or repair the local Salesforce CLI session.</p>")
+                if os.environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop").casefold() == "vm":
+                    self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable())
+                else:
+                    self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Salesforce sign-in unavailable</title><p>Salesforce CLI could not be started. Use the approved desktop launcher or repair the local Salesforce CLI session.</p>")
             return
         form = post_form(self)
         reference = exact_form_value(form, "reference")

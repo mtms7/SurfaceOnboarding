@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -161,6 +162,16 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("Salesforce connection", page)
         self.assertIn("All queues", page)
         self.assertIn("Complete SSO/MFA", page)
+        self.assertNotIn("password", page.lower())
+        self.assertNotIn("token", page.lower())
+
+    def test_vm_unavailable_page_requires_a_separate_runner_without_a_login_action(self):
+        with patch.dict(os.environ, {"SURFACE_ONBOARDING_RUNTIME": "vm"}):
+            page = page_salesforce_unavailable()
+        self.assertIn("Manual Salesforce runner is unavailable", page)
+        self.assertIn("RUNNER REQUIRED", page)
+        self.assertNotIn("/attended/salesforce-login", page)
+        self.assertNotIn("Sign in to Salesforce", page)
         self.assertNotIn("password", page.lower())
         self.assertNotIn("token", page.lower())
 
