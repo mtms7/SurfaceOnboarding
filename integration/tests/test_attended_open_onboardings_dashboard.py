@@ -174,7 +174,9 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         dashboard._salesforce_login_process = None
         process = unittest.mock.Mock()
         process.poll.return_value = None
-        with patch("tools.serve_attended_open_onboardings_dashboard.subprocess.Popen", return_value=process) as launcher:
+        with patch("tools.serve_attended_open_onboardings_dashboard.local_browser_launch_allowed", return_value=True), patch(
+            "tools.serve_attended_open_onboardings_dashboard.subprocess.Popen", return_value=process
+        ) as launcher:
             self.assertTrue(start_attended_salesforce_login())
         args, kwargs = launcher.call_args
         self.assertEqual(args[0][:4], ["sf.cmd", "org", "login", "web"])
