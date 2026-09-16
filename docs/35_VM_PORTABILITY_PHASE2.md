@@ -49,3 +49,7 @@ cannot safely use an operator's desktop session or receive credentials.
 
 These gates do not prevent local portability work; they prevent VM deployment
 or external access activation.
+
+The detailed, non-executable boundary for the future manual MFA runner is in
+[runner contract draft](36_MANUAL_SALESFORCE_RUNNER_CONTRACT.md).  The
+dashboard must not use a local Salesforce CLI profile in VM mode.
