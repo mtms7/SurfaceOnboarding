@@ -1,4 +1,6 @@
+import os
 from pathlib import Path
+import stat
 import unittest
 
 
@@ -15,3 +17,8 @@ class VmDashboardLauncherTests(unittest.TestCase):
         self.assertIn("Python 3.12 runtime is unavailable", script)
         self.assertIn("must be Python 3.12 or newer", script)
         self.assertNotIn('SURFACE_ONBOARDING_PYTHON:-python3', script)
+
+    @unittest.skipIf(os.name == "nt", "Windows does not preserve POSIX executable modes")
+    def test_ubuntu_launcher_is_executable(self):
+        script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_vm_dashboard.sh"
+        self.assertTrue(script_path.stat().st_mode & stat.S_IXUSR)
