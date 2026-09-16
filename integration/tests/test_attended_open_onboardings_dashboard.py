@@ -21,6 +21,8 @@ from tools.serve_attended_open_onboardings_dashboard import (
     page_salesforce_unavailable,
     page_salesforce_login_opened,
     page_comment_update_confirmation,
+    evaluate_co0745_renewal_comment,
+    page_co0745_renewal_evaluation,
     salesforce_cli_command,
     start_attended_salesforce_login,
     CommentUpdateEvaluation,
@@ -241,6 +243,48 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("role='status'", page)
         self.assertIn("Re-run evaluation unavailable", page)
         self.assertNotIn("<button type='submit'>Re-run evaluation</button>", page)
+
+    def test_co0745_detail_offers_a_read_only_renewal_term_evaluation(self):
+        page = page_detail("CO-0745", {
+            "Onboarding_Approval_Status__c": "Pending",
+            "Onboarding_Stage__c": "New",
+            "Onboarding_Product__c": "Surface & Credential Exposure",
+            "Onboarding_Type__c": "Renewal of Surface + New Credential Exposure Module",
+        })
+        self.assertIn("Validate DealHub renewal term", page)
+        self.assertIn("/attended/rerun-co0745-renewal-evaluation", page)
+        self.assertIn("Production existing-account validation", page)
+        self.assertNotIn("Confirm update in Salesforce", page)
+
+    def test_co0745_renewal_evaluation_selects_one_active_surface_baseline_without_writing(self):
+        co_response = {"status": 0, "result": {"records": [{
+            "Id": "a0B000000000045", "Name": "CO-0745", "Account__c": "001000000000045",
+            "Account_Name__c": "Acme Bank",
+            "LastModifiedDate": "2026-09-16T10:00:00Z", "Onboarding_Comments__c": None,
+            "Onboarding_Stage__c": "New", "Onboarding_Approval_Status__c": "Pending",
+            "Onboarding_Product__c": "Surface & Credential Exposure",
+            "Onboarding_Type__c": "Renewal of Surface + New Credential Exposure Module",
+        }]}}
+        subscriptions_response = {"status": 0, "result": {"records": [{
+            "Id": "a0C000000000045", "SystemModstamp": "2026-09-16T10:01:00Z",
+            "DealHub_Account__c": "001000000000045",
+            "Product_Full_Name__c": "Pentera Surface Go - 500 Subdomains", "DealHub_Status__c": "Active",
+            "DealHub_Subscription_Start_Date__c": "2026-09-11",
+            "DealHub_Subscription_End_Date__c": "2027-09-10",
+        }]}}
+        with patch("tools.serve_attended_open_onboardings_dashboard.sf_json", side_effect=[co_response, subscriptions_response]) as reader, patch(
+            "tools.serve_attended_open_onboardings_dashboard.sf_write_json"
+        ) as writer:
+            evaluation = evaluate_co0745_renewal_comment()
+        self.assertEqual(evaluation.proposed_comment, "2026-09-11 - 2027-09-10")
+        self.assertEqual(evaluation.product_name, "Pentera Surface Go - 500 Subdomains")
+        self.assertEqual(evaluation.expected_tenant_name, "Acme Bank - CE Only")
+        self.assertEqual(reader.call_count, 2)
+        writer.assert_not_called()
+        page = page_co0745_renewal_evaluation(evaluation)
+        self.assertIn("No Salesforce field was changed", page)
+        self.assertIn("Acme Bank - CE Only", page)
+        self.assertNotIn("Confirm update in Salesforce", page)
 
     def test_comment_update_confirmation_is_revision_bound_and_one_time(self):
         dashboard._comment_update_acks.clear()

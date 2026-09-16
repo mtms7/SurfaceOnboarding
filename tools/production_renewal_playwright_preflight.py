@@ -33,19 +33,35 @@ def _normal(value: object) -> str:
     return " ".join(str(value or "").casefold().split())
 
 
-def classify_rows(rows: list[tuple[str, str]], *, account_name: str, email_domain: str) -> str:
-    """Return only a masked result; no tenant values leave this process."""
-    matches = {(_normal(company), _normal(domain)) for company, domain in rows
-               if _normal(company) == account_name or _normal(domain) == email_domain}
+def ce_only_tenant_name(account_name: str) -> str:
+    """Return the one allowed renewal tenant name in normalized form."""
+    normalized = _normal(account_name)
+    if not normalized:
+        raise ValueError("account_name_unavailable")
+    return normalized + " - ce only"
+
+
+def classify_rows(rows: list[tuple[str, str]], *, expected_company_name: str) -> str:
+    """Classify one exact CE-only tenant result without returning tenant data.
+
+    Domain similarity is deliberately not a match condition: a renewal must
+    resolve to exactly ``<Salesforce Account Name> - CE Only``.  This keeps a
+    base Surface tenant, a similarly named tenant, and any duplicate result in
+    the manual-review path.
+    """
+    expected = _normal(expected_company_name)
+    if not expected:
+        return "tenant_target_unavailable"
+    matches = [(company, domain) for company, domain in rows if _normal(company) == expected]
     if not matches:
         return "no_exact_account_found"
     return "existing_account_found" if len(matches) == 1 else "ambiguous_match"
 
 
-def source_keys(reference: str) -> tuple[str, str]:
+def source_keys(reference: str) -> str:
     if not REFERENCE.fullmatch(reference):
         raise RuntimeError("invalid_co_reference")
-    query = "SELECT Account_Name__c, Email_Domains__c, Onboarding_Type__c FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2"
+    query = "SELECT Account_Name__c, Onboarding_Type__c FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2"
     try:
         done = subprocess.run([sf_command(), "data", "query", "--query", query, "--json"], stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, text=True, timeout=45, check=False)
@@ -54,10 +70,10 @@ def source_keys(reference: str) -> tuple[str, str]:
         if done.returncode or payload["status"] != 0 or not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
             raise ValueError()
         row = rows[0]
-        account_name, email_domain = _normal(row.get("Account_Name__c")), _normal(row.get("Email_Domains__c"))
-        if "renewal" not in _normal(row.get("Onboarding_Type__c")) or not account_name or not re.fullmatch(r"[a-z0-9.-]+", email_domain):
+        account_name = _normal(row.get("Account_Name__c"))
+        if "renewal" not in _normal(row.get("Onboarding_Type__c")) or not account_name:
             raise ValueError()
-        return account_name, email_domain
+        return ce_only_tenant_name(account_name)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("salesforce_source_unavailable") from exc
 
@@ -77,7 +93,7 @@ def table_rows(page: Any) -> list[tuple[str, str]]:
 
 def run(reference: str) -> str:
     try:
-        account_name, email_domain = source_keys(reference)
+        expected_company_name = source_keys(reference)
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return "playwright_runtime_unavailable"
@@ -104,12 +120,9 @@ def run(reference: str) -> str:
                 search = page.get_by_role("textbox", name="Search", exact=True)
                 if search.count() != 1:
                     return "tenant_search_schema_unavailable"
-                search.fill(account_name, timeout=10_000); search.press("Enter", timeout=10_000)
+                search.fill(expected_company_name, timeout=10_000); search.press("Enter", timeout=10_000)
                 page.locator("tbody tr").first.wait_for(state="attached", timeout=15_000)
-                name_rows = table_rows(page)
-                search.fill(email_domain, timeout=10_000); search.press("Enter", timeout=10_000)
-                page.locator("tbody tr").first.wait_for(state="attached", timeout=15_000)
-                return classify_rows(name_rows + table_rows(page), account_name=account_name, email_domain=email_domain)
+                return classify_rows(table_rows(page), expected_company_name=expected_company_name)
             except Exception:
                 return "production_lookup_unavailable"
             finally:

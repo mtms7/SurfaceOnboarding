@@ -54,6 +54,8 @@ ATTENDED_LEONARDO_READBACK_PATH = Path(__file__).resolve().parents[1] / "integra
 LEONARDO_READBACK_STATES = frozenset({"Account Scanning"})
 CASE4_PRODUCT = "Surface & Credential Exposure"
 CASE4_TYPE = "Renewal of Surface + New Credential Exposure Module"
+CO0745_REFERENCE = "CO-0745"
+SURFACE_BASELINE_PRODUCT = re.compile(r"^pentera surface(?: go)?\s*-\s*\d+ subdomains$", re.IGNORECASE)
 _manual_start_acks: dict[str, tuple[str, str, float]] = {}
 _manual_start_lock = Lock()
 _view_id_lock = Lock()
@@ -76,6 +78,20 @@ class CommentUpdateEvaluation:
     def binding(self) -> str:
         return sha256("\x00".join((self.co_id, self.source_revision, self.subscription_id,
                                     self.subscription_revision, self.proposed_comment)).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class RenewalCommentEvaluation:
+    """A read-only, revision-bound DealHub term proposal for one renewal CO."""
+
+    reference: str
+    co_id: str
+    source_revision: str
+    subscription_id: str
+    subscription_revision: str
+    expected_tenant_name: str
+    product_name: str
+    proposed_comment: str
 
 
 class ReadUnavailable(RuntimeError): pass
@@ -318,6 +334,85 @@ def evaluate_co0741_comment_update() -> CommentUpdateEvaluation:
             raise ReadUnavailable()
         return CommentUpdateEvaluation(co_id, revision, subscription_id, subscription_revision,
                                        f"{start_date.isoformat()} - {end_date.isoformat()}")
+    except (KeyError, TypeError, ValueError):
+        raise ReadUnavailable() from None
+
+
+def evaluate_co0745_renewal_comment() -> RenewalCommentEvaluation:
+    """Read one renewal CO and one active Surface baseline without writing.
+
+    This is deliberately scoped to CO-0745 during the attended pilot.  It
+    cannot infer an existing Production tenant and does not issue a Salesforce
+    approval/update acknowledgement.  Any missing, stale, non-Surface,
+    non-active, duplicate, or malformed source value fails closed.
+    """
+    response = sf_json([
+        "data", "query", "--query",
+        "SELECT Id, Name, Account__c, Account_Name__c, LastModifiedDate, Onboarding_Comments__c, Onboarding_Stage__c, "
+        "Onboarding_Approval_Status__c, Onboarding_Product__c, Onboarding_Type__c "
+        "FROM Customer_Onboarding__c WHERE Name = 'CO-0745' LIMIT 2",
+        "--json",
+    ])
+    try:
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:
+            raise ReadUnavailable()
+        co = records[0]
+        co_id, account_id, account_name, revision = co["Id"], co["Account__c"], co["Account_Name__c"], co["LastModifiedDate"]
+        product, onboarding_type = co.get("Onboarding_Product__c"), co.get("Onboarding_Type__c")
+        if (
+            co.get("Name") != CO0745_REFERENCE
+            or not isinstance(co_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", co_id)
+            or not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id)
+            or not isinstance(account_name, str) or not " ".join(account_name.split())
+            or not isinstance(revision, str) or not revision
+            or not isinstance(product, str) or "surface" not in product.casefold()
+            or not isinstance(onboarding_type, str) or "renewal" not in onboarding_type.casefold()
+            or co.get("Onboarding_Comments__c") not in (None, "")
+            or co.get("Onboarding_Stage__c") != "New"
+            or co.get("Onboarding_Approval_Status__c") != "Pending"
+        ):
+            raise ReadUnavailable()
+        subscriptions = sf_json([
+            "data", "query", "--query",
+            "SELECT Id, SystemModstamp, DealHub_Account__c, Product_Full_Name__c, DealHub_Status__c, "
+            "DealHub_Subscription_Start_Date__c, DealHub_Subscription_End_Date__c "
+            "FROM DealHub_Subscription__c WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100",
+            "--json",
+        ])
+        rows = subscriptions["result"]["records"]  # type: ignore[index]
+        if subscriptions["status"] != 0 or not isinstance(rows, list):
+            raise ReadUnavailable()
+        selected = [
+            row for row in rows
+            if isinstance(row, dict)
+            and row.get("DealHub_Account__c") == account_id
+            and isinstance(row.get("Product_Full_Name__c"), str)
+            and SURFACE_BASELINE_PRODUCT.fullmatch(row["Product_Full_Name__c"])
+            and isinstance(row.get("DealHub_Status__c"), str)
+            and row["DealHub_Status__c"].casefold() == "active"
+        ]
+        if len(selected) != 1:
+            raise ReadUnavailable()
+        subscription = selected[0]
+        subscription_id, subscription_revision = subscription["Id"], subscription["SystemModstamp"]
+        product_name = subscription["Product_Full_Name__c"]
+        start, end = subscription["DealHub_Subscription_Start_Date__c"], subscription["DealHub_Subscription_End_Date__c"]
+        if (
+            not isinstance(subscription_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", subscription_id)
+            or not isinstance(subscription_revision, str) or not subscription_revision
+            or not isinstance(product_name, str)
+            or not isinstance(start, str) or not isinstance(end, str)
+        ):
+            raise ReadUnavailable()
+        start_date, end_date = date.fromisoformat(start), date.fromisoformat(end)
+        if end_date <= start_date:
+            raise ReadUnavailable()
+        return RenewalCommentEvaluation(
+            CO0745_REFERENCE, co_id, revision, subscription_id, subscription_revision,
+            " ".join(account_name.split()) + " - CE Only", product_name,
+            f"{start_date.isoformat()} - {end_date.isoformat()}",
+        )
     except (KeyError, TypeError, ValueError):
         raise ReadUnavailable() from None
 
@@ -614,6 +709,29 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
             comment_repair_action = ("<section class='manual-action'><div><h2>Re-run DealHub comment evaluation</h2>"
                                      "<p>This repair action is unavailable because CO-0741 no longer has the required empty-comment, New, Pending pre-state.</p></div>"
                                      "<button type='button' disabled aria-disabled='true'>Re-run evaluation unavailable</button></section>")
+    renewal_comment_evaluation_action = ""
+    if reference == CO0745_REFERENCE:
+        co0745_eligible = (
+            row.get("Onboarding_Comments__c") in (None, "")
+            and row.get("Onboarding_Stage__c") == "New"
+            and row.get("Onboarding_Approval_Status__c") == "Pending"
+            and "renewal" in (row.get("Onboarding_Type__c") or "").casefold()
+            and "surface" in (row.get("Onboarding_Product__c") or "").casefold()
+        )
+        if co0745_eligible:
+            renewal_comment_evaluation_action = (
+                "<section class='login-preflight' aria-labelledby='co0745-evaluation-title'><div>"
+                "<h2 id='co0745-evaluation-title'>Validate DealHub renewal term</h2>"
+                "<p>Read CO-0745 and require one active Surface baseline subscription. A successful result only displays a proposed Onboarding Comments date range.</p>"
+                "<p class='login-safety'>This is read-only. Production existing-account validation and a separate final approval remain required before any Salesforce update.</p></div>"
+                "<form method='post' action='/attended/rerun-co0745-renewal-evaluation'><input type='hidden' name='reference' value='CO-0745'><button type='submit'>Run read-only evaluation</button></form></section>"
+            )
+        else:
+            renewal_comment_evaluation_action = (
+                "<section class='manual-action'><div><h2>Validate DealHub renewal term</h2>"
+                "<p>This evaluation requires CO-0745 to remain an empty-comment, New, Pending Surface renewal.</p></div>"
+                "<button type='button' disabled aria-disabled='true'>Evaluation unavailable</button></section>"
+            )
     source_ready = source_ready_to_onboard(row)
     commercial_ready = bool(commercial_readiness and commercial_readiness.get("commercial_ready"))
     commercial_manual_review = bool(commercial_readiness and commercial_readiness.get("manual_review_required"))
@@ -707,7 +825,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     if notification in notifications:
         title, message = notifications[notification]
         toast = "<section class='toast' role='status' aria-live='polite'><strong>" + escape(title) + "</strong><span>" + escape(message) + "</span></section>"
-    return "<!doctype html><title>" + escape(reference) + "</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f3f3;color:#181818;font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}main{max-width:1080px;margin:auto;padding:28px 32px 40px}a{color:#0176d3;text-decoration:none;font-weight:600}a:hover{text-decoration:underline}h1{margin:16px 0;font-size:1.625rem;line-height:1.25}.toast{position:fixed;z-index:2;right:24px;top:20px;display:grid;gap:2px;max-width:430px;padding:13px 16px;border:1px solid #2e844a;border-left:4px solid #2e844a;border-radius:5px;background:#fff;box-shadow:0 3px 10px #0003}.toast span{color:#514f4d}.readiness,.login-preflight{margin:0 0 18px;padding:16px;border:1px solid;border-left-width:4px;border-radius:4px;background:#fff}.source-ready{border-color:#2e844a}.source-blocked{border-color:#ba0517}.readiness-heading{display:flex;gap:12px;align-items:flex-start}.readiness-icon{display:grid;place-items:center;flex:0 0 22px;width:22px;height:22px;border-radius:50%;color:#fff;font-size:.875rem;font-weight:800}.source-ready .readiness-icon{background:#2e844a}.source-blocked .readiness-icon{background:#ba0517}.readiness h2,.login-preflight h2,.manual-action h2{margin:0;color:#3e3e3c;font-size:1rem}.readiness p,.login-preflight p{margin:3px 0 0;color:#514f4d}.readiness details{margin:12px 0 0;color:#3e3e3c}.readiness summary{cursor:pointer;color:#0176d3;font-weight:600}.readiness ul{margin:8px 0 0;padding-left:20px}.readiness li{margin:4px 0}.login-preflight{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;border-color:#0176d3}.login-preflight form{margin:0}.login-preflight button{padding:8px 12px;border:1px solid #0176d3;border-radius:4px;background:#0176d3;color:#fff;font:inherit;font-weight:600;cursor:pointer}.login-preflight button:hover{background:#014486}.login-safety{grid-column:1/-1;font-size:.8125rem}.manual-action{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;margin:0 0 18px;padding:16px;border:1px solid #dddbda;border-radius:4px;background:#fff}.manual-action p{margin:3px 0 0;color:#514f4d}.manual-action button{padding:8px 12px;border:1px solid #c9c7c5;border-radius:4px;background:#f3f3f3;color:#706e6b;font:inherit;font-weight:600;cursor:not-allowed}.manual-blocker{grid-column:1/-1;font-size:.8125rem}dl{display:grid;grid-template-columns:minmax(190px,260px) 1fr;margin:0;border:1px solid #dddbda;background:#fff}dt,dd{margin:0;padding:12px 16px;border-bottom:1px solid #dddbda}dt{background:#f3f2f2;color:#3e3e3c;font-size:.8125rem;font-weight:700}dd{white-space:pre-wrap;overflow-wrap:anywhere}dt:nth-last-of-type(1),dd:last-child{border-bottom:0}@media(max-width:700px){main{padding:20px 16px}.toast{left:16px;right:16px;top:12px;max-width:none}.login-preflight,.manual-action{grid-template-columns:1fr}.login-preflight form,.manual-action button{justify-self:start}dl{display:block}dt{border-bottom:0;padding-bottom:4px}dd{padding-top:4px}}</style><main><a href='/'>← Open Onboardings</a><h1>" + escape(reference) + "</h1>" + toast + case4_panel + comment_repair_action + renewal_preflight + readiness + manual_action + local_readback + "<dl>" + rows + "</dl></main>"
+    return "<!doctype html><title>" + escape(reference) + "</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f3f3;color:#181818;font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}main{max-width:1080px;margin:auto;padding:28px 32px 40px}a{color:#0176d3;text-decoration:none;font-weight:600}a:hover{text-decoration:underline}h1{margin:16px 0;font-size:1.625rem;line-height:1.25}.toast{position:fixed;z-index:2;right:24px;top:20px;display:grid;gap:2px;max-width:430px;padding:13px 16px;border:1px solid #2e844a;border-left:4px solid #2e844a;border-radius:5px;background:#fff;box-shadow:0 3px 10px #0003}.toast span{color:#514f4d}.readiness,.login-preflight{margin:0 0 18px;padding:16px;border:1px solid;border-left-width:4px;border-radius:4px;background:#fff}.source-ready{border-color:#2e844a}.source-blocked{border-color:#ba0517}.readiness-heading{display:flex;gap:12px;align-items:flex-start}.readiness-icon{display:grid;place-items:center;flex:0 0 22px;width:22px;height:22px;border-radius:50%;color:#fff;font-size:.875rem;font-weight:800}.source-ready .readiness-icon{background:#2e844a}.source-blocked .readiness-icon{background:#ba0517}.readiness h2,.login-preflight h2,.manual-action h2{margin:0;color:#3e3e3c;font-size:1rem}.readiness p,.login-preflight p{margin:3px 0 0;color:#514f4d}.readiness details{margin:12px 0 0;color:#3e3e3c}.readiness summary{cursor:pointer;color:#0176d3;font-weight:600}.readiness ul{margin:8px 0 0;padding-left:20px}.readiness li{margin:4px 0}.login-preflight{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;border-color:#0176d3}.login-preflight form{margin:0}.login-preflight button{padding:8px 12px;border:1px solid #0176d3;border-radius:4px;background:#0176d3;color:#fff;font:inherit;font-weight:600;cursor:pointer}.login-preflight button:hover{background:#014486}.login-safety{grid-column:1/-1;font-size:.8125rem}.manual-action{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;margin:0 0 18px;padding:16px;border:1px solid #dddbda;border-radius:4px;background:#fff}.manual-action p{margin:3px 0 0;color:#514f4d}.manual-action button{padding:8px 12px;border:1px solid #c9c7c5;border-radius:4px;background:#f3f3f3;color:#706e6b;font:inherit;font-weight:600;cursor:not-allowed}.manual-blocker{grid-column:1/-1;font-size:.8125rem}dl{display:grid;grid-template-columns:minmax(190px,260px) 1fr;margin:0;border:1px solid #dddbda;background:#fff}dt,dd{margin:0;padding:12px 16px;border-bottom:1px solid #dddbda}dt{background:#f3f2f2;color:#3e3e3c;font-size:.8125rem;font-weight:700}dd{white-space:pre-wrap;overflow-wrap:anywhere}dt:nth-last-of-type(1),dd:last-child{border-bottom:0}@media(max-width:700px){main{padding:20px 16px}.toast{left:16px;right:16px;top:12px;max-width:none}.login-preflight,.manual-action{grid-template-columns:1fr}.login-preflight form,.manual-action button{justify-self:start}dl{display:block}dt{border-bottom:0;padding-bottom:4px}dd{padding-top:4px}}</style><main><a href='/'>← Open Onboardings</a><h1>" + escape(reference) + "</h1>" + toast + case4_panel + comment_repair_action + renewal_comment_evaluation_action + renewal_preflight + readiness + manual_action + local_readback + "<dl>" + rows + "</dl></main>"
 
 
 def page_salesforce_unavailable() -> str:
@@ -757,6 +875,19 @@ def page_comment_update_confirmation(evaluation: CommentUpdateEvaluation, nonce:
         "<p class='note'>Confirming updates only three CO-0741 fields: Onboarding Comments, Stage to Request Approved, and Approval Status to Approved. It then immediately reads all three back. This expires in 10 minutes and is invalidated by a CO or selected subscription revision change.</p>"
         "<form method='post' action='/attended/confirm-comment-update'><input type='hidden' name='reference' value='CO-0741'><input type='hidden' name='nonce' value='" + escape(nonce) + "'><button type='submit'>Confirm update in Salesforce</button></form>"
         "<p><a href='/co/CO-0741'>Cancel and return to CO-0741</a></p></section></main>"
+    )
+
+
+def page_co0745_renewal_evaluation(evaluation: RenewalCommentEvaluation) -> str:
+    """Show a term proposal while making the remaining renewal gate explicit."""
+    return (
+        "<!doctype html><title>CO-0745 renewal evaluation</title><style>body{max-width:760px;margin:48px auto;padding:0 22px;font:16px/1.5 system-ui,sans-serif;color:#181818}section{border:1px solid #2e844a;border-left:4px solid #2e844a;border-radius:4px;padding:18px;background:#fff}code{font-weight:700}.note{color:#514f4d;font-size:.9rem}</style>"
+        "<main><h1>CO-0745 DealHub term validated</h1><section><p>One active Surface baseline subscription was selected for this CO revision.</p>"
+        "<p>Product: <code>" + escape(evaluation.product_name) + "</code></p>"
+        "<p>Proposed Onboarding Comments value: <code>" + escape(evaluation.proposed_comment) + "</code></p>"
+        "<p>Required production tenant: <code>" + escape(evaluation.expected_tenant_name) + "</code></p>"
+        "<p class='note'>No Salesforce field was changed. Production validation must find exactly this tenant name; a base-name, domain-only, missing, or duplicate result requires manual review. A separate final approval is required before an update can be prepared.</p>"
+        "<p><a href='/co/CO-0745'>Return to CO-0745</a></p></section></main>"
     )
 
 
@@ -813,6 +944,20 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Evaluation blocked</title><p>CO-0741 could not be validated as one empty-comment CO and one active matching DealHub subscription. No Salesforce change was made.</p>")
                 return
             self.send_page(HTTPStatus.OK, page_comment_update_confirmation(evaluation, nonce))
+            return
+        if path == "/attended/rerun-co0745-renewal-evaluation":
+            if reference != CO0745_REFERENCE:
+                self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
+                return
+            try:
+                evaluation = evaluate_co0745_renewal_comment()
+            except ReadUnavailable:
+                self.send_page(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "<!doctype html><title>Evaluation blocked</title><p>CO-0745 could not be validated as one empty-comment, New, Pending Surface renewal with one active baseline subscription. No Salesforce change was made.</p>",
+                )
+                return
+            self.send_page(HTTPStatus.OK, page_co0745_renewal_evaluation(evaluation))
             return
         if path == "/attended/confirm-comment-update":
             if reference != "CO-0741":
