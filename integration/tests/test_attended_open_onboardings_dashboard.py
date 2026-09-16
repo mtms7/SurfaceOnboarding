@@ -179,7 +179,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         ) as launcher:
             self.assertTrue(start_attended_salesforce_login())
         args, kwargs = launcher.call_args
-        self.assertEqual(args[0][:4], ["sf.cmd", "org", "login", "web"])
+        self.assertEqual(args[0][:4], [salesforce_cli_command(), "org", "login", "web"])
         self.assertIs(kwargs["stdin"], dashboard.subprocess.DEVNULL)
         self.assertIs(kwargs["stdout"], dashboard.subprocess.DEVNULL)
         self.assertIs(kwargs["stderr"], dashboard.subprocess.DEVNULL)
