@@ -96,15 +96,12 @@ class RenewalCommentEvaluation:
 
 
 @dataclass(frozen=True, slots=True)
-class NewSurfaceFillPreflight:
-    """Read-only candidate review for one Development-only new-Surface fill."""
+class CredentialExposureFillPreflight:
+    """Read-only candidate review for one Development-only CE-only fill."""
 
     reference: str
     source_revision: str
-    product_name: str
-    proposed_comment: str
-    assets: int
-    subdomains: int
+    email_domain_count: int
     blockers: tuple[str, ...]
 
     @property
@@ -435,19 +432,11 @@ def evaluate_co0745_renewal_comment() -> RenewalCommentEvaluation:
         raise ReadUnavailable() from None
 
 
-def evaluate_co0702_new_surface_fill_preflight() -> NewSurfaceFillPreflight:
-    """Prepare a bounded, read-only new-Surface fill review for CO-0702.
-
-    This function never opens Leonardo or creates a tenant. It keeps the
-    source and subscription values transient and returns only the proposed
-    limits plus safe blocker labels. A later attended adapter must still run
-    the duplicate checks and obtain a separate one-run create confirmation.
-    """
+def evaluate_co0702_ce_only_fill_preflight() -> CredentialExposureFillPreflight:
+    """Validate only CE-only Email Domains for the CO-0702 pilot."""
     response = sf_json([
         "data", "query", "--query",
-        "SELECT Id, Name, Account__c, LastModifiedDate, Account_Name__c, Main_Domain__c, "
-        "Primary_User_Name__c, Onboarding_Comments__c, Onboarding_Approval_Status__c, "
-        "Onboarding_Product__c, Onboarding_Type__c "
+        "SELECT Id, Name, LastModifiedDate, Email_Domains__c "
         "FROM Customer_Onboarding__c WHERE Name = 'CO-0702' LIMIT 2",
         "--json",
     ])
@@ -456,61 +445,17 @@ def evaluate_co0702_new_surface_fill_preflight() -> NewSurfaceFillPreflight:
         if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:
             raise ReadUnavailable()
         co = records[0]
-        account_id, revision = co["Account__c"], co["LastModifiedDate"]
-        if (co.get("Name") != CO0702_REFERENCE or not isinstance(account_id, str)
-                or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id)
-                or not isinstance(revision, str) or not revision):
+        revision = co["LastModifiedDate"]
+        if (co.get("Name") != CO0702_REFERENCE or not isinstance(revision, str) or not revision):
             raise ReadUnavailable()
         blockers: list[str] = []
-        product, onboarding_type = co.get("Onboarding_Product__c"), co.get("Onboarding_Type__c")
-        if co.get("Onboarding_Approval_Status__c") != "Approved":
-            blockers.append("source_not_approved")
-        if (not isinstance(product, str) or "surface" not in product.casefold()
-                or not isinstance(onboarding_type, str) or "new" not in onboarding_type.casefold()
-                or "renew" in onboarding_type.casefold()):
-            blockers.append("unsupported_new_surface_route")
-        for field, label in (("Account_Name__c", "account_name_missing"), ("Main_Domain__c", "main_domain_missing"),
-                             ("Primary_User_Name__c", "primary_user_missing")):
-            if not isinstance(co.get(field), str) or not co[field].strip():
-                blockers.append(label)
-        dates = extract_dealhub_dates(co.get("Onboarding_Comments__c"))
-        if not dates["ready_for_cse_review"]:
-            blockers.append("onboarding_comment_dates_unverified")
-        subscriptions = sf_json([
-            "data", "query", "--query",
-            "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
-            "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c WHERE DealHub_Account__c = '"
-            + account_id + "' LIMIT 100",
-            "--json",
-        ])
-        rows = subscriptions["result"]["records"]  # type: ignore[index]
-        if subscriptions["status"] != 0 or not isinstance(rows, list):
-            raise ReadUnavailable()
-        selected: list[dict[str, object]] = []
-        addons = 0
-        for row in rows:
-            if not isinstance(row, dict):
-                raise ReadUnavailable()
-            name, status = row.get("Product_Full_Name__c"), row.get("DealHub_Status__c")
-            if not isinstance(name, str) or not isinstance(status, str) or status.casefold() != "active":
-                continue
-            baseline = SURFACE_BASELINE_PRODUCT.fullmatch(name)
-            addon = re.fullmatch(r"pentera surface.*(?:add[- ]?on|additional).*?(\d+) subdomains", name, re.IGNORECASE)
-            if baseline:
-                selected.append(row)
-            elif addon:
-                addons += int(addon.group(1))
-        if len(selected) != 1:
-            blockers.append("surface_baseline_missing_or_ambiguous")
-            product_name, baseline_subdomains = "Not verified", 0
-        else:
-            product_name = selected[0]["Product_Full_Name__c"]
-            baseline_match = SURFACE_BASELINE_PRODUCT.fullmatch(str(product_name))
-            baseline_subdomains = int(baseline_match.group(1)) if baseline_match else 0
-        proposed_comment = (str(dates["dealhub_start_date"]) + " - " + str(dates["dealhub_end_date"])
-                            if dates["ready_for_cse_review"] else "Not verified")
-        return NewSurfaceFillPreflight(CO0702_REFERENCE, revision, str(product_name), proposed_comment,
-                                       10_000, baseline_subdomains + addons, tuple(sorted(set(blockers))))
+        raw_email_domains = co.get("Email_Domains__c")
+        email_domains = [item for item in re.split(r"[,;\s]+", raw_email_domains.strip()) if item] if isinstance(raw_email_domains, str) else []
+        domain = email_domains[0].casefold() if len(email_domains) == 1 else ""
+        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", domain):
+            blockers.append("exactly_one_email_domain_required")
+        return CredentialExposureFillPreflight(CO0702_REFERENCE, revision, len(email_domains),
+                                               tuple(sorted(set(blockers))))
     except (KeyError, TypeError, ValueError):
         raise ReadUnavailable() from None
 
@@ -834,8 +779,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     if reference == CO0702_REFERENCE:
         co0702_preflight_action = (
             "<section class='login-preflight' aria-labelledby='co0702-preflight-title'><div>"
-            "<h2 id='co0702-preflight-title'>Prepare Leonardo Development fill review</h2>"
-            "<p>Re-read CO-0702 and current Surface subscriptions. This calculates the proposed limits and reports only safe blockers.</p>"
+            "<h2 id='co0702-preflight-title'>Prepare Credential Exposure fill review</h2>"
+            "<p>Re-read CO-0702 Email Domains. Exactly one valid domain is required; an empty or multi-domain value is blocked.</p>"
             "<p class='login-safety'>Read-only: it does not open Leonardo, search tenants, fill a form, or create an account.</p></div>"
             "<form method='post' action='/attended/rerun-co0702-fill-preflight'><input type='hidden' name='reference' value='CO-0702'><button type='submit'>Run fill preflight</button></form></section>"
         )
@@ -998,15 +943,14 @@ def page_co0745_renewal_evaluation(evaluation: RenewalCommentEvaluation) -> str:
     )
 
 
-def page_co0702_fill_preflight(evaluation: NewSurfaceFillPreflight) -> str:
+def page_co0702_fill_preflight(evaluation: CredentialExposureFillPreflight) -> str:
     blockers = ("<li>" + "</li><li>".join(escape(item.replace("_", " ")) for item in evaluation.blockers) + "</li>"
                 if evaluation.blockers else "<li>None from the local source check.</li>")
     state = "ready for attended duplicate review" if evaluation.eligible_for_fill_review else "blocked for manual review"
     return (
         "<!doctype html><title>CO-0702 fill preflight</title><style>body{max-width:760px;margin:48px auto;padding:0 22px;font:16px/1.5 system-ui,sans-serif;color:#181818}section{border:1px solid #0176d3;border-left:4px solid #0176d3;border-radius:4px;padding:18px;background:#fff}code{font-weight:700}.note{color:#514f4d;font-size:.9rem}</style>"
-        "<main><h1>CO-0702 Leonardo Development fill preflight</h1><section><p>Local state: <code>" + state + "</code></p>"
-        "<p>Surface tier: <code>" + escape(evaluation.product_name) + "</code></p><p>Proposed subscription term: <code>" + escape(evaluation.proposed_comment) + "</code></p>"
-        "<p>Proposed limits: <code>" + str(evaluation.assets) + " assets · " + str(evaluation.subdomains) + " subdomains</code></p>"
+        "<main><h1>CO-0702 Credential Exposure fill preflight</h1><section><p>Local state: <code>" + state + "</code></p>"
+        "<p>Email Domains configured: <code>" + str(evaluation.email_domain_count) + "</code></p>"
         "<p>Blockers:</p><ul>" + blockers + "</ul>"
         "<p class='note'>No browser, Leonardo, duplicate lookup, form fill, tenant creation, or Salesforce update was performed.</p><p><a href='/co/CO-0702'>Return to CO-0702</a></p></section></main>"
     )
@@ -1085,7 +1029,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
                 return
             try:
-                evaluation = evaluate_co0702_new_surface_fill_preflight()
+                evaluation = evaluate_co0702_ce_only_fill_preflight()
             except ReadUnavailable:
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Preflight unavailable</title><p>CO-0702 could not be read for this preflight. No external action was performed.</p>")
                 return
