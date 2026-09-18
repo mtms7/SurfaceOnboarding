@@ -55,7 +55,8 @@ LEONARDO_READBACK_STATES = frozenset({"Account Scanning"})
 CASE4_PRODUCT = "Surface & Credential Exposure"
 CASE4_TYPE = "Renewal of Surface + New Credential Exposure Module"
 CO0745_REFERENCE = "CO-0745"
-SURFACE_BASELINE_PRODUCT = re.compile(r"^pentera surface(?: go)?\s*-\s*\d+ subdomains$", re.IGNORECASE)
+CO0702_REFERENCE = "CO-0702"
+SURFACE_BASELINE_PRODUCT = re.compile(r"^pentera surface(?: go)?\s*-\s*(\d+) subdomains$", re.IGNORECASE)
 _manual_start_acks: dict[str, tuple[str, str, float]] = {}
 _manual_start_lock = Lock()
 _view_id_lock = Lock()
@@ -92,6 +93,23 @@ class RenewalCommentEvaluation:
     expected_tenant_name: str
     product_name: str
     proposed_comment: str
+
+
+@dataclass(frozen=True, slots=True)
+class NewSurfaceFillPreflight:
+    """Read-only candidate review for one Development-only new-Surface fill."""
+
+    reference: str
+    source_revision: str
+    product_name: str
+    proposed_comment: str
+    assets: int
+    subdomains: int
+    blockers: tuple[str, ...]
+
+    @property
+    def eligible_for_fill_review(self) -> bool:
+        return not self.blockers
 
 
 class ReadUnavailable(RuntimeError): pass
@@ -417,6 +435,86 @@ def evaluate_co0745_renewal_comment() -> RenewalCommentEvaluation:
         raise ReadUnavailable() from None
 
 
+def evaluate_co0702_new_surface_fill_preflight() -> NewSurfaceFillPreflight:
+    """Prepare a bounded, read-only new-Surface fill review for CO-0702.
+
+    This function never opens Leonardo or creates a tenant. It keeps the
+    source and subscription values transient and returns only the proposed
+    limits plus safe blocker labels. A later attended adapter must still run
+    the duplicate checks and obtain a separate one-run create confirmation.
+    """
+    response = sf_json([
+        "data", "query", "--query",
+        "SELECT Id, Name, Account__c, LastModifiedDate, Account_Name__c, Main_Domain__c, "
+        "Primary_User_Name__c, Onboarding_Comments__c, Onboarding_Approval_Status__c, "
+        "Onboarding_Product__c, Onboarding_Type__c "
+        "FROM Customer_Onboarding__c WHERE Name = 'CO-0702' LIMIT 2",
+        "--json",
+    ])
+    try:
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:
+            raise ReadUnavailable()
+        co = records[0]
+        account_id, revision = co["Account__c"], co["LastModifiedDate"]
+        if (co.get("Name") != CO0702_REFERENCE or not isinstance(account_id, str)
+                or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id)
+                or not isinstance(revision, str) or not revision):
+            raise ReadUnavailable()
+        blockers: list[str] = []
+        product, onboarding_type = co.get("Onboarding_Product__c"), co.get("Onboarding_Type__c")
+        if co.get("Onboarding_Approval_Status__c") != "Approved":
+            blockers.append("source_not_approved")
+        if (not isinstance(product, str) or "surface" not in product.casefold()
+                or not isinstance(onboarding_type, str) or "new" not in onboarding_type.casefold()
+                or "renew" in onboarding_type.casefold()):
+            blockers.append("unsupported_new_surface_route")
+        for field, label in (("Account_Name__c", "account_name_missing"), ("Main_Domain__c", "main_domain_missing"),
+                             ("Primary_User_Name__c", "primary_user_missing")):
+            if not isinstance(co.get(field), str) or not co[field].strip():
+                blockers.append(label)
+        dates = extract_dealhub_dates(co.get("Onboarding_Comments__c"))
+        if not dates["ready_for_cse_review"]:
+            blockers.append("onboarding_comment_dates_unverified")
+        subscriptions = sf_json([
+            "data", "query", "--query",
+            "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
+            "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c WHERE DealHub_Account__c = '"
+            + account_id + "' LIMIT 100",
+            "--json",
+        ])
+        rows = subscriptions["result"]["records"]  # type: ignore[index]
+        if subscriptions["status"] != 0 or not isinstance(rows, list):
+            raise ReadUnavailable()
+        selected: list[dict[str, object]] = []
+        addons = 0
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ReadUnavailable()
+            name, status = row.get("Product_Full_Name__c"), row.get("DealHub_Status__c")
+            if not isinstance(name, str) or not isinstance(status, str) or status.casefold() != "active":
+                continue
+            baseline = SURFACE_BASELINE_PRODUCT.fullmatch(name)
+            addon = re.fullmatch(r"pentera surface.*(?:add[- ]?on|additional).*?(\d+) subdomains", name, re.IGNORECASE)
+            if baseline:
+                selected.append(row)
+            elif addon:
+                addons += int(addon.group(1))
+        if len(selected) != 1:
+            blockers.append("surface_baseline_missing_or_ambiguous")
+            product_name, baseline_subdomains = "Not verified", 0
+        else:
+            product_name = selected[0]["Product_Full_Name__c"]
+            baseline_match = SURFACE_BASELINE_PRODUCT.fullmatch(str(product_name))
+            baseline_subdomains = int(baseline_match.group(1)) if baseline_match else 0
+        proposed_comment = (str(dates["dealhub_start_date"]) + " - " + str(dates["dealhub_end_date"])
+                            if dates["ready_for_cse_review"] else "Not verified")
+        return NewSurfaceFillPreflight(CO0702_REFERENCE, revision, str(product_name), proposed_comment,
+                                       10_000, baseline_subdomains + addons, tuple(sorted(set(blockers))))
+    except (KeyError, TypeError, ValueError):
+        raise ReadUnavailable() from None
+
+
 def issue_comment_update_ack(evaluation: CommentUpdateEvaluation, *, now: float | None = None) -> str:
     """Issue one short-lived confirmation bound to both Salesforce revisions."""
     nonce = token_urlsafe(24)
@@ -732,6 +830,15 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                 "<p>This evaluation requires CO-0745 to remain an empty-comment, New, Pending Surface renewal.</p></div>"
                 "<button type='button' disabled aria-disabled='true'>Evaluation unavailable</button></section>"
             )
+    co0702_preflight_action = ""
+    if reference == CO0702_REFERENCE:
+        co0702_preflight_action = (
+            "<section class='login-preflight' aria-labelledby='co0702-preflight-title'><div>"
+            "<h2 id='co0702-preflight-title'>Prepare Leonardo Development fill review</h2>"
+            "<p>Re-read CO-0702 and current Surface subscriptions. This calculates the proposed limits and reports only safe blockers.</p>"
+            "<p class='login-safety'>Read-only: it does not open Leonardo, search tenants, fill a form, or create an account.</p></div>"
+            "<form method='post' action='/attended/rerun-co0702-fill-preflight'><input type='hidden' name='reference' value='CO-0702'><button type='submit'>Run fill preflight</button></form></section>"
+        )
     source_ready = source_ready_to_onboard(row)
     commercial_ready = bool(commercial_readiness and commercial_readiness.get("commercial_ready"))
     commercial_manual_review = bool(commercial_readiness and commercial_readiness.get("manual_review_required"))
@@ -825,7 +932,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     if notification in notifications:
         title, message = notifications[notification]
         toast = "<section class='toast' role='status' aria-live='polite'><strong>" + escape(title) + "</strong><span>" + escape(message) + "</span></section>"
-    return "<!doctype html><title>" + escape(reference) + "</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f3f3;color:#181818;font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}main{max-width:1080px;margin:auto;padding:28px 32px 40px}a{color:#0176d3;text-decoration:none;font-weight:600}a:hover{text-decoration:underline}h1{margin:16px 0;font-size:1.625rem;line-height:1.25}.toast{position:fixed;z-index:2;right:24px;top:20px;display:grid;gap:2px;max-width:430px;padding:13px 16px;border:1px solid #2e844a;border-left:4px solid #2e844a;border-radius:5px;background:#fff;box-shadow:0 3px 10px #0003}.toast span{color:#514f4d}.readiness,.login-preflight{margin:0 0 18px;padding:16px;border:1px solid;border-left-width:4px;border-radius:4px;background:#fff}.source-ready{border-color:#2e844a}.source-blocked{border-color:#ba0517}.readiness-heading{display:flex;gap:12px;align-items:flex-start}.readiness-icon{display:grid;place-items:center;flex:0 0 22px;width:22px;height:22px;border-radius:50%;color:#fff;font-size:.875rem;font-weight:800}.source-ready .readiness-icon{background:#2e844a}.source-blocked .readiness-icon{background:#ba0517}.readiness h2,.login-preflight h2,.manual-action h2{margin:0;color:#3e3e3c;font-size:1rem}.readiness p,.login-preflight p{margin:3px 0 0;color:#514f4d}.readiness details{margin:12px 0 0;color:#3e3e3c}.readiness summary{cursor:pointer;color:#0176d3;font-weight:600}.readiness ul{margin:8px 0 0;padding-left:20px}.readiness li{margin:4px 0}.login-preflight{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;border-color:#0176d3}.login-preflight form{margin:0}.login-preflight button{padding:8px 12px;border:1px solid #0176d3;border-radius:4px;background:#0176d3;color:#fff;font:inherit;font-weight:600;cursor:pointer}.login-preflight button:hover{background:#014486}.login-safety{grid-column:1/-1;font-size:.8125rem}.manual-action{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;margin:0 0 18px;padding:16px;border:1px solid #dddbda;border-radius:4px;background:#fff}.manual-action p{margin:3px 0 0;color:#514f4d}.manual-action button{padding:8px 12px;border:1px solid #c9c7c5;border-radius:4px;background:#f3f3f3;color:#706e6b;font:inherit;font-weight:600;cursor:not-allowed}.manual-blocker{grid-column:1/-1;font-size:.8125rem}dl{display:grid;grid-template-columns:minmax(190px,260px) 1fr;margin:0;border:1px solid #dddbda;background:#fff}dt,dd{margin:0;padding:12px 16px;border-bottom:1px solid #dddbda}dt{background:#f3f2f2;color:#3e3e3c;font-size:.8125rem;font-weight:700}dd{white-space:pre-wrap;overflow-wrap:anywhere}dt:nth-last-of-type(1),dd:last-child{border-bottom:0}@media(max-width:700px){main{padding:20px 16px}.toast{left:16px;right:16px;top:12px;max-width:none}.login-preflight,.manual-action{grid-template-columns:1fr}.login-preflight form,.manual-action button{justify-self:start}dl{display:block}dt{border-bottom:0;padding-bottom:4px}dd{padding-top:4px}}</style><main><a href='/'>← Open Onboardings</a><h1>" + escape(reference) + "</h1>" + toast + case4_panel + comment_repair_action + renewal_comment_evaluation_action + renewal_preflight + readiness + manual_action + local_readback + "<dl>" + rows + "</dl></main>"
+    return "<!doctype html><title>" + escape(reference) + "</title><style>*{box-sizing:border-box}body{margin:0;background:#f3f3f3;color:#181818;font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}main{max-width:1080px;margin:auto;padding:28px 32px 40px}a{color:#0176d3;text-decoration:none;font-weight:600}a:hover{text-decoration:underline}h1{margin:16px 0;font-size:1.625rem;line-height:1.25}.toast{position:fixed;z-index:2;right:24px;top:20px;display:grid;gap:2px;max-width:430px;padding:13px 16px;border:1px solid #2e844a;border-left:4px solid #2e844a;border-radius:5px;background:#fff;box-shadow:0 3px 10px #0003}.toast span{color:#514f4d}.readiness,.login-preflight{margin:0 0 18px;padding:16px;border:1px solid;border-left-width:4px;border-radius:4px;background:#fff}.source-ready{border-color:#2e844a}.source-blocked{border-color:#ba0517}.readiness-heading{display:flex;gap:12px;align-items:flex-start}.readiness-icon{display:grid;place-items:center;flex:0 0 22px;width:22px;height:22px;border-radius:50%;color:#fff;font-size:.875rem;font-weight:800}.source-ready .readiness-icon{background:#2e844a}.source-blocked .readiness-icon{background:#ba0517}.readiness h2,.login-preflight h2,.manual-action h2{margin:0;color:#3e3e3c;font-size:1rem}.readiness p,.login-preflight p{margin:3px 0 0;color:#514f4d}.readiness details{margin:12px 0 0;color:#3e3e3c}.readiness summary{cursor:pointer;color:#0176d3;font-weight:600}.readiness ul{margin:8px 0 0;padding-left:20px}.readiness li{margin:4px 0}.login-preflight{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;border-color:#0176d3}.login-preflight form{margin:0}.login-preflight button{padding:8px 12px;border:1px solid #0176d3;border-radius:4px;background:#0176d3;color:#fff;font:inherit;font-weight:600;cursor:pointer}.login-preflight button:hover{background:#014486}.login-safety{grid-column:1/-1;font-size:.8125rem}.manual-action{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center;margin:0 0 18px;padding:16px;border:1px solid #dddbda;border-radius:4px;background:#fff}.manual-action p{margin:3px 0 0;color:#514f4d}.manual-action button{padding:8px 12px;border:1px solid #c9c7c5;border-radius:4px;background:#f3f3f3;color:#706e6b;font:inherit;font-weight:600;cursor:not-allowed}.manual-blocker{grid-column:1/-1;font-size:.8125rem}dl{display:grid;grid-template-columns:minmax(190px,260px) 1fr;margin:0;border:1px solid #dddbda;background:#fff}dt,dd{margin:0;padding:12px 16px;border-bottom:1px solid #dddbda}dt{background:#f3f2f2;color:#3e3e3c;font-size:.8125rem;font-weight:700}dd{white-space:pre-wrap;overflow-wrap:anywhere}dt:nth-last-of-type(1),dd:last-child{border-bottom:0}@media(max-width:700px){main{padding:20px 16px}.toast{left:16px;right:16px;top:12px;max-width:none}.login-preflight,.manual-action{grid-template-columns:1fr}.login-preflight form,.manual-action button{justify-self:start}dl{display:block}dt{border-bottom:0;padding-bottom:4px}dd{padding-top:4px}}</style><main><a href='/'>← Open Onboardings</a><h1>" + escape(reference) + "</h1>" + toast + case4_panel + comment_repair_action + renewal_comment_evaluation_action + co0702_preflight_action + renewal_preflight + readiness + manual_action + local_readback + "<dl>" + rows + "</dl></main>"
 
 
 def page_salesforce_unavailable() -> str:
@@ -888,6 +995,20 @@ def page_co0745_renewal_evaluation(evaluation: RenewalCommentEvaluation) -> str:
         "<p>Required production tenant: <code>" + escape(evaluation.expected_tenant_name) + "</code></p>"
         "<p class='note'>No Salesforce field was changed. Production validation must find exactly this tenant name; a base-name, domain-only, missing, or duplicate result requires manual review. A separate final approval is required before an update can be prepared.</p>"
         "<p><a href='/co/CO-0745'>Return to CO-0745</a></p></section></main>"
+    )
+
+
+def page_co0702_fill_preflight(evaluation: NewSurfaceFillPreflight) -> str:
+    blockers = ("<li>" + "</li><li>".join(escape(item.replace("_", " ")) for item in evaluation.blockers) + "</li>"
+                if evaluation.blockers else "<li>None from the local source check.</li>")
+    state = "ready for attended duplicate review" if evaluation.eligible_for_fill_review else "blocked for manual review"
+    return (
+        "<!doctype html><title>CO-0702 fill preflight</title><style>body{max-width:760px;margin:48px auto;padding:0 22px;font:16px/1.5 system-ui,sans-serif;color:#181818}section{border:1px solid #0176d3;border-left:4px solid #0176d3;border-radius:4px;padding:18px;background:#fff}code{font-weight:700}.note{color:#514f4d;font-size:.9rem}</style>"
+        "<main><h1>CO-0702 Leonardo Development fill preflight</h1><section><p>Local state: <code>" + state + "</code></p>"
+        "<p>Surface tier: <code>" + escape(evaluation.product_name) + "</code></p><p>Proposed subscription term: <code>" + escape(evaluation.proposed_comment) + "</code></p>"
+        "<p>Proposed limits: <code>" + str(evaluation.assets) + " assets · " + str(evaluation.subdomains) + " subdomains</code></p>"
+        "<p>Blockers:</p><ul>" + blockers + "</ul>"
+        "<p class='note'>No browser, Leonardo, duplicate lookup, form fill, tenant creation, or Salesforce update was performed.</p><p><a href='/co/CO-0702'>Return to CO-0702</a></p></section></main>"
     )
 
 
@@ -958,6 +1079,17 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return
             self.send_page(HTTPStatus.OK, page_co0745_renewal_evaluation(evaluation))
+            return
+        if path == "/attended/rerun-co0702-fill-preflight":
+            if reference != CO0702_REFERENCE:
+                self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
+                return
+            try:
+                evaluation = evaluate_co0702_new_surface_fill_preflight()
+            except ReadUnavailable:
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Preflight unavailable</title><p>CO-0702 could not be read for this preflight. No external action was performed.</p>")
+                return
+            self.send_page(HTTPStatus.OK, page_co0702_fill_preflight(evaluation))
             return
         if path == "/attended/confirm-comment-update":
             if reference != "CO-0741":

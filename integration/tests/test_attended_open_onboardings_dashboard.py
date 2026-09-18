@@ -22,6 +22,8 @@ from tools.serve_attended_open_onboardings_dashboard import (
     page_salesforce_login_opened,
     page_comment_update_confirmation,
     evaluate_co0745_renewal_comment,
+    evaluate_co0702_new_surface_fill_preflight,
+    page_co0702_fill_preflight,
     page_co0745_renewal_evaluation,
     salesforce_cli_command,
     start_attended_salesforce_login,
@@ -285,6 +287,44 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("No Salesforce field was changed", page)
         self.assertIn("Acme Bank - CE Only", page)
         self.assertNotIn("Confirm update in Salesforce", page)
+
+    def test_co0702_preflight_calculates_new_surface_limits_without_external_action(self):
+        source = {"status": 0, "result": {"records": [{
+            "Id": "a0B000000000702", "Name": "CO-0702", "Account__c": "001000000000702",
+            "LastModifiedDate": "2026-09-17T10:00:00Z", "Account_Name__c": "Example Org",
+            "Main_Domain__c": "example.test", "Primary_User_Name__c": "Example Owner",
+            "Onboarding_Comments__c": "2026-09-01 - 2027-08-31",
+            "Onboarding_Approval_Status__c": "Approved", "Onboarding_Product__c": "Pentera Surface",
+            "Onboarding_Type__c": "New Surface Account Only",
+        }]}}
+        subscriptions = {"status": 0, "result": {"records": [
+            {"Product_Full_Name__c": "Pentera Surface Go - 500 Subdomains", "DealHub_Status__c": "Active"},
+            {"Product_Full_Name__c": "Pentera Surface Add-on 200 Subdomains", "DealHub_Status__c": "Active"},
+        ]}}
+        with patch("tools.serve_attended_open_onboardings_dashboard.sf_json", side_effect=[source, subscriptions]) as reader:
+            evaluation = evaluate_co0702_new_surface_fill_preflight()
+        self.assertTrue(evaluation.eligible_for_fill_review)
+        self.assertEqual(evaluation.assets, 10_000)
+        self.assertEqual(evaluation.subdomains, 700)
+        self.assertEqual(evaluation.proposed_comment, "2026-09-01 - 2027-08-31")
+        self.assertEqual(reader.call_count, 2)
+        page = page_co0702_fill_preflight(evaluation)
+        self.assertIn("Run fill preflight", page_detail("CO-0702", {}))
+        self.assertIn("No browser, Leonardo, duplicate lookup, form fill, tenant creation, or Salesforce update", page)
+
+    def test_co0702_preflight_blocks_unapproved_or_ambiguous_baseline(self):
+        source = {"status": 0, "result": {"records": [{
+            "Id": "a0B000000000702", "Name": "CO-0702", "Account__c": "001000000000702",
+            "LastModifiedDate": "2026-09-17T10:00:00Z", "Account_Name__c": "Example Org",
+            "Main_Domain__c": "example.test", "Primary_User_Name__c": None,
+            "Onboarding_Comments__c": None, "Onboarding_Approval_Status__c": "Pending",
+            "Onboarding_Product__c": "Pentera Surface", "Onboarding_Type__c": "New Surface Account Only",
+        }]}}
+        subscriptions = {"status": 0, "result": {"records": []}}
+        with patch("tools.serve_attended_open_onboardings_dashboard.sf_json", side_effect=[source, subscriptions]):
+            evaluation = evaluate_co0702_new_surface_fill_preflight()
+        self.assertFalse(evaluation.eligible_for_fill_review)
+        self.assertEqual(evaluation.blockers, ("onboarding_comment_dates_unverified", "primary_user_missing", "source_not_approved", "surface_baseline_missing_or_ambiguous"))
 
     def test_comment_update_confirmation_is_revision_bound_and_one_time(self):
         dashboard._comment_update_acks.clear()
