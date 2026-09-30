@@ -972,7 +972,22 @@ FILL_LABELS = (
     "Number of assets",
     "Number of domains",
     "Number of subdomains",
+    # Present on the live form (2026-09-24 inventory); only the Surface route
+    # fills or verifies them. They start empty like the live controls.
+    "Alternate Domains (Comma Separated Values)",
+    "SubDomains (Comma Separated Values)",
+    "Networks (Comma Separated Values)",
+    "Phone number",
+    "Job title",
 )
+# Under the collapsed "Advanced options" section (live probe 2026-09-29: a
+# type=number input without name/id/data-am, labelled by its MuiFormControl).
+ADVANCED_FILL_LABELS = ("Maximum scan Duration (hours)",)
+# Live defaults of text/number inputs (2026-09-29 probe); the runner must
+# overwrite and re-read them.
+LIVE_TEXT_DEFAULTS = {"Number of subdomains": "50000", "Maximum scan Duration (hours)": "24"}
+LC_DEPENDENT_LABELS = ("Leaked Credentials scanning interval",
+                       "Leaked Credentials scanned domains (Comma Separated Values)")
 SELECT_LABELS = (
     "Account Type",
     "Country",
@@ -1136,6 +1151,11 @@ class _RPControl:
             # The Add Account form controls exist only while the form is open
             # (it closes on the single Confirm click or on Cancel).
             return 0 if (self.page.confirmed or self.page.cancelled) else 1
+        if self.kind == "advanced_fill":
+            # Advanced options text controls exist only once the section is
+            # expanded (and only when the scenario's form has them).
+            return 1 if (self.page.max_duration_control and self.page.advanced_open
+                         and not (self.page.confirmed or self.page.cancelled)) else 0
         if self.kind == "detail":
             # Details-page controls are reachable only once the exact tenant
             # row exists (after a matching search in both flows).
@@ -1149,6 +1169,10 @@ class _RPControl:
         return 0
 
     def is_enabled(self) -> bool:
+        if self.label in LC_DEPENDENT_LABELS:
+            # Live form: the Leaked Credentials interval and domains are
+            # disabled while the Leaked Credentials toggle is OFF.
+            return bool(self.page.checkbox_states.get("leakedCredentialsAllowed"))
         return True
 
     def fill(self, value: str, **kwargs) -> None:
@@ -1176,10 +1200,11 @@ class _RPControl:
         pass
 
     def input_value(self):
-        if self.kind in ("fill", "date"):
+        if self.kind in ("fill", "date", "advanced_fill"):
             # The runner re-reads every value it fills; the fake must return
-            # the stored value, not the (absent) detail value.
-            return self.page.filled.get(self.label)
+            # the stored value, not the (absent) detail value. An untouched
+            # live input reads as "".
+            return self.page.filled.get(self.label, "")
         return self.page.details.get(self.label)
 
     def select_option(self, **kwargs) -> None:
@@ -1223,6 +1248,24 @@ class _RPCheckboxControl:
 
     def click(self, **kwargs) -> None:
         self.page.checkbox_states[self.key] = not self.page.checkbox_states[self.key]
+
+
+class _RPOperatorControl:
+    """Fake for the Operator Account react-select input (placeholder-located)."""
+
+    def __init__(self, page):
+        self.page = page
+        self.first = self
+
+    def count(self) -> int:
+        return 0 if (self.page.confirmed or self.page.cancelled) else self.page.operator_inputs
+
+    def input_value(self) -> str:
+        return self.page.filled.get("Operator Account", "")
+
+    def evaluate(self, script: str, *args):
+        # Number of selected-value chips in the react-select container.
+        return self.page.operator_selected
 
 
 class _RPRow:
@@ -1277,6 +1320,15 @@ class _RPPage:
         self.create_on_confirm = scenario.get("create_on_confirm", True)
         self.tenant = scenario["tenant"]
         self.domain = scenario["domain"]
+        self.max_duration_control = scenario.get("max_duration_control", True)
+        # Operator Account react-select: one input, empty, no selected chips.
+        self.operator_inputs = scenario.get("operator_inputs", 1)
+        self.operator_selected = scenario.get("operator_selected", 0)
+        # The live max-duration input may only resolve through its enclosing
+        # MuiFormControl label (no accessible-label association).
+        self.max_duration_by_form_control = scenario.get("max_duration_by_form_control", False)
+        self.filled.update(LIVE_TEXT_DEFAULTS)
+        self.filled.update(scenario.get("prefilled", {}))
 
     def confirm(self) -> None:
         if self.confirmed:
@@ -1355,6 +1407,14 @@ class _RPPage:
             # prefix and the trailing '"]'.
             key = selector[len('input[type=checkbox][name="'):-2]
             return _RPCheckboxControl(self, key)
+        if selector == runner.OPERATOR_ACCOUNT_INPUT_SELECTOR:
+            return _RPOperatorControl(self)
+        prefix = '.MuiFormControl-root:has(> label:text-is("'
+        if selector.startswith(prefix):
+            label = selector[len(prefix):selector.index('")')]
+            if label in ADVANCED_FILL_LABELS and self.max_duration_by_form_control:
+                return _RPControl(self, label, "advanced_fill")
+            return _RPControl(self, label, "other")
         if selector.startswith('[data-am="'):
             # The live form's license date inputs carry no label, name, id, or
             # placeholder; they are located by their data-am attribute. Map the
@@ -1373,6 +1433,8 @@ class _RPPage:
             kind = "fill"
         elif label in DATE_LABELS:
             kind = "date"
+        elif label in ADVANCED_FILL_LABELS:
+            kind = "other" if self.max_duration_by_form_control else "advanced_fill"
         elif label in DETAIL_LABELS:
             kind = "detail"
         else:
@@ -3072,19 +3134,29 @@ _ORIGINAL_RUN_LOG_PATH = runner.RUN_LOG_PATH
 
 
 _ORIGINAL_CHECK_STATE_PATH = runner.CHECK_STATE_PATH
+# Safety net for tests that do not patch these paths themselves (for example
+# the readback-only failure paths capture diagnostics).
+_ORIGINAL_RUNTIME_PATHS = {name: getattr(runner, name)
+                           for name in ("DIAGNOSTICS_PATH", "READBACK_PATH", "RUNNER_STATE_PATH")}
 
 
 def setUpModule():
-    # Never write the real integration/ run log or check-state files from tests.
+    # Never write the real integration/ run log, check-state, diagnostics,
+    # readback, or runner-state files from tests.
     global _RUN_LOG_DIR
     _RUN_LOG_DIR = Path(tempfile.mkdtemp(prefix="ce_run_log_"))
     runner.RUN_LOG_PATH = _RUN_LOG_DIR / "run_log.json"
     runner.CHECK_STATE_PATH = _RUN_LOG_DIR / "check_state.json"
+    runner.DIAGNOSTICS_PATH = _RUN_LOG_DIR / "diagnostics.json"
+    runner.READBACK_PATH = _RUN_LOG_DIR / "readbacks.json"
+    runner.RUNNER_STATE_PATH = _RUN_LOG_DIR / "runner_state.json"
 
 
 def tearDownModule():
     runner.RUN_LOG_PATH = _ORIGINAL_RUN_LOG_PATH
     runner.CHECK_STATE_PATH = _ORIGINAL_CHECK_STATE_PATH
+    for name, value in _ORIGINAL_RUNTIME_PATHS.items():
+        setattr(runner, name, value)
     shutil.rmtree(_RUN_LOG_DIR, ignore_errors=True)
 
 
@@ -3194,6 +3266,690 @@ class RunLogTests(unittest.TestCase):
         self.assertIn({"step": "fill_select", "outcome": "not_found", "field": "Country"},
                       [{k: v for k, v in e.items() if k != "t"} for e in events])
         self.assertFalse(page.confirmed)
+
+
+# --- Golden: the CE-only route is unchanged by the route-contract layer -------
+
+CE_GOLDEN_PLAN = {
+    "texts": {
+        "Company name": "Sample Company - CE Only",
+        "Company primary domain": "company.example",
+        "User email domains  (Comma Separated Values)": "pentera.io",
+        "First name": "Milton",
+        "Last name": "Stevenson",
+        "Organization Email": "milton.stevenson+samplecompany@pentera.io",
+        "Leaked Credentials scanned domains (Comma Separated Values)": "company.example",
+        "Number of assets": "1",
+        "Number of domains": "1",
+        "Number of subdomains": "1",
+    },
+    "selects": {
+        "Account Type": "Customer",
+        "Country": "France",
+        "Scanning interval": "None",
+        "Leaked Credentials scanning interval": "Weekly",
+        "Type": "Prepaid annual subscription",
+    },
+    "checkboxes": {
+        "mfaRequired": True, "scan_now": False,
+        "automatedDiscoveryEnabled": False, "subDomainsReconEnabled": False,
+        "webDictionaryBruteForceEnabled": False, "webDorkingEnabled": False,
+        "fullNucleiScanEnabled": False, "authenticatedTestingEnabled": False,
+        "staticOutboundIpEnabled": False, "aiEnabled": False, "multipleAttackStacksEnabled": False,
+        "notificationsAllowed": False, "multipleUsersAllowed": False, "apiAccessAllowed": False,
+        "phishingEnabled": False, "leakedCredentialsAllowed": True, "provisioningEnabled": True,
+        "subDomainsNumberAllowed": True,
+    },
+    "license_start": date(2026, 9, 29),
+    "license_end": date(2027, 9, 27),
+}
+# Captured from the pre-route-contract runner (HEAD 71bc251) on the fake form.
+CE_GOLDEN_EVENTS = [
+    ["source_read", "start", "", ""], ["source_read", "ok", "", ""],
+    ["license_dates", "ok", "", "start=2026-09-29 end=2027-09-27"],
+    ["tenant_search", "200", "", "rows=0 total=0"], ["duplicate_check", "duplicate_clear", "tenant_name", ""],
+    ["tenant_search", "200", "", "rows=0 total=0"], ["duplicate_check", "duplicate_clear", "primary_domain", ""],
+    ["add_account_open", "clicked", "", ""],
+    ["fill_select", "ok", "Account Type", ""], ["fill_select", "ok", "Scanning interval", ""],
+    ["fill_select", "ok", "Type", ""], ["advanced_options", "expanded", "", ""],
+    ["fill_toggle", "ok", "mfaRequired", ""], ["fill_toggle", "ok", "scan_now", ""],
+    ["fill_toggle", "ok", "automatedDiscoveryEnabled", ""], ["fill_toggle", "ok", "subDomainsReconEnabled", ""],
+    ["fill_toggle", "ok", "webDictionaryBruteForceEnabled", ""], ["fill_toggle", "ok", "webDorkingEnabled", ""],
+    ["fill_toggle", "ok", "fullNucleiScanEnabled", ""], ["fill_toggle", "ok", "authenticatedTestingEnabled", ""],
+    ["fill_toggle", "ok", "staticOutboundIpEnabled", ""], ["fill_toggle", "ok", "aiEnabled", ""],
+    ["fill_toggle", "ok", "multipleAttackStacksEnabled", ""], ["fill_toggle", "ok", "notificationsAllowed", ""],
+    ["fill_toggle", "ok", "multipleUsersAllowed", ""], ["fill_toggle", "ok", "apiAccessAllowed", ""],
+    ["fill_toggle", "ok", "phishingEnabled", ""], ["fill_toggle", "ok", "leakedCredentialsAllowed", ""],
+    ["fill_toggle", "ok", "provisioningEnabled", ""], ["fill_toggle", "ok", "subDomainsNumberAllowed", ""],
+    ["fill_select", "ok", "Country", ""], ["fill_select", "ok", "Leaked Credentials scanning interval", ""],
+    ["fill_text", "ok", "Company name", ""], ["fill_text", "ok", "Company primary domain", ""],
+    ["fill_text", "ok", "User email domains  (Comma Separated Values)", ""], ["fill_text", "ok", "First name", ""],
+    ["fill_text", "ok", "Last name", ""], ["fill_text", "ok", "Organization Email", ""],
+    ["fill_text", "ok", "Leaked Credentials scanned domains (Comma Separated Values)", ""],
+    ["fill_text", "ok", "Number of assets", ""], ["fill_text", "ok", "Number of domains", ""],
+    ["fill_text", "ok", "Number of subdomains", ""],
+    ["fill_date", "ok", "license_start", ""], ["fill_date", "ok", "license_end", ""],
+    ["verify_form", "ok", "", ""], ["confirm_click", "clicked", "", "account_add_status=200"],
+    ["form_close_wait", "closed", "", ""], ["tenant_search", "200", "", "rows=1 total=1"],
+    ["post_create_search", "duplicate_found", "attempt=1", ""], ["readback", "api", "", ""],
+    ["finish", "readback_verified", "", ""],
+]
+
+
+def _events(log_path: Path) -> list[list[str]]:
+    events = json.loads(log_path.read_text(encoding="utf-8"))["runs"][-1]["events"]
+    return [[e["step"], e["outcome"], e.get("field", ""), e.get("detail", "")]
+            for e in events if not e["step"].startswith("browser_")]
+
+
+class CeGoldenTests(unittest.TestCase):
+    def test_build_ce_only_fill_is_unchanged(self):
+        source = BuildCeOnlyFillTests()._source()
+        self.assertEqual(build_ce_only_fill(source, date(2026, 9, 29)), CE_GOLDEN_PLAN)
+        self.assertEqual(list(build_ce_only_fill(source, date(2026, 9, 29))["texts"]), list(CE_GOLDEN_PLAN["texts"]))
+        self.assertEqual(list(build_ce_only_fill(source, date(2026, 9, 29))["checkboxes"]),
+                         list(CE_GOLDEN_PLAN["checkboxes"]))
+
+    def test_ce_end_to_end_fake_run_is_unchanged(self):
+        case = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(case.doCleanups)
+        tracker: dict = {}
+        page = case._install_fake_playwright(case._base(), tracker)
+        with patch.object(runner, "_run_day", return_value=date(2026, 9, 29)):
+            result = case._run_scenario(page, tracker)
+        self.assertEqual(result, "readback_verified")
+        self.assertEqual(_events(runner.RUN_LOG_PATH), CE_GOLDEN_EVENTS)
+        self.assertNotIn("route", json.loads(runner.RUN_LOG_PATH.read_text(encoding="utf-8"))["runs"][-1])
+        # The default route is CE and the ce_only_names output is unchanged.
+        self.assertIs(runner.ROUTES[runner.CE_ENGINE], runner.CE_ROUTE)
+        self.assertEqual(ce_only_names("Sample Group Ltd."), runner.CeOnlyNames("Sample Group Ltd - CE Only", "sgl"))
+
+    def test_fill_ce_form_alias_is_the_generic_filler(self):
+        self.assertIs(runner._fill_ce_form, runner._fill_add_account_form)
+
+
+# --- Surface-only route (case_1_new_surface_only) ------------------------------
+
+SURFACE_ACCOUNT = "Sample Surface Co."
+SURFACE_TENANT = "Sample Surface Co"
+SURFACE_MAIN = "surface-sample.example"
+SURFACE_ALT = "other-sample.example"
+SURFACE_SUB = "app.surface-sample.example"
+SURFACE_REVISION = "2026-09-29T08:00:00.000+0000"
+RUN_DAY = date(2026, 9, 29)
+
+
+def _dealhub(product: str, status: str = "Active", start: str = "2026-09-01", end: str = "2029-08-31") -> dict:
+    return {"Product_Full_Name__c": product, "DealHub_Status__c": status,
+            "DealHub_Subscription_Start_Date__c": start, "DealHub_Subscription_End_Date__c": end}
+
+
+def _surface_source(*, alternates=(SURFACE_ALT,), subdomains=(SURFACE_SUB,), tier="go", interval="Monthly",
+                    baseline=500, addons=0, core_plus=False, revision=SURFACE_REVISION) -> runner.SurfaceFillSource:
+    entitlement = runner.SurfaceEntitlement(tier, interval, baseline, addons, None,
+                                            date(2026, 9, 1), date(2029, 8, 31), core_plus)
+    names = runner.surface_names(SURFACE_ACCOUNT)
+    return runner.SurfaceFillSource(
+        "CO-0801", revision, "a123456789012345", SURFACE_ACCOUNT, "France", SURFACE_MAIN,
+        tuple(alternates), tuple(subdomains), entitlement, names.tenant_name, names.primary_user_alias)
+
+
+class SurfaceNamingTests(unittest.TestCase):
+    def test_tenant_name_has_no_suffix_and_drops_trailing_periods(self):
+        self.assertEqual(runner.surface_names(SURFACE_ACCOUNT).tenant_name, SURFACE_TENANT)
+        self.assertEqual(runner.surface_names("Sample Company").tenant_name, "Sample Company")
+
+    def test_alias_rule_is_shared_with_ce(self):
+        for name in ("Sample Company", "First Main Bank & Trust", "Abcdefghijklmno", SURFACE_ACCOUNT):
+            with self.subTest(name=name):
+                self.assertEqual(runner.surface_names(name).primary_user_alias,
+                                 ce_only_names(name).primary_user_alias)
+
+    def test_blank_name_raises(self):
+        with self.assertRaises(ValueError):
+            runner.surface_names("  ")
+
+
+class SurfaceEntitlementTests(unittest.TestCase):
+    def _select(self, rows, run_day=RUN_DAY):
+        return runner.select_surface_entitlement(rows, run_day)
+
+    def _code(self, rows, run_day=RUN_DAY) -> str:
+        with self.assertRaises(runner.SurfaceSourceError) as caught:
+            self._select(rows, run_day)
+        return str(caught.exception)
+
+    def test_tiers_map_to_scanning_intervals(self):
+        cases = {
+            "Pentera Surface Go - 500 Subdomains": ("go", "Monthly", 500),
+            "Pentera Surface Prime - 1000 Subdomains": ("prime", "Weekly", 1000),
+            "Pentera Surface Prime": ("prime", "Weekly", 1000),
+            "Pentera Surface Software - Essentials - 150 Sub-Domains & 1 Domains": ("essentials", "Monthly", 150),
+            "Pentera Surface Software Professional - 150 Sub-Domains & 3 Domains": ("professional", "Monthly", 150),
+            "Pentera Surface Software Enterprise - Up to 650 Sub-Domains & 5 Domains": ("enterprise", "Weekly", 650),
+        }
+        for product, (tier, interval, subdomains) in cases.items():
+            with self.subTest(product=product):
+                entitlement = self._select([_dealhub(product)])
+                self.assertEqual((entitlement.tier, entitlement.scanning_interval, entitlement.licensed_subdomains),
+                                 (tier, interval, subdomains))
+                self.assertFalse(entitlement.core_plus_present)
+
+    def test_subdomain_addons_are_added_and_domain_addons_are_not(self):
+        entitlement = self._select([
+            _dealhub("Pentera Surface Software Enterprise - Up to 650 Sub-Domains & 5 Domains"),
+            _dealhub("Pentera Surface Software Enterprise - Sub-Domain Add-on - 1 Bulks of 400 Sub-Domains"),
+            _dealhub("Pentera Surface Add-on - Additional 250 Subdomains"),
+            _dealhub("Pentera Surface Software Enterprise - Domain Add-on - 1 bulks of 10 Domains"),
+            _dealhub("Pentera Surface Add-on - Additional 999 Subdomains", status="Expired"),
+        ])
+        self.assertEqual((entitlement.baseline_subdomains, entitlement.addon_subdomains,
+                          entitlement.licensed_subdomains, entitlement.product_domains), (650, 650, 1300, 5))
+
+    def test_pending_window_boundaries(self):
+        self.assertEqual(runner.SURFACE_PENDING_START_WINDOW_DAYS, 14)
+        product = "Pentera Surface Go - 500 Subdomains"
+        for offset, counts in ((-30, True), (0, True), (13, True), (14, True), (15, False)):
+            start = (RUN_DAY + runner.timedelta(days=offset)).isoformat()
+            rows = [_dealhub(product, status="Pending", start=start, end="2029-09-30")]
+            with self.subTest(offset=offset):
+                if counts:
+                    self.assertEqual(self._select(rows).baseline_subdomains, 500)
+                else:
+                    self.assertEqual(self._code(rows), "surface_baseline_unavailable")
+
+    def test_active_is_unaffected_by_a_future_start(self):
+        rows = [_dealhub("Pentera Surface Go - 500 Subdomains", status="Active", start="2027-01-01", end="2029-12-31")]
+        self.assertEqual(self._select(rows).subscription_start, date(2027, 1, 1))
+
+    def test_real_prime_pending_shape_counts(self):
+        rows = [_dealhub("Pentera Surface Prime - 1000 Subdomains", status="Pending",
+                         start="2026-10-01", end="2029-09-30")]
+        entitlement = self._select(rows, date(2026, 9, 29))
+        self.assertEqual((entitlement.tier, entitlement.scanning_interval, entitlement.licensed_subdomains),
+                         ("prime", "Weekly", 1000))
+
+    def test_expired_baselines_are_ignored(self):
+        rows = [_dealhub("Pentera Surface Software - Essentials - 150 Sub-Domains & 1 Domains", status="Expired"),
+                _dealhub("Pentera Surface Go - 500 Subdomains")]
+        self.assertEqual(self._select(rows).tier, "go")
+        self.assertEqual(self._code(rows[:1]), "surface_baseline_unavailable")
+
+    def test_two_counted_baselines_are_ambiguous(self):
+        rows = [_dealhub("Pentera Surface Go - 500 Subdomains"), _dealhub("Pentera Surface Prime - 1000 Subdomains")]
+        self.assertEqual(self._code(rows), "surface_baseline_ambiguous")
+
+    def test_fail_closed_codes(self):
+        self.assertEqual(self._code([]), "surface_baseline_unavailable")
+        self.assertEqual(self._code([_dealhub("Pentera Surface - 1000 Subdomains")]), "surface_tier_unknown")
+        self.assertEqual(self._code([_dealhub("Pentera Surface Ultra - 5 Subdomains")]), "surface_product_unrecognized")
+        self.assertEqual(self._code([_dealhub("")]), "surface_product_unrecognized")
+        self.assertEqual(self._code([_dealhub("Pentera Surface Go - 500 Subdomains", status="")]),
+                         "surface_subscription_invalid")
+        self.assertEqual(self._code([_dealhub("Pentera Surface Go - 500 Subdomains", start="x")]),
+                         "surface_subscription_invalid")
+        self.assertEqual(self._code([_dealhub("Pentera Surface Go - 500 Subdomains", end="2026-08-01")]),
+                         "surface_subscription_invalid")
+
+    def test_security_validation_advisor_rows_are_not_baselines(self):
+        rows = [_dealhub("Security Validation Advisor - Premium Incl. Surface"),
+                _dealhub("Pentera Surface Go - 500 Subdomains")]
+        self.assertEqual(self._select(rows).tier, "go")
+
+    def test_core_plus_baselines_do_not_block_and_set_the_flag(self):
+        for core in ("Pentera Core Plus Commercial - 500 End Points", "Pentera Core Plus Enterprise - 2000 End Points"):
+            with self.subTest(core=core):
+                entitlement = self._select([_dealhub("Pentera Surface Go - 500 Subdomains"), _dealhub(core)])
+                self.assertTrue(entitlement.core_plus_present)
+                self.assertEqual(entitlement.tier, "go")
+
+    def test_core_plus_bulk_or_expired_rows_do_not_set_the_flag(self):
+        for row in (_dealhub("Pentera Core Plus Commercial - Bulk 100 End Points"),
+                    _dealhub("Pentera Core Plus Commercial - Additional 100 End Points"),
+                    _dealhub("Pentera Core Plus Commercial - 500 End Points", status="Expired")):
+            with self.subTest(product=row["Product_Full_Name__c"], status=row["DealHub_Status__c"]):
+                entitlement = self._select([_dealhub("Pentera Surface Go - 500 Subdomains"), row])
+                self.assertFalse(entitlement.core_plus_present)
+        self.assertTrue(runner.is_core_plus_baseline_row("pentera core plus commercial - 500 end points"))
+        self.assertFalse(runner.is_core_plus_baseline_row(None))
+
+
+class SurfaceDomainTests(unittest.TestCase):
+    def test_alternates_are_split_into_roots_and_subdomains(self):
+        main, roots, subdomains = runner.classify_surface_domains(
+            "Surface-Sample.Example", f"{SURFACE_ALT}, {SURFACE_SUB};{SURFACE_MAIN}\n{SURFACE_ALT}")
+        self.assertEqual((main, roots, subdomains), (SURFACE_MAIN, (SURFACE_ALT,), (SURFACE_SUB,)))
+
+    def test_empty_alternates(self):
+        for value in (None, "", " , ;"):
+            with self.subTest(value=value):
+                self.assertEqual(runner.classify_surface_domains(SURFACE_MAIN, value), (SURFACE_MAIN, (), ()))
+
+    def test_main_domain_must_be_a_registrable_root(self):
+        for value in (SURFACE_SUB, "co.uk", "10.0.0.0/24", "", None, "*.surface-sample.example", "a b.example",
+                      f"{SURFACE_MAIN}, {SURFACE_ALT}"):
+            with self.subTest(value=value), self.assertRaises(runner.SurfaceSourceError) as caught:
+                runner.classify_surface_domains(value, "")
+            self.assertEqual(str(caught.exception), "surface_main_domain_invalid")
+
+    def test_networks_fail_closed(self):
+        for value in ("10.0.0.0/24", "192.0.2.10", f"{SURFACE_ALT}, 2001:db8::/32"):
+            with self.subTest(value=value), self.assertRaises(runner.SurfaceSourceError) as caught:
+                runner.classify_surface_domains(SURFACE_MAIN, value)
+            self.assertEqual(str(caught.exception), "surface_networks_not_supported")
+
+    def test_wildcards_and_malformed_entries_fail_closed(self):
+        for value in ("*.other-sample.example", "user@other-sample.example", "not a domain", "co.uk", "-bad-.example"):
+            with self.subTest(value=value), self.assertRaises(runner.SurfaceSourceError) as caught:
+                runner.classify_surface_domains(SURFACE_MAIN, value)
+            self.assertEqual(str(caught.exception), "surface_domains_invalid")
+
+
+class SurfaceFillSourceTests(unittest.TestCase):
+    CO = {"Name": "CO-0801", "LastModifiedDate": SURFACE_REVISION, "Account__c": "a123456789012345",
+          "Account_Name__c": SURFACE_ACCOUNT, "Account_Country__c": "France", "Main_Domain__c": SURFACE_MAIN,
+          "Alternate_Domains__c": f"{SURFACE_ALT}, {SURFACE_SUB}", "Onboarding_Product__c": "Surface",
+          "Onboarding_Type__c": "New Product Onboarding"}
+
+    def _patch(self, co_records, subscription_records=None):
+        responses = [CeFillSourceTests._completed(CeFillSourceTests._sf_json(co_records))]
+        if subscription_records is not None:
+            responses.append(CeFillSourceTests._completed(CeFillSourceTests._sf_json(subscription_records)))
+        return patch.object(runner.subprocess, "run", side_effect=responses)
+
+    def test_valid_read(self):
+        with self._patch([self.CO], [_dealhub("Pentera Surface Go - 500 Subdomains"),
+                                     _dealhub("Pentera Core Plus Commercial - 500 End Points")]), \
+                patch.object(runner, "_run_day", return_value=RUN_DAY):
+            source = runner.surface_fill_source("CO-0801")
+        self.assertEqual((source.tenant_name, source.main_domain, source.alternate_domains, source.subdomains),
+                         (SURFACE_TENANT, SURFACE_MAIN, (SURFACE_ALT,), (SURFACE_SUB,)))
+        self.assertEqual((source.number_of_domains, source.entitlement.licensed_subdomains), (2, 500))
+        self.assertEqual(source.primary_user_alias, ce_only_names(SURFACE_ACCOUNT).primary_user_alias)
+        self.assertTrue(source.core_plus_present)
+
+    def test_route_gate_requires_exact_values_before_the_subscription_read(self):
+        for product, onboarding_type in (("Credential Exposure", "New Product Onboarding"),
+                                         ("Surface & Credential Exposure", "New Product Onboarding"),
+                                         ("Surface", "Renewal"), ("surface", "New Product Onboarding"),
+                                         (None, None)):
+            record = dict(self.CO, Onboarding_Product__c=product, Onboarding_Type__c=onboarding_type)
+            with self.subTest(product=product, type=onboarding_type), self._patch([record]) as run_mock:
+                with self.assertRaisesRegex(RuntimeError, "surface_route_mismatch"):
+                    runner.surface_fill_source("CO-0801")
+                self.assertEqual(run_mock.call_count, 1)
+
+    def test_ce_route_still_rejects_a_surface_co(self):
+        record = dict(CeFillSourceTests.CO_RECORD, Onboarding_Product__c="Surface")
+        with patch.object(runner.subprocess, "run", side_effect=[
+                CeFillSourceTests._completed(CeFillSourceTests._sf_json([record]))]):
+            with self.assertRaisesRegex(RuntimeError, "ce_route_mismatch"):
+                ce_fill_source("CO-0702")
+
+    def test_source_failures_fail_closed(self):
+        for field, value, code in (("Account_Country__c", None, "surface_source_unavailable"),
+                                   ("Account__c", "bad", "surface_source_unavailable"),
+                                   ("Main_Domain__c", SURFACE_SUB, "surface_main_domain_invalid"),
+                                   ("Alternate_Domains__c", "10.1.0.0/16", "surface_networks_not_supported")):
+            record = dict(self.CO, **{field: value})
+            with self.subTest(field=field), self._patch([record], [_dealhub("Pentera Surface Go - 500 Subdomains")]):
+                with self.assertRaisesRegex(RuntimeError, code):
+                    runner.surface_fill_source("CO-0801")
+        with self._patch([self.CO, self.CO]):
+            with self.assertRaisesRegex(RuntimeError, "surface_source_unavailable"):
+                runner.surface_fill_source("CO-0801")
+        with self.assertRaisesRegex(RuntimeError, "invalid_co_reference"):
+            runner.surface_fill_source("BAD")
+
+
+class BuildSurfaceOnlyFillTests(unittest.TestCase):
+    def test_fill_plan_matches_the_owner_contract(self):
+        plan = runner.build_surface_only_fill(_surface_source(addons=250), RUN_DAY)
+        self.assertEqual(plan["texts"], {
+            "Company name": SURFACE_TENANT,
+            "Company primary domain": SURFACE_MAIN,
+            "Alternate Domains (Comma Separated Values)": SURFACE_ALT,
+            "SubDomains (Comma Separated Values)": SURFACE_SUB,
+            "User email domains  (Comma Separated Values)": "pentera.io",
+            "First name": "Milton",
+            "Last name": "Stevenson",
+            "Organization Email": "milton.stevenson+ssc@pentera.io",
+            "Number of assets": "10000",
+            "Number of domains": "2",
+            "Number of subdomains": "750",
+        })
+        self.assertEqual(plan["selects"], {"Account Type": "Customer", "Country": "France",
+                                           "Scanning interval": "Monthly", "Type": "Prepaid annual subscription"})
+        self.assertEqual(plan["checkboxes"], {
+            "mfaRequired": True, "scan_now": True,
+            "automatedDiscoveryEnabled": False, "subDomainsReconEnabled": True,
+            "webDictionaryBruteForceEnabled": True, "webDorkingEnabled": False,
+            "fullNucleiScanEnabled": True, "authenticatedTestingEnabled": False,
+            "staticOutboundIpEnabled": False, "aiEnabled": False, "multipleAttackStacksEnabled": False,
+            "notificationsAllowed": True, "multipleUsersAllowed": True, "apiAccessAllowed": True,
+            "phishingEnabled": False, "leakedCredentialsAllowed": False, "provisioningEnabled": True,
+            "subDomainsNumberAllowed": True,
+        })
+        self.assertEqual(plan["advanced_texts"], {"Maximum scan Duration (hours)": "90"})
+        self.assertEqual(plan["blank_texts"], ("Networks (Comma Separated Values)", "Phone number", "Job title"))
+        self.assertTrue(plan["operator_account_empty"])
+        self.assertEqual((plan["license_start"], plan["license_end"]), (RUN_DAY, date(2027, 8, 31)))
+        # The two form-disabled toggles are never touched; LC interval/domains are not filled.
+        for key in ("subDomainsMultipleAttackStacksEnabled", "webAiAttackerEnabled"):
+            self.assertNotIn(key, plan["checkboxes"])
+        self.assertNotIn("Leaked Credentials scanning interval", plan["selects"])
+        self.assertNotIn("Leaked Credentials scanned domains (Comma Separated Values)", plan["texts"])
+
+    def test_empty_alternates_and_subdomains_are_verified_blank(self):
+        plan = runner.build_surface_only_fill(_surface_source(alternates=(), subdomains=()), RUN_DAY)
+        self.assertNotIn("Alternate Domains (Comma Separated Values)", plan["texts"])
+        self.assertNotIn("SubDomains (Comma Separated Values)", plan["texts"])
+        self.assertEqual(plan["blank_texts"][:2], ("Alternate Domains (Comma Separated Values)",
+                                                   "SubDomains (Comma Separated Values)"))
+        self.assertEqual(plan["texts"]["Number of domains"], "1")
+
+    def test_prime_interval_and_multiple_values_csv(self):
+        source = _surface_source(alternates=("a-sample.example", "b-sample.example"),
+                                 subdomains=("x.surface-sample.example", "y.surface-sample.example"),
+                                 tier="prime", interval="Weekly", baseline=1000)
+        plan = runner.build_surface_only_fill(source, RUN_DAY)
+        self.assertEqual(plan["selects"]["Scanning interval"], "Weekly")
+        self.assertEqual(plan["texts"]["Alternate Domains (Comma Separated Values)"], "a-sample.example, b-sample.example")
+        self.assertEqual(plan["texts"]["SubDomains (Comma Separated Values)"],
+                         "x.surface-sample.example, y.surface-sample.example")
+        self.assertEqual((plan["texts"]["Number of domains"], plan["texts"]["Number of subdomains"]), ("3", "1000"))
+
+    def test_core_plus_on_the_account_keeps_leaked_credentials_off(self):
+        plan = runner.build_surface_only_fill(_surface_source(core_plus=True), RUN_DAY)
+        self.assertIs(plan["checkboxes"]["leakedCredentialsAllowed"], False)
+
+    def test_api_access_is_on_by_default_for_every_surface_co(self):
+        self.assertFalse(runner.SURFACE_API_ACCESS_REQUIRES_CORE_PLUS)
+        for core_plus in (False, True):
+            with self.subTest(core_plus=core_plus):
+                plan = runner.build_surface_only_fill(_surface_source(core_plus=core_plus), RUN_DAY)
+                self.assertIs(plan["checkboxes"]["apiAccessAllowed"], True)
+
+    def test_api_access_can_follow_core_plus_behind_one_constant(self):
+        with patch.object(runner, "SURFACE_API_ACCESS_REQUIRES_CORE_PLUS", True):
+            self.assertIs(runner.build_surface_only_fill(_surface_source(core_plus=True), RUN_DAY)
+                          ["checkboxes"]["apiAccessAllowed"], True)
+            self.assertIs(runner.build_surface_only_fill(_surface_source(core_plus=False), RUN_DAY)
+                          ["checkboxes"]["apiAccessAllowed"], False)
+
+    def test_expired_license_fails_closed(self):
+        with self.assertRaisesRegex(ValueError, "surface_license_dates_unavailable"):
+            runner.build_surface_only_fill(_surface_source(), date(2027, 8, 31))
+
+    def test_scope_summary_is_counts_only(self):
+        summary = runner.surface_scope_summary(_surface_source(addons=250, core_plus=True), RUN_DAY)
+        self.assertEqual(summary, {
+            "tier": "go", "scanning_interval": "Monthly", "main_domains": 1, "alternate_root_domains": 1,
+            "requested_subdomains": 1, "number_of_domains": 2, "baseline_subdomains": 500,
+            "addon_subdomains": 250, "licensed_subdomains": 750, "product_domains": None, "assets": 10000,
+            "license_start": "2026-09-29", "license_end": "2027-08-31", "large_scope": True,
+            "core_plus_present": True,
+        })
+        self.assertNotIn(SURFACE_MAIN, json.dumps(summary))
+
+
+class SurfaceApiReadbackTests(unittest.TestCase):
+    def test_scan_started_is_accepted_only_for_the_surface_route(self):
+        result = runner.TenantSearchResult([{"accountName": SURFACE_TENANT, "accountDomain": SURFACE_MAIN,
+                                             "id": SURFACE_ID, "accountUuid": UUID,
+                                             "lastReconScan": "2026-09-29T10:00:00Z"}], 1)
+        self.assertIsNone(runner._api_readback(result, SURFACE_TENANT, SURFACE_MAIN))
+        self.assertEqual(runner._api_readback(result, SURFACE_TENANT, SURFACE_MAIN, allow_scan_started=True),
+                         (SURFACE_ID, UUID, "Account Scanning"))
+        idle = runner.TenantSearchResult([dict(result.rows[0], lastReconScan=None)], 1)
+        self.assertEqual(runner._api_readback(idle, SURFACE_TENANT, SURFACE_MAIN, allow_scan_started=True),
+                         (SURFACE_ID, UUID, "No scan started"))
+        self.assertTrue(runner.SURFACE_ROUTE.allow_scan_started)
+        self.assertFalse(runner.CE_ROUTE.allow_scan_started)
+
+
+class SurfaceRunEndToEndTests(unittest.TestCase):
+    def _temp_path(self, name: str) -> Path:
+        directory = Path(tempfile.mkdtemp(prefix="surface_run_test_"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        return directory / name
+
+    def _scenario(self, **extra):
+        scenario = {"url": runner.TENANT_MANAGEMENT, "tenants": [], "empty_state_row": True, "create_on_confirm": True,
+                    "details": {"Surface Account ID": SURFACE_ID, "Account UUID": UUID,
+                                "Account Scanning": "Account Scanning"},
+                    "tenant": SURFACE_TENANT, "domain": SURFACE_MAIN}
+        scenario.update(extra)
+        return scenario
+
+    def _run(self, scenario, source=None, **patches):
+        helper = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(helper.doCleanups)
+        tracker: dict = {}
+        page = helper._install_fake_playwright(scenario, tracker)
+        self.readbacks = self._temp_path("readbacks.json")
+        self.state = self._temp_path("state.json")
+        with patch.object(runner, "surface_fill_source", return_value=source or _surface_source()), \
+                patch.object(runner, "ce_fill_source", side_effect=AssertionError("CE source must not be read")), \
+                patch.object(runner, "_run_day", return_value=RUN_DAY), \
+                patch.object(runner, "RUNNER_STATE_PATH", self.state), \
+                patch.object(runner, "READBACK_PATH", self.readbacks), \
+                patch.object(runner, "DIAGNOSTICS_PATH", self._temp_path("diag.json")), \
+                patch.object(runner, "_attach_attended_browser", helper._attach(page, tracker)):
+            result = runner.run("CO-0801", SURFACE_REVISION, review_wait_seconds=1, route=runner.SURFACE_ENGINE)
+        self.tracker = tracker
+        return result, page
+
+    def test_happy_path_creates_and_reads_back_a_scanning_tenant(self):
+        result, page = self._run(self._scenario())
+        self.assertEqual(result, "readback_verified")
+        self.assertTrue(page.confirmed)
+        plan = runner.build_surface_only_fill(_surface_source(), RUN_DAY)
+        for label, expected in plan["texts"].items():
+            self.assertEqual(page.filled.get(label), expected, label)
+        self.assertEqual(page.filled["Maximum scan Duration (hours)"], "90")
+        self.assertEqual(page.selected, plan["selects"])
+        self.assertNotIn("Leaked Credentials scanning interval", page.selected)
+        for key, target in plan["checkboxes"].items():
+            self.assertIs(page.checkbox_states[key], target, key)
+        for label in ("Networks (Comma Separated Values)", "Phone number", "Job title", "Operator Account"):
+            self.assertEqual(page.filled.get(label, ""), "", label)
+        self.assertEqual(page.filled["Start date"], "2026-09-29")
+        raw = json.loads(self.readbacks.read_text(encoding="utf-8"))
+        self.assertEqual(raw["CO-0801"]["leonardo_state"], "Account Scanning")
+        self.assertEqual(raw["CO-0801"]["surface_account_id"], SURFACE_ID)
+        self.assertEqual(json.loads(self.state.read_text(encoding="utf-8"))["CO-0801"]["result"], "readback_verified")
+        log = json.loads(runner.RUN_LOG_PATH.read_text(encoding="utf-8"))["runs"][-1]
+        self.assertEqual(log["route"], runner.SURFACE_ENGINE)
+        steps = [(e["step"], e["outcome"]) for e in log["events"]]
+        self.assertIn(("max_scan_duration", "ok"), steps)
+        self.assertIn(("verify_operator_account", "ok"), steps)
+        self.assertIn(("verify_blank", "ok"), steps)
+        lookups = [e.get("field") for e in log["events"] if e["step"] == "duplicate_check"]
+        self.assertEqual(lookups, ["tenant_name", "primary_domain"])
+
+    def test_run_log_redacts_every_surface_source_value(self):
+        source = _surface_source()
+        helper = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(helper.doCleanups)
+        page = helper._install_fake_playwright(self._scenario(), {})
+        log = runner.RunLog("CO-0801", "create", route=runner.SURFACE_ENGINE)
+        log.add_redactions(*runner.SURFACE_ROUTE.redactions(source))
+        email = runner.surface_primary_user_email(source)
+        log.event("x", "y", detail=" ".join((SURFACE_ACCOUNT, SURFACE_TENANT, SURFACE_MAIN, SURFACE_ALT,
+                                             SURFACE_SUB, email)))
+        detail = log.events[-1]["detail"].casefold()
+        for value in (SURFACE_ACCOUNT, SURFACE_MAIN, SURFACE_ALT, SURFACE_SUB, email):
+            self.assertNotIn(value.casefold(), detail)
+        self.assertIsNotNone(page)
+
+    def test_readback_without_scan_is_no_scan_started(self):
+        result, _page = self._run(self._scenario(details={"Surface Account ID": SURFACE_ID, "Account UUID": UUID,
+                                                          "Account Scanning": None}))
+        self.assertEqual(result, "readback_verified")
+        self.assertEqual(json.loads(self.readbacks.read_text(encoding="utf-8"))["CO-0801"]["leonardo_state"],
+                         "No scan started")
+
+    def test_missing_max_duration_control_fails_closed_before_confirm(self):
+        result, page = self._run(self._scenario(max_duration_control=False))
+        self.assertEqual(result, "max_scan_duration_schema_unavailable")
+        self.assertFalse(page.confirmed)
+        events = json.loads(runner.RUN_LOG_PATH.read_text(encoding="utf-8"))["runs"][-1]["events"]
+        self.assertIn(("max_scan_duration", "not_found", "Maximum scan Duration (hours)"),
+                      [(e["step"], e["outcome"], e.get("field")) for e in events])
+
+    def test_max_duration_resolved_by_its_form_control_label_and_defaults_overwritten(self):
+        result, page = self._run(self._scenario(max_duration_by_form_control=True))
+        self.assertEqual(result, "readback_verified")
+        # Live defaults 24 h and 50000 subdomains are overwritten and re-read.
+        self.assertEqual(page.filled["Maximum scan Duration (hours)"], "90")
+        self.assertEqual(page.filled["Number of subdomains"], "500")
+        self.assertIsNone(runner._locate_form_field(page, "Maximum scan Duration (hours)", ""))
+
+    def test_leaked_credentials_dependents_stay_disabled_and_untouched(self):
+        result, page = self._run(self._scenario())
+        self.assertEqual(result, "readback_verified")
+        self.assertIs(page.checkbox_states["leakedCredentialsAllowed"], False)
+        self.assertNotIn("Leaked Credentials scanning interval", page.selected)
+        self.assertNotIn("Leaked Credentials scanned domains (Comma Separated Values)", page.filled)
+        self.assertFalse(_RPControl(page, "Leaked Credentials scanning interval", "select").is_enabled())
+
+    def test_max_duration_that_does_not_keep_90_fails_closed(self):
+        original_fill = _RPControl.fill
+
+        def sticky(control, value, **kwargs):
+            if control.label == "Maximum scan Duration (hours)":
+                return  # keeps the live default of 24
+            original_fill(control, value, **kwargs)
+
+        with patch.object(_RPControl, "fill", sticky):
+            result, page = self._run(self._scenario())
+        self.assertEqual(result, "fill_value_mismatch")
+        self.assertFalse(page.confirmed)
+
+    def test_operator_account_must_be_verified_empty(self):
+        for extra, code in (({"operator_selected": 1}, "fill_value_mismatch"),
+                            ({"prefilled": {"Operator Account": "someone"}}, "fill_value_mismatch"),
+                            ({"operator_inputs": 0}, "fill_form_schema_unavailable")):
+            with self.subTest(extra=extra):
+                result, page = self._run(self._scenario(**extra))
+                self.assertEqual(result, code)
+                self.assertFalse(page.confirmed)
+
+    def test_non_empty_blank_control_fails_closed(self):
+        result, page = self._run(self._scenario(prefilled={"Networks (Comma Separated Values)": "10.0.0.0/8"}))
+        self.assertEqual(result, "fill_value_mismatch")
+        self.assertFalse(page.confirmed)
+
+    def test_duplicate_by_primary_domain_blocks(self):
+        result, page = self._run(self._scenario(tenants=[_RPRow("Other Co", SURFACE_MAIN)]))
+        self.assertEqual(result, "duplicate_found")
+        self.assertFalse(page.confirmed)
+        self.assertNotIn("Company name", page.filled)
+
+    def test_source_error_stops_before_the_browser(self):
+        helper = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(helper.doCleanups)
+        tracker: dict = {}
+        page = helper._install_fake_playwright(self._scenario(), tracker)
+        for code in ("surface_route_mismatch", "surface_baseline_ambiguous", "surface_networks_not_supported"):
+            with self.subTest(code=code), \
+                    patch.object(runner, "surface_fill_source", side_effect=runner.SurfaceSourceError(code)), \
+                    patch.object(runner, "RUNNER_STATE_PATH", self._temp_path("state.json")), \
+                    patch.object(runner, "_attach_attended_browser", helper._attach(page, tracker)):
+                self.assertEqual(runner.run("CO-0801", SURFACE_REVISION, route=runner.SURFACE_ENGINE), code)
+        self.assertFalse(tracker.get("launched", False))
+
+    def test_unknown_route_fails_closed(self):
+        with patch.object(runner, "RUNNER_STATE_PATH", self._temp_path("state.json")), \
+                patch.object(runner, "surface_fill_source", side_effect=AssertionError("no read")), \
+                patch.object(runner, "ce_fill_source", side_effect=AssertionError("no read")):
+            self.assertEqual(runner.run("CO-0801", SURFACE_REVISION, route="case_3_combined_baseline"),
+                             "route_unsupported")
+            self.assertEqual(runner.run_readback("CO-0801", route="nope"), "route_unsupported")
+            self.assertEqual(runner.run_duplicate_check("CO-0801", route="nope"), "route_unsupported")
+
+    def test_surface_readback_only_accepts_a_scanning_tenant(self):
+        helper = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(helper.doCleanups)
+        tracker: dict = {}
+        page = helper._install_fake_playwright(self._scenario(tenants=[_RPRow(SURFACE_TENANT, SURFACE_MAIN)]), tracker)
+        readbacks = self._temp_path("readbacks.json")
+        state = self._temp_path("state.json")
+        with patch.object(runner, "surface_fill_source", return_value=_surface_source()), \
+                patch.object(runner, "READBACK_PATH", readbacks), \
+                patch.object(runner, "RUNNER_STATE_PATH", state), \
+                patch.object(runner, "_readback_details_optional_state", return_value=None), \
+                patch.object(runner, "_attach_attended_browser", helper._attach(page, tracker)):
+            self.assertEqual(runner.run_readback("CO-0801", route=runner.SURFACE_ENGINE), "readback_only_verified")
+        self.assertEqual(json.loads(readbacks.read_text(encoding="utf-8"))["CO-0801"]["leonardo_state"],
+                         "Account Scanning")
+        self.assertFalse(state.exists())
+
+
+class RunnerStateRouteTests(unittest.TestCase):
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp(prefix="ce_state_route_"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        patcher = patch.object(runner, "RUNNER_STATE_PATH", directory / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_surface_start_records_route_and_scope_review(self):
+        record_runner_start("CO-0801", "rev1", "2026-09-29T10:00:00", route=runner.SURFACE_ENGINE,
+                            scope_reviewed_on="2026-09-29T10:00:00")
+        record_runner_result("CO-0801", "rev1", "readback_verified", "2026-09-29T10:02:00")
+        self.assertEqual(load_runner_state()["CO-0801"], {
+            "source_revision": "rev1", "route": runner.SURFACE_ENGINE, "started_on": "2026-09-29T10:00:00",
+            "scope_reviewed_on": "2026-09-29T10:00:00", "result": "readback_verified",
+            "completed_on": "2026-09-29T10:02:00"})
+
+    def test_ce_start_record_is_unchanged(self):
+        record_runner_start("CO-0702", "rev1", "2026-09-29T10:00:00")
+        raw = json.loads(runner.RUNNER_STATE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(raw, {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-29T10:00:00"}})
+
+    def test_invalid_route_or_review_time_is_rejected(self):
+        with self.assertRaises(ValueError):
+            record_runner_start("CO-0801", "rev1", "2026-09-29T10:00:00", route="case_9")
+        with self.assertRaises(ValueError):
+            record_runner_start("CO-0801", "rev1", "2026-09-29T10:00:00", scope_reviewed_on="yesterday")
+        for value in ({"source_revision": "r", "route": "case_9"},
+                      {"source_revision": "r", "scope_reviewed_on": "not-a-date"},
+                      {"source_revision": "r", "scope_reviewed_on": 5}):
+            with self.subTest(value=value):
+                runner.RUNNER_STATE_PATH.write_text(json.dumps({"CO-0801": value}), encoding="utf-8")
+                with self.assertRaises(RunnerStateUnavailable):
+                    load_runner_state()
+
+
+class RouteCliTests(unittest.TestCase):
+    def _main(self, *argv):
+        captured = {}
+
+        def fake_run(reference, revision, **kwargs):
+            captured.update(reference=reference, revision=revision, **kwargs)
+            return "readback_verified"
+
+        with patch.object(sys, "argv", ["runner", *argv]), patch.object(runner, "run", fake_run), \
+                contextlib.redirect_stdout(open(os.devnull, "w")) as sink:
+            self.addCleanup(sink.close)
+            self.assertEqual(runner.main(), 0)
+        return captured
+
+    def test_default_route_is_ce(self):
+        self.assertEqual(self._main("--co", "CO-0702", "--revision", "r")["route"], runner.CE_ENGINE)
+
+    def test_surface_route_is_passed_through(self):
+        captured = self._main("--co", "CO-0801", "--revision", "r", "--route", runner.SURFACE_ENGINE)
+        self.assertEqual(captured["route"], runner.SURFACE_ENGINE)
+
+    def test_unknown_route_is_rejected_by_the_cli(self):
+        with patch.object(sys, "argv", ["runner", "--co", "CO-0801", "--revision", "r", "--route", "x"]), \
+                contextlib.redirect_stderr(open(os.devnull, "w")) as sink:
+            self.addCleanup(sink.close)
+            with self.assertRaises(SystemExit):
+                runner.main()
 
 
 if __name__ == "__main__":

@@ -36,13 +36,19 @@ from tools.attended_ce_only_playwright import (
     RunnerStateUnavailable,
     bootstrap_leonardo_session,
     check_leonardo_session,
+    CE_ENGINE,
     CE_ROUTE_PRODUCT,
     CE_ROUTE_TYPE,
+    SURFACE_ENGINE,
+    SURFACE_ROUTE_PRODUCT,
+    SURFACE_ROUTE_TYPE,
     close_automation_browser,
     load_runner_state,
     record_runner_start,
     reset_leonardo_profile,
     reset_runner_record,
+    surface_fill_source,
+    surface_scope_summary,
 )
 
 HOST, PORT = "127.0.0.1", 8012
@@ -64,6 +70,10 @@ DETAIL_DISPLAY_FIELDS = (
 )
 ATTENDED_LEONARDO_READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
 ATTENDED_CE_ONLY_RUNNER = Path(__file__).resolve().with_name("attended_ce_only_playwright.py")
+# Local operator acknowledgements for post-onboarding reminders (gitignored).
+# It never drives Leonardo or Salesforce; it only hides a reminder.
+ATTENDED_REMINDERS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_reminders.json"
+REMINDER_FIELDS = {"scan_settings_off": "scan_settings_off_on", "ce_enabled": "ce_enabled_on"}
 LEONARDO_READBACK_STATES = frozenset({"Account Scanning", "No scan started"})
 CASE4_PRODUCT = "Surface & Credential Exposure"
 CASE4_TYPE = "Renewal of Surface + New Credential Exposure Module"
@@ -120,6 +130,35 @@ class CredentialExposureFillPreflight:
     @property
     def eligible_for_fill_review(self) -> bool:
         return not self.blockers
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceScopePreflight:
+    """Read-only, counts-only scope review for one Surface-only (Case 1) CO.
+
+    ``scope`` holds only counts, tier, interval, and license dates (never
+    domain values). ``scope_digest`` binds the operator's scope review to the
+    exact computed scope: DealHub rows can change without changing the CO
+    revision, so the start gate also compares this digest.
+    """
+
+    reference: str
+    source_revision: str
+    blockers: tuple[str, ...]
+    scope: dict[str, object] | None = None
+    core_plus_present: bool = False
+
+    @property
+    def eligible_for_fill_review(self) -> bool:
+        return not self.blockers and self.scope is not None and bool(self.source_revision)
+
+    @property
+    def scope_digest(self) -> str:
+        if self.scope is None:
+            return ""
+        material = json.dumps({"reference": self.reference, "source_revision": self.source_revision,
+                               "scope": self.scope}, sort_keys=True, separators=(",", ":"))
+        return sha256(material.encode("utf-8")).hexdigest()
 
 
 class ReadUnavailable(RuntimeError): pass
@@ -201,6 +240,99 @@ def start_attended_ce_only_runner(reference: str, revision: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def start_attended_surface_runner(reference: str, revision: str) -> bool:
+    """Launch one desktop-only Surface-only (Case 1) auto-confirm process."""
+    if (not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
+            or not ATTENDED_CE_ONLY_RUNNER.is_file()):
+        return False
+    try:
+        subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--co", reference, "--revision", revision,
+                          "--route", SURFACE_ENGINE],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+def route_for(row: dict[str, str | None]) -> str | None:
+    """Return the attended route engine value for exact Product/Type values only."""
+    product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
+    if product == CE_ROUTE_PRODUCT and onboarding_type == CE_ROUTE_TYPE:
+        return CE_ENGINE
+    if product == SURFACE_ROUTE_PRODUCT and onboarding_type == SURFACE_ROUTE_TYPE:
+        return SURFACE_ENGINE
+    return None
+
+
+def evaluate_surface_fill_preflight(reference: str) -> SurfaceScopePreflight:
+    """Fresh read of the Surface-only source through the runner's own reader.
+
+    The dashboard and the runner compute the scope with the same code. Any
+    source failure is a blocker (its stable code), never a partial scope.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise ReadUnavailable()
+    try:
+        source = surface_fill_source(reference)
+    except RuntimeError as error:
+        return SurfaceScopePreflight(reference, "", (str(error),))
+    try:
+        scope = surface_scope_summary(source)
+    except ValueError as error:
+        return SurfaceScopePreflight(reference, source.source_revision, (str(error),),
+                                     core_plus_present=source.core_plus_present)
+    return SurfaceScopePreflight(reference, source.source_revision, (), scope, source.core_plus_present)
+
+
+def evaluate_surface_start(acknowledged_revision: str | None, scope_digest: str | None,
+                           evaluation: SurfaceScopePreflight, state: dict[str, dict[str, str]]) -> str:
+    """One-time, revision- and scope-bound gate for the Surface-only runner start."""
+    decision = evaluate_ce_only_start(acknowledged_revision, evaluation, state)  # type: ignore[arg-type]
+    if decision != "start":
+        return decision
+    if not scope_digest or scope_digest != evaluation.scope_digest:
+        return "scope_changed"
+    return "start"
+
+
+def load_attended_reminders() -> dict[str, dict[str, str]]:
+    """Load local reminder acknowledgements; absence means none, corruption fails closed."""
+    try:
+        raw = json.loads(ATTENDED_REMINDERS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ReadUnavailable() from exc
+    if not isinstance(raw, dict):
+        raise ReadUnavailable()
+    reminders: dict[str, dict[str, str]] = {}
+    allowed = set(REMINDER_FIELDS.values())
+    for reference, value in raw.items():
+        if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict)
+                or set(value) - allowed):
+            raise ReadUnavailable()
+        for item in value.values():
+            if not isinstance(item, str):
+                raise ReadUnavailable()
+            try:
+                datetime.fromisoformat(item)
+            except ValueError as exc:
+                raise ReadUnavailable() from exc
+        reminders[reference] = dict(value)
+    return reminders
+
+
+def record_attended_reminder(reference: str, kind: str) -> None:
+    """Record one local acknowledgement (no Leonardo or Salesforce action)."""
+    if not REFERENCE.fullmatch(reference) or kind not in REMINDER_FIELDS:
+        raise ValueError("invalid_reminder_record")
+    reminders = load_attended_reminders()
+    reminders.setdefault(reference, {})[REMINDER_FIELDS[kind]] = datetime.now().isoformat(timespec="seconds")
+    temporary = ATTENDED_REMINDERS_PATH.with_name(ATTENDED_REMINDERS_PATH.name + ".tmp")
+    temporary.write_text(json.dumps(reminders, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, ATTENDED_REMINDERS_PATH)
 
 
 def evaluate_ce_only_start(acknowledged_revision: str | None, evaluation: CredentialExposureFillPreflight,
@@ -866,9 +998,12 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         )
         is_renewal = "renewal" in (row.get("Onboarding_Type__c") or "").casefold()
         ce_automated = not is_case4 and ce_only_eligible(row) and not is_renewal
-        # The "not enabled" explanation only applies to routes without the
-        # automated CE-only onboarding; it is contradictory on a CE-only CO.
-        not_enabled = ("" if ce_automated else
+        # Surface-only (Case 1): exact Product "Surface" + Type "New Product
+        # Onboarding" only; every other CO keeps its existing behaviour.
+        surface_automated = not is_case4 and not is_renewal and route_for(row) == SURFACE_ENGINE
+        # The "not enabled" explanation only applies to routes without an
+        # automated onboarding; it is contradictory on a CE-only/Surface CO.
+        not_enabled = ("" if ce_automated or surface_automated else
                        "<details><summary>Why Leonardo creation is not enabled yet</summary><ul>"
                        "<li>Approved route mapping and scope-threshold evaluation</li>"
                        "<li>Leonardo Development authentication, authority, and duplicate checks</li>"
@@ -889,6 +1024,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
             )
         elif ce_automated:
             manual_action = _ce_only_onboard_section(reference)
+        elif surface_automated:
+            manual_action = _surface_onboard_section(reference)
         else:
             session_check = (
                 "<section class='login-preflight' aria-labelledby='login-preflight-title'><div><h2 id='login-preflight-title'>Leonardo Development session check</h2>"
@@ -1100,7 +1237,7 @@ def page_ce_only_fill_preflight(evaluation: CredentialExposureFillPreflight,
 
 RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "readback_verified": ("success", "Tenant created and read back. Surface Account ID, Account UUID, and Account Scanning state were captured locally."),
-    "duplicate_found": ("blocked", "A tenant with this CE-only name or primary domain already exists in Leonardo Development. Nothing was created. Review the existing tenant; this CO should not be onboarded again."),
+    "duplicate_found": ("blocked", "A tenant with this tenant name or primary domain already exists in Leonardo Development. Nothing was created. Review the existing tenant; this CO should not be onboarded again."),
     "duplicate_ambiguous": ("blocked", "A tenant with a similar name exists, or the search returned more results than could be checked. Nothing was created. Review it in Leonardo Development before retrying."),
     "duplicate_search_schema_unavailable": ("blocked", "The Tenant Management search control could not be found (page-layout/selector issue). No tenant was created."),
     "duplicate_schema_unavailable": ("blocked", "The tenant table could not be classified (unexpected row layout). No tenant was created. Diagnostics were captured; retry after review."),
@@ -1130,9 +1267,24 @@ RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "ce_subscription_ambiguous": ("blocked", "The subscription dates are missing or conflicting. No tenant was created. Verify the DealHub subscription."),
     "fill_value_mismatch": ("blocked", "A form control did not keep the value the runner set. No tenant was created. Diagnostics were captured; review before retrying."),
     "readback_only_verified": ("success", "The existing tenant was verified read-only. Surface Account ID, Account UUID, and observed Account Scanning state were captured locally. No tenant was created or changed."),
-    "readback_only_tenant_not_found": ("blocked", "No tenant matched the expected CE-only tenant name. No tenant was created or changed. Verify manually in Leonardo Development."),
+    "readback_only_tenant_not_found": ("blocked", "No tenant matched the expected tenant name. No tenant was created or changed. Verify manually in Leonardo Development."),
     "readback_only_state_unrecognized": ("blocked", "The observed Account Scanning state is not recognized. No tenant was created or changed. Verify manually in Leonardo Development."),
     "invalid_co_reference": ("blocked", "The customer onboarding reference is invalid. No action was performed."),
+    # Surface-only route (Case 1).
+    "route_unsupported": ("blocked", "The runner was started with an unsupported route. No browser was opened and nothing was created."),
+    "surface_route_mismatch": ("blocked", "This CO is not exactly a new Surface onboarding (Onboarding Product \"Surface\", Type \"New Product Onboarding\"), so the Surface runner stopped before opening the browser. Nothing was created."),
+    "surface_source_unavailable": ("blocked", "The Surface source (CO fields or DealHub subscriptions) could not be read or is incomplete (account, country). Nothing was created."),
+    "surface_product_unrecognized": ("blocked", "A DealHub product row is missing a name or is an unrecognized Pentera Surface product. Nothing was created. Review the subscriptions manually."),
+    "surface_baseline_unavailable": ("blocked", "No counted Surface baseline subscription was found (Active, or Pending starting within 14 days). Nothing was created."),
+    "surface_baseline_ambiguous": ("blocked", "More than one counted Surface baseline subscription was found. Nothing was created. Review the subscriptions manually."),
+    "surface_tier_unknown": ("blocked", "The Surface baseline product has no approved tier (Prime, Go, Enterprise, Essentials, Professional), so no scanning interval can be chosen. Nothing was created."),
+    "surface_subscription_invalid": ("blocked", "A Surface subscription row has no status or invalid dates. Nothing was created. Verify the DealHub subscription."),
+    "surface_main_domain_invalid": ("blocked", "The Main Domain must be one valid registrable root domain (not a subdomain, public suffix, or network). Nothing was created."),
+    "surface_domains_invalid": ("blocked", "An Alternate Domains entry is malformed or a wildcard. Nothing was created. Correct the Salesforce value."),
+    "surface_networks_not_supported": ("blocked", "Alternate Domains contains a network or IP address; networks are not supported by this route yet. Nothing was created."),
+    "surface_license_dates_unavailable": ("blocked", "The Surface license expiration (from the baseline subscription) is not after today, so no valid license can start today. Nothing was created."),
+    "max_scan_duration_schema_unavailable": ("blocked", "The Advanced options \"Maximum scan Duration (hours)\" control could not be found. Nothing was created. The run log records the lookup."),
+    "scope_review_missing": ("blocked", "The scope review acknowledgement for this source revision is missing. No browser was launched."),
 }
 
 LEONARDO_SESSION_MESSAGES: dict[str, tuple[str, str]] = {
@@ -1383,6 +1535,152 @@ def _ce_only_onboard_section(reference: str) -> str:
     )
 
 
+SCAN_REMINDER_TEXT = ("Scan now / scanning interval are ON for this Leonardo Development tenant — "
+                      "turn them off later")
+CE_REMINDER_TEXT = "Core Plus (Credential Exposure) purchased — enable Credential Exposure later"
+
+
+def _surface_start_form(evaluation: SurfaceScopePreflight) -> str:
+    """One-time Start form bound to the source revision AND the reviewed scope."""
+    if not evaluation.eligible_for_fill_review:
+        return ""
+    return ("<form class='start-form' method='post' action='/attended/start-surface-runner'>"
+            "<input type='hidden' name='reference' value='" + escape(evaluation.reference) + "'>"
+            "<input type='hidden' name='source_revision' value='" + escape(evaluation.source_revision) + "'>"
+            "<input type='hidden' name='scope_digest' value='" + escape(evaluation.scope_digest) + "'>"
+            "<button type='submit'>Start Onboarding</button>"
+            "<label><input type='checkbox' name='attended_create_authorized' value='1' required> "
+            "I authorize one Leonardo Development run for this source revision</label>"
+            "<label><input type='checkbox' name='scope_reviewed' value='1' required> "
+            "I reviewed the scope for this source revision</label></form>"
+            "<p class='note'>Checks Leonardo for an existing tenant (name and primary domain) first. "
+            "If one exists, nothing is created and this CO is marked as a duplicate.</p>")
+
+
+def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
+    """Counts-only scope summary for the manual scope review (no domain values)."""
+    scope = evaluation.scope
+    if scope is None:
+        return ""
+    tier = str(scope["tier"]).title()
+    licensed = (f"{scope['licensed_subdomains']} ({scope['baseline_subdomains']} baseline + "
+                f"{scope['addon_subdomains']} add-on)")
+    rows = [
+        ("Tier", tier), ("Scanning interval", str(scope["scanning_interval"])),
+        ("Main domain", str(scope["main_domains"])),
+        ("Alternate root domains", str(scope["alternate_root_domains"])),
+        ("Requested subdomains", str(scope["requested_subdomains"])),
+        ("Number of domains", str(scope["number_of_domains"])),
+        ("Licensed subdomains", licensed),
+        ("Assets", str(scope["assets"])),
+        ("License dates", f"{scope['license_start']} → {scope['license_end']}"),
+        ("Large scope (&gt;60)", "yes — review carefully" if scope["large_scope"] else "no"),
+        ("Core Plus on account", "yes — CE to be enabled later" if scope.get("core_plus_present") else "no"),
+    ]
+    if scope.get("product_domains") is not None:
+        rows.insert(6, ("Product domain allowance", str(scope["product_domains"])))
+    return ("<dl class='scope'>" + "".join(
+        "<dt>" + label + "</dt><dd>" + escape(value) + "</dd>" for label, value in rows) + "</dl>")
+
+
+def _reminder(text: str, action: str, reference: str, button: str) -> str:
+    return ("<div class='outcome outcome-info' role='status'><span class='outcome-icon' aria-hidden='true'>!</span>"
+            "<div><strong>" + escape(text) + "</strong>"
+            "<form method='post' action='" + action + "'><input type='hidden' name='reference' value='"
+            + escape(reference) + "'><button type='submit' class='ghost'>" + escape(button) + "</button></form>"
+            "<span class='meta'>Records a local acknowledgement only; nothing is changed in Leonardo or Salesforce.</span>"
+            "</div></div>")
+
+
+def _surface_onboard_section(reference: str) -> str:
+    """Render the Surface-only (Case 1) Onboard card: scope review + one Start action.
+
+    Mirrors the CE-only card (chip, outcome banner, reset for failed runs) and
+    adds the counts-only scope summary, the required revision-bound scope
+    review, and the local Scan-now / Credential Exposure reminders.
+    """
+    ref = escape(reference)
+    evaluation = evaluate_surface_fill_preflight(reference)
+    try:
+        state = load_runner_state()
+    except RunnerStateUnavailable:
+        state = None
+    record = state.get(reference) if state is not None else None
+    same_revision = (record is not None and bool(evaluation.source_revision)
+                     and record.get("source_revision") == evaluation.source_revision)
+    if record is not None and record.get("result") == "readback_verified":
+        status_chip = "<span class='chip chip-ok'>Onboarded</span>"
+    elif not evaluation.eligible_for_fill_review:
+        status_chip = "<span class='chip chip-bad'>Blocked</span>"
+    elif same_revision and record.get("result") in ("duplicate_found", "duplicate_ambiguous"):
+        status_chip = "<span class='chip chip-bad'>Duplicate</span>"
+    elif same_revision and record.get("result"):
+        status_chip = "<span class='chip chip-bad'>Failed</span>"
+    elif same_revision:
+        status_chip = "<span class='chip chip-warn'>Running</span>"
+    else:
+        status_chip = "<span class='chip chip-info'>Ready</span>"
+    runner_note = ""
+    start_action = ""
+    if same_revision and record.get("result"):
+        kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
+        runner_note = _outcome_banner(kind, message, record["result"], record.get("completed_on"))
+    elif same_revision:
+        started = " at " + escape(record["started_on"]) if record.get("started_on") else ""
+        runner_note = ("<p class='note'>An attended run for this source revision was started" + started +
+                       " and has not reported a result. Do not start another. "
+                       "<a href='/attended/ce-only-runner-status?ref=" + ref + "'>View progress</a></p>")
+    elif record is not None and record.get("result") == "readback_verified":
+        # A verified tenant exists; a later source revision never re-creates it.
+        runner_note = _outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
+                                      "readback_verified", record.get("completed_on"))
+    else:
+        if record is not None:
+            runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +
+                           escape(record.get("result", "no result recorded")) + "</code></p>")
+        start_action = _surface_start_form(evaluation)
+    blockers = ""
+    if evaluation.blockers:
+        blockers = "".join(
+            "<p class='note'>Blocked: <code>" + escape(code) + "</code> "
+            + RUNNER_RESULT_MESSAGES.get(code, ("blocked", ""))[1] + "</p>" for code in evaluation.blockers)
+    try:
+        reminders = load_attended_reminders().get(reference, {})
+        reminder_error = ""
+    except ReadUnavailable:
+        reminders = {}
+        reminder_error = "<p class='note'>The local reminders file could not be read; reminders are shown until it is repaired.</p>"
+    reminder_html = ""
+    if evaluation.core_plus_present and not reminders.get(REMINDER_FIELDS["ce_enabled"]):
+        reminder_html += _reminder(CE_REMINDER_TEXT, "/attended/mark-ce-enabled", reference, "Mark CE enabled")
+    if (record is not None and record.get("route") == SURFACE_ENGINE and record.get("result") == "readback_verified"
+            and not reminders.get(REMINDER_FIELDS["scan_settings_off"])):
+        reminder_html += _reminder(SCAN_REMINDER_TEXT, "/attended/mark-scan-settings-off", reference,
+                                   "Mark scan settings turned off")
+    for kind, label in (("scan_settings_off", "Scan settings marked off"), ("ce_enabled", "Credential Exposure marked enabled")):
+        if reminders.get(REMINDER_FIELDS[kind]):
+            reminder_html += "<p class='note'>" + label + " on " + escape(reminders[REMINDER_FIELDS[kind]]) + ".</p>"
+    reset_action = ""
+    if record is not None and record.get("result") and record["result"] != "readback_verified":
+        reset_action = (
+            "<form class='reset-form' method='post' action='/attended/reset-ce-only-runner'>"
+            "<input type='hidden' name='reference' value='" + ref + "'>"
+            "<label><input type='checkbox' name='reset_authorized' value='1' required> "
+            "Re-arm this failed run (nothing was created)</label>"
+            "<button type='submit' class='ghost'>Reset runner record</button></form>"
+        )
+    revision = evaluation.source_revision or "unavailable"
+    return (
+        "<section class='card onboard' aria-labelledby='onboard-title'>"
+        "<div class='card-head'><h2 id='onboard-title' class='pill'>Surface onboarding</h2>" + status_chip + "</div>"
+        + runner_note + reminder_html + reminder_error +
+        "<div class='facts'><span>Route <b>" + escape(SURFACE_ENGINE) + "</b></span>"
+        "<span>Source revision <b>" + escape(revision) + "</b></span></div>"
+        + _surface_scope_facts(evaluation) + blockers + start_action + reset_action +
+        "</section>"
+    )
+
+
 def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, reference: str) -> str:
     """Show the attended runner outcome; auto-refresh until a result is recorded."""
     ref = escape(reference)
@@ -1420,6 +1718,7 @@ POST_ROUTES = frozenset({
     "/attended/rerun-comment-evaluation", "/attended/rerun-co0745-renewal-evaluation",
     "/attended/rerun-ce-only-fill-preflight", "/attended/rerun-co0702-fill-preflight",
     "/attended/start-ce-only-runner", "/attended/start-co0702-ce-only-runner", "/attended/reset-ce-only-runner",
+    "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding",
 })
@@ -1585,6 +1884,85 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
                 return
             self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+            return
+        if path == "/attended/start-surface-runner":
+            back = "<p><a href='/co/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>"
+            if exact_form_value(form, "attended_create_authorized") != "1":
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>An explicit attended authorization is required.</p>" + back)
+                return
+            if exact_form_value(form, "scope_reviewed") != "1":
+                # scope_review_missing: every Surface CO needs the revision-bound
+                # scope review (owner decision 2026-09-29, option b).
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>"
+                               + RUNNER_RESULT_MESSAGES["scope_review_missing"][1] + "</p>" + back)
+                return
+            acknowledged_revision = exact_form_value(form, "source_revision")
+            scope_digest = exact_form_value(form, "scope_digest")
+            try:
+                evaluation = evaluate_surface_fill_preflight(reference)
+            except ReadUnavailable:
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Preflight unavailable</title><p>" + escape(reference) + " could not be freshly read. No browser was launched.</p>")
+                return
+            try:
+                state = load_runner_state()
+            except RunnerStateUnavailable:
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The local runner state file could not be read. No browser was launched. Do not retry; inspect the state file.</p>")
+                return
+            record = state.get(reference)
+            if record is not None and record.get("result") == "readback_verified":
+                # A verified tenant exists: show it; a later revision never re-creates it.
+                self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+                return
+            decision = evaluate_surface_start(acknowledged_revision, scope_digest, evaluation, state)
+            if decision == "revision_already_acknowledged":
+                self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+                return
+            if decision != "start":
+                blocked = {
+                    "revision_acknowledgement_missing": "The source-revision acknowledgement is missing. No browser was launched.",
+                    "preflight_blocked": "The Surface preflight is blocked. No browser was launched.",
+                    "source_revision_changed": "The source revision changed since the scope was shown. No browser was launched. Review the scope again.",
+                    "scope_changed": "The computed scope changed since it was reviewed. No browser was launched. Review the scope again.",
+                }[decision]
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>" + blocked + "</p>" + back)
+                return
+            if not start_attended_surface_runner(reference, evaluation.source_revision):
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>The isolated desktop runner is unavailable. No Leonardo action was performed.</p>")
+                return
+            now = datetime.now().isoformat(timespec="seconds")
+            try:
+                record_runner_start(reference, evaluation.source_revision, now,
+                                    route=SURFACE_ENGINE, scope_reviewed_on=now)
+            except (OSError, ValueError, RunnerStateUnavailable):
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
+                return
+            self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+            return
+        if path in ("/attended/mark-scan-settings-off", "/attended/mark-ce-enabled"):
+            # Local acknowledgements only: no Leonardo, browser, or Salesforce write.
+            if path == "/attended/mark-scan-settings-off":
+                kind = "scan_settings_off"
+                try:
+                    record = load_runner_state().get(reference)
+                except RunnerStateUnavailable:
+                    record = None
+                allowed = (record is not None and record.get("route") == SURFACE_ENGINE
+                           and record.get("result") == "readback_verified")
+            else:
+                kind = "ce_enabled"
+                try:
+                    allowed = evaluate_surface_fill_preflight(reference).core_plus_present
+                except ReadUnavailable:
+                    allowed = False
+            if not allowed:
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Reminder not applicable</title><p>This reminder does not apply to " + escape(reference) + ". Nothing was recorded.</p>")
+                return
+            try:
+                record_attended_reminder(reference, kind)
+            except (OSError, ValueError, ReadUnavailable):
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Reminder unavailable</title><p>The local reminders file could not be written. Nothing was changed in Leonardo or Salesforce.</p>")
+                return
+            self.send_redirect("/co/" + reference)
             return
         if path == "/attended/reset-ce-only-runner":
             if exact_form_value(form, "reset_authorized") != "1":

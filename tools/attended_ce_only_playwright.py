@@ -1,4 +1,11 @@
-"""Desktop-only, attended Leonardo Development CE-only auto-confirm runner.
+"""Desktop-only, attended Leonardo Development auto-confirm runner.
+
+Two route contracts share the browser, duplicate-check, fill, confirm, and
+readback machinery (ROUTES): the CE-only route (case_2_new_ce_only, the
+default, unchanged) and the Surface-only route (case_1_new_surface_only,
+selected with --route). A RouteContract supplies the source reader, license
+dates, fill plan, duplicate lookups, run-log redactions, and whether the
+readback may observe a tenant that is already scanning.
 
 The runner deliberately has no Salesforce writeback.  It uses a dedicated,
 persisted, desktop-only browser profile (the documented §10 option-3 temporary
@@ -214,8 +221,13 @@ class CeOnlyNames:
     primary_user_alias: str
 
 
-def ce_only_names(account_name: str) -> CeOnlyNames:
-    """Derive the owner-approved CE-only tenant name and Pentera alias."""
+def _account_display_name_and_alias(account_name: str) -> tuple[str, str]:
+    """Shared naming rule: (display name without trailing periods, email alias).
+
+    Used by every attended route so the primary-user alias rule is identical:
+    names of 15 characters or fewer drop spaces and symbols; longer names use
+    word initials; the alias is always lowercase.
+    """
     compact = " ".join(account_name.split())
     if not compact:
         raise ValueError("account_name_unavailable")
@@ -225,7 +237,6 @@ def ce_only_names(account_name: str) -> CeOnlyNames:
     display_name = compact.rstrip(". ")
     if not display_name:
         raise ValueError("account_name_unavailable")
-    tenant_name = display_name + " - CE Only"
     alphanumeric = re.findall(r"[A-Za-z0-9]+", compact)
     if not alphanumeric:
         raise ValueError("account_name_unavailable")
@@ -235,7 +246,20 @@ def ce_only_names(account_name: str) -> CeOnlyNames:
         alias = "".join(word[0] for word in alphanumeric).casefold()
     if not alias:
         raise ValueError("primary_user_alias_unavailable")
-    return CeOnlyNames(tenant_name, alias)
+    return display_name, alias
+
+
+def ce_only_names(account_name: str) -> CeOnlyNames:
+    """Derive the owner-approved CE-only tenant name and Pentera alias."""
+    display_name, alias = _account_display_name_and_alias(account_name)
+    return CeOnlyNames(display_name + " - CE Only", alias)
+
+
+def surface_names(account_name: str) -> CeOnlyNames:
+    """Surface-only tenant name (the account name, trailing periods removed,
+    no suffix) and the same Pentera alias rule as the CE-only route."""
+    display_name, alias = _account_display_name_and_alias(account_name)
+    return CeOnlyNames(display_name, alias)
 
 
 def one_email_domain(value: object) -> str | None:
@@ -515,6 +539,466 @@ def build_ce_only_fill(source: CeFillSource, run_day: date | None = None) -> dic
         "license_start": start,
         "license_end": end,
     }
+
+
+# --- Surface-only route (Case 1, engine case_1_new_surface_only) -------------
+# Owner decisions 2026-09-29 (operator), per the Guru card "Surface Customer
+# Onboarding - New Surface Account Only" (docs/37_CASE1_SURFACE_ONLY_GURU_NOTES).
+CE_ENGINE = "case_2_new_ce_only"
+SURFACE_ENGINE = "case_1_new_surface_only"
+SURFACE_ROUTE_PRODUCT = "Surface"
+SURFACE_ROUTE_TYPE = "New Product Onboarding"
+# Engine values a runner-state record may carry in its optional "route" key.
+RUNNER_STATE_ROUTES = frozenset({CE_ENGINE, SURFACE_ENGINE})
+# Core Plus detection lives behind is_core_plus_baseline_row so the rule can
+# change in one place: any "Pentera Core Plus ..." baseline row (Commercial,
+# Enterprise, any tier); "Bulk"/"Additional" rows are add-ons of a Core Plus
+# baseline and are ignored. Owner decision 2026-09-29: on an exact Surface /
+# New Product Onboarding CO a Core Plus row does NOT block; the Surface-only
+# tenant is created (Leaked Credentials OFF) and the dashboard reminds the
+# operator to enable Credential Exposure later.
+CORE_PLUS_PRODUCT_PREFIX = "Pentera Core Plus"
+CORE_PLUS_ADDON_MARKERS = ("bulk", "additional")
+# A Surface baseline/add-on row counts when Active, or when Pending and its
+# subscription starts within this many days of the run day. Other statuses
+# (Expired, later-starting Pending, ...) are ignored.
+SURFACE_PENDING_START_WINDOW_DAYS = 14
+SURFACE_LICENSE_ASSETS = "10000"
+SURFACE_MAX_SCAN_DURATION_LABEL = "Maximum scan Duration (hours)"
+SURFACE_MAX_SCAN_DURATION_HOURS = "90"
+ALTERNATE_DOMAINS_LABEL = "Alternate Domains (Comma Separated Values)"
+SUBDOMAINS_LABEL = "SubDomains (Comma Separated Values)"
+NETWORKS_LABEL = "Networks (Comma Separated Values)"
+USER_EMAIL_DOMAINS_LABEL = "User email domains  (Comma Separated Values)"
+# The Operator Account control is a react-select text input (2026-09-24 form
+# inventory: placeholder "Select Operator Accounts"). Development has no
+# operator mapping, so it must stay empty (owner decision: Dev skip).
+OPERATOR_ACCOUNT_INPUT_SELECTOR = 'input[placeholder="Select Operator Accounts"]'
+# Surface advanced-option profile (Guru card; MAS for subdomains and Web Agent
+# are disabled by the form and left untouched).
+SURFACE_ADVANCED_TOGGLES = {
+    "automatedDiscoveryEnabled": False,
+    "subDomainsReconEnabled": True,
+    "webDictionaryBruteForceEnabled": True,
+    "webDorkingEnabled": False,
+    "fullNucleiScanEnabled": True,
+    "authenticatedTestingEnabled": False,
+    "staticOutboundIpEnabled": False,
+    "aiEnabled": False,
+    "multipleAttackStacksEnabled": False,
+}
+
+
+class SurfaceSourceError(RuntimeError):
+    """A stable, value-free Surface source result code (fail closed)."""
+
+
+def is_core_plus_baseline_row(product: object) -> bool:
+    """True for a "Pentera Core Plus ..." baseline row (CE purchased on the account)."""
+    if not isinstance(product, str):
+        return False
+    name = " ".join(product.split()).casefold()
+    return (name.startswith(CORE_PLUS_PRODUCT_PREFIX.casefold())
+            and not any(marker in name for marker in CORE_PLUS_ADDON_MARKERS))
+
+
+def _row_status(row: dict[str, Any]) -> str:
+    status = row.get("DealHub_Status__c")
+    return " ".join(status.split()).casefold() if isinstance(status, str) else ""
+
+
+def _surface_row_counts(status: str, start: date | None, run_day: date) -> bool:
+    """Owner rule: Active counts; Pending counts when it starts within the window."""
+    if status == "active":
+        return True
+    if status == "pending":
+        return start is not None and start <= run_day + timedelta(days=SURFACE_PENDING_START_WINDOW_DAYS)
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceEntitlement:
+    tier: str
+    scanning_interval: str
+    baseline_subdomains: int
+    addon_subdomains: int
+    product_domains: int | None
+    subscription_start: date
+    subscription_end: date
+    core_plus_present: bool = False
+
+    @property
+    def licensed_subdomains(self) -> int:
+        return self.baseline_subdomains + self.addon_subdomains
+
+
+def select_surface_entitlement(rows: list[Any], run_day: date | None = None) -> SurfaceEntitlement:
+    """Select exactly one counted Surface baseline plus its subdomain add-ons.
+
+    A Surface row counts when Active, or Pending with a start no later than
+    run day + SURFACE_PENDING_START_WINDOW_DAYS; Expired and later Pending
+    rows are ignored. A Core Plus baseline row (is_core_plus_baseline_row)
+    that is not Expired never blocks: it only sets core_plus_present (CE is
+    enabled later, separately). Fails closed (SurfaceSourceError) on: a
+    product row without a name, or a Surface row without a status
+    (surface_product_unrecognized / surface_subscription_invalid); an
+    unrecognized "Pentera Surface" product; zero or several counted
+    baselines (surface_baseline_unavailable / surface_baseline_ambiguous); a
+    baseline without an approved tier (surface_tier_unknown); unparseable
+    baseline dates (surface_subscription_invalid).
+    """
+    from phase1_validator.surface_source_readiness import classify_surface_product, surface_scanning_interval
+
+    day = run_day or _run_day()
+    baselines: list[tuple[Any, date, date]] = []
+    addon_subdomains = 0
+    core_plus_present = False
+    for row in rows:
+        if not isinstance(row, dict):
+            raise SurfaceSourceError("surface_subscription_invalid")
+        product = row.get("Product_Full_Name__c")
+        if not isinstance(product, str) or not product.strip():
+            raise SurfaceSourceError("surface_product_unrecognized")
+        status = _row_status(row)
+        start = _parse_subscription_date(row.get("DealHub_Subscription_Start_Date__c"))
+        end = _parse_subscription_date(row.get("DealHub_Subscription_End_Date__c"))
+        if is_core_plus_baseline_row(product):
+            # Conservative: an unknown status still shows the (non-blocking)
+            # "enable Credential Exposure later" reminder.
+            if status not in ("expired", "cancelled", "canceled", "inactive"):
+                core_plus_present = True
+            continue
+        classified = classify_surface_product(product)
+        if classified is None:
+            continue
+        if classified.kind == "unrecognized":
+            raise SurfaceSourceError("surface_product_unrecognized")
+        if not status:
+            raise SurfaceSourceError("surface_subscription_invalid")
+        if not _surface_row_counts(status, start, day):
+            continue
+        if classified.kind == "baseline":
+            if start is None or end is None or end <= start:
+                raise SurfaceSourceError("surface_subscription_invalid")
+            baselines.append((classified, start, end))
+        elif classified.kind == "subdomain_addon":
+            addon_subdomains += classified.subdomains
+    if not baselines:
+        raise SurfaceSourceError("surface_baseline_unavailable")
+    if len(baselines) != 1:
+        raise SurfaceSourceError("surface_baseline_ambiguous")
+    baseline, start, end = baselines[0]
+    interval = surface_scanning_interval(baseline.tier)
+    if interval is None:
+        raise SurfaceSourceError("surface_tier_unknown")
+    return SurfaceEntitlement(baseline.tier, interval, baseline.subdomains, addon_subdomains,
+                              baseline.domains, start, end, core_plus_present)
+
+
+_PSL: Any = None
+
+
+def _public_suffix_list() -> Any:
+    """The pinned Public Suffix List snapshot (loaded once; local file only)."""
+    global _PSL
+    if _PSL is None:
+        from phase2_leonardo.intake import PublicSuffixList
+        _PSL = PublicSuffixList()
+    return _PSL
+
+
+def classify_surface_domains(main_domain: object, alternate_domains: object) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
+    """Return (main root, alternate roots, subdomains) with the shared normalizer.
+
+    Main_Domain__c must be one valid registrable root (not a subdomain, not a
+    public suffix, not a network). Alternate_Domains__c entries (comma,
+    semicolon, or newline separated) are split into alternate roots and
+    subdomains; a duplicate of the main root is dropped. Networks/IPs are not
+    supported in v1 (surface_networks_not_supported); wildcards and malformed
+    entries fail closed (surface_domains_invalid).
+    """
+    from phase2_leonardo.intake import IntakeError, normalize_domain_candidate
+
+    psl = _public_suffix_list()
+    if not isinstance(main_domain, str) or not main_domain.strip():
+        raise SurfaceSourceError("surface_main_domain_invalid")
+    try:
+        main = normalize_domain_candidate(main_domain, psl)
+    except IntakeError as exc:
+        raise SurfaceSourceError("surface_main_domain_invalid") from exc
+    if main.kind != "root_domain":
+        raise SurfaceSourceError("surface_main_domain_invalid")
+    if alternate_domains is None:
+        alternate_domains = ""
+    if not isinstance(alternate_domains, str):
+        raise SurfaceSourceError("surface_domains_invalid")
+    roots: set[str] = set()
+    subdomains: set[str] = set()
+    for raw in (item.strip() for item in re.split(r"[,;\r\n]+", alternate_domains)):
+        if not raw:
+            continue
+        try:
+            candidate = normalize_domain_candidate(raw, psl)
+        except IntakeError as exc:
+            raise SurfaceSourceError("surface_domains_invalid") from exc
+        if candidate.kind == "network":
+            raise SurfaceSourceError("surface_networks_not_supported")
+        if candidate.kind == "root_domain":
+            if candidate.value != main.value:
+                roots.add(candidate.value)
+        elif candidate.kind == "subdomain":
+            subdomains.add(candidate.value)
+        else:
+            raise SurfaceSourceError("surface_domains_invalid")
+    return main.value, tuple(sorted(roots)), tuple(sorted(subdomains))
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceFillSource:
+    reference: str
+    source_revision: str
+    account_id: str
+    account_name: str
+    country: str
+    main_domain: str
+    alternate_domains: tuple[str, ...]
+    subdomains: tuple[str, ...]
+    entitlement: SurfaceEntitlement
+    tenant_name: str
+    primary_user_alias: str
+
+    @property
+    def number_of_domains(self) -> int:
+        """Owner rule: 1 (main) + the alternate root domains."""
+        return 1 + len(self.alternate_domains)
+
+    @property
+    def subscription_start(self) -> date:
+        return self.entitlement.subscription_start
+
+    @property
+    def subscription_end(self) -> date:
+        return self.entitlement.subscription_end
+
+    @property
+    def core_plus_present(self) -> bool:
+        return self.entitlement.core_plus_present
+
+
+def surface_fill_source(reference: str, run_day: date | None = None) -> SurfaceFillSource:
+    """Fresh, fixed-field Surface-only fill source read (CO + DealHub rows).
+
+    The CO must be exactly Onboarding_Product__c "Surface" with
+    Onboarding_Type__c "New Product Onboarding" (surface_route_mismatch).
+    Fails closed with a stable SurfaceSourceError code on any missing,
+    ambiguous, or unsupported value. Values stay in this process only.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise RuntimeError("invalid_co_reference")
+    try:
+        rows = _sf_records(
+            "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
+            "Main_Domain__c, Alternate_Domains__c, Onboarding_Product__c, Onboarding_Type__c "
+            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+            raise ValueError()
+        row = rows[0]
+        if (row.get("Onboarding_Product__c") != SURFACE_ROUTE_PRODUCT
+                or row.get("Onboarding_Type__c") != SURFACE_ROUTE_TYPE):
+            raise SurfaceSourceError("surface_route_mismatch")
+        revision = row.get("LastModifiedDate")
+        account_id = row.get("Account__c")
+        account_name = row.get("Account_Name__c")
+        country = row.get("Account_Country__c")
+        if not isinstance(revision, str) or not revision:
+            raise ValueError()
+        if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
+            raise ValueError()
+        if not isinstance(account_name, str) or not " ".join(account_name.split()):
+            raise ValueError()
+        if not isinstance(country, str) or not " ".join(country.split()):
+            raise ValueError()
+        main, roots, subdomains = classify_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
+        names = surface_names(account_name)
+        subscription_rows = _sf_records(
+            "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
+            "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
+            "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
+        entitlement = select_surface_entitlement(subscription_rows, run_day)
+        return SurfaceFillSource(
+            reference, revision, account_id, " ".join(account_name.split()), " ".join(country.split()),
+            main, roots, subdomains, entitlement, names.tenant_name, names.primary_user_alias)
+    except SurfaceSourceError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise SurfaceSourceError("surface_source_unavailable") from exc
+
+
+def surface_run_license_dates(source: SurfaceFillSource, run_day: date | None = None) -> tuple[date, date]:
+    """Surface license dates: the CE rule (start = run day; expiration =
+    min(subscription start + 1 year - 1 day, subscription end)).
+
+    Raises ValueError("surface_license_dates_unavailable") when that
+    expiration is not after the run day.
+    """
+    try:
+        return ce_run_license_dates(source.subscription_start, source.subscription_end, run_day)
+    except ValueError as exc:
+        raise ValueError("surface_license_dates_unavailable") from exc
+
+
+# Open owner question (2026-09-29): the Guru tier card says API access
+# "depends on Core Plus" while the Verified Case 1 card says API access ON.
+# Until answered, API access stays ON; flip this constant to derive it from
+# core_plus_present instead (one place).
+SURFACE_API_ACCESS_REQUIRES_CORE_PLUS = False
+
+
+def surface_api_access(source: SurfaceFillSource) -> bool:
+    """apiAccessAllowed for the Surface route (see SURFACE_API_ACCESS_REQUIRES_CORE_PLUS)."""
+    return source.core_plus_present if SURFACE_API_ACCESS_REQUIRES_CORE_PLUS else True
+
+
+def surface_primary_user_email(source: SurfaceFillSource | CeFillSource) -> str:
+    return f"{CE_PRIMARY_USER_EMAIL_LOCAL}+{source.primary_user_alias}@{CE_USER_EMAIL_DOMAIN}"
+
+
+def build_surface_only_fill(source: SurfaceFillSource, run_day: date | None = None) -> dict[str, Any]:
+    """Build the Surface-only Add Account fill plan (owner decisions 2026-09-29).
+
+    Company name = account name (no suffix); Customer; main root as primary
+    domain; alternate roots / subdomains as CSV when provided (verified empty
+    otherwise); pentera.io user email domain; Networks, phone, job title
+    verified empty; Salesforce country; Milton Stevenson with the shared alias
+    rule; MFA ON; Operator Account verified empty (Dev skip); Scanning
+    interval per tier; Scan now ON; Surface advanced profile with Maximum scan
+    Duration 90 h; Notifications/Multiple users/API ON; Phishing and Leaked
+    Credentials OFF (their interval/domains untouched); Provisioning and
+    Subdomains ON; Prepaid annual subscription, 10000 assets, 1 + alternate
+    roots domains, baseline + add-on subdomains; CE date rule.
+    """
+    start, end = surface_run_license_dates(source, run_day)
+    texts: dict[str, str] = {
+        "Company name": source.tenant_name,
+        "Company primary domain": source.main_domain,
+    }
+    blank_texts: list[str] = []
+    for label, values in ((ALTERNATE_DOMAINS_LABEL, source.alternate_domains), (SUBDOMAINS_LABEL, source.subdomains)):
+        if values:
+            texts[label] = ", ".join(values)
+        else:
+            blank_texts.append(label)
+    texts.update({
+        USER_EMAIL_DOMAINS_LABEL: CE_USER_EMAIL_DOMAIN,
+        "First name": CE_PRIMARY_USER_FIRST_NAME,
+        "Last name": CE_PRIMARY_USER_LAST_NAME,
+        "Organization Email": surface_primary_user_email(source),
+        "Number of assets": SURFACE_LICENSE_ASSETS,
+        "Number of domains": str(source.number_of_domains),
+        "Number of subdomains": str(source.entitlement.licensed_subdomains),
+    })
+    blank_texts.extend((NETWORKS_LABEL, "Phone number", "Job title"))
+    return {
+        "texts": texts,
+        "selects": {
+            "Account Type": "Customer",
+            "Country": source.country,
+            "Scanning interval": source.entitlement.scanning_interval,
+            "Type": "Prepaid annual subscription",
+        },
+        "checkboxes": {
+            "mfaRequired": True,
+            "scan_now": True,
+            **SURFACE_ADVANCED_TOGGLES,
+            "notificationsAllowed": True,
+            "multipleUsersAllowed": True,
+            "apiAccessAllowed": surface_api_access(source),
+            "phishingEnabled": False,
+            "leakedCredentialsAllowed": False,
+            "provisioningEnabled": True,
+            "subDomainsNumberAllowed": True,
+        },
+        "advanced_texts": {SURFACE_MAX_SCAN_DURATION_LABEL: SURFACE_MAX_SCAN_DURATION_HOURS},
+        "blank_texts": tuple(blank_texts),
+        "operator_account_empty": True,
+        "license_start": start,
+        "license_end": end,
+    }
+
+
+def surface_scope_summary(source: SurfaceFillSource, run_day: date | None = None) -> dict[str, Any]:
+    """Counts-only scope summary for the dashboard's manual scope review."""
+    from integration.onboarding.scope_policy import ScopeCounts, manual_review_reason
+
+    entitlement = source.entitlement
+    start, end = surface_run_license_dates(source, run_day)
+    counts = ScopeCounts(root_domains=source.number_of_domains, subdomains=len(source.subdomains),
+                         licensed_domains=source.number_of_domains,
+                         licensed_subdomains=entitlement.licensed_subdomains)
+    return {
+        "tier": entitlement.tier,
+        "scanning_interval": entitlement.scanning_interval,
+        "main_domains": 1,
+        "alternate_root_domains": len(source.alternate_domains),
+        "requested_subdomains": len(source.subdomains),
+        "number_of_domains": source.number_of_domains,
+        "baseline_subdomains": entitlement.baseline_subdomains,
+        "addon_subdomains": entitlement.addon_subdomains,
+        "licensed_subdomains": entitlement.licensed_subdomains,
+        "product_domains": entitlement.product_domains,
+        "assets": int(SURFACE_LICENSE_ASSETS),
+        "license_start": start.isoformat(),
+        "license_end": end.isoformat(),
+        "large_scope": manual_review_reason(counts) is not None,
+        "core_plus_present": entitlement.core_plus_present,
+    }
+
+
+@dataclass(frozen=True)
+class RouteContract:
+    """One attended route: how to read its source and build/verify its tenant."""
+
+    engine: str
+    load_source: Any  # (reference) -> source
+    license_dates: Any  # (source, run_day | None) -> (start, end)
+    build_fill: Any  # (source, run_day | None) -> fill plan
+    primary_domain: Any  # (source) -> str
+    redactions: Any  # (source) -> tuple[str, ...]
+    allow_scan_started: bool
+
+    def duplicate_lookups(self, source: Any) -> tuple[tuple[str, str], ...]:
+        """Duplicate check: tenant name, then primary domain (both routes)."""
+        return (("tenant_name", source.tenant_name), ("primary_domain", self.primary_domain(source)))
+
+
+def _ce_license_dates(source: CeFillSource, run_day: date | None = None) -> tuple[date, date]:
+    return ce_run_license_dates(source.subscription_start, source.subscription_end, run_day)
+
+
+# Module-level lookups (not bound functions) so tests can patch the source
+# readers and plan builders by name.
+CE_ROUTE = RouteContract(
+    engine=CE_ENGINE,
+    load_source=lambda reference: ce_fill_source(reference),
+    license_dates=lambda source, run_day=None: _ce_license_dates(source, run_day),
+    build_fill=lambda source, run_day=None: build_ce_only_fill(source, run_day),
+    primary_domain=lambda source: source.email_domain,
+    redactions=lambda source: (source.account_name, source.tenant_name, source.email_domain,
+                               surface_primary_user_email(source)),
+    allow_scan_started=False,
+)
+SURFACE_ROUTE = RouteContract(
+    engine=SURFACE_ENGINE,
+    load_source=lambda reference: surface_fill_source(reference),
+    license_dates=lambda source, run_day=None: surface_run_license_dates(source, run_day),
+    build_fill=lambda source, run_day=None: build_surface_only_fill(source, run_day),
+    primary_domain=lambda source: source.main_domain,
+    redactions=lambda source: (source.account_name, source.tenant_name, source.main_domain,
+                               *source.alternate_domains, *source.subdomains,
+                               surface_primary_user_email(source)),
+    allow_scan_started=True,
+)
+ROUTES = {CE_ENGINE: CE_ROUTE, SURFACE_ENGINE: SURFACE_ROUTE}
 
 
 def _format_date_for_placeholder(value: date, placeholder: Any) -> str:
@@ -998,10 +1482,16 @@ def load_runner_state() -> dict[str, dict[str, str]]:
             revision = value.get("source_revision")
             if not isinstance(revision, str) or not revision:
                 raise ValueError()
-            if set(value) - {"source_revision", "started_on", "result", "completed_on"}:
+            if set(value) - {"source_revision", "started_on", "result", "completed_on",
+                             "scope_reviewed_on", "route"}:
                 raise ValueError()
             record: dict[str, str] = {"source_revision": revision}
-            for key in ("started_on", "completed_on"):
+            if "route" in value:
+                # Only recorded for non-default routes (the Surface route).
+                if value["route"] not in RUNNER_STATE_ROUTES:
+                    raise ValueError()
+                record["route"] = value["route"]
+            for key in ("started_on", "completed_on", "scope_reviewed_on"):
                 if key in value:
                     if not isinstance(value[key], str):
                         raise ValueError()
@@ -1068,12 +1558,30 @@ def record_check_result(reference: str, kind: str, result: str, completed_on: st
     _write_json_atomic(CHECK_STATE_PATH, state)
 
 
-def record_runner_start(reference: str, revision: str, started_on: str) -> None:
-    """Record one acknowledged start; a different revision supersedes the prior record."""
+def record_runner_start(reference: str, revision: str, started_on: str, *,
+                        route: str | None = None, scope_reviewed_on: str | None = None) -> None:
+    """Record one acknowledged start; a different revision supersedes the prior record.
+
+    ``route`` and ``scope_reviewed_on`` are recorded only when given (the
+    Surface route's revision-bound scope-review acknowledgement), so a CE-only
+    start writes exactly the same record as before.
+    """
     if not REFERENCE.fullmatch(reference) or not revision:
         raise ValueError("invalid_runner_state_record")
+    if route is not None and route not in RUNNER_STATE_ROUTES:
+        raise ValueError("invalid_runner_state_record")
+    if scope_reviewed_on is not None:
+        try:
+            datetime.fromisoformat(scope_reviewed_on)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid_runner_state_record") from exc
     state = load_runner_state()
-    state[reference] = {"source_revision": revision, "started_on": started_on}
+    record = {"source_revision": revision, "started_on": started_on}
+    if route is not None:
+        record["route"] = route
+    if scope_reviewed_on is not None:
+        record["scope_reviewed_on"] = scope_reviewed_on
+    state[reference] = record
     _write_json_atomic(RUNNER_STATE_PATH, state)
 
 
@@ -2186,9 +2694,11 @@ class RunLog:
     Failures are swallowed: logging must never change the runner's outcome.
     """
 
-    def __init__(self, reference: str, mode: str) -> None:
+    def __init__(self, reference: str, mode: str, route: str = CE_ENGINE) -> None:
         self.reference = reference
         self.mode = mode
+        # Recorded only for non-CE runs so the CE-only log format is unchanged.
+        self.route = route
         self.started_on = datetime.now().isoformat(timespec="seconds")
         self.events: list[dict[str, str]] = []
         self.diagnostics: list[dict[str, Any]] = []
@@ -2270,12 +2780,15 @@ class RunLog:
                     runs = []
             except (OSError, ValueError):
                 runs = []
-            runs.append({
+            entry: dict[str, Any] = {
                 "reference": self.reference, "mode": self.mode, "started_on": self.started_on,
                 "completed_on": datetime.now().isoformat(timespec="seconds"),
                 "result": result, "events": self.events,
                 "diagnostics": self.diagnostics[-RUN_LOG_MAX_DIAGNOSTICS:],
-            })
+            }
+            if self.route != CE_ENGINE:
+                entry["route"] = str(self.route)[:64]
+            runs.append(entry)
             _write_json_atomic(RUN_LOG_PATH, {
                 "note": "Redacted attended-runner step log. No cookies, headers, bodies, query strings, or source values.",
                 "runs": runs[-RUN_LOG_MAX_RUNS:],
@@ -2316,15 +2829,166 @@ def _selected_option_text(control: Any) -> str:
     return " ".join(str(selected or "").split())
 
 
-def _fill_ce_form(page: Any, plan: dict[str, Any]) -> tuple[str | None, Any]:
-    """Fill the CE-only Add Account form, logging every field outcome.
+def _fill_text_control(page: Any, label: str, expected: str, step: str = "fill_text") -> tuple[str | None, Any]:
+    """Fill one labelled text control and verify it kept the value."""
+    log = _log()
+    control = _locate_form_field(page, label, "")
+    if control is None:
+        log.event(step, "not_found", label)
+        return "fill_form_schema_unavailable", None
+    try:
+        if not control.first.is_enabled():
+            log.event(step, "disabled", label)
+            return "fill_form_schema_unavailable", None
+        control.first.fill(expected, timeout=FIELD_TIMEOUT_MS)
+        actual = control.first.input_value()
+    except Exception as exc:
+        log.error(step, label, exc)
+        return "fill_form_schema_unavailable", None
+    if actual != expected:
+        log.event(step, "mismatch", label)
+        return "fill_value_mismatch", None
+    log.event(step, "ok", label)
+    return None, control
 
-    Order: toggles first (dependent controls such as the Leaked Credentials
-    interval and domains may only be enabled once their toggle is on), then
-    selects, then text fields, then license dates, then a final re-read of
-    every toggle and select before Confirm. Each control must resolve to
-    exactly one enabled element and keep the value set. Returns
-    (failure_code, company_name_control); failure_code is None on success.
+
+def _text_control_value(page: Any, label: str) -> str | None:
+    """Re-read one labelled text control; None when missing or unreadable."""
+    control = _locate_form_field(page, label, "")
+    if control is None:
+        return None
+    try:
+        value = control.first.input_value()
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _verify_blank_text(page: Any, label: str) -> str | None:
+    """Verify a control the plan leaves empty is present and empty."""
+    control = _locate_form_field(page, label, "")
+    if control is None:
+        _log().event("verify_blank", "not_found", label)
+        return "fill_form_schema_unavailable"
+    value = _text_control_value(page, label)
+    if value is None:
+        _log().event("verify_blank", "unreadable", label)
+        return "fill_form_schema_unavailable"
+    if value.strip():
+        _log().event("verify_blank", "not_empty", label)
+        return "fill_value_mismatch"
+    _log().event("verify_blank", "ok", label)
+    return None
+
+
+def _verify_operator_account_empty(page: Any) -> str | None:
+    """Verify the Operator Account react-select has no selection (Dev skip).
+
+    The control must resolve to exactly one input, its typed value must be
+    empty, and its select container must hold no selected-value element.
+    Anything unreadable fails closed; no value is ever entered.
+    """
+    log = _log()
+    try:
+        control = page.locator(OPERATOR_ACCOUNT_INPUT_SELECTOR)
+        if control.count() != 1:
+            log.event("verify_operator_account", "not_found", detail=f"count={control.count()}")
+            return "fill_form_schema_unavailable"
+        typed = control.first.input_value()
+        selected = control.first.evaluate(
+            """el => {
+                const box = el.closest('[class*="container"]') || el.parentElement;
+                if (!box) return -1;
+                return box.querySelectorAll('[class*="multiValue"], [class*="multi-value"], '
+                    + '[class*="singleValue"], [class*="single-value"]').length;
+            }""")
+    except Exception as exc:
+        log.error("verify_operator_account", "Operator Account", exc)
+        return "fill_form_schema_unavailable"
+    if not isinstance(selected, int) or selected < 0:
+        log.event("verify_operator_account", "unreadable")
+        return "fill_form_schema_unavailable"
+    if (typed or "").strip() or selected:
+        log.event("verify_operator_account", "not_empty", detail=f"selected={selected}")
+        return "fill_value_mismatch"
+    log.event("verify_operator_account", "ok")
+    return None
+
+
+def _locate_advanced_text(page: Any, label: str) -> Any | None:
+    """Locate one Advanced options input by its label, failing closed.
+
+    Live probe 2026-09-29: "Maximum scan Duration (hours)" is a type=number
+    input with no name, id, or data-am; its label is the <label> of the
+    enclosing .MuiFormControl-root. The accessible-label lookups are tried
+    first, then that enclosing form-control label (exactly one input).
+    """
+    control = _locate_form_field(page, label, "")
+    if control is not None:
+        return control
+    try:
+        escaped = label.replace("\\", "\\\\").replace('"', '\\"')
+        control = page.locator(
+            f'.MuiFormControl-root:has(> label:text-is("{escaped}")) input:not([type=hidden])')
+        if control.count() == 1:
+            return control
+    except Exception:
+        return None
+    return None
+
+
+def _fill_advanced_texts(page: Any, advanced_texts: dict[str, str]) -> str | None:
+    """Fill the Advanced options text controls (Maximum scan Duration).
+
+    The section is already expanded (the advanced toggles resolved). The live
+    default (24) is overwritten and re-read. A missing or ambiguous control
+    stops the run with max_scan_duration_schema_unavailable and a log event.
+    """
+    log = _log()
+    for label, expected in advanced_texts.items():
+        control = _locate_advanced_text(page, label)
+        if control is None:
+            log.event("max_scan_duration", "not_found", label)
+            return "max_scan_duration_schema_unavailable"
+        try:
+            if not control.first.is_enabled():
+                log.event("max_scan_duration", "disabled", label)
+                return "max_scan_duration_schema_unavailable"
+            control.first.fill(expected, timeout=FIELD_TIMEOUT_MS)
+            actual = control.first.input_value()
+        except Exception as exc:
+            log.error("max_scan_duration", label, exc)
+            return "max_scan_duration_schema_unavailable"
+        if actual != expected:
+            log.event("max_scan_duration", "mismatch", label)
+            return "fill_value_mismatch"
+        log.event("max_scan_duration", "ok", label)
+    return None
+
+
+def _advanced_text_value(page: Any, label: str) -> str | None:
+    control = _locate_advanced_text(page, label)
+    try:
+        value = control.first.input_value() if control is not None else None
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _fill_add_account_form(page: Any, plan: dict[str, Any]) -> tuple[str | None, Any]:
+    """Fill the Add Account form for any route plan, logging every field outcome.
+
+    Order: early selects (they can reset dependent controls), expand Advanced
+    options, toggles (dependent controls such as the Leaked Credentials
+    interval and domains may only be enabled once their toggle is on), the
+    optional Advanced options texts, the remaining selects, text fields, the
+    optional blank-control and Operator Account checks, license dates, then a
+    final re-read of every toggle, select, date, and optional control before
+    Confirm. Each control must resolve to exactly one enabled element and keep
+    the value set. The optional keys (advanced_texts, blank_texts,
+    operator_account_empty) are absent from the CE-only plan, whose fill is
+    unchanged. Returns (failure_code, company_name_control); failure_code is
+    None on success.
     """
     log = _log()
     early = {label: option for label, option in plan["selects"].items() if label in EARLY_SELECTS}
@@ -2340,31 +3004,30 @@ def _fill_ce_form(page: Any, plan: dict[str, Any]) -> tuple[str | None, Any]:
             log.event("fill_toggle", "failed", key, f"target={'on' if target else 'off'}")
             return "fill_form_schema_unavailable", None
         log.event("fill_toggle", "ok", key)
+    advanced_texts = plan.get("advanced_texts") or {}
+    if advanced_texts:
+        failure = _fill_advanced_texts(page, advanced_texts)
+        if failure:
+            return failure, None
     for label, option in late.items():
         failure = _fill_select(page, label, option)
         if failure:
             return failure, None
     company_control = None
     for label, expected in plan["texts"].items():
-        control = _locate_form_field(page, label, "")
-        if control is None:
-            log.event("fill_text", "not_found", label)
-            return "fill_form_schema_unavailable", None
-        try:
-            if not control.first.is_enabled():
-                log.event("fill_text", "disabled", label)
-                return "fill_form_schema_unavailable", None
-            control.first.fill(expected, timeout=FIELD_TIMEOUT_MS)
-            actual = control.first.input_value()
-        except Exception as exc:
-            log.error("fill_text", label, exc)
-            return "fill_form_schema_unavailable", None
-        if actual != expected:
-            log.event("fill_text", "mismatch", label)
-            return "fill_value_mismatch", None
-        log.event("fill_text", "ok", label)
+        failure, control = _fill_text_control(page, label, expected)
+        if failure:
+            return failure, None
         if label == "Company name":
             company_control = control
+    for label in plan.get("blank_texts") or ():
+        failure = _verify_blank_text(page, label)
+        if failure:
+            return failure, None
+    if plan.get("operator_account_empty"):
+        failure = _verify_operator_account_empty(page)
+        if failure:
+            return failure, None
     for key in ("license_start", "license_end"):
         if not _fill_license_date(page, key, plan[key]):
             log.event("fill_date", "failed", key)
@@ -2394,8 +3057,24 @@ def _fill_ce_form(page: Any, plan: dict[str, Any]) -> tuple[str | None, Any]:
         if not _license_date_kept(page, key, plan[key]):
             log.event("verify_date", "mismatch", key)
             return "fill_value_mismatch", None
+    for label, expected in advanced_texts.items():
+        if _advanced_text_value(page, label) != expected:
+            log.event("verify_text", "mismatch", label)
+            return "fill_value_mismatch", None
+    for label in plan.get("blank_texts") or ():
+        value = _text_control_value(page, label)
+        if value is None or value.strip():
+            log.event("verify_blank", "mismatch", label)
+            return "fill_value_mismatch", None
+    if plan.get("operator_account_empty") and _verify_operator_account_empty(page) is not None:
+        return "fill_value_mismatch", None
     log.event("verify_form", "ok")
     return None, company_control
+
+
+# The CE-only name is kept for callers and tests; the CE plan has none of the
+# optional keys, so its fill order and events are unchanged.
+_fill_ce_form = _fill_add_account_form
 
 
 def _expand_advanced_options(page: Any, checkboxes: dict[str, bool]) -> bool:
@@ -2574,14 +3253,17 @@ def _api_duplicate(result: TenantSearchResult, expected_name: str, expected_doma
 
 
 def _api_readback(result: TenantSearchResult, tenant_name: str,
-                  expected_domain: str | None) -> tuple[str, str, str] | None:
+                  expected_domain: str | None, *, allow_scan_started: bool = False) -> tuple[str, str, str] | None:
     """Read Surface Account ID, Account UUID and scan state from the search response.
 
     Requires exactly one row whose accountName equals the tenant name (and,
     when given, whose accountDomain equals the expected domain), with a
     well-formed id and accountUuid. A tenant that has never scanned
-    (lastReconScan null) is "No scan started"; any other scan state returns
-    None so the caller falls back to the details view.
+    (lastReconScan null) is "No scan started". A tenant with a scan state
+    returns None so the caller falls back to the details view, unless
+    ``allow_scan_started`` (the Surface route, whose contract turns Scan now
+    ON, so the tenant can be scanning right after Confirm): then any set
+    lastReconScan is "Account Scanning".
     """
     name = " ".join(tenant_name.casefold().split())
     exact = [row for row in result.rows
@@ -2599,22 +3281,31 @@ def _api_readback(result: TenantSearchResult, tenant_name: str,
             and isinstance(account_uuid, str) and re.fullmatch(ACCOUNT_UUID_PATTERN, account_uuid)):
         return None
     if row.get("lastReconScan") is not None:
+        if allow_scan_started:
+            return surface_account_id, account_uuid, "Account Scanning"
         return None
     return surface_account_id, account_uuid, "No scan started"
 
 
 def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float = MAX_WAIT_SECONDS,
-        dry_run: bool = False) -> str:
+        dry_run: bool = False, route: str = CE_ENGINE) -> str:
     """Run one attended auto-confirm session.  Never writes back to Salesforce.
 
-    ``dry_run`` runs every check and fills and re-verifies the full form, then
-    cancels it instead of clicking Confirm. It creates nothing and never
-    records to the one-time create gate (only the run log is written).
+    ``route`` selects the route contract (ROUTES); the default is the CE-only
+    route so existing launches are unchanged. An unknown route fails closed
+    before any read. ``dry_run`` runs every check and fills and re-verifies
+    the full form, then cancels it instead of clicking Confirm. It creates
+    nothing and never records to the one-time create gate (only the run log
+    is written).
     """
     global _ACTIVE_RUN_LOG
-    _ACTIVE_RUN_LOG = RunLog(reference, DRY_RUN_MODE if dry_run else "create")
+    _ACTIVE_RUN_LOG = RunLog(reference, DRY_RUN_MODE if dry_run else "create", route=route)
     try:
-        return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run)
+        contract = ROUTES.get(route)
+        if contract is None:
+            return _finish(reference, acknowledged_revision, "route_unsupported")
+        return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run,
+                    contract=contract)
     finally:
         _ACTIVE_RUN_LOG = None
 
@@ -2636,28 +3327,28 @@ def _cancel_add_account(page: Any) -> bool:
     return False
 
 
-def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float, dry_run: bool = False) -> str:
+def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float, dry_run: bool = False,
+         contract: RouteContract = CE_ROUTE) -> str:
     log = _log()
     log.event("source_read", "start")
     try:
-        source = ce_fill_source(reference)
+        source = contract.load_source(reference)
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return _finish(reference, acknowledged_revision, "playwright_runtime_unavailable")
     except RuntimeError as error:
         return _finish(reference, acknowledged_revision, str(error))
-    log.add_redactions(source.account_name, source.tenant_name, source.email_domain,
-                       f"{CE_PRIMARY_USER_EMAIL_LOCAL}+{source.primary_user_alias}@{CE_USER_EMAIL_DOMAIN}")
+    log.add_redactions(*contract.redactions(source))
     log.event("source_read", "ok")
     if source.source_revision != acknowledged_revision:
         return _finish(reference, acknowledged_revision, "source_revision_drift")
     try:
         # Validate the license dates before any browser work.
-        license_start, license_end = ce_run_license_dates(source.subscription_start, source.subscription_end)
+        license_start, license_end = contract.license_dates(source)
     except ValueError as error:
         return _finish(reference, acknowledged_revision, str(error))
     log.event("license_dates", "ok", detail=f"start={license_start.isoformat()} end={license_end.isoformat()}")
-    tenant_name, main_domain = source.tenant_name, source.email_domain
+    tenant_name, main_domain = source.tenant_name, contract.primary_domain(source)
     with sync_playwright() as playwright:
         try:
             # The login wait happens inside _attach_attended_browser (CDP /json
@@ -2672,7 +3363,7 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                 if search is None:
                     _capture_search_diagnostics(page)
                     return _finish(reference, acknowledged_revision, "duplicate_search_schema_unavailable")
-                for lookup_name, lookup in (("tenant_name", tenant_name), ("primary_domain", main_domain)):
+                for lookup_name, lookup in contract.duplicate_lookups(source):
                     searched = _search_tenants(page, search, lookup)
                     if searched is None:
                         duplicate = "duplicate_schema_unavailable"
@@ -2686,7 +3377,7 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                         if duplicate in ("duplicate_schema_unavailable", "duplicate_ambiguous"):
                             _capture_search_diagnostics(page)
                         return _finish(reference, acknowledged_revision, duplicate)
-                if ce_fill_source(reference) != source:
+                if contract.load_source(reference) != source:
                     return _finish(reference, acknowledged_revision, "source_revision_drift")
                 add_account = page.get_by_role("button", name="Add Account", exact=True)
                 if add_account.count() != 1:
@@ -2705,7 +3396,8 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                 # exactly one element and keep the value the runner set
                 # (re-read verification); any ambiguity or mismatch stops the
                 # runner before the form is submitted.
-                failure, account_name_control = _fill_ce_form(page, build_ce_only_fill(source, license_start))
+                failure, account_name_control = _fill_add_account_form(
+                    page, contract.build_fill(source, license_start))
                 if failure is not None:
                     _capture_search_diagnostics(page)
                     if dry_run:
@@ -2782,9 +3474,13 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                                    "confirm_no_create" if duplicate == "duplicate_clear" else duplicate)
                 # The CE-only contract disables scanning and "Scan now", so a
                 # freshly created tenant has no scan state yet; record it as
-                # "No scan started" (same rule as the readback-only mode).
+                # "No scan started" (same rule as the readback-only mode). The
+                # Surface contract turns Scan now ON, so its tenant may already
+                # be "Account Scanning" (allow_scan_started).
                 # Primary: the server's own search row; fallback: details view.
-                details = _api_readback(searched, tenant_name, main_domain) if searched is not None else None
+                details = (_api_readback(searched, tenant_name, main_domain,
+                                         allow_scan_started=contract.allow_scan_started)
+                           if searched is not None else None)
                 log.event("readback", "api" if details else "api_unavailable")
                 if details is None:
                     details = _readback_details_optional_state(page, tenant_name)
@@ -2813,7 +3509,7 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
             return _finish(reference, acknowledged_revision, "attended_ce_runner_unavailable")
 
 
-def run_readback(reference: str, tenant_name_override: str | None = None) -> str:
+def run_readback(reference: str, tenant_name_override: str | None = None, route: str = CE_ENGINE) -> str:
     """Read-only verification of an existing Leonardo Development tenant.
 
     Searches for the exact tenant name, requires exactly one exact row, reads
@@ -2827,15 +3523,20 @@ def run_readback(reference: str, tenant_name_override: str | None = None) -> str
     deviates from the contract name (for example a dev tenant created with a
     " test" suffix). It replaces the computed tenant name for the search, the
     row classification, and the details lookup; the email domain is still
-    taken from the Salesforce source.
+    taken from the Salesforce source. ``route`` selects the route contract
+    (default CE-only); the Surface route accepts a tenant that is scanning.
     """
+    contract = ROUTES.get(route)
+    if contract is None:
+        return "route_unsupported"
     try:
-        source = ce_fill_source(reference)
+        source = contract.load_source(reference)
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return "playwright_runtime_unavailable"
     except RuntimeError as error:
         return str(error)
+    primary_domain = contract.primary_domain(source)
     tenant_name = tenant_name_override.strip() if tenant_name_override and tenant_name_override.strip() else source.tenant_name
     with sync_playwright() as playwright:
         try:
@@ -2846,7 +3547,7 @@ def run_readback(reference: str, tenant_name_override: str | None = None) -> str
                     return "duplicate_search_schema_unavailable"
                 searched = _search_tenants(page, search, tenant_name)
                 if searched is not None:
-                    classification = _settled_tenant_rows(page, tenant_name, source.email_domain)
+                    classification = _settled_tenant_rows(page, tenant_name, primary_domain)
                 else:
                     classification = "duplicate_schema_unavailable"
                 if classification == "duplicate_clear":
@@ -2857,8 +3558,9 @@ def run_readback(reference: str, tenant_name_override: str | None = None) -> str
                 # Primary: the server's own search row. An overridden (deviating)
                 # tenant name may carry a deviating domain too, so the domain is
                 # only enforced for the contract name. Fallback: details view.
-                expected_domain = None if tenant_name != source.tenant_name else source.email_domain
-                details = _api_readback(searched, tenant_name, expected_domain)
+                expected_domain = None if tenant_name != source.tenant_name else primary_domain
+                details = _api_readback(searched, tenant_name, expected_domain,
+                                        allow_scan_started=contract.allow_scan_started)
                 if details is None:
                     details = _readback_details_optional_state(page, tenant_name)
                 if details is None:
@@ -2892,8 +3594,8 @@ def _combine_duplicate(ui: str, api: str) -> str:
     return "duplicate_clear"
 
 
-def run_duplicate_check(reference: str) -> str:
-    """Read-only duplicate check for one CE-only CO (never fills, submits, or creates).
+def run_duplicate_check(reference: str, route: str = CE_ENGINE) -> str:
+    """Read-only duplicate check for one CO (never fills, submits, or creates).
 
     Runs the same two lookups as a create run -- the contract tenant name and
     the primary domain -- and classifies each from both the tenant table and
@@ -2902,11 +3604,12 @@ def run_duplicate_check(reference: str) -> str:
     does not touch the one-time create gate; only the run log is written.
     """
     global _ACTIVE_RUN_LOG
-    _ACTIVE_RUN_LOG = RunLog(reference, "duplicate_check")
+    _ACTIVE_RUN_LOG = RunLog(reference, "duplicate_check", route=route)
     log = _ACTIVE_RUN_LOG
     result = "attended_ce_runner_unavailable"
     try:
-        result = _duplicate_check(reference, log)
+        contract = ROUTES.get(route)
+        result = "route_unsupported" if contract is None else _duplicate_check(reference, log, contract)
         return result
     finally:
         log.event("finish", result)
@@ -2914,16 +3617,17 @@ def run_duplicate_check(reference: str) -> str:
         _ACTIVE_RUN_LOG = None
 
 
-def _duplicate_check(reference: str, log: RunLog) -> str:
+def _duplicate_check(reference: str, log: RunLog, contract: RouteContract = CE_ROUTE) -> str:
     try:
-        source = ce_fill_source(reference)
+        source = contract.load_source(reference)
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return "playwright_runtime_unavailable"
     except RuntimeError as error:
         return str(error)
-    log.add_redactions(source.account_name, source.tenant_name, source.email_domain)
+    log.add_redactions(*contract.redactions(source))
     log.event("source_read", "ok")
+    primary_domain = contract.primary_domain(source)
     with sync_playwright() as playwright:
         try:
             with _attended_page(playwright) as page:
@@ -2932,14 +3636,14 @@ def _duplicate_check(reference: str, log: RunLog) -> str:
                 if search is None:
                     _capture_search_diagnostics(page)
                     return "duplicate_search_schema_unavailable"
-                for lookup_name, lookup in (("tenant_name", source.tenant_name), ("primary_domain", source.email_domain)):
+                for lookup_name, lookup in contract.duplicate_lookups(source):
                     searched = _search_tenants(page, search, lookup)
                     if searched is None:
                         duplicate = "duplicate_schema_unavailable"
                     else:
                         duplicate = _combine_duplicate(
-                            _settled_tenant_rows(page, source.tenant_name, source.email_domain),
-                            _api_duplicate(searched, source.tenant_name, source.email_domain))
+                            _settled_tenant_rows(page, source.tenant_name, primary_domain),
+                            _api_duplicate(searched, source.tenant_name, primary_domain))
                     log.event("duplicate_check", duplicate, lookup_name)
                     if duplicate == "duplicate_schema_unavailable":
                         _capture_search_diagnostics(page)
@@ -2985,18 +3689,20 @@ def main() -> int:
                         help="With --co/--revision: run every check and fill the full form, then Cancel instead of Confirm (no create; does not consume the create gate).")
     parser.add_argument("--duplicate-check", action="store_true",
                         help="With --co: read-only duplicate check by CE tenant name and primary domain (no fill, submit, or create; does not consume the create gate).")
+    parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
+                        help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
     if args.duplicate_check:
         if not args.co:
             parser.error("--co is required with --duplicate-check")
-        result = run_duplicate_check(args.co)
+        result = run_duplicate_check(args.co, route=args.route)
         _record_check(args.co, "duplicate_check", result)
         print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0
     if args.readback_only:
         if not args.co:
             parser.error("--co is required with --readback-only")
-        result = run_readback(args.co, tenant_name_override=args.tenant_name)
+        result = run_readback(args.co, tenant_name_override=args.tenant_name, route=args.route)
         _record_check(args.co, "readback", result)
         print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0
@@ -3019,7 +3725,7 @@ def main() -> int:
         return 0
     if not args.co or not args.revision:
         parser.error("--co and --revision are required unless --check-session, --reset-profile, --bootstrap-session, --close-browser, or --readback-only is given")
-    result = run(args.co, args.revision, dry_run=args.dry_run)
+    result = run(args.co, args.revision, dry_run=args.dry_run, route=args.route)
     print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
     return 0
 

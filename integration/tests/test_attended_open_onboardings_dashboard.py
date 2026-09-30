@@ -466,17 +466,22 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
                 self.assertFalse(evaluation.eligible_for_fill_review)
 
     def test_surface_co_detail_does_not_offer_the_ce_only_start(self):
+        # A Surface CO now gets the Surface-only card (Case 1), never the CE one.
         row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Product__c": "Surface",
                "Onboarding_Type__c": "New Product Onboarding", "Email_Domains__c": "example.test"}
+        blocked = dashboard.SurfaceScopePreflight("CO-0649", "", ("surface_baseline_unavailable",))
         with patch.object(dashboard, "load_runner_state", return_value={}), \
                 patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
                 patch.object(dashboard, "source_ready_to_onboard", return_value=True), \
                 patch.object(dashboard, "evaluate_ce_only_fill_preflight",
                              side_effect=AssertionError("CE preflight must not run for a Surface CO")), \
+                patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=blocked), \
                 patch.object(dashboard, "manual_start_ack_nonce", return_value=None):
             page = page_detail("CO-0649", row)
         self.assertNotIn("Start Onboarding", page)
         self.assertNotIn("Credential Exposure onboarding", page)
+        self.assertIn("Surface onboarding", page)
+        self.assertIn("surface_baseline_unavailable", page)
 
     def test_evaluate_ce_only_start_requires_revision_acknowledgement(self):
         evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev1", 1, ())
@@ -770,6 +775,275 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("Onboarding_Comments__c='2026-09-11 - 2027-09-10'", values)
         self.assertIn("Onboarding_Stage__c='Request Approved'", values)
         self.assertIn("Onboarding_Approval_Status__c=Approved", values)
+
+
+SURFACE_ROW = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Product__c": "Surface",
+               "Onboarding_Type__c": "New Product Onboarding", "Main_Domain__c": "surface-sample.example"}
+SURFACE_SCOPE = {
+    "tier": "prime", "scanning_interval": "Weekly", "main_domains": 1, "alternate_root_domains": 2,
+    "requested_subdomains": 3, "number_of_domains": 3, "baseline_subdomains": 1000, "addon_subdomains": 400,
+    "licensed_subdomains": 1400, "product_domains": None, "assets": 10000,
+    "license_start": "2026-09-29", "license_end": "2027-09-28", "large_scope": True, "core_plus_present": False,
+}
+
+
+def _surface_evaluation(revision="rev1", *, core_plus=False, scope=SURFACE_SCOPE):
+    return dashboard.SurfaceScopePreflight("CO-0801", revision, (), dict(scope, core_plus_present=core_plus),
+                                           core_plus)
+
+
+class SurfaceRouteDashboardTests(unittest.TestCase):
+    def setUp(self):
+        import shutil
+        import tempfile
+        from pathlib import Path
+        directory = Path(tempfile.mkdtemp(prefix="dashboard_reminders_"))
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        patcher = patch.object(dashboard, "ATTENDED_REMINDERS_PATH", directory / "reminders.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _post(self, path: str, body: str):
+        return AttendedOpenOnboardingsDashboardTests._post(self, path, body)
+
+    def _section(self, evaluation, state=None):
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value=state or {}):
+            return dashboard._surface_onboard_section("CO-0801")
+
+    def test_route_for_uses_exact_product_and_type(self):
+        self.assertEqual(dashboard.route_for(SURFACE_ROW), "case_1_new_surface_only")
+        self.assertEqual(dashboard.route_for({"Onboarding_Product__c": "Credential Exposure",
+                                              "Onboarding_Type__c": "New Product Onboarding"}), "case_2_new_ce_only")
+        for product, onboarding_type in (("Surface", "Renewal"), ("surface", "New Product Onboarding"),
+                                         ("Surface & Credential Exposure", "New Product Onboarding"), (None, None)):
+            with self.subTest(product=product, type=onboarding_type):
+                self.assertIsNone(dashboard.route_for({"Onboarding_Product__c": product,
+                                                       "Onboarding_Type__c": onboarding_type}))
+        from integration.onboarding.models import EngineValue
+        self.assertEqual(dashboard.SURFACE_ENGINE, EngineValue.CASE_1.value)
+        self.assertEqual(dashboard.CE_ENGINE, EngineValue.CASE_2.value)
+
+    def test_preflight_maps_source_errors_to_blockers(self):
+        from tools.attended_ce_only_playwright import SurfaceSourceError
+        with patch.object(dashboard, "surface_fill_source", side_effect=SurfaceSourceError("surface_tier_unknown")):
+            evaluation = dashboard.evaluate_surface_fill_preflight("CO-0801")
+        self.assertEqual(evaluation.blockers, ("surface_tier_unknown",))
+        self.assertFalse(evaluation.eligible_for_fill_review)
+        self.assertEqual(evaluation.scope_digest, "")
+        with self.assertRaises(dashboard.ReadUnavailable):
+            dashboard.evaluate_surface_fill_preflight("BAD")
+
+    def test_scope_digest_changes_with_the_scope(self):
+        first, second = _surface_evaluation(), _surface_evaluation(scope=dict(SURFACE_SCOPE, licensed_subdomains=9))
+        self.assertEqual(len(first.scope_digest), 64)
+        self.assertNotEqual(first.scope_digest, second.scope_digest)
+        self.assertNotEqual(first.scope_digest, _surface_evaluation("rev2").scope_digest)
+
+    def test_detail_page_shows_the_surface_card_with_scope_and_both_checkboxes(self):
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=_surface_evaluation()), \
+                patch.object(dashboard, "evaluate_ce_only_fill_preflight", side_effect=AssertionError("no CE")), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
+            page = page_detail("CO-0801", SURFACE_ROW)
+        self.assertIn("Surface onboarding", page)
+        self.assertIn("chip-info'>Ready<", page)
+        self.assertEqual(page.count("<button type='submit'>Start Onboarding</button>"), 1)
+        self.assertIn("action='/attended/start-surface-runner'", page)
+        self.assertIn("name='attended_create_authorized' value='1' required", page)
+        self.assertIn("name='scope_reviewed' value='1' required", page)
+        self.assertIn("I reviewed the scope for this source revision", page)
+        self.assertIn("value='" + _surface_evaluation().scope_digest + "'", page)
+        for label, value in (("Tier", "Prime"), ("Scanning interval", "Weekly"), ("Alternate root domains", "2"),
+                             ("Requested subdomains", "3"), ("Assets", "10000"),
+                             ("Licensed subdomains", "1400 (1000 baseline + 400 add-on)"),
+                             ("License dates", "2026-09-29 → 2027-09-28")):
+            self.assertIn("<dt>" + label + "</dt><dd>" + value + "</dd>", page)
+        self.assertNotIn("Why Leonardo creation is not enabled yet", page)
+        self.assertNotIn("Start manual onboarding", page)
+        self.assertNotIn("Credential Exposure onboarding", page)
+
+    def test_non_surface_cos_keep_todays_behaviour(self):
+        row = dict(SURFACE_ROW, Onboarding_Product__c="Surface & Credential Exposure")
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", side_effect=AssertionError("no Surface")), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
+                patch.object(dashboard, "manual_start_ack_nonce", return_value=None):
+            page = page_detail("CO-0802", row, commercial_readiness=None)
+        self.assertIn("Start manual onboarding", page)
+        self.assertNotIn("Surface onboarding", page)
+
+    def test_blocked_card_shows_the_code_and_message_without_a_start(self):
+        section = self._section(dashboard.SurfaceScopePreflight("CO-0801", "rev1", ("surface_networks_not_supported",)))
+        self.assertIn("chip-bad'>Blocked<", section)
+        self.assertIn("surface_networks_not_supported", section)
+        self.assertIn("networks are not supported", section)
+        self.assertNotIn("Start Onboarding", section)
+
+    def test_prior_result_and_reset_for_failed_runs(self):
+        state = {"CO-0801": {"source_revision": "rev1", "route": "case_1_new_surface_only",
+                             "result": "max_scan_duration_schema_unavailable", "completed_on": "2026-09-29T10:00:00"}}
+        section = self._section(_surface_evaluation(), state)
+        self.assertIn("Onboarding failed", section)
+        self.assertIn("Maximum scan Duration (hours)", section)
+        self.assertIn("Reset runner record", section)
+        self.assertNotIn("Start Onboarding", section)
+
+    def test_verified_run_never_offers_a_new_start_for_a_later_revision(self):
+        state = {"CO-0801": {"source_revision": "rev1", "route": "case_1_new_surface_only",
+                             "result": "readback_verified", "completed_on": "2026-09-29T10:00:00"}}
+        section = self._section(_surface_evaluation("rev2"), state)
+        self.assertIn("chip-ok'>Onboarded<", section)
+        self.assertNotIn("Start Onboarding", section)
+
+    def test_new_result_codes_have_messages(self):
+        for code in ("surface_route_mismatch", "surface_source_unavailable", "surface_product_unrecognized",
+                     "surface_baseline_unavailable", "surface_baseline_ambiguous", "surface_tier_unknown",
+                     "surface_subscription_invalid", "surface_main_domain_invalid", "surface_domains_invalid",
+                     "surface_networks_not_supported", "surface_license_dates_unavailable",
+                     "max_scan_duration_schema_unavailable", "scope_review_missing", "route_unsupported"):
+            with self.subTest(code=code):
+                self.assertIn(code, dashboard.RUNNER_RESULT_MESSAGES)
+        self.assertNotIn("surface_route_case3_detected", dashboard.RUNNER_RESULT_MESSAGES)
+
+    def test_start_without_scope_review_is_rejected(self):
+        evaluation = _surface_evaluation()
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "start_attended_surface_runner", side_effect=AssertionError("no launch")), \
+                patch.object(dashboard, "record_runner_start", side_effect=AssertionError("no record")):
+            for body in ("reference=CO-0801&attended_create_authorized=1&source_revision=rev1&scope_digest="
+                         + evaluation.scope_digest,
+                         "reference=CO-0801&attended_create_authorized=1&scope_reviewed=0&source_revision=rev1"):
+                with self.subTest(body=body):
+                    status, _location, page = self._post("/attended/start-surface-runner", body)
+                    self.assertEqual(status, 409)
+                    self.assertIn("scope review acknowledgement", page)
+            status, _location, _page = self._post(
+                "/attended/start-surface-runner", "reference=CO-0801&scope_reviewed=1&source_revision=rev1")
+            self.assertEqual(status, 409)
+
+    def test_start_with_changed_scope_or_revision_is_rejected(self):
+        evaluation = _surface_evaluation()
+        stale = _surface_evaluation(scope=dict(SURFACE_SCOPE, licensed_subdomains=1)).scope_digest
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "start_attended_surface_runner", side_effect=AssertionError("no launch")):
+            status, _location, page = self._post(
+                "/attended/start-surface-runner",
+                "reference=CO-0801&attended_create_authorized=1&scope_reviewed=1&source_revision=rev1&scope_digest=" + stale)
+            self.assertEqual(status, 409)
+            self.assertIn("computed scope changed", page)
+            status, _location, page = self._post(
+                "/attended/start-surface-runner",
+                "reference=CO-0801&attended_create_authorized=1&scope_reviewed=1&source_revision=rev0&scope_digest="
+                + evaluation.scope_digest)
+            self.assertEqual(status, 409)
+            self.assertIn("source revision changed", page)
+
+    def test_reviewed_start_launches_the_surface_route_and_records_the_review(self):
+        evaluation = _surface_evaluation()
+        launched, recorded = [], []
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "start_attended_surface_runner",
+                             side_effect=lambda ref, rev: launched.append((ref, rev)) or True), \
+                patch.object(dashboard, "start_attended_ce_only_runner", side_effect=AssertionError("not CE")), \
+                patch.object(dashboard, "record_runner_start",
+                             side_effect=lambda *args, **kwargs: recorded.append((args, kwargs))):
+            status, location, _page = self._post(
+                "/attended/start-surface-runner",
+                "reference=CO-0801&attended_create_authorized=1&scope_reviewed=1&source_revision=rev1&scope_digest="
+                + evaluation.scope_digest)
+        self.assertEqual((status, location), (303, "/attended/ce-only-runner-status?ref=CO-0801"))
+        self.assertEqual(launched, [("CO-0801", "rev1")])
+        (args, kwargs), = recorded
+        self.assertEqual(args[:2], ("CO-0801", "rev1"))
+        self.assertEqual(kwargs["route"], "case_1_new_surface_only")
+        self.assertEqual(kwargs["scope_reviewed_on"], args[2])
+
+    def test_surface_runner_command_passes_the_route(self):
+        with patch.object(dashboard, "local_browser_launch_allowed", return_value=True), \
+                patch.object(dashboard.subprocess, "Popen") as popen:
+            self.assertTrue(dashboard.start_attended_surface_runner("CO-0801", "rev1"))
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-2:], ["--route", "case_1_new_surface_only"])
+        self.assertIn("--revision", command)
+
+    def test_scan_reminder_after_a_verified_surface_run_and_its_acknowledgement(self):
+        state = {"CO-0801": {"source_revision": "rev1", "route": "case_1_new_surface_only",
+                             "result": "readback_verified", "completed_on": "2026-09-29T10:00:00"}}
+        section = self._section(_surface_evaluation(), state)
+        self.assertIn(dashboard.SCAN_REMINDER_TEXT, section)
+        self.assertIn("Scan now / scanning interval are ON for this Leonardo Development tenant", section)
+        self.assertIn("action='/attended/mark-scan-settings-off'", section)
+        self.assertIn("Mark scan settings turned off", section)
+        with patch.object(dashboard, "load_runner_state", return_value=state), \
+                patch.object(dashboard, "evaluate_surface_fill_preflight", side_effect=AssertionError("no read")):
+            status, location, _page = self._post("/attended/mark-scan-settings-off", "reference=CO-0801")
+        self.assertEqual((status, location), (303, "/co/CO-0801"))
+        stored = json.loads(dashboard.ATTENDED_REMINDERS_PATH.read_text(encoding="utf-8"))
+        self.assertIn("scan_settings_off_on", stored["CO-0801"])
+        section = self._section(_surface_evaluation(), state)
+        self.assertNotIn("Mark scan settings turned off", section)
+        self.assertIn("Scan settings marked off on", section)
+
+    def test_scan_reminder_is_refused_for_ce_or_unverified_runs(self):
+        for record in ({"source_revision": "rev1", "result": "readback_verified"},
+                       {"source_revision": "rev1", "route": "case_1_new_surface_only", "result": "duplicate_found"},
+                       None):
+            state = {} if record is None else {"CO-0801": record}
+            with self.subTest(record=record), patch.object(dashboard, "load_runner_state", return_value=state):
+                status, _location, _page = self._post("/attended/mark-scan-settings-off", "reference=CO-0801")
+                self.assertEqual(status, 409)
+                self.assertNotIn(dashboard.SCAN_REMINDER_TEXT, self._section(_surface_evaluation(), state))
+        self.assertFalse(dashboard.ATTENDED_REMINDERS_PATH.exists())
+
+    def test_core_plus_reminder_before_onboarding_and_its_acknowledgement(self):
+        evaluation = _surface_evaluation(core_plus=True)
+        section = self._section(evaluation)
+        self.assertIn(dashboard.CE_REMINDER_TEXT, section)
+        self.assertIn("Core Plus (Credential Exposure) purchased", section)
+        self.assertIn("<dt>Core Plus on account</dt><dd>yes — CE to be enabled later</dd>", section)
+        self.assertIn("Mark CE enabled", section)
+        self.assertIn("Start Onboarding", section)  # Core Plus never blocks the Surface route
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation):
+            status, location, _page = self._post("/attended/mark-ce-enabled", "reference=CO-0801")
+        self.assertEqual((status, location), (303, "/co/CO-0801"))
+        self.assertIn("ce_enabled_on", json.loads(dashboard.ATTENDED_REMINDERS_PATH.read_text(encoding="utf-8"))["CO-0801"])
+        section = self._section(evaluation)
+        self.assertNotIn("Mark CE enabled", section)
+        self.assertIn("Credential Exposure marked enabled on", section)
+
+    def test_core_plus_reminder_after_onboarding_and_refused_without_core_plus(self):
+        state = {"CO-0801": {"source_revision": "rev1", "route": "case_1_new_surface_only",
+                             "result": "readback_verified", "completed_on": "2026-09-29T10:00:00"}}
+        section = self._section(_surface_evaluation(core_plus=True), state)
+        self.assertIn(dashboard.CE_REMINDER_TEXT, section)
+        self.assertIn(dashboard.SCAN_REMINDER_TEXT, section)
+        self.assertNotIn(dashboard.CE_REMINDER_TEXT, self._section(_surface_evaluation(core_plus=False)))
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=_surface_evaluation()):
+            status, _location, _page = self._post("/attended/mark-ce-enabled", "reference=CO-0801")
+        self.assertEqual(status, 409)
+        self.assertFalse(dashboard.ATTENDED_REMINDERS_PATH.exists())
+
+    def test_reminders_file_validation(self):
+        self.assertEqual(dashboard.load_attended_reminders(), {})
+        for content in ("{bad", "[]", json.dumps({"CO-0801": {"other": "2026-09-29T10:00:00"}}),
+                        json.dumps({"CO-0801": {"ce_enabled_on": "yesterday"}}), json.dumps({"bad": {}})):
+            with self.subTest(content=content):
+                dashboard.ATTENDED_REMINDERS_PATH.write_text(content, encoding="utf-8")
+                with self.assertRaises(dashboard.ReadUnavailable):
+                    dashboard.load_attended_reminders()
+        with self.assertRaises(ValueError):
+            dashboard.record_attended_reminder("CO-0801", "other")
+
+    def test_reminders_file_is_gitignored(self):
+        from pathlib import Path
+        gitignore = (Path(dashboard.__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("integration/attended_scan_reminders.json", gitignore.splitlines())
+        self.assertEqual(dashboard.REMINDER_FIELDS, {"scan_settings_off": "scan_settings_off_on",
+                                                     "ce_enabled": "ce_enabled_on"})
 
 
 class SalesforceCliEncodingTests(unittest.TestCase):
