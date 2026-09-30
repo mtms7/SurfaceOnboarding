@@ -51,6 +51,30 @@ questions below are still required before the route is built.
    user in tenant user management.
 4. Move the Salesforce request to **User Created** and mark it the current onboarding stage.
 
+## Surface License Tiers Breakdown (Guru card, **Unverified**, updated ~1 year earlier)
+
+- Naming update: the old Surface tiers **Essentials** and **Enterprise** are now **Surface Go**
+  and **Surface Prime** respectively.
+- Surface Go = 500 subdomains, Surface Prime = 1,000 subdomains; domains and users no limit.
+- Scan frequency: Go = Monthly, Prime = Weekly (discovery). Provisioning (the attack itself):
+  Go weekly, Prime daily.
+- **API** and **Credential Exposure (Threat Intel)** "depend on Core Plus" for both tiers.
+  Pentera Core Plus is provisioned with a single CE email domain; more are an add-on.
+
+## Owner decisions recorded 2026-09-29 (operator)
+
+- Scan now ON in Dev, with a dashboard reminder to turn scanning off later.
+- Operator Account skipped in Dev. Leaked Credentials OFF, Phishing OFF (CE enabled later for Surface + CE).
+- Assets 10,000 unless the licence says otherwise. Number of domains = main + alternate domains.
+  Subdomains = number in the product name (Go 500, Prime 1,000) + add-on rows.
+- License dates: same rule as CE (start = run day; expiration = min(start + 1 year − 1 day, subscription end)).
+- Pending Surface subscriptions count when they start within 14 days.
+- A Core Plus baseline row (Commercial or Enterprise) does not block: create the Surface tenant
+  and show a reminder to enable CE later.
+- Every Surface Go / Prime CO needs a revision-bound manual scope review before Start Onboarding.
+- First version: create + readback, then the scan-status sweep. Salesforce updates and
+  customer-user creation stay manual.
+
 ## Differences from the CE-only route (Case 2)
 
 - Company name has no `- CE Only` suffix.
