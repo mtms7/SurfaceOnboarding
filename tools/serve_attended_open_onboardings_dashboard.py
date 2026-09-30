@@ -854,6 +854,7 @@ class ClosedHistory:
     months: tuple[HistoryMonth, ...]  # oldest -> newest; the last is the current month
     as_of: date
     kpis: ClosedKpis | None = None
+    read_at: str = ""  # local HH:MM of the Salesforce read (the value is cached)
 
     @property
     def completed_total(self) -> int:
@@ -981,18 +982,34 @@ def closed_history(*, now: float | None = None, today: date | None = None,
                 if cached is None:
                     raise ReadUnavailable()
                 return cached
+        read_clock = wall_clock or datetime.now().astimezone()
         try:
             history = build_closed_history(_aggregate_records(COMPLETED_HISTORY_QUERY),
                                            _aggregate_records(CREATED_HISTORY_QUERY), today or date.today())
             kpis = build_closed_kpis(_aggregate_records(COMPLETION_DURATIONS_QUERY),
-                                     _aggregate_records(REJECTED_TOTAL_QUERY),
-                                     wall_clock or datetime.now().astimezone())
+                                     _aggregate_records(REJECTED_TOTAL_QUERY), read_clock)
         except ReadUnavailable:
             _history_cache = (clock, None)
             raise
-        history = ClosedHistory(history.series, history.months, history.as_of, kpis)
+        history = ClosedHistory(history.series, history.months, history.as_of, kpis, read_clock.strftime("%H:%M"))
         _history_cache = (clock, history)
         return history
+
+
+def cached_closed_history(*, now: float | None = None) -> ClosedHistory | None:
+    """Return the fresh cached history without reading Salesforce (None when cold).
+
+    Filtered queue views use this for the history tile so they never pay for
+    a history read; the unfiltered view and the History tab warm the cache.
+    """
+    clock = monotonic() if now is None else now
+    with _history_lock:
+        if _history_cache is None:
+            return None
+        cached_at, cached = _history_cache
+        if cached is None or clock - cached_at >= HISTORY_CACHE_SECONDS:
+            return None
+        return cached
 
 
 def detail_row(reference: str) -> dict[str, str | None]:
@@ -1223,10 +1240,11 @@ def render_closed_history(history: ClosedHistory, read_at: str) -> str:
 
 
 def history_card(history: ClosedHistory | None, read_at: str, failed: bool = False) -> str:
-    """The closed-onboardings card for the unfiltered queue view."""
+    """The closed-onboardings card shown on the History tab."""
     if failed or history is None:
         body = ("<p class='empty'><span class='chip chip-warn'>History unavailable</span> The Salesforce history read "
-                "failed. The queue above is unaffected; refresh to retry.</p>")
+                "failed. The onboarding queue is unaffected; reload in a minute to retry. If the Salesforce session "
+                "expired, sign in again on <a href='/connection'>Connection</a>.</p>")
         summary = ""
     else:
         body = render_closed_history(history, read_at)
@@ -1235,6 +1253,44 @@ def history_card(history: ClosedHistory | None, read_at: str, failed: bool = Fal
                    f"last {len(history.months) - 1} months + this month</span>")
     return ("<section class='card' id='history' aria-labelledby='history-h'><div class='card-head'>"
             "<h2 class='pill' id='history-h'>Closed onboardings</h2>" + summary + "</div>" + body + "</section>")
+
+
+def history_tile(history: ClosedHistory | None, failed: bool = False) -> str:
+    """The main-dashboard tile that summarizes the closed queue and opens the History tab."""
+    kpis = history.kpis if history is not None else None
+    if kpis is not None:
+        delta = kpis.completed_30d - kpis.completed_prev_30d
+        number, label = f"{kpis.completed_30d:,}", "Completed"
+        sub = "30 days · " + ("no change" if delta == 0 else f"{delta:+d} vs prior")
+    elif history is not None:
+        number, label, sub = f"{history.completed_total:,}", "Completed", f"last {len(history.months)} months"
+    else:
+        number, label = "—", "Closed history"
+        sub = "Unavailable · open to retry" if failed else "Monthly trend"
+    return (f"<a class='tile hist' href='/history'><b>{number}</b><span>{escape(label)} "
+            f"<i aria-hidden='true'>&rarr;</i></span><small>{escape(sub)}</small></a>")
+
+
+def page_history(history: ClosedHistory | None, failed: bool = False) -> str:
+    """The History tab: the closed-onboardings chart, stat strip, and table view."""
+    read_at = (history.read_at if history is not None else "") or datetime.now().strftime("%H:%M")
+    meta = (f"<span>Read from Salesforce at {escape(read_at)} · updates every {HISTORY_CACHE_SECONDS // 60} min</span>"
+            if not failed and history is not None else "")
+    head = f"<div class='page-head'><h1>History</h1><div class='head-meta'>{meta}</div></div>"
+    return _app_shell("History", head + history_card(history, read_at, failed=failed or history is None),
+                      active="history")
+
+
+def render_history() -> str:
+    """Read the cached closed-onboardings history and render the History tab.
+
+    A history read failure degrades inside the page (never the connection
+    page) because the history is independent of the open queue.
+    """
+    try:
+        return page_history(closed_history())
+    except ReadUnavailable:
+        return page_history(None, failed=True)
 
 
 # Queue keys stay stable for bookmarks and tests ("scanning" is the follow-up queue).
@@ -1326,8 +1382,8 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
                runner_state: dict[str, dict[str, str]] | None = None, runner_state_unavailable: bool = False,
                history: ClosedHistory | None = None, history_failed: bool = False,
                read_at: str | None = None, today: date | None = None) -> str:
-    """Render the open-onboardings dashboard: queue tiles, one aligned table per
-    queue, and (on the unfiltered view) the closed-onboardings history card."""
+    """Render the open-onboardings dashboard: queue tiles, a closed-history tile
+    that opens the History tab, and one aligned table per queue."""
     today = today or date.today()
     read_at = read_at or datetime.now().strftime("%H:%M")
     state = runner_state or {}
@@ -1361,9 +1417,11 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
         return (f"<a class='tile{state_class}' href='{href}'{current}><b>{number}</b><span>{escape(label)}</span>"
                 f"<small>{escape(sub)}</small></a>")
 
-    tiles = ("<nav class='tiles' aria-label='Queues'>" + tile("/", "", len(rows), "All open", f"{need_you} need you")
+    tiles = ("<nav class='tiles' aria-label='Queues and history'>"
+             + tile("/", "", len(rows), "All open", f"{need_you} need you")
              + "".join(tile(f"/?queue={key}", key, len(by_queue[key]), label, tile_subs[key])
-                       for key, label, _helper in QUEUE_DEFINITIONS) + "</nav>")
+                       for key, label, _helper in QUEUE_DEFINITIONS)
+             + history_tile(history, failed=history_failed) + "</nav>")
     banner = ""
     if runner_state_unavailable:
         banner = _outcome_banner("info", "The local attended-run record could not be read, so run results are not shown. "
@@ -1412,10 +1470,7 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
     head = (f"<div class='page-head'><h1>{escape(title)}</h1><div class='head-meta'><span>Read from Salesforce at "
             f"{escape(read_at)}</span><form method='get' action='/'>{hidden}<button class='ghost' type='submit'>Refresh"
             "</button></form></div></div>")
-    history_html = ""
-    if not selected and (history is not None or history_failed):
-        history_html = history_card(history, read_at, failed=history_failed)
-    return _app_shell("Onboardings", head + tiles + banner + cards + history_html, active="onboardings")
+    return _app_shell("Onboardings", head + tiles + banner + cards, active="onboardings")
 
 
 def ce_only_eligible(row: dict[str, str | None]) -> bool:
@@ -1621,11 +1676,13 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
 
 
 def render_dashboard(selected_queue: str = "") -> str:
-    """Read the open queue (live), the local run records, and on the unfiltered
-    view the cached closed-onboardings history, then render the dashboard.
+    """Read the open queue (live), the local run records, and the cached
+    closed-onboardings history for the history tile, then render the dashboard.
 
     A queue read failure propagates (ReadUnavailable → the connection page).
     A history or run-record failure only degrades its own part of the page.
+    Filtered views only peek at the history cache and never read Salesforce
+    for it.
     """
     rows = queue_rows()
     try:
@@ -1640,6 +1697,8 @@ def render_dashboard(selected_queue: str = "") -> str:
             history = closed_history()
         except ReadUnavailable:
             history_failed = True
+    else:
+        history = cached_closed_history()
     return page_queue(rows, selected_queue, runner_state=runner_state,
                       runner_state_unavailable=runner_state_unavailable,
                       history=history, history_failed=history_failed, read_at=datetime.now().strftime("%H:%M"))
@@ -1961,7 +2020,9 @@ PENTERA_CSS = (
     # Queue page (tiles that are both counts and filters, aligned table rows).
     ".head-meta{margin-left:auto;display:flex;align-items:center;gap:10px;color:var(--heading);font-size:12.5px}"
     ".head-meta form{margin:0}"
-    ".tiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;margin:0 0 16px}"
+    ".tiles{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:0 0 16px}"
+    "@media(max-width:1180px){.tiles{grid-template-columns:repeat(3,minmax(0,1fr))}}"
+    ".tile.hist span i{font-style:normal;color:var(--primary-dark)}"
     ".tile{display:block;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;"
     "color:var(--text);box-shadow:0 1px 2px #1018280a}.tile:hover{border-color:var(--primary);text-decoration:none}"
     ".tile b{display:block;font-size:24px;line-height:1.15}.tile span{display:block;font-weight:600;color:var(--heading)}"
@@ -1993,7 +2054,9 @@ PENTERA_CSS = (
     ".qh-legend{display:flex;flex-wrap:wrap;gap:4px 18px;margin:0 0 6px;padding:0;list-style:none;color:var(--heading);font-size:12.5px}"
     ".qh-legend li{display:flex;align-items:center;gap:6px}.qh-sw{width:10px;height:10px;border-radius:2px}"
     ".qh-lk{width:16px;height:2px;border-radius:1px;background:var(--cr)}"
-    ".qh-scroll{overflow-x:auto}.qh-plot{position:relative;min-width:748px;max-width:880px}"
+    # rtl on the scroller opens a narrow window on the newest months; the plot itself stays ltr.
+    ".qh-scroll{overflow-x:auto;direction:rtl}"
+    ".qh-plot{direction:ltr;margin:0 auto 0 0;position:relative;min-width:748px;max-width:880px}"
     ".qh svg{display:block;width:100%;height:auto;overflow:visible}"
     ".qh svg text{fill:var(--muted);font-size:12px;font-variant-numeric:tabular-nums;text-anchor:middle}"
     ".qh svg .yt{text-anchor:end}.qh svg .yr{font-size:11px}"
@@ -2028,7 +2091,8 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "") 
         "<meta name='viewport' content='width=device-width,initial-scale=1'>" + refresh +
         "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body><div class='shell'>"
         "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
-        + nav("/", "Onboardings", "onboardings") + nav("/connection", "Connection", "connection") +
+        + nav("/", "Onboardings", "onboardings") + nav("/history", "History", "history")
+        + nav("/connection", "Connection", "connection") +
         "<div class='side-foot'>Attended · localhost only</div></aside>"
         "<main>" + main_html + "</main></div></body></html>"
     )
@@ -2352,6 +2416,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.OK, render_dashboard(selected_queue)); return
             if path == "/connection":
                 self.send_page(HTTPStatus.OK, page_salesforce_unavailable(failed=False)); return
+            if path == "/history":
+                self.send_page(HTTPStatus.OK, render_history()); return
             if path in ("/attended/ce-only-runner-status", "/attended/co0702-runner-status"):
                 ref = parse_qs(parsed.query).get("ref", [CO0702_REFERENCE])[0]
                 if not REFERENCE.fullmatch(ref):

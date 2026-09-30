@@ -255,7 +255,62 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
     def test_history_card_unavailable_state_keeps_the_queue(self):
         card = dashboard.history_card(None, "20:45", failed=True)
         self.assertIn("History unavailable", card)
-        self.assertIn("The queue above is unaffected", card)
+        self.assertIn("The onboarding queue is unaffected", card)
+        self.assertIn("href='/connection'", card)
+
+    def test_history_tile_summarizes_the_closed_queue_and_opens_the_history_tab(self):
+        tile = dashboard.history_tile(self._history_fixture())
+        self.assertIn("href='/history'", tile)
+        self.assertIn("<b>41</b>", tile)
+        self.assertIn("<span>Completed <i aria-hidden='true'>&rarr;</i></span>", tile)
+        self.assertIn("30 days · +6 vs prior", tile)
+        self.assertIn("Unavailable · open to retry", dashboard.history_tile(None, failed=True))
+        self.assertIn("Monthly trend", dashboard.history_tile(None))  # cold cache on a filtered view
+
+    def test_cached_closed_history_peeks_without_reading_salesforce(self):
+        history = self._history_fixture()
+        with patch.object(dashboard, "sf_json", side_effect=AssertionError("a peek never reads Salesforce")):
+            with patch.object(dashboard, "_history_cache", None):
+                self.assertIsNone(dashboard.cached_closed_history(now=10.0))
+            with patch.object(dashboard, "_history_cache", (10.0, history)):
+                self.assertIs(dashboard.cached_closed_history(now=10.0 + 60), history)
+                self.assertIsNone(dashboard.cached_closed_history(now=10.0 + dashboard.HISTORY_CACHE_SECONDS))
+            with patch.object(dashboard, "_history_cache", (10.0, None)):  # a cached failure
+                self.assertIsNone(dashboard.cached_closed_history(now=11.0))
+
+    def test_history_tab_renders_the_chart_in_the_shell(self):
+        history = self._history_fixture()
+        history = dashboard.ClosedHistory(history.series, history.months, history.as_of, history.kpis, "20:40")
+        page = dashboard.page_history(history)
+        self.assertIn("<h1>History</h1>", page)
+        self.assertIn("id='history'", page)
+        self.assertIn("<svg viewBox='0 0 880 200'", page)
+        self.assertIn("Read from Salesforce at 20:40 · updates every 10 min", page)  # the cached read time
+        self.assertIn("<a href='/history' class='active'>History</a>", page)
+        self.assertNotIn("<script", page)
+        with patch.object(dashboard, "closed_history", side_effect=dashboard.ReadUnavailable()):
+            failed = dashboard.render_history()
+        self.assertIn("History unavailable", failed)
+        self.assertNotIn("Read from Salesforce at", failed)
+
+    def test_history_route_serves_the_history_tab(self):
+        class _FakeRequest:
+            def __init__(self, path):
+                self.path = path
+                self.sent = []
+
+            def send_page(self, status, page):
+                self.sent.append((status, page))
+
+            def __getattr__(self, name):
+                raise AssertionError("unexpected handler access: " + name)
+
+        request = _FakeRequest("/history")
+        with patch.object(dashboard, "closed_history", return_value=self._history_fixture()), \
+                patch.object(dashboard, "queue_rows", side_effect=AssertionError("the History tab skips the queue read")):
+            dashboard.Handler.do_GET(request)
+        self.assertEqual(request.sent[0][0], 200)
+        self.assertIn("<h1>History</h1>", request.sent[0][1])
 
     def test_queue_classification_rules(self):
         base = {"Name": "CO-9001", "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
@@ -305,7 +360,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         page = page_queue(rows, runner_state={"CO-9003": {"source_revision": "r", "result": "readback_verified"}},
                           history=self._history_fixture(), read_at="20:45", today=date(2026, 9, 29))
         self.assertIn("class='side'", page)  # the shared Pentera shell
-        self.assertIn("<nav class='tiles' aria-label='Queues'>", page)
+        self.assertIn("<nav class='tiles' aria-label='Queues and history'>", page)
+        self.assertIn("<a href='/history'>History</a>", page)  # the History tab in the top navigation
         self.assertIn("aria-current='page'", page)  # "All open" tile is current
         self.assertIn("<table class='q'>", page)
         self.assertIn("Start onboarding", page)
@@ -313,10 +369,11 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("chip chip-ok'>Onboarded", page)
         self.assertIn("19 d", page)
         self.assertIn("Read from Salesforce at 20:45", page)
-        self.assertIn("id='history'", page)
+        self.assertIn("<a class='tile hist' href='/history'><b>41</b>", page)  # the closed-queue summary tile
+        self.assertNotIn("id='history'", page)  # the full chart lives on the History tab
         self.assertNotIn("<script", page)
         filtered = page_queue(rows, "ready", history=self._history_fixture(), read_at="20:45")
-        self.assertNotIn("id='history'", filtered)  # the chart shows only on the unfiltered view
+        self.assertIn("class='tile hist'", filtered)  # the tile stays put on filtered views
         self.assertIn("<h1>Ready to onboard</h1>", filtered)
 
     def test_dashboard_page_degrades_when_run_records_are_unreadable(self):
@@ -335,12 +392,14 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
                 patch.object(dashboard, "load_runner_state", return_value={}), \
                 patch.object(dashboard, "closed_history", side_effect=dashboard.ReadUnavailable()):
             page = dashboard.render_dashboard("")
-        self.assertIn("History unavailable", page)
+        self.assertIn("Unavailable · open to retry", page)
         self.assertIn("CO-9002", page)
         with patch.object(dashboard, "queue_rows", return_value=rows), \
                 patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "cached_closed_history", return_value=self._history_fixture()), \
                 patch.object(dashboard, "closed_history", side_effect=AssertionError("filtered views skip the history read")):
-            dashboard.render_dashboard("validation")
+            filtered = dashboard.render_dashboard("validation")
+        self.assertIn("<b>41</b><span>Completed", filtered)  # served from the cache peek
 
     def test_connection_page_only_claims_a_failure_on_the_failure_path(self):
         with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "desktop"}, clear=False):
