@@ -180,6 +180,7 @@ SELECT_NAMES = {
 FIELD_TIMEOUT_MS = 5_000
 TOGGLE_CLICK_TIMEOUT_MS = 2_000
 CONFIRM_ENABLE_POLLS = 12  # x 250 ms
+DIAGNOSE_SETTLE_MS = 700  # per no-submit Confirm probe (--diagnose-confirm)
 FORM_CLOSE_POLL_SECONDS = 0.5
 # Server-side tenant search (getAllDetailedAccounts per edit, HAR-verified):
 # wait for the response that carries this lookup instead of a fixed sleep.
@@ -3163,7 +3164,214 @@ def _confirm_enabled(page: Any, confirm: Any) -> bool:
     except Exception:
         invalid = []
     _log().event("confirm_enable", "disabled", detail="invalid=" + ",".join(str(i) for i in (invalid or [])))
+    _log_form_validation(page)
     return False
+
+
+# Domains and email addresses in form messages are redacted before logging,
+# on top of the run log's own redaction of every known source value.
+_DOMAIN_TOKEN = re.compile(r"(?i)[\w.+-]+@[\w-]+(?:\.[\w-]+)+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b")
+
+
+def _redact_domains(text: object) -> str:
+    return _DOMAIN_TOKEN.sub("<domain>", str(text))
+
+
+def _log_form_validation(page: Any, stage: str = "") -> None:
+    """Log the open form's validation state without any field value.
+
+    For each visible control that is flagged (required and empty,
+    aria-invalid, inside .Mui-error, failing the browser's constraint
+    validation, or disabled) its label/name and flags are logged; number
+    inputs always report their min/max/step. Visible error/helper texts and
+    the Confirm control's disabled/title attributes are logged too. Values are
+    only tested for emptiness in the page and never returned. Best effort:
+    diagnostics never change the runner's outcome.
+    """
+    log = _log()
+    try:
+        report = page.evaluate(
+            """(modalSelector) => {
+                const root = document.querySelector(modalSelector) || document;
+                const safe = (fn) => { try { return fn(); } catch (e) { return ''; } };
+                const labelOf = (el) => {
+                    let t = el.id ? safe(() => {
+                        const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                        return l ? l.textContent : '';
+                    }) : '';
+                    if (!t) t = safe(() => { const w = el.closest('label'); return w ? w.textContent : ''; });
+                    if (!t) t = safe(() => {
+                        const box = el.closest('.MuiFormControl-root');
+                        const l = box ? box.querySelector('label') : null;
+                        return l ? l.textContent : '';
+                    });
+                    return (t || '').replace(/\\s+/g, ' ').trim();
+                };
+                const controls = [];
+                for (const el of root.querySelectorAll('input, select, textarea')) {
+                    if (el.type === 'hidden') continue;
+                    const name = (labelOf(el) || el.getAttribute('name') || el.getAttribute('placeholder')
+                        || el.getAttribute('data-am') || el.tagName.toLowerCase()).slice(0, 80);
+                    const flags = [];
+                    const empty = el.type !== 'checkbox' && !String(el.value || '').trim();
+                    if (el.required && empty) flags.push('required-empty');
+                    if (el.getAttribute('aria-invalid') === 'true') flags.push('aria-invalid');
+                    if (el.closest('.Mui-error')) flags.push('mui-error');
+                    if (typeof el.checkValidity === 'function' && !el.checkValidity())
+                        flags.push('invalid:' + String(el.validationMessage || '').slice(0, 100));
+                    if (el.disabled) flags.push('disabled');
+                    if (el.type === 'number') flags.push('min=' + el.min, 'max=' + el.max, 'step=' + el.step);
+                    if (flags.length) controls.push(name + ' [' + flags.join(';') + ']');
+                }
+                const messages = [];
+                const selector = '.Mui-error, .MuiFormHelperText-root, [role="alert"], [class*="error" i], '
+                    + '[class*="invalid" i], [class*="warning" i]';
+                for (const el of root.querySelectorAll(selector)) {
+                    if (el.offsetParent === null) continue;
+                    const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (text && text.length <= 200 && !messages.includes(text)) messages.push(text.slice(0, 120));
+                    if (messages.length >= 20) break;
+                }
+                let buttons = Array.from(root.querySelectorAll('button'))
+                    .filter(b => (b.textContent || '').trim() === 'Confirm');
+                if (!buttons.length) buttons = Array.from(document.querySelectorAll('button'))
+                    .filter(b => (b.textContent || '').trim() === 'Confirm');
+                const confirm = buttons.slice(0, 3).map(b => 'disabled=' + b.disabled
+                    + ' aria-disabled=' + b.getAttribute('aria-disabled')
+                    + ' title=' + String(b.getAttribute('title')
+                        || (b.parentElement && b.parentElement.getAttribute('title')) || '').slice(0, 100));
+                return {controls: controls.slice(0, 60), messages: messages, confirm: confirm};
+            }""",
+            ADD_ACCOUNT_MODAL_SELECTOR)
+    except Exception as exc:
+        log.error("form_validation", stage or "report", exc)
+        return
+    if not isinstance(report, dict):
+        log.event("form_validation", "unreadable", stage)
+        return
+    for kind in ("controls", "messages", "confirm"):
+        items = report.get(kind)
+        for item in (items if isinstance(items, list) else [])[:60]:
+            log.event("form_validation", kind.rstrip("s"), stage, _redact_domains(item))
+    log.event("form_validation", "reported", stage,
+              "controls={} messages={}".format(len(report.get("controls") or []), len(report.get("messages") or [])))
+
+
+def _confirm_is_enabled_now(page: Any, confirm: Any) -> bool:
+    page.wait_for_timeout(DIAGNOSE_SETTLE_MS)
+    try:
+        return bool(confirm.first.is_enabled())
+    except Exception:
+        return False
+
+
+def _set_text_value(page: Any, label: str, value: str, *, advanced: bool = False) -> bool:
+    control = _locate_advanced_text(page, label) if advanced else _locate_form_field(page, label, "")
+    if control is None:
+        return False
+    try:
+        control.first.fill(value, timeout=FIELD_TIMEOUT_MS)
+        return control.first.input_value() == value
+    except Exception:
+        return False
+
+
+def _touch_form_fields(page: Any) -> bool:
+    """Focus and blur each editable control once (the form's own touched validation).
+
+    Read-only date inputs are skipped so no picker opens; nothing is typed.
+    """
+    try:
+        page.evaluate(
+            """(modalSelector) => {
+                const root = document.querySelector(modalSelector) || document;
+                for (const el of root.querySelectorAll('input:not([type=hidden]):not([readonly]), select, textarea')) {
+                    try { el.focus(); el.blur(); } catch (e) {}
+                }
+            }""",
+            ADD_ACCOUNT_MODAL_SELECTOR)
+        return True
+    except Exception:
+        return False
+
+
+def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
+    """No-submit probes for a disabled Confirm: try one change at a time.
+
+    Each probe changes one control, checks whether Confirm enables, and puts
+    the planned value back before the next probe; the runner then cancels the
+    form. Confirm is never clicked. Probe names and outcomes are logged (no
+    values). Returns diagnose_confirm_blocker_found when some single change
+    enabled Confirm, else diagnose_confirm_blocker_unknown.
+    """
+    log = _log()
+    texts = plan.get("texts", {})
+    advanced = plan.get("advanced_texts", {})
+    selects = plan.get("selects", {})
+    found: list[str] = []
+
+    def probe(name: str, apply: Any, undo: Any) -> None:
+        try:
+            applied = apply()
+        except Exception as exc:
+            log.error("diagnose_probe", name, exc)
+            applied = False
+        if not applied:
+            log.event("diagnose_probe", "skipped", name)
+            return
+        enabled = _confirm_is_enabled_now(page, confirm)
+        log.event("diagnose_probe", "enables_confirm" if enabled else "no_change", name)
+        if enabled:
+            found.append(name)
+        try:
+            restored = undo()
+        except Exception as exc:
+            log.error("diagnose_probe", name + ":undo", exc)
+            restored = False
+        if not restored:
+            log.event("diagnose_probe", "undo_failed", name)
+
+    # 1. Touch every field: surfaces the form's own per-field errors, if any.
+    touched = _touch_form_fields(page)
+    enabled = touched and _confirm_is_enabled_now(page, confirm)
+    log.event("diagnose_probe", "enables_confirm" if enabled else ("no_change" if touched else "skipped"), "touch_fields")
+    if enabled:
+        found.append("touch_fields")
+    _log_form_validation(page, "after_touch")
+    duration_label = SURFACE_MAX_SCAN_DURATION_LABEL
+    if duration_label in advanced:
+        probe("max_scan_duration_24",
+              lambda: _set_text_value(page, duration_label, "24", advanced=True),
+              lambda: _set_text_value(page, duration_label, advanced[duration_label], advanced=True))
+    alternates = texts.get(ALTERNATE_DOMAINS_LABEL)
+    if alternates:
+        compact = ",".join(part.strip() for part in alternates.split(","))
+        if compact != alternates:
+            probe("alternate_domains_no_spaces",
+                  lambda: _set_text_value(page, ALTERNATE_DOMAINS_LABEL, compact),
+                  lambda: _set_text_value(page, ALTERNATE_DOMAINS_LABEL, alternates))
+        probe("alternate_domains_blank",
+              lambda: _set_text_value(page, ALTERNATE_DOMAINS_LABEL, ""),
+              lambda: _set_text_value(page, ALTERNATE_DOMAINS_LABEL, alternates))
+    subdomains = texts.get("Number of subdomains")
+    if subdomains and subdomains != "50000":
+        probe("number_of_subdomains_50000",
+              lambda: _set_text_value(page, "Number of subdomains", "50000"),
+              lambda: _set_text_value(page, "Number of subdomains", subdomains))
+    domains = texts.get("Number of domains")
+    if domains and domains != "1":
+        probe("number_of_domains_1",
+              lambda: _set_text_value(page, "Number of domains", "1"),
+              lambda: _set_text_value(page, "Number of domains", domains))
+    # Last: switching the interval can reset dependent controls; the form is
+    # cancelled right after, so no later probe depends on it.
+    interval = selects.get("Scanning interval")
+    if interval and interval != "None":
+        probe("scanning_interval_none",
+              lambda: _fill_select(page, "Scanning interval", "None") is None,
+              lambda: _fill_select(page, "Scanning interval", interval) is None)
+    log.event("diagnose_confirm", "found" if found else "unknown", detail=",".join(found))
+    return "diagnose_confirm_blocker_found" if found else "diagnose_confirm_blocker_unknown"
 
 
 def _fill_select(page: Any, label: str, option: str) -> str | None:
@@ -3316,24 +3524,26 @@ def _api_readback(result: TenantSearchResult, tenant_name: str,
 
 
 def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float = MAX_WAIT_SECONDS,
-        dry_run: bool = False, route: str = CE_ENGINE) -> str:
+        dry_run: bool = False, route: str = CE_ENGINE, diagnose: bool = False) -> str:
     """Run one attended auto-confirm session.  Never writes back to Salesforce.
 
     ``route`` selects the route contract (ROUTES); the default is the CE-only
     route so existing launches are unchanged. An unknown route fails closed
     before any read. ``dry_run`` runs every check and fills and re-verifies
-    the full form, then cancels it instead of clicking Confirm. It creates
-    nothing and never records to the one-time create gate (only the run log
-    is written).
+    the full form, requires Confirm to be enabled (never clicking it), then
+    cancels. It creates nothing and never records to the one-time create gate
+    (only the run log is written). ``diagnose`` implies ``dry_run`` and, when
+    Confirm stays disabled, runs the no-submit probes (_diagnose_confirm).
     """
     global _ACTIVE_RUN_LOG
+    dry_run = dry_run or diagnose
     _ACTIVE_RUN_LOG = RunLog(reference, DRY_RUN_MODE if dry_run else "create", route=route)
     try:
         contract = ROUTES.get(route)
         if contract is None:
             return _finish(reference, acknowledged_revision, "route_unsupported")
         return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run,
-                    contract=contract)
+                    contract=contract, diagnose=diagnose)
     finally:
         _ACTIVE_RUN_LOG = None
 
@@ -3356,7 +3566,7 @@ def _cancel_add_account(page: Any) -> bool:
 
 
 def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float, dry_run: bool = False,
-         contract: RouteContract = CE_ROUTE) -> str:
+         contract: RouteContract = CE_ROUTE, diagnose: bool = False) -> str:
     log = _log()
     log.event("source_read", "start")
     try:
@@ -3424,18 +3634,32 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                 # exactly one element and keep the value the runner set
                 # (re-read verification); any ambiguity or mismatch stops the
                 # runner before the form is submitted.
-                failure, account_name_control = _fill_add_account_form(
-                    page, contract.build_fill(source, license_start))
+                plan = contract.build_fill(source, license_start)
+                failure, account_name_control = _fill_add_account_form(page, plan)
                 if failure is not None:
                     _capture_search_diagnostics(page)
                     if dry_run:
                         _cancel_add_account(page)
                     return _finish(reference, acknowledged_revision, failure)
                 if dry_run:
-                    # Everything up to Confirm passed; cancel instead of submitting.
+                    # Everything up to Confirm passed. A dry run also requires
+                    # Confirm to be enabled (it is never clicked), then cancels.
+                    # With diagnose, a disabled Confirm runs the no-submit probes.
+                    confirm = _locate_confirm_button(page)
+                    if confirm is None:
+                        _capture_search_diagnostics(page)
+                        result = "confirm_button_schema_unavailable"
+                    elif _confirm_enabled(page, confirm):
+                        log.event("confirm_enable", "enabled")
+                        result = "dry_run_fill_verified"
+                    elif diagnose:
+                        result = _diagnose_confirm(page, confirm, plan)
+                    else:
+                        _capture_search_diagnostics(page)
+                        result = "dry_run_confirm_not_enabled"
                     cancelled = _cancel_add_account(page)
                     return _finish(reference, acknowledged_revision,
-                                   "dry_run_fill_verified" if cancelled else "dry_run_cancel_unavailable")
+                                   result if cancelled else "dry_run_cancel_unavailable")
                 # Auto-confirm: the operator triggered this attended run and the
                 # source passed a clear duplicate check and a validated fill, so
                 # the runner submits the form by clicking the single Confirm
@@ -3715,6 +3939,8 @@ def main() -> int:
                         help="Override the expected tenant name for --readback-only (targets a live tenant whose name intentionally deviates from the contract name).")
     parser.add_argument("--dry-run", action="store_true",
                         help="With --co/--revision: run every check and fill the full form, then Cancel instead of Confirm (no create; does not consume the create gate).")
+    parser.add_argument("--diagnose-confirm", action="store_true",
+                        help="With --co/--revision: a dry run that, if Confirm stays disabled, logs the form's value-free validation state and tries one no-submit change at a time to find the blocking field, then Cancels (no create; does not consume the create gate).")
     parser.add_argument("--duplicate-check", action="store_true",
                         help="With --co: read-only duplicate check by CE tenant name and primary domain (no fill, submit, or create; does not consume the create gate).")
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
@@ -3753,7 +3979,7 @@ def main() -> int:
         return 0
     if not args.co or not args.revision:
         parser.error("--co and --revision are required unless --check-session, --reset-profile, --bootstrap-session, --close-browser, or --readback-only is given")
-    result = run(args.co, args.revision, dry_run=args.dry_run, route=args.route)
+    result = run(args.co, args.revision, dry_run=args.dry_run, route=args.route, diagnose=args.diagnose_confirm)
     print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
     return 0
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -1708,6 +1709,20 @@ class RunEndToEndTests(unittest.TestCase):
         self.assertEqual(page.filled.get("Company name"), TENANT)
         run_log = json.loads(runner.RUN_LOG_PATH.read_text(encoding="utf-8"))["runs"][-1]
         self.assertEqual((run_log["mode"], run_log["result"]), ("dry_run", "dry_run_fill_verified"))
+        # The dry run checked (never clicked) Confirm before cancelling.
+        self.assertIn(("confirm_enable", "enabled"), [(e["step"], e["outcome"]) for e in run_log["events"]])
+
+    def test_redact_domains_masks_domains_and_emails_only(self):
+        text = runner._redact_domains("Invalid domain a-b.example.co.uk; mail x.y+z@corp.example; max=72; 1.5 h")
+        self.assertEqual(text, "Invalid domain <domain>; mail <domain>; max=72; 1.5 h")
+
+    def test_cli_diagnose_confirm_runs_a_diagnose_dry_run(self):
+        with patch.object(runner, "run", return_value="diagnose_confirm_blocker_found") as run, \
+                patch.object(sys, "argv", ["runner", "--co", "CO-0649", "--revision", REVISION,
+                                           "--route", runner.SURFACE_ENGINE, "--diagnose-confirm"]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(), 0)
+        run.assert_called_once_with("CO-0649", REVISION, dry_run=False, route=runner.SURFACE_ENGINE, diagnose=True)
 
     def test_dry_run_fill_failure_still_cancels_and_skips_the_gate(self):
         tracker: dict = {}
@@ -3729,7 +3744,7 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         scenario.update(extra)
         return scenario
 
-    def _run(self, scenario, source=None, **patches):
+    def _run(self, scenario, source=None, **run_kwargs):
         helper = RunEndToEndTests("test_readback_verified_happy_path")
         self.addCleanup(helper.doCleanups)
         tracker: dict = {}
@@ -3743,9 +3758,77 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
                 patch.object(runner, "READBACK_PATH", self.readbacks), \
                 patch.object(runner, "DIAGNOSTICS_PATH", self._temp_path("diag.json")), \
                 patch.object(runner, "_attach_attended_browser", helper._attach(page, tracker)):
-            result = runner.run("CO-0801", SURFACE_REVISION, review_wait_seconds=1, route=runner.SURFACE_ENGINE)
+            result = runner.run("CO-0801", SURFACE_REVISION, review_wait_seconds=1, route=runner.SURFACE_ENGINE,
+                                **run_kwargs)
         self.tracker = tracker
         return result, page
+
+    @staticmethod
+    def _events():
+        return json.loads(runner.RUN_LOG_PATH.read_text(encoding="utf-8"))["runs"][-1]["events"]
+
+    def _confirm_enabled_when(self, condition):
+        original = _RPControl.is_enabled
+        return patch.object(_RPControl, "is_enabled",
+                            lambda control: condition(control.page) if control.kind == "confirm" else original(control))
+
+    def test_dry_run_with_disabled_confirm_fails_and_cancels(self):
+        # Live 2026-09-30 (CO-0649): the fill verified but Confirm stayed
+        # disabled. A dry run must now catch that instead of reporting success.
+        with self._confirm_enabled_when(lambda page: False):
+            result, page = self._run(self._scenario(), dry_run=True)
+        self.assertEqual(result, "dry_run_confirm_not_enabled")
+        self.assertFalse(page.confirmed)
+        self.assertTrue(page.cancelled)
+        self.assertFalse(self.state.exists())  # the one-time gate is untouched
+        steps = [(e["step"], e["outcome"]) for e in self._events()]
+        self.assertIn(("confirm_enable", "disabled"), steps)
+
+    def test_dry_run_requires_and_logs_an_enabled_confirm(self):
+        result, page = self._run(self._scenario(), dry_run=True)
+        self.assertEqual(result, "dry_run_fill_verified")
+        self.assertFalse(page.confirmed)
+        self.assertIn(("confirm_enable", "enabled"), [(e["step"], e["outcome"]) for e in self._events()])
+
+    def test_diagnose_finds_the_single_blocking_change_and_restores_it(self):
+        blocked_by_duration = self._confirm_enabled_when(
+            lambda page: page.filled.get(runner.SURFACE_MAX_SCAN_DURATION_LABEL) == "24")
+        with blocked_by_duration:
+            result, page = self._run(self._scenario(), diagnose=True)
+        self.assertEqual(result, "diagnose_confirm_blocker_found")
+        self.assertFalse(page.confirmed)
+        self.assertTrue(page.cancelled)
+        self.assertFalse(self.state.exists())
+        probes = {e["field"]: e["outcome"] for e in self._events() if e["step"] == "diagnose_probe"}
+        self.assertEqual(probes["max_scan_duration_24"], "enables_confirm")
+        self.assertEqual(probes["alternate_domains_blank"], "no_change")
+        self.assertEqual(probes["scanning_interval_none"], "no_change")
+        self.assertNotIn("undo_failed", probes.values())
+        # Every probe put the planned value back before the next one.
+        self.assertEqual(page.filled[runner.SURFACE_MAX_SCAN_DURATION_LABEL], "90")
+        plan = runner.build_surface_only_fill(_surface_source(), RUN_DAY)
+        self.assertEqual(page.filled[runner.ALTERNATE_DOMAINS_LABEL], plan["texts"][runner.ALTERNATE_DOMAINS_LABEL])
+        self.assertEqual(page.selected["Scanning interval"], plan["selects"]["Scanning interval"])
+
+    def test_diagnose_without_a_single_blocking_change_reports_unknown(self):
+        with self._confirm_enabled_when(lambda page: False):
+            result, page = self._run(self._scenario(), diagnose=True)
+        self.assertEqual(result, "diagnose_confirm_blocker_unknown")
+        self.assertFalse(page.confirmed)
+        self.assertTrue(page.cancelled)
+
+    def test_form_validation_report_is_logged_without_values(self):
+        report = {"controls": ["Maximum scan Duration (hours) [invalid:Value must be <= 72;min=1;max=72;step=1]"],
+                  "messages": ["Invalid domain " + SURFACE_ALT], "confirm": ["disabled=true aria-disabled=null title="]}
+        with self._confirm_enabled_when(lambda page: False), \
+                patch.object(_RPPage, "evaluate", lambda self, script, *a: report, create=True):
+            result, _page = self._run(self._scenario(), dry_run=True)
+        self.assertEqual(result, "dry_run_confirm_not_enabled")
+        raw = runner.RUN_LOG_PATH.read_text(encoding="utf-8")
+        self.assertNotIn(SURFACE_ALT, raw)
+        details = [e.get("detail", "") for e in self._events() if e["step"] == "form_validation"]
+        self.assertTrue(any("max=72" in d for d in details))
+        self.assertTrue(any("<domain>" in d or "<value>" in d for d in details))
 
     def test_happy_path_creates_and_reads_back_a_scanning_tenant(self):
         result, page = self._run(self._scenario())
