@@ -75,6 +75,23 @@ questions below are still required before the route is built.
 - First version: create + readback, then the scan-status sweep. Salesforce updates and
   customer-user creation stay manual.
 
+## Live Add Account form defaults (no-submit probe, 2026-09-29)
+
+Observed with Advanced options expanded; the form was cancelled, nothing created.
+
+- **Maximum scan Duration (hours)**: number input, only visible after expanding Advanced
+  options, no name/data-am, **default 24** (Guru wants 90 → must be set).
+- **Number of subdomains**: number input, **default 50000** (must be overwritten).
+  Number of assets / Number of domains: empty text inputs.
+- Toggle defaults: MFA ON, Scan now ON, Automated discovery ON, Recon Subdomains ON,
+  Multiple attack stacks OFF, MAS for subdomains disabled, Web dictionary brute force ON,
+  Web dorking OFF, **Nuclei OFF**, Authenticated Testing OFF, Static outbound IP OFF, AI OFF,
+  Web Agent disabled, Notifications ON, Multiple users ON, API access ON, Phishing OFF,
+  Leaked Credentials OFF (its interval and scanned-domains fields are disabled while OFF),
+  Include Provisioning ON, Include subdomains ON.
+- Scanning interval default None (None/Daily/Weekly/Monthly); License Type default Evaluation.
+- Operator Account: react-select, placeholder "Select Operator Accounts", nothing selected.
+
 ## Differences from the CE-only route (Case 2)
 
 - Company name has no `- CE Only` suffix.
