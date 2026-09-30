@@ -3845,7 +3845,27 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertNotIn("leakedCredentialsAllowed", turned_on)
         self.assertNotIn("phishingEnabled", turned_on)
         self.assertFalse(page.checkbox_states["leakedCredentialsAllowed"])
-        self.assertTrue(page.checkbox_states["apiAccessAllowed"])  # every toggle probe was undone
+        self.assertNotIn("undo_failed", probes.values())  # every single-change probe was undone
+        # The cumulative groups then ran (left applied; the form is cancelled).
+        steps = [(e["step"], e["outcome"]) for e in self._events()]
+        self.assertIn(("diagnose_cumulative", "still_disabled"), steps)
+
+    def test_diagnose_cumulative_groups_find_a_combined_blocker_without_lc(self):
+        # Confirm enables only once two fields change together: no single
+        # probe finds it, the cumulative CE-like groups do (never touching LC).
+        def combined(page):
+            return (page.filled.get(runner.ALTERNATE_DOMAINS_LABEL) == ""
+                    and page.filled.get("Number of assets") == "1")
+        with self._confirm_enabled_when(combined):
+            result, page = self._run(self._scenario(), diagnose=True)
+        self.assertEqual(result, "diagnose_confirm_blocker_combined")
+        self.assertFalse(page.confirmed)
+        self.assertTrue(page.cancelled)
+        self.assertFalse(page.checkbox_states["leakedCredentialsAllowed"])
+        self.assertFalse(page.checkbox_states["phishingEnabled"])
+        groups = {e["field"]: e["outcome"] for e in self._events() if e["step"] == "diagnose_group"}
+        self.assertEqual(groups["numbers_ce_like"], "no_change")
+        self.assertEqual(groups["alternate_domains_blank"], "enables_confirm")
 
     def test_diagnose_logs_the_react_form_errors_without_values(self):
         state = {"errors": ["leakedCredentialsScanningInterval: Required", "licenseDomains: Invalid " + SURFACE_ALT],

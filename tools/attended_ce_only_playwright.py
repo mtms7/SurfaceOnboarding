@@ -3380,6 +3380,94 @@ def _log_react_form_state(page: Any, stage: str = "") -> None:
               "errors={} flags={}".format(len(state.get("errors") or []), len(state.get("flags") or [])))
 
 
+def _log_react_component_keys(page: Any, stage: str = "") -> None:
+    """Log the shape of the components above Confirm: names and booleans only.
+
+    For the first ancestors of the Confirm button: each component's prop
+    names (booleans with their value, other types as their type name) and
+    each hook state's keys (booleans with value). Strings, numbers, and
+    nested values are never returned. Used to spot an internal validity flag
+    when the form library keeps no errors object.
+    """
+    log = _log()
+    try:
+        shapes = page.evaluate(
+            """() => {
+                const button = Array.from(document.querySelectorAll('button'))
+                    .find(b => (b.textContent || '').trim() === 'Confirm');
+                if (!button) return ['no-confirm-button'];
+                const key = Object.keys(button).find(k => k.startsWith('__reactFiber$')
+                    || k.startsWith('__reactInternalInstance$'));
+                if (!key) return ['no-react-fiber'];
+                const describe = (v) => typeof v === 'boolean' ? String(v)
+                    : v === null ? 'null' : Array.isArray(v) ? 'array' : typeof v;
+                const shape = (obj, limit) => Object.keys(obj).slice(0, limit)
+                    .map(k => k + ':' + describe(obj[k])).join(',');
+                const out = [];
+                let fiber = button[key];
+                for (let depth = 0; fiber && depth < 18; depth++, fiber = fiber.return) {
+                    if (typeof fiber.type === 'string') continue;  // host elements
+                    const name = (fiber.type && (fiber.type.displayName || fiber.type.name)) || '?';
+                    const props = fiber.memoizedProps;
+                    if (props && typeof props === 'object')
+                        out.push(depth + ':' + name + ' props{' + shape(props, 40) + '}');
+                    let hook = fiber.memoizedState;
+                    for (let i = 0; hook && typeof hook === 'object' && 'next' in hook && i < 40; i++, hook = hook.next) {
+                        const v = hook.memoizedState;
+                        if (typeof v === 'boolean') out.push(depth + ':' + name + ' hook' + i + '=' + v);
+                        else if (v && typeof v === 'object' && !Array.isArray(v) && !('current' in v)
+                                 && !('deps' in v) && Object.keys(v).length <= 60)
+                            out.push(depth + ':' + name + ' hook' + i + '{' + shape(v, 60) + '}');
+                    }
+                    if (out.length >= 60) break;
+                }
+                return out.slice(0, 60);
+            }""")
+    except Exception as exc:
+        log.error("react_component_keys", stage or "report", exc)
+        return
+    for item in (shapes if isinstance(shapes, list) else [])[:60]:
+        log.event("react_component_keys", "shape", stage, str(item))
+
+
+def _diagnose_cumulative(page: Any, confirm: Any, plan: dict[str, Any]) -> list[str]:
+    """Apply CE-like changes in cumulative groups (never Leaked Credentials or
+    Phishing), checking Confirm after each group. Not undone: the form is
+    cancelled right after. Returns the group names that left Confirm enabled."""
+    log = _log()
+    texts = plan.get("texts", {})
+    enabled_after: list[str] = []
+
+    def group(name: str, steps: list[Any]) -> None:
+        applied = 0
+        for step in steps:
+            try:
+                applied += 1 if step() else 0
+            except Exception as exc:
+                log.error("diagnose_group", name, exc)
+        enabled = _confirm_is_enabled_now(page, confirm)
+        log.event("diagnose_group", "enables_confirm" if enabled else "no_change", name, f"applied={applied}/{len(steps)}")
+        if enabled:
+            enabled_after.append(name)
+
+    numbers = [lambda label=label: _set_text_value(page, label, "1")
+               for label in ("Number of assets", "Number of domains", "Number of subdomains") if label in texts]
+    if SURFACE_MAX_SCAN_DURATION_LABEL in plan.get("advanced_texts", {}):
+        numbers.append(lambda: _set_text_value(page, SURFACE_MAX_SCAN_DURATION_LABEL, "24", advanced=True))
+    group("numbers_ce_like", numbers)
+    keep_on = {"mfaRequired", "provisioningEnabled", "subDomainsNumberAllowed"}  # ON in the CE plan too
+    group("surface_toggles_off", [lambda key=key: _set_checkbox(page, key, False)
+                                  for key, target in plan.get("checkboxes", {}).items()
+                                  if target is True and key not in keep_on and key not in DIAGNOSE_NEVER_ENABLE])
+    if ALTERNATE_DOMAINS_LABEL in texts:
+        group("alternate_domains_blank", [lambda: _set_text_value(page, ALTERNATE_DOMAINS_LABEL, "")])
+    if plan.get("selects", {}).get("Scanning interval") not in (None, "None"):
+        group("interval_none_scan_now_off", [lambda: _fill_select(page, "Scanning interval", "None") is None,
+                                             lambda: _set_checkbox(page, "scan_now", False)])
+    log.event("diagnose_cumulative", "enabled" if enabled_after else "still_disabled", detail=",".join(enabled_after))
+    return enabled_after
+
+
 def _confirm_is_enabled_now(page: Any, confirm: Any) -> bool:
     page.wait_for_timeout(DIAGNOSE_SETTLE_MS)
     try:
@@ -3455,6 +3543,7 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
             log.event("diagnose_probe", "undo_failed", name)
 
     _log_react_form_state(page)
+    _log_react_component_keys(page)
     # 1. Touch every field: surfaces the form's own per-field errors, if any.
     touched = _touch_form_fields(page)
     enabled = touched and _confirm_is_enabled_now(page, confirm)
@@ -3518,7 +3607,13 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
               lambda: _fill_select(page, "Scanning interval", "None") is None,
               lambda: _fill_select(page, "Scanning interval", interval) is None)
     log.event("diagnose_confirm", "found" if found else "unknown", detail=",".join(found))
-    return "diagnose_confirm_blocker_found" if found else "diagnose_confirm_blocker_unknown"
+    if found:
+        return "diagnose_confirm_blocker_found"
+    # No single change helped: try cumulative CE-like groups (last; the form
+    # is cancelled right after, so nothing is undone).
+    if _diagnose_cumulative(page, confirm, plan):
+        return "diagnose_confirm_blocker_combined"
+    return "diagnose_confirm_blocker_unknown"
 
 
 def _fill_select(page: Any, label: str, option: str) -> str | None:
