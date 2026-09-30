@@ -73,7 +73,8 @@ ATTENDED_CE_ONLY_RUNNER = Path(__file__).resolve().with_name("attended_ce_only_p
 # Local operator acknowledgements for post-onboarding reminders (gitignored).
 # It never drives Leonardo or Salesforce; it only hides a reminder.
 ATTENDED_REMINDERS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_reminders.json"
-REMINDER_FIELDS = {"scan_settings_off": "scan_settings_off_on", "ce_enabled": "ce_enabled_on"}
+REMINDER_FIELDS = {"scan_settings_off": "scan_settings_off_on", "ce_enabled": "ce_enabled_on",
+                   "operator_assigned": "operator_assigned_on"}
 LEONARDO_READBACK_STATES = frozenset({"Account Scanning", "No scan started"})
 CASE4_PRODUCT = "Surface & Credential Exposure"
 CASE4_TYPE = "Renewal of Surface + New Credential Exposure Module"
@@ -1893,6 +1894,7 @@ RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "surface_subscription_invalid": ("blocked", "A Surface subscription row has no status or invalid dates. Nothing was created. Verify the DealHub subscription."),
     "surface_main_domain_invalid": ("blocked", "The Main Domain must be one valid registrable root domain (not a subdomain, public suffix, or network). Nothing was created."),
     "surface_domains_invalid": ("blocked", "An Alternate Domains entry is malformed or a wildcard. Nothing was created. Correct the Salesforce value."),
+    "surface_domains_exceed_license": ("blocked", "The CO lists more domains (main + alternate) than the licensed subdomains allow. Nothing was created. Check the Salesforce domains and the DealHub subdomain add-ons."),
     "surface_networks_not_supported": ("blocked", "Alternate Domains contains a network or IP address; networks are not supported by this route yet. Nothing was created."),
     "surface_license_dates_unavailable": ("blocked", "The Surface license expiration (from the baseline subscription) is not after today, so no valid license can start today. Nothing was created."),
     "max_scan_duration_schema_unavailable": ("blocked", "The Advanced options \"Maximum scan Duration (hours)\" control could not be found. Nothing was created. The run log records the lookup."),
@@ -2215,6 +2217,9 @@ def _ce_only_onboard_section(reference: str) -> str:
 SCAN_REMINDER_TEXT = ("Scan now / scanning interval are ON for this Leonardo Development tenant — "
                       "turn them off later")
 CE_REMINDER_TEXT = "Core Plus (Credential Exposure) purchased — enable Credential Exposure later"
+# Owner decision 2026-09-30: the runner leaves Operator Account empty; it is
+# assigned (TA/CSM from Salesforce) after the first scan finishes.
+OPERATOR_REMINDER_TEXT = "Operator Account left empty — assign the TA/CSM from Salesforce after the first scan finishes"
 
 
 def _surface_start_form(evaluation: SurfaceScopePreflight) -> str:
@@ -2334,7 +2339,12 @@ def _surface_onboard_section(reference: str) -> str:
             and not reminders.get(REMINDER_FIELDS["scan_settings_off"])):
         reminder_html += _reminder(SCAN_REMINDER_TEXT, "/attended/mark-scan-settings-off", reference,
                                    "Mark scan settings turned off")
-    for kind, label in (("scan_settings_off", "Scan settings marked off"), ("ce_enabled", "Credential Exposure marked enabled")):
+    if (record is not None and record.get("route") == SURFACE_ENGINE and record.get("result") == "readback_verified"
+            and not reminders.get(REMINDER_FIELDS["operator_assigned"])):
+        reminder_html += _reminder(OPERATOR_REMINDER_TEXT, "/attended/mark-operator-assigned", reference,
+                                   "Mark Operator Account assigned")
+    for kind, label in (("scan_settings_off", "Scan settings marked off"), ("ce_enabled", "Credential Exposure marked enabled"),
+                        ("operator_assigned", "Operator Account marked assigned")):
         if reminders.get(REMINDER_FIELDS[kind]):
             reminder_html += "<p class='note'>" + label + " on " + escape(reminders[REMINDER_FIELDS[kind]]) + ".</p>"
     reset_action = ""
@@ -2396,7 +2406,7 @@ POST_ROUTES = frozenset({
     "/attended/rerun-ce-only-fill-preflight", "/attended/rerun-co0702-fill-preflight",
     "/attended/start-ce-only-runner", "/attended/start-co0702-ce-only-runner", "/attended/reset-ce-only-runner",
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
-    "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
+    "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding",
 })
 
@@ -2617,10 +2627,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
             return
-        if path in ("/attended/mark-scan-settings-off", "/attended/mark-ce-enabled"):
+        if path in ("/attended/mark-scan-settings-off", "/attended/mark-ce-enabled", "/attended/mark-operator-assigned"):
             # Local acknowledgements only: no Leonardo, browser, or Salesforce write.
-            if path == "/attended/mark-scan-settings-off":
-                kind = "scan_settings_off"
+            if path in ("/attended/mark-scan-settings-off", "/attended/mark-operator-assigned"):
+                kind = "scan_settings_off" if path == "/attended/mark-scan-settings-off" else "operator_assigned"
                 try:
                     record = load_runner_state().get(reference)
                 except RunnerStateUnavailable:

@@ -3583,9 +3583,22 @@ class SurfaceFillSourceTests(unittest.TestCase):
             source = runner.surface_fill_source("CO-0801")
         self.assertEqual((source.tenant_name, source.main_domain, source.alternate_domains, source.subdomains),
                          (SURFACE_TENANT, SURFACE_MAIN, (SURFACE_ALT,), (SURFACE_SUB,)))
-        self.assertEqual((source.number_of_domains, source.entitlement.licensed_subdomains), (2, 500))
+        self.assertEqual((source.listed_domains, source.number_of_domains, source.entitlement.licensed_subdomains),
+                         (2, 500, 500))  # owner rule 2026-09-30: domains = licensed subdomains
         self.assertEqual(source.primary_user_alias, ce_only_names(SURFACE_ACCOUNT).primary_user_alias)
         self.assertTrue(source.core_plus_present)
+
+    def test_listed_domains_beyond_the_licensed_subdomains_fail_closed(self):
+        # Owner rule 2026-09-30: Number of domains = licensed subdomains; the
+        # CO's own domains (main + alternates) must fit in it.
+        tiny = runner.SurfaceEntitlement(tier="go", scanning_interval="Monthly", baseline_subdomains=1,
+                                         addon_subdomains=0, product_domains=None,
+                                         subscription_start=date(2026, 9, 1), subscription_end=date(2027, 8, 31))
+        with self._patch([self.CO], [_dealhub("Pentera Surface Go - 500 Subdomains")]), \
+                patch.object(runner, "select_surface_entitlement", return_value=tiny), \
+                self.assertRaises(runner.SurfaceSourceError) as caught:
+            runner.surface_fill_source("CO-0801")
+        self.assertEqual(str(caught.exception), "surface_domains_exceed_license")
 
     def test_route_gate_requires_exact_values_before_the_subscription_read(self):
         for product, onboarding_type in (("Credential Exposure", "New Product Onboarding"),
@@ -3634,7 +3647,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
             "Last name": "Stevenson",
             "Organization Email": "milton.stevenson+ssc@pentera.io",
             "Number of assets": "10000",
-            "Number of domains": "2",
+            "Number of domains": "750",  # owner rule 2026-09-30: = licensed subdomains
             "Number of subdomains": "750",
         })
         self.assertEqual(plan["selects"], {"Account Type": "Customer", "Country": "France",
@@ -3668,7 +3681,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
         self.assertNotIn("SubDomains (Comma Separated Values)", plan["texts"])
         self.assertEqual(plan["blank_texts"][:2], ("Alternate Domains (Comma Separated Values)",
                                                    "SubDomains (Comma Separated Values)"))
-        self.assertEqual(plan["texts"]["Number of domains"], "1")
+        self.assertEqual(plan["texts"]["Number of domains"], plan["texts"]["Number of subdomains"])
 
     def test_prime_interval_and_multiple_values_csv(self):
         source = _surface_source(alternates=("a-sample.example", "b-sample.example"),
@@ -3679,7 +3692,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
         self.assertEqual(plan["texts"]["Alternate Domains (Comma Separated Values)"], "a-sample.example, b-sample.example")
         self.assertEqual(plan["texts"]["SubDomains (Comma Separated Values)"],
                          "x.surface-sample.example, y.surface-sample.example")
-        self.assertEqual((plan["texts"]["Number of domains"], plan["texts"]["Number of subdomains"]), ("3", "1000"))
+        self.assertEqual((plan["texts"]["Number of domains"], plan["texts"]["Number of subdomains"]), ("1000", "1000"))
 
     def test_core_plus_on_the_account_keeps_leaked_credentials_off(self):
         plan = runner.build_surface_only_fill(_surface_source(core_plus=True), RUN_DAY)
@@ -3707,7 +3720,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
         summary = runner.surface_scope_summary(_surface_source(addons=250, core_plus=True), RUN_DAY)
         self.assertEqual(summary, {
             "tier": "go", "scanning_interval": "Monthly", "main_domains": 1, "alternate_root_domains": 1,
-            "requested_subdomains": 1, "number_of_domains": 2, "baseline_subdomains": 500,
+            "requested_subdomains": 1, "number_of_domains": 750, "baseline_subdomains": 500,
             "addon_subdomains": 250, "licensed_subdomains": 750, "product_domains": None, "assets": 10000,
             "license_start": "2026-09-29", "license_end": "2027-08-31", "large_scope": True,
             "core_plus_present": True,
@@ -3811,11 +3824,43 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertEqual(page.selected["Scanning interval"], plan["selects"]["Scanning interval"])
 
     def test_diagnose_without_a_single_blocking_change_reports_unknown(self):
-        with self._confirm_enabled_when(lambda page: False):
+        turned_on = []
+        original_click = _RPCheckboxControl.click
+
+        def click(control, **kwargs):
+            original_click(control, **kwargs)
+            if control.page.checkbox_states[control.key]:
+                turned_on.append(control.key)
+
+        with self._confirm_enabled_when(lambda page: False), patch.object(_RPCheckboxControl, "click", click):
             result, page = self._run(self._scenario(), diagnose=True)
         self.assertEqual(result, "diagnose_confirm_blocker_unknown")
         self.assertFalse(page.confirmed)
         self.assertTrue(page.cancelled)
+        probes = {e["field"]: e["outcome"] for e in self._events() if e["step"] == "diagnose_probe"}
+        for name in ("number_of_assets_1", "company_name_plain", "organization_email_plain",
+                     "toggle_off:apiAccessAllowed", "toggle_off:fullNucleiScanEnabled"):
+            self.assertEqual(probes.get(name), "no_change", name)
+        # No CE on a Surface-only tenant: no probe ever turned these ON.
+        self.assertNotIn("leakedCredentialsAllowed", turned_on)
+        self.assertNotIn("phishingEnabled", turned_on)
+        self.assertFalse(page.checkbox_states["leakedCredentialsAllowed"])
+        self.assertTrue(page.checkbox_states["apiAccessAllowed"])  # every toggle probe was undone
+
+    def test_diagnose_logs_the_react_form_errors_without_values(self):
+        state = {"errors": ["leakedCredentialsScanningInterval: Required", "licenseDomains: Invalid " + SURFACE_ALT],
+                 "flags": ["7:Formik.props.isValid=false"], "props": ["2:Button.disabled=true"],
+                 "sources": ["7:Formik.props.errors keys=2"]}
+        with self._confirm_enabled_when(lambda page: False), \
+                patch.object(_RPPage, "evaluate", lambda self, script, *a: state if "__reactFiber" in script else None,
+                             create=True):
+            result, _page = self._run(self._scenario(), diagnose=True)
+        self.assertEqual(result, "diagnose_confirm_blocker_unknown")
+        raw = runner.RUN_LOG_PATH.read_text(encoding="utf-8")
+        self.assertNotIn(SURFACE_ALT, raw)
+        details = [e.get("detail", "") for e in self._events() if e["step"] == "react_form_state"]
+        self.assertIn("leakedCredentialsScanningInterval: Required", details)
+        self.assertIn("7:Formik.props.isValid=false", details)
 
     def test_form_validation_report_is_logged_without_values(self):
         report = {"controls": ["Maximum scan Duration (hours) [invalid:Value must be <= 72;min=1;max=72;step=1]"],

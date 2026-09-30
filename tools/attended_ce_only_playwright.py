@@ -181,6 +181,8 @@ FIELD_TIMEOUT_MS = 5_000
 TOGGLE_CLICK_TIMEOUT_MS = 2_000
 CONFIRM_ENABLE_POLLS = 12  # x 250 ms
 DIAGNOSE_SETTLE_MS = 700  # per no-submit Confirm probe (--diagnose-confirm)
+# Toggles no diagnostic probe may ever switch ON (a Surface-only tenant has no CE).
+DIAGNOSE_NEVER_ENABLE = frozenset({"leakedCredentialsAllowed", "phishingEnabled"})
 FORM_CLOSE_POLL_SECONDS = 0.5
 # Server-side tenant search (getAllDetailedAccounts per edit, HAR-verified):
 # wait for the response that carries this lookup instead of a fixed sleep.
@@ -202,7 +204,7 @@ ADVANCED_TOGGLES_OFF = (
 )
 ADVANCED_EXPAND_POLLS = 20  # x 100 ms
 RUN_LOG_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_run_log.json"
-RUN_LOG_MAX_EVENTS = 300
+RUN_LOG_MAX_EVENTS = 500
 RUN_LOG_MAX_RUNS = 20
 RUN_LOG_DETAIL_CHARS = 300
 RUN_LOG_MAX_DIAGNOSTICS = 3
@@ -769,9 +771,18 @@ class SurfaceFillSource:
     primary_user_alias: str
 
     @property
-    def number_of_domains(self) -> int:
-        """Owner rule: 1 (main) + the alternate root domains."""
+    def listed_domains(self) -> int:
+        """Domains the CO lists: 1 (main) + the alternate root domains."""
         return 1 + len(self.alternate_domains)
+
+    @property
+    def number_of_domains(self) -> int:
+        """Owner rule 2026-09-30: the licensed subdomains (baseline + DealHub add-ons).
+
+        Replaces the 2026-09-29 rule (1 + alternate roots). The listed domains
+        must fit in it (surface_fill_source fails closed otherwise).
+        """
+        return self.entitlement.licensed_subdomains
 
     @property
     def subscription_start(self) -> date:
@@ -826,6 +837,8 @@ def surface_fill_source(reference: str, run_day: date | None = None) -> SurfaceF
             "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
             "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
         entitlement = select_surface_entitlement(subscription_rows, run_day)
+        if 1 + len(roots) > entitlement.licensed_subdomains:
+            raise SurfaceSourceError("surface_domains_exceed_license")
         return SurfaceFillSource(
             reference, revision, account_id, " ".join(account_name.split()), " ".join(country.split()),
             main, roots, subdomains, entitlement, names.tenant_name, names.primary_user_alias)
@@ -875,8 +888,9 @@ def build_surface_only_fill(source: SurfaceFillSource, run_day: date | None = No
     interval per tier; Scan now ON; Surface advanced profile with Maximum scan
     Duration 90 h; Notifications/Multiple users/API ON; Phishing and Leaked
     Credentials OFF (their interval/domains untouched); Provisioning and
-    Subdomains ON; Prepaid annual subscription, 10000 assets, 1 + alternate
-    roots domains, baseline + add-on subdomains; CE date rule.
+    Subdomains ON; Prepaid annual subscription, 10000 assets, domains and
+    subdomains both = baseline + add-on subdomains (owner rule 2026-09-30);
+    CE date rule.
     """
     start, end = surface_run_license_dates(source, run_day)
     texts: dict[str, str] = {
@@ -940,7 +954,7 @@ def surface_scope_summary(source: SurfaceFillSource, run_day: date | None = None
 
     entitlement = source.entitlement
     start, end = surface_run_license_dates(source, run_day)
-    counts = ScopeCounts(root_domains=source.number_of_domains, subdomains=len(source.subdomains),
+    counts = ScopeCounts(root_domains=source.listed_domains, subdomains=len(source.subdomains),
                          licensed_domains=source.number_of_domains,
                          licensed_subdomains=entitlement.licensed_subdomains)
     return {
@@ -3223,6 +3237,16 @@ def _log_form_validation(page: Any, stage: str = "") -> None:
                     if (el.type === 'number') flags.push('min=' + el.min, 'max=' + el.max, 'step=' + el.step);
                     if (flags.length) controls.push(name + ' [' + flags.join(';') + ']');
                 }
+                // Settings dropdowns: the selected option text (never Country,
+                // which is source data) and whether the control is disabled.
+                const selects = [];
+                for (const el of root.querySelectorAll('select')) {
+                    const name = el.getAttribute('name') || labelOf(el) || 'select';
+                    if (name === 'accountCountry') continue;
+                    const opt = el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                    selects.push(name.slice(0, 60) + '=' + (opt ? String(opt.textContent || '').trim().slice(0, 60) || '<blank>' : '<none>')
+                        + (el.disabled ? ' (disabled)' : '') + ' options=' + el.options.length);
+                }
                 const messages = [];
                 const selector = '.Mui-error, .MuiFormHelperText-root, [role="alert"], [class*="error" i], '
                     + '[class*="invalid" i], [class*="warning" i]';
@@ -3240,7 +3264,7 @@ def _log_form_validation(page: Any, stage: str = "") -> None:
                     + ' aria-disabled=' + b.getAttribute('aria-disabled')
                     + ' title=' + String(b.getAttribute('title')
                         || (b.parentElement && b.parentElement.getAttribute('title')) || '').slice(0, 100));
-                return {controls: controls.slice(0, 60), messages: messages, confirm: confirm};
+                return {controls: controls.slice(0, 60), selects: selects.slice(0, 20), messages: messages, confirm: confirm};
             }""",
             ADD_ACCOUNT_MODAL_SELECTOR)
     except Exception as exc:
@@ -3249,12 +3273,111 @@ def _log_form_validation(page: Any, stage: str = "") -> None:
     if not isinstance(report, dict):
         log.event("form_validation", "unreadable", stage)
         return
-    for kind in ("controls", "messages", "confirm"):
+    for kind in ("controls", "selects", "messages", "confirm"):
         items = report.get(kind)
         for item in (items if isinstance(items, list) else [])[:60]:
             log.event("form_validation", kind.rstrip("s"), stage, _redact_domains(item))
     log.event("form_validation", "reported", stage,
               "controls={} messages={}".format(len(report.get("controls") or []), len(report.get("messages") or [])))
+
+
+def _log_react_form_state(page: Any, stage: str = "") -> None:
+    """Log the React form library's own validation state, without values.
+
+    Walks the React fiber tree up from the Confirm button (bounded) and
+    reports (a) any ``errors`` object found in component props, hook state,
+    or context (Formik / react-hook-form style) as field paths with their
+    messages, (b) scalar form flags such as isValid/dirty, and (c) boolean
+    props named like valid/disabled/error on the Confirm button's ancestors.
+    ``values`` are never read. Messages are domain-redacted and the run log
+    also redacts every known source value. Best effort only.
+    """
+    log = _log()
+    try:
+        state = page.evaluate(
+            """(modalSelector) => {
+                const out = {errors: [], flags: [], props: [], sources: []};
+                const button = Array.from(document.querySelectorAll('button'))
+                    .find(b => (b.textContent || '').trim() === 'Confirm');
+                const start = button || document.querySelector(modalSelector);
+                if (!start) { out.flags.push('no-start-element'); return out; }
+                const key = Object.keys(start).find(k => k.startsWith('__reactFiber$')
+                    || k.startsWith('__reactInternalInstance$'));
+                if (!key) { out.flags.push('no-react-fiber'); return out; }
+                const seen = new WeakSet();
+                const flatten = (obj, path, depth) => {
+                    if (out.errors.length >= 40 || depth > 5 || obj === null || obj === undefined) return;
+                    if (typeof obj === 'string') { out.errors.push(path + ': ' + obj.slice(0, 100)); return; }
+                    if (typeof obj !== 'object') { out.errors.push(path + ': ' + String(obj).slice(0, 40)); return; }
+                    if (typeof obj.message === 'string') { out.errors.push(path + ': ' + obj.message.slice(0, 100)); return; }
+                    for (const k of Object.keys(obj).slice(0, 60)) {
+                        if (k === 'ref' || k.startsWith('_')) continue;
+                        flatten(obj[k], path ? path + '.' + k : k, depth + 1);
+                    }
+                };
+                const flagKeys = ['isValid', 'dirty', 'isDirty', 'isSubmitting', 'isValidating', 'submitCount', 'valid'];
+                const inspect = (obj, where, depth) => {
+                    if (!obj || typeof obj !== 'object' || depth > 2) return;
+                    if (seen.has(obj)) return;
+                    seen.add(obj);
+                    if (obj.errors && typeof obj.errors === 'object' && !Array.isArray(obj.errors)) {
+                        out.sources.push(where + '.errors keys=' + Object.keys(obj.errors).length);
+                        flatten(obj.errors, '', 0);
+                    }
+                    for (const k of flagKeys) {
+                        if (k in obj && ['boolean', 'number'].includes(typeof obj[k])) out.flags.push(where + '.' + k + '=' + obj[k]);
+                    }
+                    for (const k of ['formik', 'formState', '_formState', 'form', 'control']) {
+                        if (obj[k] && typeof obj[k] === 'object') inspect(obj[k], where + '.' + k, depth + 1);
+                    }
+                };
+                const typeName = (f) => (f.type && (f.type.displayName || f.type.name))
+                    || (typeof f.type === 'string' ? f.type : '?');
+                let fiber = start[key];
+                for (let depth = 0; fiber && depth < 60; depth++, fiber = fiber.return) {
+                    const name = depth + ':' + typeName(fiber);
+                    const props = fiber.memoizedProps;
+                    inspect(props, name + '.props', 0);
+                    if (depth < 12 && props && typeof props === 'object') {
+                        for (const k of Object.keys(props)) {
+                            if (typeof props[k] === 'boolean'
+                                    && /valid|disabl|error|dirty|submit|ready|complete|missing|required|allow/i.test(k))
+                                out.props.push(name + '.' + k + '=' + props[k]);
+                        }
+                    }
+                    let hook = fiber.memoizedState;
+                    inspect(hook, name + '.state', 0);
+                    for (let i = 0; hook && typeof hook === 'object' && 'next' in hook && i < 40; i++, hook = hook.next) {
+                        inspect(hook.memoizedState, name + '.hook' + i, 0);
+                    }
+                    let context = fiber.dependencies && fiber.dependencies.firstContext;
+                    for (let j = 0; context && j < 10; j++, context = context.next) {
+                        inspect(context.memoizedValue, name + '.context' + j, 0);
+                    }
+                }
+                const unique = (list, n) => Array.from(new Set(list)).slice(0, n);
+                return {errors: unique(out.errors, 40), flags: unique(out.flags, 30),
+                        props: unique(out.props, 30), sources: unique(out.sources, 10)};
+            }""",
+            ADD_ACCOUNT_MODAL_SELECTOR)
+    except Exception as exc:
+        log.error("react_form_state", stage or "report", exc)
+        return
+    if not isinstance(state, dict):
+        log.event("react_form_state", "unreadable", stage)
+        return
+    for kind in ("sources", "errors", "flags", "props"):
+        items = state.get(kind)
+        for item in (items if isinstance(items, list) else [])[:40]:
+            text = str(item)
+            if kind == "errors" and ": " in text:
+                # "field.path: message" - only the message can carry data.
+                path, message = text.split(": ", 1)
+                text = path + ": " + _redact_domains(message)
+            # sources/flags/props are code identifiers (component.prop=bool).
+            log.event("react_form_state", kind.rstrip("s"), stage, text)
+    log.event("react_form_state", "reported", stage,
+              "errors={} flags={}".format(len(state.get("errors") or []), len(state.get("flags") or [])))
 
 
 def _confirm_is_enabled_now(page: Any, confirm: Any) -> bool:
@@ -3331,6 +3454,7 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
         if not restored:
             log.event("diagnose_probe", "undo_failed", name)
 
+    _log_react_form_state(page)
     # 1. Touch every field: surfaces the form's own per-field errors, if any.
     touched = _touch_form_fields(page)
     enabled = touched and _confirm_is_enabled_now(page, confirm)
@@ -3363,6 +3487,29 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
         probe("number_of_domains_1",
               lambda: _set_text_value(page, "Number of domains", "1"),
               lambda: _set_text_value(page, "Number of domains", domains))
+    assets = texts.get("Number of assets")
+    if assets and assets != "1":
+        probe("number_of_assets_1",
+              lambda: _set_text_value(page, "Number of assets", "1"),
+              lambda: _set_text_value(page, "Number of assets", assets))
+    company = texts.get("Company name")
+    if company:
+        probe("company_name_plain",
+              lambda: _set_text_value(page, "Company name", "Diagnostic Probe Company"),
+              lambda: _set_text_value(page, "Company name", company))
+    email = texts.get("Organization Email")
+    plain_email = f"{CE_PRIMARY_USER_EMAIL_LOCAL}@{CE_USER_EMAIL_DOMAIN}"
+    if email and email != plain_email:
+        probe("organization_email_plain",
+              lambda: _set_text_value(page, "Organization Email", plain_email),
+              lambda: _set_text_value(page, "Organization Email", email))
+    # Each planned-ON toggle turned OFF, one at a time. Leaked Credentials and
+    # Phishing are never turned ON (owner decision: no CE on a Surface-only tenant).
+    for key, target in plan.get("checkboxes", {}).items():
+        if target is True and key not in DIAGNOSE_NEVER_ENABLE:
+            probe(f"toggle_off:{key}",
+                  lambda key=key: _set_checkbox(page, key, False),
+                  lambda key=key: _set_checkbox(page, key, True))
     # Last: switching the interval can reset dependent controls; the form is
     # cancelled right after, so no later probe depends on it.
     interval = selects.get("Scanning interval")

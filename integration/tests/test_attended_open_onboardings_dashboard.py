@@ -1305,6 +1305,34 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
         self.assertNotIn("Mark scan settings turned off", section)
         self.assertIn("Scan settings marked off on", section)
 
+    def test_operator_account_reminder_after_a_verified_surface_run(self):
+        # Owner decision 2026-09-30: Operator Account is left empty by the
+        # runner and assigned after the first scan finishes.
+        state = {"CO-0801": {"source_revision": "rev1", "route": "case_1_new_surface_only",
+                             "result": "readback_verified", "completed_on": "2026-09-30T10:00:00"}}
+        section = self._section(_surface_evaluation(), state)
+        self.assertIn(dashboard.OPERATOR_REMINDER_TEXT, section)
+        self.assertIn("action='/attended/mark-operator-assigned'", section)
+        with patch.object(dashboard, "load_runner_state", return_value=state):
+            status, location, _page = self._post("/attended/mark-operator-assigned", "reference=CO-0801")
+        self.assertEqual((status, location), (303, "/co/CO-0801"))
+        stored = json.loads(dashboard.ATTENDED_REMINDERS_PATH.read_text(encoding="utf-8"))
+        self.assertIn("operator_assigned_on", stored["CO-0801"])
+        section = self._section(_surface_evaluation(), state)
+        self.assertNotIn("Mark Operator Account assigned", section)
+        self.assertIn("Operator Account marked assigned on", section)
+        # Not shown (and refused) before a verified Surface create.
+        unverified = {"CO-0801": dict(state["CO-0801"], result="confirm_button_not_enabled")}
+        self.assertNotIn(dashboard.OPERATOR_REMINDER_TEXT, self._section(_surface_evaluation(), unverified))
+        with patch.object(dashboard, "load_runner_state", return_value=unverified):
+            status, _location, _page = self._post("/attended/mark-operator-assigned", "reference=CO-0802")
+        self.assertEqual(status, 409)
+
+    def test_domains_exceeding_the_license_block_with_a_message(self):
+        kind, message = dashboard.RUNNER_RESULT_MESSAGES["surface_domains_exceed_license"]
+        self.assertEqual(kind, "blocked")
+        self.assertIn("Nothing was created", message)
+
     def test_scan_reminder_is_refused_for_ce_or_unverified_runs(self):
         for record in ({"source_revision": "rev1", "result": "readback_verified"},
                        {"source_revision": "rev1", "route": "case_1_new_surface_only", "result": "duplicate_found"},
@@ -1360,7 +1388,8 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
         gitignore = (Path(dashboard.__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("integration/attended_scan_reminders.json", gitignore.splitlines())
         self.assertEqual(dashboard.REMINDER_FIELDS, {"scan_settings_off": "scan_settings_off_on",
-                                                     "ce_enabled": "ce_enabled_on"})
+                                                     "ce_enabled": "ce_enabled_on",
+                                                     "operator_assigned": "operator_assigned_on"})
 
 
 class SalesforceCliEncodingTests(unittest.TestCase):
