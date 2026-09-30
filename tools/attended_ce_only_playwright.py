@@ -204,7 +204,30 @@ ADVANCED_TOGGLES_OFF = (
 )
 ADVANCED_EXPAND_POLLS = 20  # x 100 ms
 RUN_LOG_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_run_log.json"
-RUN_LOG_MAX_EVENTS = 500
+RUN_LOG_MAX_EVENTS = 700
+# Diagnose timeline: which run-log steps trigger a Confirm/state snapshot.
+TIMELINE_STEP_PREFIXES = ("add_account_open", "fill_", "absent_toggle", "advanced_options", "max_scan_duration",
+                          "verify_", "pick_date", "diagnose_lc_prefill")
+# Value-free snapshot: Confirm enabled/disabled and the boolean hooks of the
+# form component (the one whose state object carries "<field>Error" keys).
+TIMELINE_SNAPSHOT_JS = """() => {
+    const b = Array.from(document.querySelectorAll('button')).find(x => (x.textContent || '').trim() === 'Confirm');
+    if (!b) return 'confirm=absent';
+    const s = 'confirm=' + (b.disabled ? 'disabled' : 'enabled');
+    const key = Object.keys(b).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'));
+    if (!key) return s;
+    let f = b[key];
+    for (let d = 0; f && d < 30; d++, f = f.return) {
+        let h = f.memoizedState; const bools = []; let form = false;
+        for (let i = 0; h && typeof h === 'object' && 'next' in h && i < 60; i++, h = h.next) {
+            const v = h.memoizedState;
+            if (typeof v === 'boolean') bools.push(i + ':' + v);
+            else if (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).some(k => /Error$/.test(k))) form = true;
+        }
+        if (form) return s + ' form_hooks=' + bools.join(',');
+    }
+    return s;
+}"""
 RUN_LOG_MAX_RUNS = 20
 RUN_LOG_DETAIL_CHARS = 300
 RUN_LOG_MAX_DIAGNOSTICS = 3
@@ -2725,6 +2748,25 @@ class RunLog:
         self.events: list[dict[str, str]] = []
         self.diagnostics: list[dict[str, Any]] = []
         self._redact: list[str] = []
+        # Diagnose timeline (--diagnose-confirm): after each form step, record
+        # Confirm's state and the form component's boolean hooks (no values),
+        # and log every Leonardo API request as it starts.
+        self.timeline = False
+        self.timeline_page: Any = None
+        self._in_timeline = False
+
+    def _timeline_snapshot(self, step: str) -> None:
+        if (not self.timeline or self.timeline_page is None or self._in_timeline
+                or not step.startswith(TIMELINE_STEP_PREFIXES)):
+            return
+        self._in_timeline = True
+        try:
+            snapshot = self.timeline_page.evaluate(TIMELINE_SNAPSHOT_JS)
+            self.event("timeline", "snapshot", step, snapshot if isinstance(snapshot, str) else "unreadable")
+        except Exception:
+            pass
+        finally:
+            self._in_timeline = False
 
     def add_redactions(self, *values: str) -> None:
         for value in values:
@@ -2750,6 +2792,7 @@ class RunLog:
             self.events.append(entry)
         except Exception:
             pass
+        self._timeline_snapshot(step)
 
     def error(self, step: str, field: str, exc: BaseException) -> None:
         message = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
@@ -2785,8 +2828,18 @@ class RunLog:
             except Exception:
                 pass
 
-        for name, handler in (("console", on_console), ("pageerror", on_page_error),
-                              ("requestfailed", on_request_failed), ("response", on_response)):
+        def on_request(request: Any) -> None:
+            try:
+                if "/api/" in request.url:
+                    self.event("browser_request", "started", _path(request.url), request.method)
+            except Exception:
+                pass
+
+        handlers = [("console", on_console), ("pageerror", on_page_error),
+                    ("requestfailed", on_request_failed), ("response", on_response)]
+        if self.timeline:
+            handlers.append(("request", on_request))
+        for name, handler in handlers:
             try:
                 page.on(name, handler)
             except Exception:
@@ -3504,6 +3557,24 @@ def _log_form_field_errors(page: Any, stage: str = "") -> None:
             log.event("form_field_errors", "empty_field", stage, f"{where} {name}")
 
 
+def _diagnose_alternate_domain_searches(page: Any, search: Any, source: Any, tenant_name: str) -> None:
+    """Read-only tenant search for each alternate domain (diagnose only).
+
+    Logs, per alternate domain by position (never the value), the server's
+    row count and whether a row matches that domain exactly. It never blocks
+    the run: the main duplicate check is unchanged.
+    """
+    log = _log()
+    for index, domain in enumerate(getattr(source, "alternate_domains", ()) or (), start=1):
+        name = f"alternate_{index}"
+        searched = _search_tenants(page, search, domain)
+        if searched is None:
+            log.event("diagnose_alt_domain_search", "unavailable", name)
+            continue
+        verdict = _api_duplicate(searched, tenant_name, domain)
+        log.event("diagnose_alt_domain_search", verdict, name, f"rows={len(searched.rows)} total={searched.total_count}")
+
+
 def _diagnose_cumulative(page: Any, confirm: Any, plan: dict[str, Any]) -> list[str]:
     """Apply CE-like changes in cumulative groups (never Leaked Credentials or
     Phishing), checking Confirm after each group. Not undone: the form is
@@ -3907,6 +3978,7 @@ def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: floa
     global _ACTIVE_RUN_LOG
     dry_run = dry_run or diagnose
     _ACTIVE_RUN_LOG = RunLog(reference, DRY_RUN_MODE if dry_run else "create", route=route)
+    _ACTIVE_RUN_LOG.timeline = diagnose
     try:
         contract = ROUTES.get(route)
         if contract is None:
@@ -3965,11 +4037,15 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
             log.event("browser_attach", "start")
             with _attended_page(playwright) as page:
                 log.attach(page)
+                if log.timeline:
+                    log.timeline_page = page
                 log.event("browser_attach", "ok")
                 search = _open_search(page)
                 if search is None:
                     _capture_search_diagnostics(page)
                     return _finish(reference, acknowledged_revision, "duplicate_search_schema_unavailable")
+                if diagnose:
+                    _diagnose_alternate_domain_searches(page, search, source, tenant_name)
                 for lookup_name, lookup in contract.duplicate_lookups(source):
                     searched = _search_tenants(page, search, lookup)
                     if searched is None:

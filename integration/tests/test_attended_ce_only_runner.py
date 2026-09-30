@@ -3884,6 +3884,31 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertIn(("diagnose_lc_prefill", "lc_off_verified", ""), steps)
         self.assertIn(("diagnose_probe", "enables_confirm", "lc_domains_prefill_lc_off"), steps)
 
+    def test_diagnose_timeline_and_alternate_domain_searches(self):
+        with self._confirm_enabled_when(lambda page: False), \
+                patch.object(_RPPage, "evaluate", lambda self, script, *a:
+                             "confirm=disabled form_hooks=4:true,5:false" if script == runner.TIMELINE_SNAPSHOT_JS
+                             else None, create=True):
+            result, page = self._run(self._scenario(tenants=[_RPRow("Other Co", SURFACE_ALT)]), diagnose=True)
+        self.assertEqual(result, "diagnose_confirm_blocker_unknown")
+        self.assertFalse(page.confirmed)
+        events = self._events()
+        snapshots = [e for e in events if e["step"] == "timeline"]
+        self.assertTrue(snapshots)
+        self.assertIn("fill_text", {e["field"] for e in snapshots})
+        self.assertEqual(snapshots[0]["detail"], "confirm=disabled form_hooks=4:true,5:false")
+        alt = [e for e in events if e["step"] == "diagnose_alt_domain_search"]
+        self.assertEqual([(e["field"], e["outcome"]) for e in alt], [("alternate_1", "duplicate_found")])
+        self.assertNotIn(SURFACE_ALT, runner.RUN_LOG_PATH.read_text(encoding="utf-8"))
+
+    def test_normal_runs_take_no_timeline_snapshots(self):
+        with patch.object(_RPPage, "evaluate", lambda self, script, *a:
+                          (_ for _ in ()).throw(AssertionError("no snapshot")) if script == runner.TIMELINE_SNAPSHOT_JS
+                          else None, create=True):
+            result, _page = self._run(self._scenario(), dry_run=True)
+        self.assertEqual(result, "dry_run_fill_verified")
+        self.assertFalse([e for e in self._events() if e["step"] in ("timeline", "browser_request")])
+
     def test_diagnose_without_the_flag_never_touches_lc(self):
         touched = []
         original_click = _RPCheckboxControl.click
