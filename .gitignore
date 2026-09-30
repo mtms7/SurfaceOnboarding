@@ -19,6 +19,10 @@ credentials.json
 secrets.json
 passwords.txt
 integration/attended_leonardo_readbacks.json
+integration/attended_ce_only_runner_state.json
+integration/attended_ce_only_diagnostics.json
+integration/attended_ce_only_table_diagnostics.json
+integration/attended_ce_only_table_diagnostics.*.bak.json
 
 # Browser/session artifacts and generated evidence
 *.har
@@ -46,3 +50,5 @@ tmp/
 
 # Legacy duplicate handover export; source remains in the main project tree
 Surface_Workato_OPA_Handover_2026-08-26/
+integration/attended_ce_only_run_log.json
+integration/attended_ce_only_check_state.json

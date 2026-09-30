@@ -1,0 +1,3028 @@
+"""Desktop-only, attended Leonardo Development CE-only auto-confirm runner.
+
+The runner deliberately has no Salesforce writeback.  It uses a dedicated,
+persisted, desktop-only browser profile (the documented §10 option-3 temporary
+development bridge) so the operator's Leonardo Development session is retained
+and SSO/MFA is only required when it expires.  That profile is never the
+operator's main Chrome, never placed on the VM, and never copied to Git, logs,
+or backups.  A read-only session check (check_leonardo_session) reports the
+session state and a reset (reset_leonardo_profile) clears it.
+
+One automation Chrome window is reused: each attended operation opens its own
+new tab in the already-running automation browser (discovered and verified via
+the profile's DevToolsActivePort file and the loopback /json/version endpoint),
+or launches it when none is running, and closes only that tab afterwards.
+While the window stays open its loopback CDP port lets local processes on the
+desktop drive that Leonardo Development session; the operator closes the
+automation window (or runs --close-browser) at the end of the day.
+
+After a clear duplicate check and a validated fill, the runner auto-confirms:
+it clicks the single Add Account Confirm control exactly once and never retries
+an uncertain submit.  After the form closes it re-searches (read-only) and
+reads the exact tenant back, recording minimal local readback evidence; it
+never updates Salesforce.
+
+The runner is revision-bound: it accepts the source revision acknowledged by
+the dashboard and fails closed if its fresh source read differs.  Each
+acknowledged revision may be run once; the local state file records the start
+and the final result so the dashboard can display it and refuse a retry.  A
+completed, non-successful run may be re-armed by reset_runner_record; a
+verified creation can never be reset.
+
+The Leonardo Development details-page labels used for the readback
+("Surface Account ID", "Account UUID", "Account Scanning") are derived from
+the dashboard display names and must be confirmed on the first attended run;
+any unavailable or ambiguous control stops the runner without writing
+evidence.
+"""
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from time import monotonic, sleep
+from typing import Any
+import urllib.request
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+REFERENCE = re.compile(r"CO-[0-9]{4,10}$")
+DEVELOPMENT_LOGIN = "https://leonardo.dev.app.pentera.io/login"
+TENANT_MANAGEMENT = "https://leonardo.dev.app.pentera.io/backoffice/tenantManagement"
+TENANT_MANAGEMENT_PATH = "/backoffice/tenantManagement"
+MAX_WAIT_SECONDS = 15 * 60
+POLL_SECONDS = 5
+# Bounded window for the read-only session check: long enough for a valid
+# session to reach tenant-management, short enough to keep the check snappy.
+SESSION_CHECK_SECONDS = 25
+# Reused automation browser (one window, one new tab per attended run). Chrome
+# writes the chosen CDP port (line 1) and its per-instance browser WebSocket
+# path (line 2) to this file inside the user-data-dir.
+DEVTOOLS_ACTIVE_PORT_FILE = "DevToolsActivePort"
+DEVTOOLS_ACTIVE_PORT_MAX_BYTES = 512
+BROWSER_LAUNCH_SECONDS = 30.0
+BROWSER_CLOSE_SECONDS = 15.0
+PROFILE_REMOVE_ATTEMPTS = 5
+# The launched window keeps this neutral anchor tab so closing the run's own
+# tab never closes the last tab (which would exit the reused browser).
+ANCHOR_TAB_URL = "about:blank"
+CDP_TARGET_ID = re.compile(r"[A-Za-z0-9-]{1,128}")
+CDP_BROWSER_WS_PATH = re.compile(r"/devtools/browser/[A-Za-z0-9-]{1,128}")
+RUNNER_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_runner_state.json"
+# Latest read-only check per CO (duplicate check / readback): local evidence
+# for the dashboard only; it never gates or consumes a create run.
+CHECK_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_check_state.json"
+CHECK_KINDS = frozenset({"duplicate_check", "readback"})
+READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
+DIAGNOSTICS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_diagnostics.json"
+READBACK_SOURCE = "Leonardo Development Details readback"
+READBACK_STATE = "Account Scanning"
+SURFACE_ACCOUNT_ID_PATTERN = r"[A-Za-z0-9]{16,64}"
+ACCOUNT_UUID_PATTERN = r"[a-f0-9]{32}"
+# CE-only Add Account fill contract (owner-confirmed 2026-09-25, per the
+# CO-0702 creation HAR and the 2026-09-24 live form diagnostics). The form
+# has no "Email Domains" or "Primary User Email" controls. The accessible
+# label is the primary locator for every control; native selects are
+# resolved by label and set by option label text; checkboxes are resolved
+# by their stable name attribute (the "Scan now" control by its aria name).
+CE_PRIMARY_USER_FIRST_NAME = "Milton"
+CE_PRIMARY_USER_LAST_NAME = "Stevenson"
+CE_PRIMARY_USER_EMAIL_LOCAL = "milton.stevenson"
+CE_USER_EMAIL_DOMAIN = "pentera.io"
+# All Pentera Core Plus subscriptions include CE; the license dates come from
+# the account's Core Plus subscription rows ("Bulk"/"Additional" rows never
+# match this prefix).
+CE_SUBSCRIPTION_PRODUCT_PREFIX = "Pentera Core Plus Commercial"
+# Exact Salesforce picklist values of the only route this runner may create
+# (observed live on CO-0679/CO-0728, 2026-09-29).
+CE_ROUTE_PRODUCT = "Credential Exposure"
+CE_ROUTE_TYPE = "New Product Onboarding"
+# License quantities are fixed 1/1/1 for the CE-only pilot; the subscription
+# endpoint count is not the license quantity.
+CE_LICENSE_QUANTITIES = {
+    "Number of assets": "1",
+    "Number of domains": "1",
+    "Number of subdomains": "1",
+}
+# License date controls (confirmed by the 2026-09-25 extended read-only
+# diagnostic): two plain text inputs with NO label, name, id, or placeholder.
+# They are identified only by their stable data-am attributes, which is the
+# primary locator. The label candidates below are kept only as a fallback in
+# case the form regresses to labeled controls.
+LICENSE_DATE_DATA_AM = {
+    "license_start": "AddEditTenantModal-date-startDate",
+    "license_end": "AddEditTenantModal-date-expirationDate",
+}
+# Display format the date-picker text inputs accept (strftime pattern),
+# confirmed by the operator from the CO-0702 manual creation (YYYY-MM-DD).
+# The post-fill re-read still verifies the value and fails closed on any
+# mismatch (e.g. if the picker reformats the input).
+LICENSE_DATE_INPUT_FORMAT = "%Y-%m-%d"
+# Live form (2026-09-29 probe): the date inputs are readonly, display
+# "Sep 29, 2026", and are set through a Material-UI (v3/v4) picker dialog.
+LICENSE_DATE_DISPLAY_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d")
+PICKER_DIALOG_SELECTOR = ".MuiPickersModal-dialogRoot"
+PICKER_HEADER_SELECTOR = ".MuiPickersCalendarHeader-transitionContainer"
+PICKER_ARROW_SELECTOR = ".MuiPickersCalendarHeader-switchHeader button"
+PICKER_DAY_SELECTOR = "button.MuiPickersDay-day:not(.MuiPickersDay-hidden)"
+PICKER_DAY_DISABLED_CLASS = "MuiPickersDay-dayDisabled"
+PICKER_DAY_SELECTED_SELECTOR = "button.MuiPickersDay-daySelected:not(.MuiPickersDay-hidden)"
+# react-transition-group classes present only while a month slide runs.
+PICKER_TRANSITION_SELECTOR = '[class*="MuiPickersSlideTransition-slideE"]'
+PICKER_MAX_MONTH_STEPS = 60
+DRY_RUN_MODE = "dry_run"
+ADD_ACCOUNT_MODAL_SELECTOR = ".tenants-add-account"
+PICKER_SETTLE_POLLS = 20  # x 100 ms per month step
+LICENSE_DATE_LABEL_CANDIDATES = {
+    "license_start": ("Start date", "Start Date", "License start date", "License start"),
+    "license_end": ("Expiration date", "Expiration Date", "License expiration date", "Expiration", "End date"),
+}
+# Observed Account Scanning states accepted in local readback evidence.
+READBACK_STATES = frozenset({"Account Scanning", "No scan started"})
+# Normalized (casefolded, whitespace-collapsed, trailing period removed)
+# MUIDataTable zero-result messages. Only these exact texts mark a clean,
+# zero-result search; anything else in a short row fails closed.
+EMPTY_STATE_MESSAGES = frozenset({
+    "no records found", "no matching records found", "sorry, no matching records found",
+})
+# Re-reads of an unclassifiable table after a search (1 s apart) so a
+# transient loading row can settle; a table that never settles fails closed.
+TABLE_SETTLE_RETRIES = 4
+DEVELOPMENT_ORIGIN = "https://leonardo.dev.app.pentera.io"
+# Add Account <select> controls by their stable name attribute (the live
+# selects have no associated <label>; 2026-09-29 diagnostics).
+SELECT_NAMES = {
+    "Account Type": "accountType",
+    "Country": "accountCountry",
+    "Scanning interval": "scanningInterval",
+    "Leaked Credentials scanning interval": "leakedCredentialsScanningInterval",
+    "Type": "licenseType",
+}
+# Bounded per-field wait so a disabled/hidden control fails fast and is logged
+# instead of hanging on Playwright's 30 s default.
+FIELD_TIMEOUT_MS = 5_000
+TOGGLE_CLICK_TIMEOUT_MS = 2_000
+CONFIRM_ENABLE_POLLS = 12  # x 250 ms
+FORM_CLOSE_POLL_SECONDS = 0.5
+# Server-side tenant search (getAllDetailedAccounts per edit, HAR-verified):
+# wait for the response that carries this lookup instead of a fixed sleep.
+TENANT_SEARCH_API = "getAllDetailedAccounts"
+SEARCH_RESPONSE_TIMEOUT_MS = 10_000
+ACCOUNT_ADD_API = "/backoffice/account/add"
+# Selects that can reset dependent controls are set before the toggles.
+EARLY_SELECTS = ("Account Type", "Type", "Scanning interval")
+# The Surface/web toggles live under a collapsed "Advanced options" section
+# (2026-09-29 probe). Three of them default ON and must be OFF for CE-only
+# (owner decision 2026-09-29); the rest default OFF and are pinned OFF so the
+# form is verified against the CO-0702 HAR contract. Two dependent controls
+# (MAS for subdomains, Web Agent) are disabled by the form and left alone.
+ADVANCED_OPTIONS_TEXT = "Advanced options"
+ADVANCED_TOGGLES_OFF = (
+    "automatedDiscoveryEnabled", "subDomainsReconEnabled", "webDictionaryBruteForceEnabled",
+    "webDorkingEnabled", "fullNucleiScanEnabled", "authenticatedTestingEnabled",
+    "staticOutboundIpEnabled", "aiEnabled", "multipleAttackStacksEnabled",
+)
+ADVANCED_EXPAND_POLLS = 20  # x 100 ms
+RUN_LOG_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_run_log.json"
+RUN_LOG_MAX_EVENTS = 300
+RUN_LOG_MAX_RUNS = 20
+RUN_LOG_DETAIL_CHARS = 300
+RUN_LOG_MAX_DIAGNOSTICS = 3
+
+
+class RunnerStateUnavailable(RuntimeError):
+    """The local runner state file is unreadable or violates its schema."""
+
+
+class LoginTimeout(Exception):
+    """The operator did not reach tenant-management within the wait window."""
+
+
+@dataclass(frozen=True, slots=True)
+class CeOnlyNames:
+    tenant_name: str
+    primary_user_alias: str
+
+
+def ce_only_names(account_name: str) -> CeOnlyNames:
+    """Derive the owner-approved CE-only tenant name and Pentera alias."""
+    compact = " ".join(account_name.split())
+    if not compact:
+        raise ValueError("account_name_unavailable")
+    # Owner decision 2026-09-29: a trailing period is dropped from the tenant
+    # name ("Tango Group Ltd." -> "Tango Group Ltd - CE Only"). Only trailing
+    # periods are removed; internal ones stay. The alias below is unchanged.
+    display_name = compact.rstrip(". ")
+    if not display_name:
+        raise ValueError("account_name_unavailable")
+    tenant_name = display_name + " - CE Only"
+    alphanumeric = re.findall(r"[A-Za-z0-9]+", compact)
+    if not alphanumeric:
+        raise ValueError("account_name_unavailable")
+    if len(compact) <= 15:
+        alias = "".join(alphanumeric).casefold()
+    else:
+        alias = "".join(word[0] for word in alphanumeric).casefold()
+    if not alias:
+        raise ValueError("primary_user_alias_unavailable")
+    return CeOnlyNames(tenant_name, alias)
+
+
+def one_email_domain(value: object) -> str | None:
+    """Return exactly one valid CE domain; no normalization expands its scope."""
+    if not isinstance(value, str):
+        return None
+    domains = [item.casefold() for item in re.split(r"[,;\s]+", value.strip()) if item]
+    if len(domains) != 1:
+        return None
+    domain = domains[0]
+    pattern = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+    return domain if re.fullmatch(pattern, domain) else None
+
+
+def sf_command() -> str:
+    return os.environ.get("SURFACE_SF_CLI", "sf.cmd" if os.name == "nt" else "sf")
+
+
+def source_for_fill(reference: str) -> tuple[str, str, str, str, str]:
+    """Fresh, fixed-field source read; retain values only in this process.
+
+    For a Credential Exposure the Primary Domain is the single Email Domains
+    value; Main_Domain__c is not required and is not used.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise RuntimeError("invalid_co_reference")
+    query = (
+        "SELECT Name, LastModifiedDate, Account_Name__c, "
+        "Email_Domains__c FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2"
+    )
+    try:
+        # Decode CLI output as UTF-8 (the --json contract) rather than the
+        # locale code page; cp1252 cannot decode UTF-8 continuation bytes and
+        # would otherwise leave completed.stdout as None and fail the read.
+        completed = subprocess.run([sf_command(), "data", "query", "--query", query, "--json"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                                   timeout=45, check=False)
+        if completed.stdout is None:
+            raise ValueError()
+        payload = json.loads(completed.stdout)
+        rows = payload["result"]["records"]
+        if completed.returncode or payload["status"] != 0 or not isinstance(rows, list) or len(rows) != 1:
+            raise ValueError()
+        row = rows[0]
+        if not isinstance(row, dict) or row.get("Name") != reference:
+            raise ValueError()
+        revision, account = row.get("LastModifiedDate"), row.get("Account_Name__c")
+        email_domain = one_email_domain(row.get("Email_Domains__c"))
+        if not all(isinstance(value, str) and value.strip() for value in (revision, account, email_domain)):
+            raise ValueError()
+        # CE-only: the Primary Domain is the single Email Domains value.
+        return revision, account, email_domain, email_domain, ce_only_names(account).tenant_name
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("salesforce_fill_source_unavailable") from exc
+
+
+def _sf_records(query: str) -> list[Any]:
+    """Run one read-only sf query and return its records, failing closed."""
+    completed = subprocess.run(
+        [sf_command(), "data", "query", "--query", query, "--json"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+        text=True, encoding="utf-8", errors="replace", timeout=45, check=False,
+    )
+    if completed.stdout is None:
+        raise ValueError()
+    payload = json.loads(completed.stdout)
+    records = payload["result"]["records"]
+    if completed.returncode or payload["status"] != 0 or not isinstance(records, list):
+        raise ValueError()
+    return records
+
+
+def _parse_subscription_date(value: Any) -> date | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return date.fromisoformat(value.strip()[:10])
+    except ValueError:
+        return None
+
+
+def select_ce_subscription(rows: list[Any]) -> tuple[date, date]:
+    """Select the CE license subscription dates, failing closed.
+
+    Prefers "Pentera Core Plus Commercial" rows (all Pentera Core Plus
+    subscriptions include CE); "Bulk"/"Additional" rows never match the
+    prefix. Every matching row must carry parseable dates with end after
+    start, and all matching rows must agree on the same (start, end) pair.
+    """
+    matches: list[tuple[date, date]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        product = row.get("Product_Full_Name__c")
+        if not isinstance(product, str):
+            continue
+        if not product.casefold().startswith(CE_SUBSCRIPTION_PRODUCT_PREFIX.casefold()):
+            continue
+        # "Bulk"/"Additional" rows never carry the CE license, even when their
+        # product name starts with the Core Plus prefix.
+        if "bulk" in product.casefold() or "additional" in product.casefold():
+            continue
+        start = _parse_subscription_date(row.get("DealHub_Subscription_Start_Date__c"))
+        end = _parse_subscription_date(row.get("DealHub_Subscription_End_Date__c"))
+        if start is None or end is None or end <= start:
+            raise RuntimeError("ce_subscription_ambiguous")
+        matches.append((start, end))
+    if not matches:
+        raise RuntimeError("ce_subscription_unavailable")
+    if any(pair != matches[0] for pair in matches[1:]):
+        raise RuntimeError("ce_subscription_ambiguous")
+    return matches[0]
+
+
+def _add_one_year(value: date) -> date:
+    try:
+        return value.replace(year=value.year + 1)
+    except ValueError:  # February 29
+        return value.replace(year=value.year + 1, day=28)
+
+
+def ce_license_dates(subscription_start: date, subscription_end: date) -> tuple[date, date]:
+    """CE license dates per the owner-confirmed rule (2026-09-25).
+
+    startDate is the Core Plus subscription start; expirationDate is one
+    year minus one day from the start, capped at the subscription end.
+    (Future renewal rule: a CE renewal never modifies the start date.)
+    """
+    annual_end = _add_one_year(subscription_start) - timedelta(days=1)
+    return subscription_start, min(annual_end, subscription_end)
+
+
+def _run_day() -> date:
+    """The local calendar day of this attended run (patched in tests)."""
+    return date.today()
+
+
+def ce_run_license_dates(subscription_start: date, subscription_end: date,
+                         run_day: date | None = None) -> tuple[date, date]:
+    """License dates entered for an attended Development run.
+
+    Owner decision 2026-09-29: Leonardo Development refuses a start date after
+    the current day, so the license starts on the day the onboarding runs.
+    The expiration keeps the contract rule (ce_license_dates). Raises
+    ValueError ("ce_license_dates_unavailable") when that expiration is not
+    after the run day, so the run stops before any browser work.
+    """
+    day = run_day or _run_day()
+    _contract_start, expiration = ce_license_dates(subscription_start, subscription_end)
+    if expiration <= day:
+        raise ValueError("ce_license_dates_unavailable")
+    return day, expiration
+
+
+@dataclass(frozen=True, slots=True)
+class CeFillSource:
+    reference: str
+    source_revision: str
+    account_id: str
+    account_name: str
+    email_domain: str
+    country: str
+    subscription_start: date
+    subscription_end: date
+    tenant_name: str
+    primary_user_alias: str
+
+
+class RouteMismatch(RuntimeError):
+    """The CO is not a new Credential Exposure onboarding; nothing may run."""
+
+    def __init__(self) -> None:
+        super().__init__("ce_route_mismatch")
+
+
+def ce_fill_source(reference: str) -> CeFillSource:
+    """Fresh, fixed-field CE fill source read (CO + DealHub subscription).
+
+    Fails closed (RuntimeError) on any missing or ambiguous value: the CO
+    must be a single row with a valid account id, account name, country,
+    and one valid email domain, and the account must carry an unambiguous
+    Pentera Core Plus Commercial subscription.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise RuntimeError("invalid_co_reference")
+    try:
+        rows = _sf_records(
+            "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, "
+            "Email_Domains__c, Account_Country__c, Onboarding_Product__c, Onboarding_Type__c "
+            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+            raise ValueError()
+        row = rows[0]
+        # Route gate: this runner creates CE-only tenants, so the CO must be
+        # exactly a new Credential Exposure onboarding (2026-09-29 audit: the
+        # route was previously inferred from the email-domain count alone).
+        if (row.get("Onboarding_Product__c") != CE_ROUTE_PRODUCT
+                or row.get("Onboarding_Type__c") != CE_ROUTE_TYPE):
+            raise RouteMismatch()
+        revision = row.get("LastModifiedDate")
+        account_id = row.get("Account__c")
+        account_name = row.get("Account_Name__c")
+        country = row.get("Account_Country__c")
+        if not isinstance(revision, str) or not revision:
+            raise ValueError()
+        if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
+            raise ValueError()
+        if not isinstance(account_name, str) or not " ".join(account_name.split()):
+            raise ValueError()
+        if not isinstance(country, str) or not " ".join(country.split()):
+            raise ValueError()
+        email_domain = one_email_domain(row.get("Email_Domains__c"))
+        if email_domain is None:
+            raise ValueError()
+        names = ce_only_names(account_name)
+        subscription_rows = _sf_records(
+            "SELECT Product_Full_Name__c, DealHub_Subscription_Start_Date__c, "
+            "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
+            "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
+        subscription_start, subscription_end = select_ce_subscription(subscription_rows)
+        return CeFillSource(
+            reference, revision, account_id, " ".join(account_name.split()),
+            email_domain, " ".join(country.split()),
+            subscription_start, subscription_end,
+            names.tenant_name, names.primary_user_alias)
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("salesforce_fill_source_unavailable") from exc
+
+
+def build_ce_only_fill(source: CeFillSource, run_day: date | None = None) -> dict[str, Any]:
+    """Build the full CE-only Add Account fill plan from one fresh source read.
+
+    The contract (owner-confirmed 2026-09-25, per the CO-0702 creation HAR):
+    company name "<Account> - CE Only", customer type, the single Email
+    Domains value as primary domain, pentera.io user email domain, Milton
+    Stevenson as primary user with the lowercase-alias organization email,
+    the Salesforce country, no account scan, weekly leaked-credentials scan
+    on the primary domain, a prepaid annual subscription with 1/1/1
+    quantities and the CE license date rule, tenant MFA required (owner
+    decision 2026-09-29, matching the CO-0702 manual creation HAR and the
+    Leonardo default), and every feature toggle off except Leaked
+    Credentials, Provisioning, and Subdomains.
+    """
+    start, end = ce_run_license_dates(source.subscription_start, source.subscription_end, run_day)
+    return {
+        "texts": {
+            "Company name": source.tenant_name,
+            "Company primary domain": source.email_domain,
+            "User email domains  (Comma Separated Values)": CE_USER_EMAIL_DOMAIN,
+            "First name": CE_PRIMARY_USER_FIRST_NAME,
+            "Last name": CE_PRIMARY_USER_LAST_NAME,
+            "Organization Email": (
+                f"{CE_PRIMARY_USER_EMAIL_LOCAL}+{source.primary_user_alias}@{CE_USER_EMAIL_DOMAIN}"),
+            "Leaked Credentials scanned domains (Comma Separated Values)": source.email_domain,
+            **CE_LICENSE_QUANTITIES,
+        },
+        "selects": {
+            "Account Type": "Customer",
+            "Country": source.country,
+            "Scanning interval": "None",
+            "Leaked Credentials scanning interval": "Weekly",
+            "Type": "Prepaid annual subscription",
+        },
+        "checkboxes": {
+            "mfaRequired": True,
+            "scan_now": False,
+            **{key: False for key in ADVANCED_TOGGLES_OFF},
+            "notificationsAllowed": False,
+            "multipleUsersAllowed": False,
+            "apiAccessAllowed": False,
+            "phishingEnabled": False,
+            "leakedCredentialsAllowed": True,
+            "provisioningEnabled": True,
+            "subDomainsNumberAllowed": True,
+        },
+        "license_start": start,
+        "license_end": end,
+    }
+
+
+def _format_date_for_placeholder(value: date, placeholder: Any) -> str:
+    """Format a date for a date-picker input from its placeholder skeleton.
+
+    Recognizes yyyy/yy/mm/m/dd/d tokens (e.g. "mm/dd/yyyy" -> "10/24/2026",
+    "yyyy-mm-dd" -> "2026-10-24"), preserving the placeholder separators.
+    Any missing or unrecognized placeholder falls back to mm/dd/yyyy so the
+    fill stays deterministic; the post-fill re-read still verifies the value.
+    """
+    skeleton = (placeholder or "").casefold()
+    tokens = re.findall(r"yyyy|yy|mm|m|dd|d", skeleton)
+    if not tokens or not (any(t in ("yyyy", "yy") for t in tokens)
+                          and any(t in ("mm", "m") for t in tokens)
+                          and any(t in ("dd", "d") for t in tokens)):
+        return value.strftime("%m/%d/%Y")
+    parts = {
+        "yyyy": str(value.year), "yy": str(value.year % 100).zfill(2),
+        "mm": str(value.month).zfill(2), "m": str(value.month),
+        "dd": str(value.day).zfill(2), "d": str(value.day),
+    }
+    output: list[str] = []
+    index = 0
+    while index < len(skeleton):
+        match = re.match(r"yyyy|yy|mm|m|dd|d", skeleton[index:])
+        if match:
+            output.append(parts[match.group(0)])
+            index += len(match.group(0))
+        else:
+            output.append(skeleton[index])
+            index += 1
+    return "".join(output)
+
+
+def _locate_checkbox(page: Any, key: str) -> Any | None:
+    """Locate one Add Account checkbox by its stable name (or aria name)."""
+    try:
+        if key == "scan_now":
+            control = page.get_by_role("checkbox", name="primary checkbox", exact=True)
+        else:
+            control = page.locator(f'input[type=checkbox][name="{key}"]')
+        if control.count() == 1:
+            return control
+    except Exception:
+        return None
+    return None
+
+
+def _set_checkbox(page: Any, key: str, target: bool) -> bool:
+    """Set one checkbox to its target state, verifying by re-reading it.
+
+    Returns False (fail-closed) when the control is missing or ambiguous,
+    cannot be set, or does not report the target state afterwards.
+    """
+    control = _locate_checkbox(page, key)
+    if control is None:
+        _log().event("fill_toggle", "not_found", key)
+        return False
+    try:
+        if control.first.is_checked() == target:
+            return True
+        try:
+            control.first.click(timeout=TOGGLE_CLICK_TIMEOUT_MS)
+        except Exception as exc:
+            # A switch's visual track can intercept the pointer on the input;
+            # retry once with a forced click (the state is still re-verified).
+            _log().error("fill_toggle", f"{key}:click", exc)
+            control.first.click(force=True, timeout=TOGGLE_CLICK_TIMEOUT_MS)
+        for _poll in range(5):
+            if control.first.is_checked() == target:
+                return True
+            page.wait_for_timeout(200)
+        _log().event("fill_toggle", "state_unchanged", key)
+        return False
+    except Exception as exc:
+        _log().error("fill_toggle", key, exc)
+        return False
+
+
+def _locate_license_date(page: Any, key: str) -> Any | None:
+    """Locate one license date control.
+
+    Primary: the stable data-am attribute (the live form's date inputs carry
+    no label, name, id, or placeholder). Fallback: candidate accessible labels,
+    in case the form regresses to labeled controls.
+    """
+    data_am = LICENSE_DATE_DATA_AM.get(key)
+    if data_am:
+        try:
+            control = page.locator(f'[data-am="{data_am}"]')
+            if control.count() == 1:
+                return control
+        except Exception:
+            pass
+    for label in LICENSE_DATE_LABEL_CANDIDATES[key]:
+        control = _locate_form_field(page, label, "")
+        if control is not None:
+            return control
+    return None
+
+
+def _fill_license_date(page: Any, key: str, value: date) -> bool:
+    """Fill one license date control, verifying the value by re-reading it.
+
+    The date inputs are plain text fields with no placeholder, so the value is
+    formatted with the confirmed LICENSE_DATE_INPUT_FORMAT. Returns False
+    (fail-closed) when the control is missing, the fill fails, or the control
+    does not keep the formatted value (a date-picker reformat is caught here).
+    """
+    control = _locate_license_date(page, key)
+    if control is None:
+        _log().event("fill_date", "not_found", key)
+        return False
+    element = control.first
+    try:
+        read_only = element.get_attribute("readonly") is not None
+    except Exception:
+        read_only = False
+    if read_only:
+        # Live form (2026-09-29 probe): the date inputs are readonly and set
+        # only through a Material-UI picker dialog; typing can never work.
+        return _pick_license_date(page, element, key, value)
+    formatted = value.strftime(LICENSE_DATE_INPUT_FORMAT)
+    # The picker keeps its own datetime state (the CO-0702 HAR carries the
+    # form-open minute), so a typed value can revert on blur: blur (Tab) and
+    # re-read after a short settle. One keystroke-by-keystroke retry covers a
+    # picker that ignores programmatic fill.
+    for attempt in ("fill", "type"):
+        try:
+            if attempt == "fill":
+                element.fill(formatted, timeout=FIELD_TIMEOUT_MS)
+            else:
+                element.fill("", timeout=FIELD_TIMEOUT_MS)
+                element.press_sequentially(formatted, delay=30, timeout=FIELD_TIMEOUT_MS)
+            element.press("Tab")
+            page.wait_for_timeout(300)
+            actual = element.input_value()
+        except Exception as exc:
+            _log().error("fill_date", f"{key}:{attempt}", exc)
+            continue
+        if actual == formatted:
+            return True
+        _log().event("fill_date", "reverted", f"{key}:{attempt}", f"length={len(actual or '')}")
+    return False
+
+
+def _parse_display_date(text: object) -> date | None:
+    """Parse a license date as the form displays it ("Sep 29, 2026") or ISO."""
+    if not isinstance(text, str):
+        return None
+    cleaned = " ".join(text.split())
+    for pattern in LICENSE_DATE_DISPLAY_FORMATS:
+        try:
+            return datetime.strptime(cleaned, pattern).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _picker_month(header_text: object) -> tuple[int, int] | None:
+    """Parse the picker header ("September 2026") to (year, month)."""
+    if not isinstance(header_text, str):
+        return None
+    try:
+        parsed = datetime.strptime(" ".join(header_text.split()), "%B %Y")
+    except ValueError:
+        return None
+    return parsed.year, parsed.month
+
+
+def _settled_picker_month(page: Any, header: Any, previous: tuple[int, int] | None = None) -> tuple[int, int] | None:
+    """Read the picker header once its slide transition has settled.
+
+    Mid-transition the header holds both the outgoing and incoming month, so
+    poll (bounded) until it parses as exactly one month that differs from
+    ``previous`` (when given).
+    """
+    month = None
+    for _poll in range(PICKER_SETTLE_POLLS):
+        try:
+            month = _picker_month(header.first.inner_text()) if header.count() >= 1 else None
+        except Exception:
+            month = None
+        if month is not None and month != previous:
+            return month
+        page.wait_for_timeout(100)
+    return month
+
+
+def _picker_idle(page: Any, picker: Any) -> bool:
+    """True once no slide transition (header or day grid) is in progress."""
+    transitions = picker.first.locator(PICKER_TRANSITION_SELECTOR)
+    for _poll in range(PICKER_SETTLE_POLLS):
+        try:
+            if transitions.count() == 0:
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(100)
+    return False
+
+
+def _close_picker(page: Any, picker: Any) -> bool:
+    """Dismiss an open picker without accepting a value; always returns False.
+
+    The picker's own Cancel (scoped to the picker dialog, never the Add
+    Account form's Cancel) is preferred; Escape is the fallback.
+    """
+    try:
+        if picker.count() >= 1 and picker.first.is_visible():
+            cancel = picker.first.get_by_role("button", name="Cancel", exact=True)
+            if cancel.count() == 1:
+                cancel.first.click(timeout=FIELD_TIMEOUT_MS)
+            else:
+                page.keyboard.press("Escape")
+            picker.first.wait_for(state="hidden", timeout=FIELD_TIMEOUT_MS)
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+    return False
+
+
+def _pick_license_date(page: Any, element: Any, key: str, value: date) -> bool:
+    """Set one readonly license date through the Material-UI picker dialog.
+
+    Opens the picker, steps month by month to the target (bounded, and it
+    stops if the header does not advance), clicks the single enabled day
+    button with the exact day number, accepts with the picker's own OK, and
+    verifies the displayed value parses back to the target date. Fails
+    closed (False) on any missing or ambiguous picker control.
+    """
+    log = _log()
+    picker = page.locator(PICKER_DIALOG_SELECTOR)
+    try:
+        element.click(timeout=FIELD_TIMEOUT_MS)
+        picker.first.wait_for(state="visible", timeout=FIELD_TIMEOUT_MS)
+        if picker.count() != 1:
+            log.event("pick_date", "picker_ambiguous", key, f"count={picker.count()}")
+            return False
+        header = picker.first.locator(PICKER_HEADER_SELECTOR)
+        arrows = picker.first.locator(PICKER_ARROW_SELECTOR)
+        target = (value.year, value.month)
+        current = _settled_picker_month(page, header)
+        for _step in range(PICKER_MAX_MONTH_STEPS + 1):
+            if current is None:
+                log.event("pick_date", "header_unreadable", key)
+                return _close_picker(page, picker)
+            if current == target:
+                break
+            if arrows.count() != 2:
+                log.event("pick_date", "arrows_unavailable", key, f"count={arrows.count()}")
+                return _close_picker(page, picker)
+            (arrows.nth(1) if current < target else arrows.nth(0)).click(timeout=FIELD_TIMEOUT_MS)
+            # The header slides: mid-transition it holds both months, so wait
+            # for a single, different month before the next step.
+            following = _settled_picker_month(page, header, previous=current)
+            if following is None or following == current:
+                log.event("pick_date", "header_stuck", key)
+                return _close_picker(page, picker)
+            current = following
+        else:
+            log.event("pick_date", "month_out_of_range", key)
+            return _close_picker(page, picker)
+        # The day grid slides too: wait until no transition is in progress so
+        # the counted buttons are the target month's, not the outgoing one's.
+        if not _picker_idle(page, picker):
+            log.event("pick_date", "calendar_not_idle", key)
+            return _close_picker(page, picker)
+        day_text = str(value.day)
+        days = picker.first.locator(PICKER_DAY_SELECTOR)
+        matches = [index for index in range(days.count())
+                   if " ".join(days.nth(index).inner_text().split()) == day_text]
+        if len(matches) != 1:
+            log.event("pick_date", "day_ambiguous", key, f"matches={len(matches)}")
+            return _close_picker(page, picker)
+        day = days.nth(matches[0])
+        if (day.get_attribute("disabled") is not None
+                or PICKER_DAY_DISABLED_CLASS in (day.get_attribute("class") or "")):
+            log.event("pick_date", "day_disabled", key)
+            return _close_picker(page, picker)
+        day.click(timeout=FIELD_TIMEOUT_MS)
+        # Live picker auto-accepts: the day click closes it (2026-09-29 probe).
+        # If it stays open instead, the day must be selected and OK accepts it.
+        closed = False
+        for _poll in range(PICKER_SETTLE_POLLS):
+            if picker.count() == 0 or not picker.first.is_visible():
+                closed = True
+                break
+            page.wait_for_timeout(100)
+        if not closed:
+            selected = picker.first.locator(PICKER_DAY_SELECTED_SELECTOR)
+            if not (selected.count() == 1 and " ".join(selected.first.inner_text().split()) == day_text):
+                log.event("pick_date", "day_not_selected", key, f"selected_count={selected.count()}")
+                return _close_picker(page, picker)
+            ok = picker.first.get_by_role("button", name="OK", exact=True)
+            if ok.count() != 1:
+                log.event("pick_date", "ok_unavailable", key, f"count={ok.count()}")
+                return _close_picker(page, picker)
+            ok.first.click(timeout=FIELD_TIMEOUT_MS)
+            picker.first.wait_for(state="hidden", timeout=FIELD_TIMEOUT_MS)
+        page.wait_for_timeout(300)
+        shown = element.input_value()
+    except Exception as exc:
+        log.error("pick_date", key, exc)
+        return _close_picker(page, picker)
+    if _parse_display_date(shown) != value:
+        # The form silently refuses some dates (e.g. a start date after today,
+        # 2026-09-29 probe). A displayed license date is not sensitive.
+        log.event("pick_date", "rejected_by_form", key, f"shown={shown!r} expected={value.isoformat()}")
+        return False
+    log.event("pick_date", "ok", key)
+    return True
+
+
+def _license_date_kept(page: Any, key: str, value: date) -> bool:
+    """Re-read one license date control (final pre-Confirm verification)."""
+    control = _locate_license_date(page, key)
+    try:
+        return control is not None and _parse_display_date(control.first.input_value()) == value
+    except Exception:
+        return False
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _capture_search_diagnostics(page: Any) -> None:
+    """Capture redacted control metadata for selector diagnosis.
+
+    Records only control metadata (roles, accessible names, input types,
+    placeholders, aria-labels, ids, data-am attributes, associated label text,
+    button names) — never form values, tenant names, or table contents. Written
+    to a local file for offline diagnosis of page-layout (selector) drift.
+    Failures are swallowed: diagnostics must never change the runner's
+    fail-closed outcome.
+    """
+    def _safe(fn, default: str = "") -> str:
+        try:
+            value = fn()
+            return str(value)[:120] if value is not None else default
+        except Exception:
+            return default
+    try:
+        url = _safe(lambda: page.url, "").split("?", 1)[0].split("#", 1)[0]
+        title = _safe(lambda: page.title, "")
+        roles: list[dict[str, str]] = []
+        for role in ("textbox", "searchbox", "combobox", "button"):
+            try:
+                loc = page.get_by_role(role)
+                for index in range(min(loc.count(), 40)):
+                    element = loc.nth(index)
+                    entry: dict[str, str] = {"role": role}
+                    name = _safe(lambda e=element: e.get_attribute("aria-label"))
+                    if not name:
+                        name = _safe(lambda e=element: e.get_attribute("placeholder"))
+                    if name:
+                        entry["name"] = name
+                    roles.append(entry)
+            except Exception:
+                continue
+        inputs: list[dict[str, str]] = []
+        try:
+            # Evaluate in-page so we can capture data-am attributes and the
+            # associated <label> text (label[for], wrapping label, or
+            # aria-labelledby) that Playwright's get_by_label relies on. Only
+            # metadata is returned — never form values.
+            collected = page.evaluate(
+                """() => {
+                    const inputs = Array.from(document.querySelectorAll('input, select, textarea'));
+                    const safe = (fn) => { try { return fn(); } catch (e) { return null; } };
+                    return inputs.slice(0, 60).map(el => {
+                        const meta = { tag: el.tagName.toLowerCase() };
+                        for (const attr of ['type','placeholder','aria-label','name','id','data-am']) {
+                            const v = el.getAttribute(attr);
+                            if (v) meta[attr] = v;
+                        }
+                        let labelText = '';
+                        if (el.id) {
+                            labelText = safe(() => {
+                                const label = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                                return label ? label.textContent : '';
+                            }) || '';
+                        }
+                        if (!labelText) {
+                            labelText = safe(() => {
+                                const wrapping = el.closest('label');
+                                return wrapping ? wrapping.textContent : '';
+                            }) || '';
+                        }
+                        if (!labelText && el.getAttribute('aria-labelledby')) {
+                            labelText = safe(() => {
+                                const ids = el.getAttribute('aria-labelledby').split(/\\s+/);
+                                return ids.map(id => {
+                                    const e = document.getElementById(id);
+                                    return e ? e.textContent : '';
+                                }).filter(Boolean).join(' ');
+                            }) || '';
+                        }
+                        if (labelText) meta['label'] = labelText.trim().slice(0, 120);
+                        return meta;
+                    });
+                }"""
+            )
+            if isinstance(collected, list):
+                for item in collected:
+                    if isinstance(item, dict):
+                        inputs.append({k: str(v)[:120] for k, v in item.items() if v})
+        except Exception:
+            pass
+        table_rows: list[dict[str, str]] = []
+        try:
+            # Table-structure metadata only (cell counts, colspan, checkbox
+            # presence) — never row contents — so an unexpected row layout
+            # (e.g. a zero-result empty-state row or a selectable-row checkbox
+            # column) can be diagnosed offline.
+            rows = page.locator("tbody tr")
+            row_count = rows.count()
+            for index in range(min(row_count, 5)):
+                cells = rows.nth(index).locator("td")
+                cell_count = cells.count()
+                entry: dict[str, str] = {"index": str(index), "cell_count": str(cell_count)}
+                if cell_count == 1:
+                    colspan = _safe(lambda: cells.first.get_attribute("colspan"))
+                    if colspan:
+                        entry["colspan"] = colspan
+                checkbox_cells = 0
+                for cell_index in range(min(cell_count, 12)):
+                    try:
+                        if cells.nth(cell_index).locator("input[type=checkbox]").count() >= 1:
+                            checkbox_cells += 1
+                    except Exception:
+                        pass
+                if checkbox_cells:
+                    entry["checkbox_cells"] = str(checkbox_cells)
+                if cell_count <= 3:
+                    # Short-row shape only: per-cell text lengths and whether a
+                    # cell is a known empty-state message — never the text.
+                    lengths: list[str] = []
+                    matched = False
+                    for cell_index in range(cell_count):
+                        text = _safe(lambda c=cells.nth(cell_index): c.inner_text())
+                        lengths.append(str(len(text)))
+                        matched = matched or _normalized_ui_text(text) in EMPTY_STATE_MESSAGES
+                    entry["cell_text_lengths"] = ",".join(lengths)
+                    entry["empty_state_message"] = "yes" if matched else "no"
+                table_rows.append(entry)
+        except Exception:
+            pass
+        payload = {
+            "url": url[:200],
+            "title": title[:120],
+            "roles": roles,
+            "inputs": inputs,
+            "table_rows": table_rows,
+            "captured_on": datetime.now().isoformat(timespec="seconds"),
+            "note": "Redacted control and table-structure metadata only. No form values, tenant names, or table contents.",
+        }
+        _write_json_atomic(DIAGNOSTICS_PATH, payload)
+        # Keep a copy with the run's log so a later capture (another run or a
+        # session check) cannot overwrite the evidence of this failure.
+        _log().diagnostics.append(payload)
+    except Exception:
+        pass
+
+
+def load_runner_state() -> dict[str, dict[str, str]]:
+    """Load one-time acknowledgement records; absence means no records."""
+    try:
+        raw = json.loads(RUNNER_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError()
+        state: dict[str, dict[str, str]] = {}
+        for reference, value in raw.items():
+            if not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict):
+                raise ValueError()
+            revision = value.get("source_revision")
+            if not isinstance(revision, str) or not revision:
+                raise ValueError()
+            if set(value) - {"source_revision", "started_on", "result", "completed_on"}:
+                raise ValueError()
+            record: dict[str, str] = {"source_revision": revision}
+            for key in ("started_on", "completed_on"):
+                if key in value:
+                    if not isinstance(value[key], str):
+                        raise ValueError()
+                    datetime.fromisoformat(value[key])
+                    record[key] = value[key]
+            if "completed_on" in record and "result" not in value:
+                raise ValueError()
+            if "result" in value:
+                if not isinstance(value["result"], str) or not value["result"]:
+                    raise ValueError()
+                record["result"] = value["result"]
+            state[reference] = record
+        return state
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RunnerStateUnavailable() from exc
+
+
+def load_check_state() -> dict[str, dict[str, str]]:
+    """Load the latest read-only check per CO (duplicate check or readback).
+
+    Local evidence only: it never gates a create run. A missing file means no
+    checks; a corrupt one raises ValueError so the dashboard can say so.
+    """
+    try:
+        raw = json.loads(CHECK_STATE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("check_state_unreadable") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("check_state_unreadable")
+    state: dict[str, dict[str, str]] = {}
+    for reference, value in raw.items():
+        if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict)
+                or value.get("kind") not in CHECK_KINDS
+                or set(value) - {"kind", "started_on", "completed_on", "result"}
+                or not all(isinstance(item, str) and item for item in value.values())):
+            raise ValueError("check_state_unreadable")
+        state[reference] = dict(value)
+    return state
+
+
+def record_check_start(reference: str, kind: str, started_on: str) -> None:
+    """Record that a read-only check started; it replaces the CO's previous check."""
+    if not REFERENCE.fullmatch(reference) or kind not in CHECK_KINDS:
+        raise ValueError("invalid_check_record")
+    state = load_check_state()
+    state[reference] = {"kind": kind, "started_on": started_on}
+    _write_json_atomic(CHECK_STATE_PATH, state)
+
+
+def record_check_result(reference: str, kind: str, result: str, completed_on: str) -> None:
+    """Record a read-only check's result (keeps the recorded start when it matches)."""
+    if not REFERENCE.fullmatch(reference) or kind not in CHECK_KINDS or not result:
+        raise ValueError("invalid_check_record")
+    state = load_check_state()
+    previous = state.get(reference, {})
+    record = {"kind": kind, "result": result, "completed_on": completed_on}
+    if previous.get("kind") == kind and "result" not in previous and previous.get("started_on"):
+        record["started_on"] = previous["started_on"]
+    state[reference] = record
+    _write_json_atomic(CHECK_STATE_PATH, state)
+
+
+def record_runner_start(reference: str, revision: str, started_on: str) -> None:
+    """Record one acknowledged start; a different revision supersedes the prior record."""
+    if not REFERENCE.fullmatch(reference) or not revision:
+        raise ValueError("invalid_runner_state_record")
+    state = load_runner_state()
+    state[reference] = {"source_revision": revision, "started_on": started_on}
+    _write_json_atomic(RUNNER_STATE_PATH, state)
+
+
+def record_runner_result(reference: str, revision: str, result: str, completed_on: str) -> None:
+    """Record the final result for the acknowledged revision; the first result wins."""
+    if not REFERENCE.fullmatch(reference) or not revision or not result:
+        raise ValueError("invalid_runner_state_record")
+    state = load_runner_state()
+    record = state.get(reference)
+    if record is None:
+        state[reference] = {"source_revision": revision, "result": result, "completed_on": completed_on}
+    elif record["source_revision"] == revision and "result" not in record:
+        record["result"] = result
+        record["completed_on"] = completed_on
+    else:
+        return
+    _write_json_atomic(RUNNER_STATE_PATH, state)
+
+
+def write_readback_evidence(reference: str, surface_account_id: str, account_uuid: str, observed_on: str,
+                            state: str = READBACK_STATE) -> None:
+    """Append one minimal local readback entry; never overwrites another CO's entry.
+
+    The observed Account Scanning state must be one of the accepted states
+    (a created-and-scanning tenant or a tenant with no scan started yet).
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise ValueError("invalid_readback_reference")
+    if not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, surface_account_id):
+        raise ValueError("invalid_readback_surface_account_id")
+    if not re.fullmatch(ACCOUNT_UUID_PATTERN, account_uuid):
+        raise ValueError("invalid_readback_account_uuid")
+    if not isinstance(state, str) or state not in READBACK_STATES:
+        raise ValueError("invalid_readback_state")
+    date.fromisoformat(observed_on)
+    try:
+        raw = json.loads(READBACK_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError()
+    except FileNotFoundError:
+        raw: dict[str, Any] = {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("readback_evidence_unreadable") from exc
+    raw[reference] = {
+        "surface_account_id": surface_account_id,
+        "account_uuid": account_uuid,
+        "leonardo_state": state,
+        "observed_on": observed_on,
+        "source": READBACK_SOURCE,
+    }
+    _write_json_atomic(READBACK_PATH, raw)
+
+
+def _row_text_cells(cells: Any) -> list[str] | None:
+    """Return a row's text-cell values, skipping leading checkbox-only cells.
+
+    MUIDataTable renders a leading checkbox column when rows are selectable;
+    such a cell has no text and must not be mistaken for the company name
+    (comparing it would silently false-clear a real duplicate and break the
+    readback). Returns None when the row has no usable text cells, so the
+    caller can fail closed.
+    """
+    try:
+        count = cells.count()
+    except Exception:
+        return None
+    texts: list[str] = []
+    for index in range(min(count, 12)):
+        cell = cells.nth(index)
+        try:
+            has_checkbox = cell.locator("input[type=checkbox]").count() >= 1
+            text = cell.inner_text()
+        except Exception:
+            return None
+        if has_checkbox and not text.strip():
+            continue
+        texts.append(text)
+    return texts or None
+
+
+def _normalized_ui_text(text: str) -> str:
+    return " ".join(text.casefold().split()).rstrip(".")
+
+
+def _is_empty_state_row(cells: Any) -> bool:
+    """True for the MUIDataTable zero-result row, e.g. "No records found".
+
+    Two live shapes are recognized:
+    - the standard layout: a single <td> spanning the table (colspan > 1);
+    - the stacked (responsive) layout the Development tenant table uses, where
+      every body cell renders as a label <td> plus a value <td>: the zero-result
+      row is 2-3 cells, exactly one holding a known empty-state message and
+      the rest blank (observed 2026-09-29: one row, two cells).
+
+    A zero-result search is by definition a clean duplicate check: no visible
+    row can be a duplicate. Any other short-row shape (a loading row, a
+    truncated row, unexpected text) cannot be classified and stays fail-closed.
+    """
+    try:
+        count = cells.count()
+        if count == 1:
+            colspan = cells.first.get_attribute("colspan")
+            return colspan is not None and int(colspan) > 1
+        if not 2 <= count <= 3:
+            return False
+        texts = [_normalized_ui_text(cells.nth(index).inner_text()) for index in range(count)]
+    except Exception:
+        return False
+    messages = [text for text in texts if text]
+    return len(messages) == 1 and messages[0] in EMPTY_STATE_MESSAGES
+
+
+def _tenant_row_values(texts: list[str]) -> tuple[str | None, str | None]:
+    """Return (company, domain) from a tenant row's text cells.
+
+    The live tenant table renders each column as a label cell followed by its
+    value cell (with an empty spacer between pairs), e.g.
+    ["Company name", <name>, "", "Company primary domain", <domain>, ...].
+    Comparing the fixed first two cells would therefore compare the literal
+    label "Company name" against the expected company name and never match.
+    The values are resolved by their label instead, which is robust to column
+    reordering. Returns (None, None) when either label is absent so the caller
+    fails closed.
+    """
+    company = None
+    domain = None
+    for index, cell in enumerate(texts):
+        normalized = " ".join(cell.casefold().split())
+        if index + 1 >= len(texts):
+            continue
+        if normalized == "company name":
+            company = texts[index + 1]
+        elif normalized == "company primary domain":
+            domain = texts[index + 1]
+    return company, domain
+
+
+def _exact_tenant_rows(page: Any, expected_name: str, expected_domain: str) -> str:
+    """Classify a visible tenant table without retaining a result row.
+
+    The zero-result empty-state row (a single full-width cell) is the only
+    legitimate short row: it means the search matched nothing, which is a
+    clean duplicate check. A leading checkbox-only cell is skipped so the
+    company and domain cells are compared against the right columns; the
+    company and domain values are resolved by their label cells (see
+    _tenant_row_values). Any other short-row shape or missing label fails
+    closed.
+    """
+    rows = page.locator("tbody tr")
+    count = rows.count()
+    if count > 100:
+        return "duplicate_schema_unavailable"
+    exact = 0
+    for index in range(count):
+        cells = rows.nth(index).locator("td")
+        if count == 1 and _is_empty_state_row(cells):
+            return "duplicate_clear"
+        texts = _row_text_cells(cells)
+        if texts is None or len(texts) < 2:
+            return "duplicate_schema_unavailable"
+        company, domain = _tenant_row_values(texts)
+        if company is None or domain is None:
+            return "duplicate_schema_unavailable"
+        normalized_company = " ".join(company.casefold().split())
+        normalized_domain = domain.casefold().strip().rstrip(".")
+        if normalized_company == " ".join(expected_name.casefold().split()) or normalized_domain == expected_domain:
+            exact += 1
+        elif (normalized_company.startswith(" ".join(expected_name.casefold().split()) + " ")
+              or " ".join(expected_name.casefold().split()).startswith(normalized_company + " ")):
+            return "duplicate_ambiguous"
+    return "duplicate_clear" if exact == 0 else "duplicate_found"
+
+
+def _settled_tenant_rows(page: Any, expected_name: str, expected_domain: str) -> str:
+    """Classify the tenant table after a search, letting a transient row settle.
+
+    Waits for the client-side search to apply, then re-reads an
+    unclassifiable table up to TABLE_SETTLE_RETRIES times (1 s apart) so a
+    loading placeholder cannot fail an otherwise valid check. It never turns
+    an unclassifiable table into a clear one: only a successful read can.
+    """
+    # The caller has already waited for this lookup's search response; this
+    # only lets the table re-render from it.
+    page.wait_for_timeout(500)
+    result = _exact_tenant_rows(page, expected_name, expected_domain)
+    for _attempt in range(TABLE_SETTLE_RETRIES):
+        if result != "duplicate_schema_unavailable":
+            break
+        page.wait_for_timeout(1_000)
+        result = _exact_tenant_rows(page, expected_name, expected_domain)
+    return result
+
+
+def _detail_value(page: Any, label: str) -> str | None:
+    """Read one exact-labeled details control; ambiguity stops the readback."""
+    control = page.get_by_label(label, exact=True)
+    if control.count() != 1:
+        return None
+    element = control.first
+    try:
+        value = element.input_value()
+    except Exception:
+        try:
+            value = element.inner_text()
+        except Exception:
+            return None
+    value = " ".join(value.split())
+    return value or None
+
+
+def _open_tenant_details(page: Any, tenant_name: str) -> bool:
+    """Click the exact tenant's row to open its details page (read-only)."""
+    expected = " ".join(tenant_name.casefold().split())
+    rows = page.locator("tbody tr")
+    count = rows.count()
+    target = None
+    for index in range(min(count, 100)):
+        cells = rows.nth(index).locator("td")
+        texts = _row_text_cells(cells)
+        if not texts:
+            continue
+        company, _domain = _tenant_row_values(texts)
+        if company is None or " ".join(company.casefold().split()) != expected:
+            continue
+        target = rows.nth(index)
+        break
+    if target is None:
+        return False
+    links = target.locator("a")
+    if links.count() == 1:
+        links.first.click()
+    else:
+        target.click()
+    page.wait_for_timeout(1_500)
+    return True
+
+
+def _readback_details(page: Any, tenant_name: str) -> tuple[str, str, str] | None:
+    """Open the exact tenant's details page and read the three evidence values."""
+    if not _open_tenant_details(page, tenant_name):
+        return None
+    surface_account_id = _detail_value(page, "Surface Account ID")
+    account_uuid = _detail_value(page, "Account UUID")
+    state = _detail_value(page, "Account Scanning")
+    if not all(isinstance(item, str) and item for item in (surface_account_id, account_uuid, state)):
+        return None
+    return surface_account_id, account_uuid, state
+
+
+def _readback_details_optional_state(page: Any, tenant_name: str) -> tuple[str, str, str | None] | None:
+    """Read the tenant details, tolerating an empty Account Scanning state.
+
+    A tenant with no scan yet has no observed state; the Surface Account ID
+    and Account UUID are still required. Returns None when the row or either
+    required value is unavailable.
+    """
+    if not _open_tenant_details(page, tenant_name):
+        return None
+    surface_account_id = _detail_value(page, "Surface Account ID")
+    account_uuid = _detail_value(page, "Account UUID")
+    if not (isinstance(surface_account_id, str) and surface_account_id
+            and isinstance(account_uuid, str) and account_uuid):
+        return None
+    return surface_account_id, account_uuid, _detail_value(page, "Account Scanning")
+
+
+def _open_search(page: Any) -> Any | None:
+    """Open the tenant-list search and return its input control.
+
+    The MUIDataTable tenant search is a toolbar icon button (accessible name
+    "Search"), not a text box; the text input (also accessible name "Search",
+    auto-focused) only exists once the icon is clicked. Returns the input
+    locator when exactly one is present, or None so the caller fails closed.
+    """
+    search_input = page.get_by_role("textbox", name="Search", exact=True)
+    if search_input.count() == 1:
+        return search_input
+    search_button = page.get_by_role("button", name="Search", exact=True)
+    if search_button.count() != 1:
+        return None
+    search_button.click()
+    deadline = monotonic() + 5.0
+    while monotonic() < deadline:
+        if search_input.count() == 1:
+            return search_input
+        sleep(0.25)
+    return None
+
+
+def _form_field_id_by_label(page: Any, label: str) -> str | None:
+    """Return the id of the single input whose associated label text matches.
+
+    The associated label is resolved in-page from a <label for>, a wrapping
+    <label>, or aria-labelledby. Returns None when zero or more than one input
+    matches (or the lookup fails), so the caller fails closed on ambiguity.
+    """
+    try:
+        matched_id = page.evaluate(
+            """(label) => {
+                const inputs = Array.from(document.querySelectorAll('input, select, textarea'));
+                const safe = (fn) => { try { return fn(); } catch (e) { return null; } };
+                const labelFor = (el) => {
+                    let t = '';
+                    if (el.id) {
+                        t = safe(() => {
+                            const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]');
+                            return l ? l.textContent : '';
+                        }) || '';
+                    }
+                    if (!t) {
+                        t = safe(() => {
+                            const w = el.closest('label');
+                            return w ? w.textContent : '';
+                        }) || '';
+                    }
+                    if (!t && el.getAttribute('aria-labelledby')) {
+                        t = safe(() => {
+                            const ids = el.getAttribute('aria-labelledby').split(/\\s+/);
+                            return ids.map(id => {
+                                const e = document.getElementById(id);
+                                return e ? e.textContent : '';
+                            }).filter(Boolean).join(' ');
+                        }) || '';
+                    }
+                    return t.trim();
+                };
+                const matches = inputs.filter(el => labelFor(el) === label);
+                return matches.length === 1 && matches[0].id ? matches[0].id : null;
+            }""",
+            label,
+        )
+    except Exception:
+        return None
+    return matched_id if isinstance(matched_id, str) and matched_id else None
+
+
+def _locate_form_field(page: Any, label: str, data_am: str) -> Any | None:
+    """Locate one Add Account form field by accessible label, then by its
+    stable data-am attribute, then by its associated label text.
+
+    Returns the resolved locator when exactly one control matches, or None so
+    the caller fails closed. The accessible label is preferred (it is the
+    operator-facing name); the data-am attribute and the associated label text
+    are fallbacks for a renamed or unlabeled control.
+    """
+    control = page.get_by_label(label, exact=True)
+    if control.count() == 1:
+        return control
+    control = page.locator(f'[data-am="{data_am}"]')
+    if control.count() == 1:
+        return control
+    matched_id = _form_field_id_by_label(page, label)
+    if matched_id:
+        control = page.get_by_id(matched_id)
+        if control.count() == 1:
+            return control
+    return None
+
+
+def _finish(reference: str, acknowledged_revision: str, result: str) -> str:
+    """Record the final result (best effort) and return it.
+
+    A dry run never touches the one-time create gate; it only writes its log.
+    """
+    if _ACTIVE_RUN_LOG is None or _ACTIVE_RUN_LOG.mode != DRY_RUN_MODE:
+        try:
+            record_runner_result(reference, acknowledged_revision, result, datetime.now().isoformat(timespec="seconds"))
+        except (OSError, ValueError, RunnerStateUnavailable):
+            pass
+    if _ACTIVE_RUN_LOG is not None:
+        _ACTIVE_RUN_LOG.event("finish", result)
+        _ACTIVE_RUN_LOG.write(result)
+    return result
+
+
+def _free_port() -> int:
+    """Return an available localhost TCP port for the CDP endpoint."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _chrome_executable() -> str | None:
+    """Return the operator's installed Chrome, or None to use the bundled build."""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _wait_for_cdp(port: int, timeout_seconds: float = 30.0) -> bool:
+    """Poll the CDP version endpoint until it answers or the deadline passes."""
+    deadline = monotonic() + timeout_seconds
+    while monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=3) as response:
+                if response.status == 200:
+                    return True
+        except Exception:
+            pass
+        sleep(0.5)
+    return False
+
+
+def _cdp_request(port: int, path: str, *, method: str = "GET", timeout: float = 3.0) -> bytes | None:
+    """Issue one loopback-only CDP HTTP request; return the body or None.
+
+    The host is always 127.0.0.1: the automation browser is launched without
+    --remote-debugging-address, so Chrome binds its DevTools endpoint to
+    loopback only, and this helper never talks to any other host. Proxy
+    settings are ignored so a loopback request is never routed via a proxy.
+    """
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            if response.status != 200:
+                return None
+            return response.read(1_000_000)
+    except Exception:
+        return None
+
+
+def _cdp_json(port: int, path: str, *, method: str = "GET") -> Any:
+    """Return the decoded JSON body of a CDP HTTP endpoint, or None."""
+    body = _cdp_request(port, path, method=method)
+    if body is None:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _cdp_page_targets(port: int) -> list[dict[str, str]]:
+    """Return [{"id", "url"}] for every live page target via CDP /json.
+
+    The /json endpoint always reflects the current target list, unlike a
+    Playwright context.pages reference held across a cross-origin SSO redirect
+    (which can replace the underlying CDP target and leave the old reference
+    stale). Returns an empty list when the endpoint is unreachable.
+    """
+    targets = _cdp_json(port, "/json")
+    if not isinstance(targets, list):
+        return []
+    pages: list[dict[str, str]] = []
+    for target in targets:
+        if not isinstance(target, dict) or target.get("type") != "page":
+            continue
+        url = target.get("url")
+        if not isinstance(url, str):
+            continue
+        target_id = target.get("id")
+        pages.append({"id": target_id if isinstance(target_id, str) else "", "url": url})
+    return pages
+
+
+def _cdp_page_urls(port: int, tab: "_AutomationTab | None" = None) -> list[str]:
+    """Return the URLs of live page targets via the CDP /json endpoint.
+
+    With ``tab`` the result is restricted to the tab this run opened (see
+    _AutomationTab.select), so another tab in the reused automation window
+    (for example one the operator opened at tenant-management) can never be
+    mistaken for this run's page. Without ``tab`` every page target counts.
+    """
+    targets = _cdp_page_targets(port)
+    if tab is not None:
+        targets = tab.select(targets)
+    return [target["url"] for target in targets]
+
+
+def _cdp_open_tab(port: int, url: str) -> str | None:
+    """Open a new tab at url in the automation browser; return its target id.
+
+    Uses the CDP HTTP endpoint (PUT /json/new, required since Chrome 111), so
+    the tab exists before any Playwright attach and is tracked by target id.
+    Only the fixed Leonardo Development URLs (or the anchor tab) are opened.
+    """
+    if url != ANCHOR_TAB_URL and not url.startswith(DEVELOPMENT_ORIGIN + "/"):
+        return None
+    created = _cdp_json(port, "/json/new?" + url, method="PUT")
+    if not isinstance(created, dict):
+        return None
+    target_id = created.get("id")
+    if not isinstance(target_id, str) or not CDP_TARGET_ID.fullmatch(target_id):
+        return None
+    return target_id
+
+
+def _cdp_close_tab(port: int, target_id: str) -> bool:
+    """Close one tab by target id via CDP /json/close; True when accepted."""
+    if not CDP_TARGET_ID.fullmatch(target_id):
+        return False
+    return _cdp_request(port, "/json/close/" + target_id) is not None
+
+
+def _read_devtools_active_port(profile_dir: Path) -> tuple[int, str] | None:
+    """Parse the DevToolsActivePort file Chrome writes into the user-data-dir.
+
+    Line 1 is the CDP port and line 2 the per-instance browser WebSocket path
+    (/devtools/browser/<id>). Returns (port, ws_path), or None when the file is
+    missing, oversized, not ASCII, or malformed. The file holds no session
+    material; its values are never logged.
+    """
+    path = profile_dir / DEVTOOLS_ACTIVE_PORT_FILE
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(DEVTOOLS_ACTIVE_PORT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > DEVTOOLS_ACTIVE_PORT_MAX_BYTES:
+        return None
+    try:
+        lines = raw.decode("ascii").splitlines()
+    except UnicodeDecodeError:
+        return None
+    if len(lines) < 2:
+        return None
+    port_text, ws_path = lines[0].strip(), lines[1].strip()
+    if not re.fullmatch(r"[0-9]{1,5}", port_text):
+        return None
+    port = int(port_text)
+    if not 1 <= port <= 65535 or not CDP_BROWSER_WS_PATH.fullmatch(ws_path):
+        return None
+    return port, ws_path
+
+
+def _verified_automation_port(profile_dir: Path) -> int | None:
+    """Return the CDP port of the live automation browser for profile_dir.
+
+    The DevToolsActivePort entry is trusted only when the loopback
+    /json/version endpoint answers with a browser WebSocket URL whose host is
+    loopback, whose port matches, and whose path equals the file's per-instance
+    browser path. That proves the listener is the Chrome instance using this
+    dedicated profile, not a stale file (crash) or an unrelated process that
+    reused the port. Anything else means "not running": nothing is deleted.
+    """
+    from urllib.parse import urlsplit
+
+    entry = _read_devtools_active_port(profile_dir)
+    if entry is None:
+        return None
+    port, ws_path = entry
+    version = _cdp_json(port, "/json/version")
+    if not isinstance(version, dict):
+        return None
+    ws_url = version.get("webSocketDebuggerUrl")
+    if not isinstance(ws_url, str):
+        return None
+    try:
+        parts = urlsplit(ws_url)
+        ws_port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "ws" or parts.hostname not in ("127.0.0.1", "localhost") \
+            or ws_port != port or parts.path != ws_path:
+        return None
+    return port
+
+
+def _url_path(url: str) -> str:
+    """Return the path component of a URL, tolerant of query strings/fragments.
+
+    Post-login tenant-management URLs carry query strings (e.g. ?tab=accounts)
+    and the SSO redirect can append fragments; an exact full-URL match misses
+    those, which is what turned a valid login into a development_login_timeout.
+    """
+    from urllib.parse import urlsplit
+    try:
+        return urlsplit(url).path
+    except Exception:
+        return url.split("?", 1)[0].split("#", 1)[0]
+
+
+def _is_tenant_management_url(url: str) -> bool:
+    """True when a live page target is at the Development tenant-management route."""
+    return TENANT_MANAGEMENT_PATH in _url_path(url)
+
+
+def _wait_for_tenant_management(port: int, timeout_seconds: float, stable_polls: int = 5,
+                                tab: "_AutomationTab | None" = None) -> bool:
+    """Poll the CDP /json endpoint until a page target is stably at
+    tenant-management.
+
+    "Stably" means the tenant-management URL is observed on stable_polls
+    consecutive 1-second polls: the app can briefly show the
+    tenant-management URL before a client-side auth redirect sends an
+    expired session to /login, and that pre-redirect sighting must not
+    count as having reached tenant-management. With ``tab`` only the tab this
+    run opened counts.
+    """
+    deadline = monotonic() + timeout_seconds
+    stable_count = 0
+    while monotonic() < deadline:
+        urls = _cdp_page_urls(port, tab) if tab is not None else _cdp_page_urls(port)
+        if any(_is_tenant_management_url(url) for url in urls):
+            stable_count += 1
+            if stable_count >= stable_polls:
+                return True
+        else:
+            stable_count = 0
+        sleep(1)
+    return False
+
+
+def _classify_leonardo_session(port: int, timeout_seconds: float, stable_polls: int = 5,
+                               tab: "_AutomationTab | None" = None) -> str:
+    """Classify the Leonardo session from live CDP page targets (read-only).
+
+    Returns "active" when a page is stably at tenant-management (the URL is
+    observed on stable_polls consecutive 1-second polls, so a pre-redirect
+    sighting of an expired session does not count), "expired" when a page is
+    present but never stably reaches tenant-management (the session
+    redirected to login/SSO), and "unavailable" when no page target is
+    reachable (likely a VPN/network issue). With ``tab`` only the tab this
+    check opened is classified. This never fills, submits, or creates anything.
+    """
+    deadline = monotonic() + timeout_seconds
+    saw_page = False
+    stable_count = 0
+    while monotonic() < deadline:
+        at_tenant_management = False
+        urls = _cdp_page_urls(port, tab) if tab is not None else _cdp_page_urls(port)
+        for url in urls:
+            saw_page = True
+            if _is_tenant_management_url(url):
+                at_tenant_management = True
+        if at_tenant_management:
+            stable_count += 1
+            if stable_count >= stable_polls:
+                return "active"
+        else:
+            stable_count = 0
+        sleep(1)
+    return "expired" if saw_page else "unavailable"
+
+
+def leonardo_profile() -> tuple[Path, bool]:
+    """Return (profile_dir, persist) for the attended Leonardo browser.
+
+    On the operator desktop this is a dedicated, persisted automation profile
+    (the documented §10 option-3 temporary development bridge): it retains the
+    Leonardo Development session so SSO/MFA is only required when it expires.
+    It is never the operator's main Chrome profile, never placed on the VM,
+    and never copied to Git, logs, or backups. persist=True means the dir must
+    be retained across runs (not deleted on completion). On any non-Windows
+    host, or when an override is not set, a fresh temporary profile is used and
+    persist=False so no session is ever retained off the operator desktop.
+    """
+    override = os.environ.get("SURFACE_LEONARDO_PROFILE_DIR")
+    if override:
+        return Path(override), True
+    if os.name != "nt":
+        return Path(tempfile.mkdtemp(prefix="attended_ce_chrome_")), False
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    return Path(base) / "SurfaceOnboarding" / "leonardo-automation", True
+
+
+@dataclass
+class _AutomationTab:
+    """The one tab an attended operation opened in the automation browser.
+
+    ``target_id`` is the CDP target this run created. ``preexisting`` holds the
+    page target ids that existed before it was opened, so if a cross-origin
+    SSO redirect replaces the target (new id) the single new, not-preexisting
+    target is adopted as ours; zero or several such candidates select nothing
+    (fail closed) so another tab is never mistaken for this run's page.
+    ``chrome_proc`` is set only when this operation launched the browser.
+    """
+    port: int
+    target_id: str
+    preexisting: frozenset[str]
+    profile_dir: Path
+    persist: bool
+    chrome_proc: Any | None
+    reused: bool
+
+    def select(self, targets: list[dict[str, str]]) -> list[dict[str, str]]:
+        """Return the entries of targets that are this run's tab (0 or 1)."""
+        for target in targets:
+            if target.get("id") == self.target_id:
+                return [target]
+        replacements = [target for target in targets
+                        if target.get("id") and target.get("id") not in self.preexisting]
+        if len(replacements) == 1:
+            self.target_id = replacements[0]["id"]
+            return replacements
+        return []
+
+    def current_target_id(self) -> str | None:
+        """Resolve this run's live target id now (None when gone/ambiguous)."""
+        selected = self.select(_cdp_page_targets(self.port))
+        return selected[0]["id"] if selected else None
+
+
+def _stop_chrome_process(chrome_proc: Any) -> None:
+    """Terminate a Chrome process this operation launched (best effort)."""
+    if chrome_proc is None:
+        return
+    try:
+        chrome_proc.terminate()
+        chrome_proc.wait(timeout=10)
+    except Exception:
+        try:
+            chrome_proc.kill()
+        except Exception:
+            pass
+
+
+def _launch_automation_chrome(executable: str, profile_dir: Path, persist: bool) -> tuple[Any, int | None]:
+    """Launch the automation Chrome with an OS-chosen loopback CDP port.
+
+    --remote-debugging-port=0 lets Chrome bind a free loopback port itself
+    (no _free_port() probe-then-bind race and no fixed, predictable port) and
+    record it in DevToolsActivePort, which is also how later runs discover and
+    verify this same instance for reuse. The window opens on a neutral anchor
+    tab; each operation opens its own tab next to it. A persisted launch is
+    placed in its own process group so it outlives the runner process (the
+    window is reused by the next run). Returns (chrome_proc, port) where port
+    is None when the endpoint was not verified in time.
+    """
+    kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                              "stdin": subprocess.DEVNULL}
+    if persist and os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    chrome_proc = subprocess.Popen(
+        [executable, f"--user-data-dir={profile_dir}", "--remote-debugging-port=0",
+         "--no-first-run", "--no-default-browser-check", ANCHOR_TAB_URL],
+        **kwargs,
+    )
+    deadline = monotonic() + BROWSER_LAUNCH_SECONDS
+    while monotonic() < deadline:
+        port = _verified_automation_port(profile_dir)
+        if port is not None:
+            return chrome_proc, port
+        sleep(0.5)
+    return chrome_proc, None
+
+
+def _open_automation_tab(playwright: Any, url: str) -> _AutomationTab:
+    """Open a new tab at url in the (reused or freshly launched) automation browser.
+
+    With the persisted desktop profile an already-running automation Chrome
+    (verified via DevToolsActivePort + /json/version) is reused: only a new
+    tab is opened, so the Leonardo session stays warm and no new window
+    appears. Otherwise the browser is launched. A temporary (non-persisted)
+    profile is never reused: it is always a fresh launch that
+    _release_automation_tab tears down completely.
+
+    Security: while the reused automation window stays open its loopback CDP
+    port lets any local process on this desktop drive that Leonardo
+    Development session. The operator closes the automation window (or uses
+    --close-browser / close_automation_browser) at the end of the day.
+    Raises RuntimeError with leonardo_profile_unavailable,
+    browser_cdp_unavailable, or browser_tab_unavailable.
+    """
+    profile_dir, persist = leonardo_profile()
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError("leonardo_profile_unavailable") from exc
+    chrome_proc = None
+    port = _verified_automation_port(profile_dir) if persist else None
+    reused = port is not None
+    try:
+        if port is None:
+            executable = _chrome_executable() or playwright.chromium.executable_path
+            chrome_proc, port = _launch_automation_chrome(executable, profile_dir, persist)
+            if port is None:
+                raise RuntimeError("browser_cdp_unavailable")
+        preexisting = frozenset(target["id"] for target in _cdp_page_targets(port) if target["id"])
+        target_id = _cdp_open_tab(port, url)
+        if target_id is None:
+            raise RuntimeError("browser_tab_unavailable")
+        return _AutomationTab(port=port, target_id=target_id, preexisting=preexisting,
+                              profile_dir=profile_dir, persist=persist,
+                              chrome_proc=chrome_proc, reused=reused)
+    except BaseException:
+        # A browser this operation launched but could not use is not left
+        # behind; a reused browser is never terminated here.
+        _stop_chrome_process(chrome_proc)
+        if not persist:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        raise
+
+
+def _release_automation_tab(tab: _AutomationTab) -> None:
+    """Tear down what this operation opened.
+
+    Persisted profile: close ONLY this run's tab (resolved by target id, so a
+    replaced SSO target is still found) and leave the automation window and
+    its session running for the next run. A persisted profile is never
+    removed here. Temporary profile: terminate the launched Chrome and delete
+    the temporary profile, exactly as before.
+    """
+    if tab.persist:
+        target_id = tab.current_target_id()
+        if target_id is not None:
+            _cdp_close_tab(tab.port, target_id)
+        return
+    _stop_chrome_process(tab.chrome_proc)
+    shutil.rmtree(tab.profile_dir, ignore_errors=True)
+
+
+def _page_target_id(context: Any, page: Any) -> str | None:
+    """Return the CDP target id of a Playwright page, or None."""
+    session = None
+    try:
+        session = context.new_cdp_session(page)
+        info = session.send("Target.getTargetInfo")
+        target_id = info["targetInfo"]["targetId"]
+        return target_id if isinstance(target_id, str) else None
+    except Exception:
+        return None
+    finally:
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:
+                pass
+
+
+def _attach_attended_browser(playwright: Any) -> tuple[Any, Any, Any, _AutomationTab]:
+    """Open this run's tab in the automation browser, wait for the operator's
+    SSO/MFA (skipped when the session is still valid), then attach over CDP.
+
+    Returns (browser, context, page, tab); the caller must pass tab to
+    _release_automation_tab. Playwright's own launch() is avoided because its
+    flag set terminates the browser process when it reaches the Leonardo
+    Development host over the RND (Fortinet) VPN; a normally-launched Chrome
+    with a loopback CDP port reaches the host reliably while keeping the
+    session isolated in the dedicated automation profile.
+
+    The login wait polls the CDP /json endpoint (which always reflects the
+    live target list) restricted to this run's tab, rather than a held
+    Playwright page reference: a cross-origin SSO redirect can replace the
+    underlying CDP target, so a reference taken before login can go stale.
+    Attaching only after this tab reaches tenant-management yields a fresh,
+    valid page object, matched to this run's target id so another tab in the
+    reused window is never used. Raises LoginTimeout if tenant-management is
+    not reached in time.
+    """
+    tab = _open_automation_tab(playwright, TENANT_MANAGEMENT)
+    try:
+        if not _wait_for_tenant_management(tab.port, MAX_WAIT_SECONDS, tab=tab):
+            raise LoginTimeout()
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{tab.port}")
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = _find_live_page(context, tab)
+        if page is None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+            raise RuntimeError("login_page_schema_unavailable")
+        return browser, context, page, tab
+    except BaseException:
+        _release_automation_tab(tab)
+        raise
+
+
+@contextmanager
+def _attended_page(playwright: Any):
+    """Attach the attended browser and guarantee teardown; yield the page.
+
+    _attach_attended_browser already releases its tab on its own failure, so
+    teardown here only handles the attached (success) path. browser.close() on
+    a connect_over_cdp browser only disconnects Playwright; it does not close
+    the automation browser. A persisted automation profile keeps its window
+    and session (only this run's tab is closed); a temporary profile is torn
+    down completely.
+    """
+    browser, _context, page, tab = _attach_attended_browser(playwright)
+    try:
+        yield page
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        _release_automation_tab(tab)
+
+
+def _find_live_page(context: Any, tab: _AutomationTab | None = None) -> Any:
+    """Return the live page at the tenant-management URL, or None.
+
+    A cross-origin SSO redirect can replace the underlying CDP target, leaving
+    any previously-held page reference stale (its .url never advances past the
+    login page). Re-scanning context.pages adopts the current live page. With
+    ``tab`` only the page whose CDP target id is this run's tab is accepted,
+    and anything other than exactly one such page returns None (fail closed).
+    """
+    if tab is None:
+        for candidate in context.pages:
+            try:
+                url = candidate.url
+            except Exception:
+                continue
+            if _is_tenant_management_url(url):
+                return candidate
+        return None
+    target_id = tab.current_target_id()
+    if target_id is None:
+        return None
+    matches = []
+    for candidate in context.pages:
+        try:
+            url = candidate.url
+        except Exception:
+            continue
+        if _is_tenant_management_url(url) and _page_target_id(context, candidate) == target_id:
+            matches.append(candidate)
+    return matches[0] if len(matches) == 1 else None
+
+
+def check_leonardo_session() -> str:
+    """Read-only Leonardo Development session check (the §10 bridge).
+
+    Opens a new tab at tenant-management in the automation browser (reusing
+    the running automation window, or launching it with the dedicated
+    persisted profile) and classifies only that tab via CDP page targets.
+    Returns "leonardo_session_active", "leonardo_session_expired", or
+    "leonardo_session_unavailable" (plus fail-closed codes). It never fills,
+    submits, or creates; it closes only its own tab and never deletes the
+    persisted profile, so a valid session is reused by the next attended run.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    with sync_playwright() as playwright:
+        try:
+            tab = _open_automation_tab(playwright, TENANT_MANAGEMENT)
+        except RuntimeError as error:
+            return str(error)
+        try:
+            classification = _classify_leonardo_session(tab.port, SESSION_CHECK_SECONDS, tab=tab)
+            return {
+                "active": "leonardo_session_active",
+                "expired": "leonardo_session_expired",
+                "unavailable": "leonardo_session_unavailable",
+            }[classification]
+        finally:
+            _release_automation_tab(tab)
+
+
+def bootstrap_leonardo_session(wait_seconds: float = MAX_WAIT_SECONDS) -> str:
+    """Open the attended browser so the operator can complete SSO/MFA once.
+
+    Opens a new tab at tenant-management in the automation browser (reused
+    or launched with the dedicated persisted profile) and waits (bounded)
+    until that tab is stably there: with a valid session this returns almost
+    immediately; with an expired session the operator completes SSO/MFA in
+    that tab and the wait then succeeds. It never fills, submits, or creates;
+    it only establishes or refreshes the persisted session, then closes its
+    own tab and leaves the automation window running.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    with sync_playwright() as playwright:
+        try:
+            tab = _open_automation_tab(playwright, TENANT_MANAGEMENT)
+        except RuntimeError as error:
+            return str(error)
+        try:
+            if not _wait_for_tenant_management(tab.port, wait_seconds, tab=tab):
+                return "development_login_timeout"
+            return "leonardo_session_bootstrapped"
+        finally:
+            _release_automation_tab(tab)
+
+
+def _send_browser_close(port: int) -> None:
+    """Ask the automation browser to exit via CDP Browser.close (best effort)."""
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+        try:
+            browser.new_browser_cdp_session().send("Browser.close")
+        except Exception:
+            # The connection drops as the browser exits; the caller verifies.
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+
+def _close_automation_browser_at(profile_dir: Path, timeout_seconds: float = BROWSER_CLOSE_SECONDS) -> str:
+    """Close the running automation browser for profile_dir, if any.
+
+    Returns "automation_browser_not_running" (no verified instance),
+    "automation_browser_closed" (Browser.close sent and the loopback endpoint
+    verified gone), or "automation_browser_close_unavailable" (fail closed:
+    the browser could not be closed or is still answering).
+    """
+    port = _verified_automation_port(profile_dir)
+    if port is None:
+        return "automation_browser_not_running"
+    try:
+        _send_browser_close(port)
+    except Exception:
+        return "automation_browser_close_unavailable"
+    deadline = monotonic() + timeout_seconds
+    while monotonic() < deadline:
+        if _cdp_request(port, "/json/version") is None:
+            return "automation_browser_closed"
+        sleep(0.5)
+    return "automation_browser_close_unavailable"
+
+
+def close_automation_browser() -> str:
+    """Close the reused automation Chrome window (ends the warm CDP exposure).
+
+    The persisted profile (and therefore the Leonardo session) is retained;
+    only the running browser exits. A temporary (non-persisted) profile never
+    outlives a run, so there is nothing to close.
+    """
+    profile_dir, persist = leonardo_profile()
+    if not persist:
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        return "automation_browser_not_running"
+    return _close_automation_browser_at(profile_dir)
+
+
+def reset_leonardo_profile() -> bool:
+    """Wipe the dedicated persisted Leonardo automation profile.
+
+    Forces a fresh SSO/MFA on the next attended run. A running automation
+    browser is closed first (CDP Browser.close) so the profile is not wiped
+    underneath a live session; if it cannot be closed the reset fails closed
+    and nothing is removed. Only removes the dedicated automation profile
+    (never the operator's main Chrome profile). Returns True when the profile
+    was removed (or was already absent).
+    """
+    profile_dir, persist = leonardo_profile()
+    if not profile_dir.exists():
+        return True
+    if persist and _close_automation_browser_at(profile_dir) == "automation_browser_close_unavailable":
+        return False
+    for attempt in range(PROFILE_REMOVE_ATTEMPTS):
+        shutil.rmtree(profile_dir, ignore_errors=True)
+        if not profile_dir.exists():
+            return True
+        if attempt + 1 < PROFILE_REMOVE_ATTEMPTS:
+            # Chrome can hold profile files briefly after its endpoint closes.
+            sleep(1)
+    return not profile_dir.exists()
+
+
+def reset_runner_record(reference: str) -> bool:
+    """Re-arm one completed, non-successful attended run for the same revision.
+
+    Refuses to reset an in-flight run (no result yet) or a run that verified a
+    created tenant (readback_verified), so a successful creation can never be
+    re-run. Any other recorded result (a blocked or no-create outcome) removes
+    the record so the operator may start again; the duplicate check still
+    guards against an existing tenant.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise ValueError("invalid_runner_state_record")
+    state = load_runner_state()
+    record = state.get(reference)
+    if record is None:
+        return True
+    if "result" not in record:
+        raise ValueError("runner_in_progress_cannot_be_reset")
+    if record["result"] == "readback_verified":
+        raise ValueError("runner_result_cannot_be_reset")
+    del state[reference]
+    _write_json_atomic(RUNNER_STATE_PATH, state)
+    return True
+
+
+def _locate_confirm_button(page: Any) -> Any | None:
+    """Locate the single Add Account Confirm control, failing closed on ambiguity.
+
+    The Confirm control is located by its exact accessible name. The exact
+    label is confirmed on the first attended run; any zero or multiple match
+    stops the runner before the form is submitted so an uncertain mutation
+    never occurs. Diagnostics capture the live button names for diagnosis.
+    """
+    control = page.get_by_role("button", name="Confirm", exact=True)
+    try:
+        count = control.count()
+    except Exception:
+        return None
+    if count == 1:
+        return control
+    return None
+
+
+class RunLog:
+    """Redacted, step-by-step local log of one attended run.
+
+    Records each runner step and field outcome, plus browser-side signals
+    (console errors/warnings, uncaught page errors, failed requests, and the
+    method/path/status of Leonardo API calls) so a failed run can be diagnosed
+    without re-running it. It never records cookies, headers, request or
+    response bodies, or query strings, and every known source value (tenant
+    name, domains, email) is replaced with a placeholder before it is stored.
+    Failures are swallowed: logging must never change the runner's outcome.
+    """
+
+    def __init__(self, reference: str, mode: str) -> None:
+        self.reference = reference
+        self.mode = mode
+        self.started_on = datetime.now().isoformat(timespec="seconds")
+        self.events: list[dict[str, str]] = []
+        self.diagnostics: list[dict[str, Any]] = []
+        self._redact: list[str] = []
+
+    def add_redactions(self, *values: str) -> None:
+        for value in values:
+            if isinstance(value, str) and len(value.strip()) >= 3:
+                self._redact.append(value.strip())
+        self._redact.sort(key=len, reverse=True)
+
+    def _clean(self, text: object) -> str:
+        cleaned = " ".join(str(text).split())
+        for value in self._redact:
+            cleaned = re.sub(re.escape(value), "<value>", cleaned, flags=re.IGNORECASE)
+        return cleaned[:RUN_LOG_DETAIL_CHARS]
+
+    def event(self, step: str, outcome: str, field: str = "", detail: object = "") -> None:
+        try:
+            if len(self.events) >= RUN_LOG_MAX_EVENTS:
+                return
+            entry = {"t": datetime.now().isoformat(timespec="seconds"), "step": step, "outcome": outcome}
+            if field:
+                entry["field"] = field
+            if detail:
+                entry["detail"] = self._clean(detail)
+            self.events.append(entry)
+        except Exception:
+            pass
+
+    def error(self, step: str, field: str, exc: BaseException) -> None:
+        message = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+        self.event(step, "error", field, f"{type(exc).__name__}: {message}")
+
+    def attach(self, page: Any) -> None:
+        """Subscribe to browser-side signals on the attended page."""
+        def _path(url: str) -> str:
+            return _url_path(url) if url.startswith(DEVELOPMENT_ORIGIN) else "<other-origin>"
+
+        def on_console(message: Any) -> None:
+            try:
+                if message.type in ("error", "warning"):
+                    self.event("browser_console", message.type, detail=message.text)
+            except Exception:
+                pass
+
+        def on_page_error(error: Any) -> None:
+            self.event("browser_page_error", "error", detail=error)
+
+        def on_request_failed(request: Any) -> None:
+            try:
+                self.event("browser_request_failed", "error", _path(request.url),
+                           f"{request.method} {request.failure or ''}")
+            except Exception:
+                pass
+
+        def on_response(response: Any) -> None:
+            try:
+                url = response.url
+                if "/api/" in url or response.status >= 400:
+                    self.event("browser_response", str(response.status), _path(url), response.request.method)
+            except Exception:
+                pass
+
+        for name, handler in (("console", on_console), ("pageerror", on_page_error),
+                              ("requestfailed", on_request_failed), ("response", on_response)):
+            try:
+                page.on(name, handler)
+            except Exception:
+                pass
+
+    def write(self, result: str) -> None:
+        """Append this run to the local log file (keeps the newest runs only)."""
+        try:
+            try:
+                existing = json.loads(RUN_LOG_PATH.read_text(encoding="utf-8"))
+                runs = existing.get("runs", []) if isinstance(existing, dict) else []
+                if not isinstance(runs, list):
+                    runs = []
+            except (OSError, ValueError):
+                runs = []
+            runs.append({
+                "reference": self.reference, "mode": self.mode, "started_on": self.started_on,
+                "completed_on": datetime.now().isoformat(timespec="seconds"),
+                "result": result, "events": self.events,
+                "diagnostics": self.diagnostics[-RUN_LOG_MAX_DIAGNOSTICS:],
+            })
+            _write_json_atomic(RUN_LOG_PATH, {
+                "note": "Redacted attended-runner step log. No cookies, headers, bodies, query strings, or source values.",
+                "runs": runs[-RUN_LOG_MAX_RUNS:],
+            })
+        except Exception:
+            pass
+
+
+_ACTIVE_RUN_LOG: RunLog | None = None
+
+
+def _log() -> RunLog:
+    """The active run's log, or a throwaway log outside a run."""
+    return _ACTIVE_RUN_LOG if _ACTIVE_RUN_LOG is not None else RunLog("-", "none")
+
+
+def _locate_select(page: Any, label: str) -> Any | None:
+    """Locate one Add Account <select> by its stable name attribute.
+
+    The live form's selects carry no associated <label> (2026-09-29
+    diagnostics), so a label lookup finds nothing; the name attribute is the
+    stable contract. The label lookup remains as a fallback.
+    """
+    name = SELECT_NAMES.get(label)
+    if name:
+        try:
+            control = page.locator(f'select[name="{name}"]')
+            if control.count() == 1:
+                return control
+        except Exception:
+            pass
+    return _locate_form_field(page, label, "")
+
+
+def _selected_option_text(control: Any) -> str:
+    selected = control.evaluate(
+        "el => el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex].textContent : ''")
+    return " ".join(str(selected or "").split())
+
+
+def _fill_ce_form(page: Any, plan: dict[str, Any]) -> tuple[str | None, Any]:
+    """Fill the CE-only Add Account form, logging every field outcome.
+
+    Order: toggles first (dependent controls such as the Leaked Credentials
+    interval and domains may only be enabled once their toggle is on), then
+    selects, then text fields, then license dates, then a final re-read of
+    every toggle and select before Confirm. Each control must resolve to
+    exactly one enabled element and keep the value set. Returns
+    (failure_code, company_name_control); failure_code is None on success.
+    """
+    log = _log()
+    early = {label: option for label, option in plan["selects"].items() if label in EARLY_SELECTS}
+    late = {label: option for label, option in plan["selects"].items() if label not in EARLY_SELECTS}
+    for label, option in early.items():
+        failure = _fill_select(page, label, option)
+        if failure:
+            return failure, None
+    if not _expand_advanced_options(page, plan["checkboxes"]):
+        return "fill_form_schema_unavailable", None
+    for key, target in plan["checkboxes"].items():
+        if not _set_checkbox(page, key, target):
+            log.event("fill_toggle", "failed", key, f"target={'on' if target else 'off'}")
+            return "fill_form_schema_unavailable", None
+        log.event("fill_toggle", "ok", key)
+    for label, option in late.items():
+        failure = _fill_select(page, label, option)
+        if failure:
+            return failure, None
+    company_control = None
+    for label, expected in plan["texts"].items():
+        control = _locate_form_field(page, label, "")
+        if control is None:
+            log.event("fill_text", "not_found", label)
+            return "fill_form_schema_unavailable", None
+        try:
+            if not control.first.is_enabled():
+                log.event("fill_text", "disabled", label)
+                return "fill_form_schema_unavailable", None
+            control.first.fill(expected, timeout=FIELD_TIMEOUT_MS)
+            actual = control.first.input_value()
+        except Exception as exc:
+            log.error("fill_text", label, exc)
+            return "fill_form_schema_unavailable", None
+        if actual != expected:
+            log.event("fill_text", "mismatch", label)
+            return "fill_value_mismatch", None
+        log.event("fill_text", "ok", label)
+        if label == "Company name":
+            company_control = control
+    for key in ("license_start", "license_end"):
+        if not _fill_license_date(page, key, plan[key]):
+            log.event("fill_date", "failed", key)
+            return "fill_form_schema_unavailable", None
+        log.event("fill_date", "ok", key)
+    # Final re-read before Confirm: a later change must not have flipped an
+    # earlier toggle or select (e.g. a dependent control resetting another).
+    for key, target in plan["checkboxes"].items():
+        control = _locate_checkbox(page, key)
+        try:
+            ok = control is not None and control.first.is_checked() == target
+        except Exception:
+            ok = False
+        if not ok:
+            log.event("verify_toggle", "mismatch", key)
+            return "fill_value_mismatch", None
+    for label, option in plan["selects"].items():
+        control = _locate_select(page, label)
+        try:
+            ok = control is not None and _selected_option_text(control.first) == option
+        except Exception:
+            ok = False
+        if not ok:
+            log.event("verify_select", "mismatch", label)
+            return "fill_value_mismatch", None
+    for key in ("license_start", "license_end"):
+        if not _license_date_kept(page, key, plan[key]):
+            log.event("verify_date", "mismatch", key)
+            return "fill_value_mismatch", None
+    log.event("verify_form", "ok")
+    return None, company_control
+
+
+def _expand_advanced_options(page: Any, checkboxes: dict[str, bool]) -> bool:
+    """Expand the collapsed "Advanced options" section when the plan needs it.
+
+    Idempotent: the section is opened only while an advanced toggle cannot be
+    found, so a section the form already shows open is never collapsed. Fails
+    closed (False) when the button is missing or the toggles never appear.
+    """
+    needed = [key for key in checkboxes if key in ADVANCED_TOGGLES_OFF]
+    if not needed:
+        return True
+    log = _log()
+    probe = needed[0]
+    if _locate_checkbox(page, probe) is not None:
+        log.event("advanced_options", "already_open")
+        return True
+    try:
+        button = page.locator(ADD_ACCOUNT_MODAL_SELECTOR).get_by_text(ADVANCED_OPTIONS_TEXT, exact=True)
+        if button.count() < 1:
+            log.event("advanced_options", "button_not_found")
+            return False
+        button.first.click(timeout=FIELD_TIMEOUT_MS)
+    except Exception as exc:
+        log.error("advanced_options", "click", exc)
+        return False
+    for _poll in range(ADVANCED_EXPAND_POLLS):
+        if all(_locate_checkbox(page, key) is not None for key in needed):
+            log.event("advanced_options", "expanded")
+            return True
+        page.wait_for_timeout(100)
+    missing = [key for key in needed if _locate_checkbox(page, key) is None]
+    log.event("advanced_options", "toggles_missing", detail=",".join(missing))
+    return False
+
+
+def _confirm_enabled(page: Any, confirm: Any) -> bool:
+    """Wait briefly for Confirm to enable; on failure log which fields are invalid.
+
+    Only field identifiers (name, id, data-am, associated label) of controls
+    marked invalid are logged — never their values.
+    """
+    for _poll in range(CONFIRM_ENABLE_POLLS):
+        try:
+            if confirm.first.is_enabled():
+                return True
+        except Exception:
+            pass
+        page.wait_for_timeout(250)
+    try:
+        invalid = page.evaluate(
+            """() => Array.from(document.querySelectorAll('[aria-invalid="true"], .Mui-error input, .Mui-error select'))
+                .slice(0, 20).map(el => {
+                    const label = el.id ? document.querySelector('label[for="' + CSS.escape(el.id) + '"]') : null;
+                    return [el.getAttribute('name'), el.getAttribute('data-am'), label ? label.textContent : '']
+                        .filter(Boolean).join('/').slice(0, 80);
+                })""")
+    except Exception:
+        invalid = []
+    _log().event("confirm_enable", "disabled", detail="invalid=" + ",".join(str(i) for i in (invalid or [])))
+    return False
+
+
+def _fill_select(page: Any, label: str, option: str) -> str | None:
+    """Select one option by its visible label; return a failure code or None."""
+    log = _log()
+    control = _locate_select(page, label)
+    if control is None:
+        log.event("fill_select", "not_found", label)
+        return "fill_form_schema_unavailable"
+    try:
+        if not control.first.is_enabled():
+            log.event("fill_select", "disabled", label)
+            return "fill_form_schema_unavailable"
+        control.first.select_option(label=option, timeout=FIELD_TIMEOUT_MS)
+        selected = _selected_option_text(control.first)
+    except Exception as exc:
+        log.error("fill_select", label, exc)
+        return "fill_form_schema_unavailable"
+    if selected != option:
+        log.event("fill_select", "mismatch", label)
+        return "fill_value_mismatch"
+    log.event("fill_select", "ok", label)
+    return None
+
+
+def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult | None":
+    """Run one server-side tenant search and wait for its own response.
+
+    The tenant search is server-side (a getAllDetailedAccounts POST per edit,
+    HAR-verified 2026-09-29), so a fixed sleep can read the previous lookup's
+    table and false-clear. The box is cleared first so re-searching the same
+    text still issues a request, and only a response whose request carries
+    this lookup counts. Returns the parsed rows, or None (the caller fails
+    closed) when no such response arrives in time or its schema is unexpected.
+    """
+    needle = lookup.casefold()
+
+    def matches(response: Any) -> bool:
+        try:
+            if TENANT_SEARCH_API not in response.url:
+                return False
+            body = response.request.post_data or ""
+            return needle in body.casefold()
+        except Exception:
+            return False
+
+    try:
+        search.fill("", timeout=FIELD_TIMEOUT_MS)
+        with page.expect_response(matches, timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
+            search.fill(lookup, timeout=FIELD_TIMEOUT_MS)
+            search.press("Enter")
+        status = info.value.status
+    except Exception as exc:
+        _log().error("tenant_search", "response", exc)
+        return None
+    if status in (401, 403):
+        # The tab can still show Tenant Management while its API token has
+        # expired; say so instead of reporting a table/schema problem.
+        _log().event("tenant_search", str(status), detail="leonardo session expired")
+        raise LeonardoSessionExpired()
+    if not 200 <= status < 300:
+        _log().event("tenant_search", str(status))
+        return None
+    try:
+        body = info.value.json()
+        paged = body.get("pagination_response") if isinstance(body, dict) else None
+        rows = paged.get("table_data") if isinstance(paged, dict) else None
+        total = paged.get("total_count") if isinstance(paged, dict) else None
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("table_data")
+        if not isinstance(total, int):
+            raise ValueError("total_count")
+    except Exception as exc:
+        _log().error("tenant_search", "response_schema", exc)
+        return None
+    _log().event("tenant_search", str(status), detail=f"rows={len(rows)} total={total}")
+    return TenantSearchResult(rows, total)
+
+
+class LeonardoSessionExpired(RuntimeError):
+    """The Leonardo API rejected the session (401/403); nothing was changed.
+
+    A RuntimeError so every runner mode reports it as its result code.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("leonardo_session_expired")
+
+
+@dataclass(frozen=True, slots=True)
+class TenantSearchResult:
+    """The server's rows for one tenant search (in memory only; never persisted)."""
+    rows: list[dict[str, Any]]
+    total_count: int
+
+
+def _api_duplicate(result: TenantSearchResult, expected_name: str, expected_domain: str) -> str:
+    """Classify the server search response (second, independent duplicate check).
+
+    Any exact company-name or primary-domain match is a duplicate. A response
+    that reports more matches than it returned cannot be fully checked and is
+    ambiguous.
+    """
+    if result.total_count > len(result.rows):
+        return "duplicate_ambiguous"
+    name = " ".join(expected_name.casefold().split())
+    for row in result.rows:
+        row_name = row.get("accountName")
+        row_domain = row.get("accountDomain")
+        if isinstance(row_name, str) and " ".join(row_name.casefold().split()) == name:
+            return "duplicate_found"
+        if isinstance(row_domain, str) and row_domain.casefold().strip().rstrip(".") == expected_domain:
+            return "duplicate_found"
+    return "duplicate_clear"
+
+
+def _api_readback(result: TenantSearchResult, tenant_name: str,
+                  expected_domain: str | None) -> tuple[str, str, str] | None:
+    """Read Surface Account ID, Account UUID and scan state from the search response.
+
+    Requires exactly one row whose accountName equals the tenant name (and,
+    when given, whose accountDomain equals the expected domain), with a
+    well-formed id and accountUuid. A tenant that has never scanned
+    (lastReconScan null) is "No scan started"; any other scan state returns
+    None so the caller falls back to the details view.
+    """
+    name = " ".join(tenant_name.casefold().split())
+    exact = [row for row in result.rows
+             if isinstance(row.get("accountName"), str)
+             and " ".join(row["accountName"].casefold().split()) == name]
+    if len(exact) != 1:
+        return None
+    row = exact[0]
+    if expected_domain is not None:
+        domain = row.get("accountDomain")
+        if not isinstance(domain, str) or domain.casefold().strip().rstrip(".") != expected_domain:
+            return None
+    surface_account_id, account_uuid = row.get("id"), row.get("accountUuid")
+    if not (isinstance(surface_account_id, str) and re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, surface_account_id)
+            and isinstance(account_uuid, str) and re.fullmatch(ACCOUNT_UUID_PATTERN, account_uuid)):
+        return None
+    if row.get("lastReconScan") is not None:
+        return None
+    return surface_account_id, account_uuid, "No scan started"
+
+
+def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float = MAX_WAIT_SECONDS,
+        dry_run: bool = False) -> str:
+    """Run one attended auto-confirm session.  Never writes back to Salesforce.
+
+    ``dry_run`` runs every check and fills and re-verifies the full form, then
+    cancels it instead of clicking Confirm. It creates nothing and never
+    records to the one-time create gate (only the run log is written).
+    """
+    global _ACTIVE_RUN_LOG
+    _ACTIVE_RUN_LOG = RunLog(reference, DRY_RUN_MODE if dry_run else "create")
+    try:
+        return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run)
+    finally:
+        _ACTIVE_RUN_LOG = None
+
+
+def _cancel_add_account(page: Any) -> bool:
+    """Cancel the open Add Account form (its own Cancel, never a picker's)."""
+    try:
+        cancel = page.locator(ADD_ACCOUNT_MODAL_SELECTOR).get_by_role("button", name="Cancel", exact=True)
+        if cancel.count() != 1:
+            _log().event("dry_run_cancel", "cancel_unavailable", detail=f"count={cancel.count()}")
+            return False
+        cancel.first.click(timeout=FIELD_TIMEOUT_MS)
+        for _poll in range(20):
+            if page.get_by_label("Company name", exact=True).count() == 0:
+                return True
+            page.wait_for_timeout(100)
+    except Exception as exc:
+        _log().error("dry_run_cancel", "Cancel", exc)
+    return False
+
+
+def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float, dry_run: bool = False) -> str:
+    log = _log()
+    log.event("source_read", "start")
+    try:
+        source = ce_fill_source(reference)
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return _finish(reference, acknowledged_revision, "playwright_runtime_unavailable")
+    except RuntimeError as error:
+        return _finish(reference, acknowledged_revision, str(error))
+    log.add_redactions(source.account_name, source.tenant_name, source.email_domain,
+                       f"{CE_PRIMARY_USER_EMAIL_LOCAL}+{source.primary_user_alias}@{CE_USER_EMAIL_DOMAIN}")
+    log.event("source_read", "ok")
+    if source.source_revision != acknowledged_revision:
+        return _finish(reference, acknowledged_revision, "source_revision_drift")
+    try:
+        # Validate the license dates before any browser work.
+        license_start, license_end = ce_run_license_dates(source.subscription_start, source.subscription_end)
+    except ValueError as error:
+        return _finish(reference, acknowledged_revision, str(error))
+    log.event("license_dates", "ok", detail=f"start={license_start.isoformat()} end={license_end.isoformat()}")
+    tenant_name, main_domain = source.tenant_name, source.email_domain
+    with sync_playwright() as playwright:
+        try:
+            # The login wait happens inside _attach_attended_browser (CDP /json
+            # polling) and attaches only after the operator reaches
+            # tenant-management, so `page` is a fresh, valid reference. When the
+            # persisted session is still valid this skips SSO/MFA entirely.
+            log.event("browser_attach", "start")
+            with _attended_page(playwright) as page:
+                log.attach(page)
+                log.event("browser_attach", "ok")
+                search = _open_search(page)
+                if search is None:
+                    _capture_search_diagnostics(page)
+                    return _finish(reference, acknowledged_revision, "duplicate_search_schema_unavailable")
+                for lookup_name, lookup in (("tenant_name", tenant_name), ("primary_domain", main_domain)):
+                    searched = _search_tenants(page, search, lookup)
+                    if searched is None:
+                        duplicate = "duplicate_schema_unavailable"
+                    else:
+                        duplicate = _settled_tenant_rows(page, tenant_name, main_domain)
+                        if duplicate == "duplicate_clear":
+                            # Independent check against the server's own rows.
+                            duplicate = _api_duplicate(searched, tenant_name, main_domain)
+                    log.event("duplicate_check", duplicate, lookup_name)
+                    if duplicate != "duplicate_clear":
+                        if duplicate in ("duplicate_schema_unavailable", "duplicate_ambiguous"):
+                            _capture_search_diagnostics(page)
+                        return _finish(reference, acknowledged_revision, duplicate)
+                if ce_fill_source(reference) != source:
+                    return _finish(reference, acknowledged_revision, "source_revision_drift")
+                add_account = page.get_by_role("button", name="Add Account", exact=True)
+                if add_account.count() != 1:
+                    _capture_search_diagnostics(page)
+                    return _finish(reference, acknowledged_revision, "add_account_schema_unavailable")
+                add_account.click()
+                log.event("add_account_open", "clicked")
+                # Give the Add Account form a bounded moment to render before the
+                # first field lookup. This is defensive only: the lookup below
+                # still fails closed if the form (or a field) is not present.
+                try:
+                    page.get_by_label("Company name", exact=True).first.wait_for(state="attached", timeout=5_000)
+                except Exception:
+                    pass
+                # Fill the full CE-only contract. Every control must resolve to
+                # exactly one element and keep the value the runner set
+                # (re-read verification); any ambiguity or mismatch stops the
+                # runner before the form is submitted.
+                failure, account_name_control = _fill_ce_form(page, build_ce_only_fill(source, license_start))
+                if failure is not None:
+                    _capture_search_diagnostics(page)
+                    if dry_run:
+                        _cancel_add_account(page)
+                    return _finish(reference, acknowledged_revision, failure)
+                if dry_run:
+                    # Everything up to Confirm passed; cancel instead of submitting.
+                    cancelled = _cancel_add_account(page)
+                    return _finish(reference, acknowledged_revision,
+                                   "dry_run_fill_verified" if cancelled else "dry_run_cancel_unavailable")
+                # Auto-confirm: the operator triggered this attended run and the
+                # source passed a clear duplicate check and a validated fill, so
+                # the runner submits the form by clicking the single Confirm
+                # control. It clicks exactly once and never retries an uncertain
+                # submit; if the form does not close it fails closed without
+                # re-clicking.
+                confirm = _locate_confirm_button(page)
+                if confirm is None:
+                    _capture_search_diagnostics(page)
+                    return _finish(reference, acknowledged_revision, "confirm_button_schema_unavailable")
+                if not _confirm_enabled(page, confirm):
+                    _capture_search_diagnostics(page)
+                    return _finish(reference, acknowledged_revision, "confirm_button_not_enabled")
+                create_status = None
+                try:
+                    with page.expect_response(lambda r: ACCOUNT_ADD_API in r.url, timeout=30_000) as created:
+                        confirm.first.click(timeout=5_000)
+                    create_status = created.value.status
+                except Exception as exc:
+                    # Uncertain: the click may or may not have submitted. Never
+                    # re-click; the read-only form-close/search below reconciles.
+                    log.error("confirm_click", "Confirm", exc)
+                log.event("confirm_click", "clicked", detail=f"account_add_status={create_status}")
+                # Wait for the Add Account form to close (submission) within a
+                # bounded window. A lookup error is "unknown", not "closed".
+                deadline = monotonic() + min(review_wait_seconds, 60.0)
+                form_closed = False
+                while monotonic() < deadline:
+                    try:
+                        if account_name_control.count() == 0:
+                            form_closed = True
+                            break
+                    except Exception:
+                        pass
+                    sleep(FORM_CLOSE_POLL_SECONDS)
+                log.event("form_close_wait", "closed" if form_closed else "still_open")
+                created_ok = isinstance(create_status, int) and 200 <= create_status < 300
+                if not form_closed and not created_ok:
+                    _capture_search_diagnostics(page)
+                    return _finish(reference, acknowledged_revision, "confirm_no_create")
+                # Re-search (read-only) for the created tenant. A short bounded
+                # retry lets an in-progress creation settle; it never re-clicks
+                # Confirm, so an uncertain mutation is never repeated.
+                search = _open_search(page)
+                if search is None:
+                    return _finish(reference, acknowledged_revision, "duplicate_search_schema_unavailable")
+                duplicate = "duplicate_clear"
+                for attempt in range(3):
+                    if attempt:
+                        page.wait_for_timeout(2_000)
+                    # Clear-and-refill so each retry issues a fresh server search.
+                    searched = _search_tenants(page, search, tenant_name)
+                    if searched is None:
+                        duplicate = "duplicate_schema_unavailable"
+                        continue
+                    duplicate = _settled_tenant_rows(page, tenant_name, main_domain)
+                    log.event("post_create_search", duplicate, f"attempt={attempt + 1}")
+                    if duplicate == "duplicate_found":
+                        break
+                if duplicate != "duplicate_found":
+                    if duplicate == "duplicate_schema_unavailable":
+                        _capture_search_diagnostics(page)
+                    return _finish(reference, acknowledged_revision,
+                                   "confirm_no_create" if duplicate == "duplicate_clear" else duplicate)
+                # The CE-only contract disables scanning and "Scan now", so a
+                # freshly created tenant has no scan state yet; record it as
+                # "No scan started" (same rule as the readback-only mode).
+                # Primary: the server's own search row; fallback: details view.
+                details = _api_readback(searched, tenant_name, main_domain) if searched is not None else None
+                log.event("readback", "api" if details else "api_unavailable")
+                if details is None:
+                    details = _readback_details_optional_state(page, tenant_name)
+                if details is None:
+                    return _finish(reference, acknowledged_revision, "readback_schema_unavailable")
+                surface_account_id, account_uuid, state = details
+                observed_state = state if state else "No scan started"
+                if not (re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, surface_account_id)
+                        and re.fullmatch(ACCOUNT_UUID_PATTERN, account_uuid)
+                        and observed_state in READBACK_STATES):
+                    return _finish(reference, acknowledged_revision, "readback_value_mismatch")
+                try:
+                    write_readback_evidence(reference, surface_account_id, account_uuid,
+                                            date.today().isoformat(), observed_state)
+                except (OSError, ValueError):
+                    return _finish(reference, acknowledged_revision, "readback_write_unavailable")
+                return _finish(reference, acknowledged_revision, "readback_verified")
+        except LoginTimeout:
+            return _finish(reference, acknowledged_revision, "development_login_timeout")
+        except RuntimeError as error:
+            # Preserve the specific browser/profile/CDP failure codes raised by
+            # _attach_attended_browser instead of collapsing them.
+            return _finish(reference, acknowledged_revision, str(error))
+        except Exception as exc:
+            log.error("runner", "unexpected", exc)
+            return _finish(reference, acknowledged_revision, "attended_ce_runner_unavailable")
+
+
+def run_readback(reference: str, tenant_name_override: str | None = None) -> str:
+    """Read-only verification of an existing Leonardo Development tenant.
+
+    Searches for the exact tenant name, requires exactly one exact row, reads
+    the Surface Account ID, Account UUID, and observed Account Scanning state
+    from the details page, and records the readback evidence (an empty state
+    is recorded as "No scan started"). It never fills, confirms, creates, or
+    updates anything, and it does not consume the attended create gate or
+    touch the runner state file.
+
+    ``tenant_name_override`` targets a live tenant whose name intentionally
+    deviates from the contract name (for example a dev tenant created with a
+    " test" suffix). It replaces the computed tenant name for the search, the
+    row classification, and the details lookup; the email domain is still
+    taken from the Salesforce source.
+    """
+    try:
+        source = ce_fill_source(reference)
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    except RuntimeError as error:
+        return str(error)
+    tenant_name = tenant_name_override.strip() if tenant_name_override and tenant_name_override.strip() else source.tenant_name
+    with sync_playwright() as playwright:
+        try:
+            with _attended_page(playwright) as page:
+                search = _open_search(page)
+                if search is None:
+                    _capture_search_diagnostics(page)
+                    return "duplicate_search_schema_unavailable"
+                searched = _search_tenants(page, search, tenant_name)
+                if searched is not None:
+                    classification = _settled_tenant_rows(page, tenant_name, source.email_domain)
+                else:
+                    classification = "duplicate_schema_unavailable"
+                if classification == "duplicate_clear":
+                    return "readback_only_tenant_not_found"
+                if classification != "duplicate_found":
+                    _capture_search_diagnostics(page)
+                    return classification
+                # Primary: the server's own search row. An overridden (deviating)
+                # tenant name may carry a deviating domain too, so the domain is
+                # only enforced for the contract name. Fallback: details view.
+                expected_domain = None if tenant_name != source.tenant_name else source.email_domain
+                details = _api_readback(searched, tenant_name, expected_domain)
+                if details is None:
+                    details = _readback_details_optional_state(page, tenant_name)
+                if details is None:
+                    return "readback_schema_unavailable"
+                surface_account_id, account_uuid, state = details
+                if not (re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, surface_account_id)
+                        and re.fullmatch(ACCOUNT_UUID_PATTERN, account_uuid)):
+                    return "readback_value_mismatch"
+                observed_state = state if state else "No scan started"
+                if observed_state not in READBACK_STATES:
+                    return "readback_only_state_unrecognized"
+                try:
+                    write_readback_evidence(reference, surface_account_id, account_uuid,
+                                            date.today().isoformat(), state=observed_state)
+                except (OSError, ValueError):
+                    return "readback_write_unavailable"
+                return "readback_only_verified"
+        except LoginTimeout:
+            return "development_login_timeout"
+        except RuntimeError as error:
+            return str(error)
+        except Exception:
+            return "attended_ce_runner_unavailable"
+
+
+def _combine_duplicate(ui: str, api: str) -> str:
+    """Combine the table and server-row classifications (worst outcome wins)."""
+    for outcome in ("duplicate_schema_unavailable", "duplicate_found", "duplicate_ambiguous"):
+        if outcome in (ui, api):
+            return outcome
+    return "duplicate_clear"
+
+
+def run_duplicate_check(reference: str) -> str:
+    """Read-only duplicate check for one CE-only CO (never fills, submits, or creates).
+
+    Runs the same two lookups as a create run -- the contract tenant name and
+    the primary domain -- and classifies each from both the tenant table and
+    the server's own search rows. Returns duplicate_check_clear,
+    duplicate_check_found, duplicate_check_ambiguous, or a failure code. It
+    does not touch the one-time create gate; only the run log is written.
+    """
+    global _ACTIVE_RUN_LOG
+    _ACTIVE_RUN_LOG = RunLog(reference, "duplicate_check")
+    log = _ACTIVE_RUN_LOG
+    result = "attended_ce_runner_unavailable"
+    try:
+        result = _duplicate_check(reference, log)
+        return result
+    finally:
+        log.event("finish", result)
+        log.write(result)
+        _ACTIVE_RUN_LOG = None
+
+
+def _duplicate_check(reference: str, log: RunLog) -> str:
+    try:
+        source = ce_fill_source(reference)
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    except RuntimeError as error:
+        return str(error)
+    log.add_redactions(source.account_name, source.tenant_name, source.email_domain)
+    log.event("source_read", "ok")
+    with sync_playwright() as playwright:
+        try:
+            with _attended_page(playwright) as page:
+                log.attach(page)
+                search = _open_search(page)
+                if search is None:
+                    _capture_search_diagnostics(page)
+                    return "duplicate_search_schema_unavailable"
+                for lookup_name, lookup in (("tenant_name", source.tenant_name), ("primary_domain", source.email_domain)):
+                    searched = _search_tenants(page, search, lookup)
+                    if searched is None:
+                        duplicate = "duplicate_schema_unavailable"
+                    else:
+                        duplicate = _combine_duplicate(
+                            _settled_tenant_rows(page, source.tenant_name, source.email_domain),
+                            _api_duplicate(searched, source.tenant_name, source.email_domain))
+                    log.event("duplicate_check", duplicate, lookup_name)
+                    if duplicate == "duplicate_schema_unavailable":
+                        _capture_search_diagnostics(page)
+                        return duplicate
+                    if duplicate != "duplicate_clear":
+                        return {"duplicate_found": "duplicate_check_found",
+                                "duplicate_ambiguous": "duplicate_check_ambiguous"}[duplicate]
+                return "duplicate_check_clear"
+        except LoginTimeout:
+            return "development_login_timeout"
+        except RuntimeError as error:
+            return str(error)
+        except Exception as exc:
+            log.error("runner", "unexpected", exc)
+            return "attended_ce_runner_unavailable"
+
+
+def _record_check(reference: str, kind: str, result: str) -> None:
+    """Best-effort: record a read-only check result for the dashboard."""
+    try:
+        record_check_result(reference, kind, result, datetime.now().isoformat(timespec="seconds"))
+    except (OSError, ValueError):
+        pass
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Attended Leonardo Development CE-only auto-confirm runner.")
+    parser.add_argument("--co", required=False, help="Customer Onboarding reference (e.g. CO-0702).")
+    parser.add_argument("--revision", required=False, help="Salesforce source revision acknowledged by the dashboard.")
+    parser.add_argument("--check-session", action="store_true",
+                        help="Read-only Leonardo Development session check (no fill, submit, or create).")
+    parser.add_argument("--reset-profile", action="store_true",
+                        help="Wipe the dedicated persisted Leonardo automation profile (forces fresh SSO/MFA).")
+    parser.add_argument("--bootstrap-session", action="store_true",
+                        help="Open the attended browser for the operator to complete SSO/MFA (no fill, submit, or create).")
+    parser.add_argument("--close-browser", action="store_true",
+                        help="Close the reused automation Chrome window (keeps the persisted profile; no fill, submit, or create).")
+    parser.add_argument("--readback-only", action="store_true",
+                        help="Read-only verification of an existing tenant (no fill, submit, or create; does not consume the create gate).")
+    parser.add_argument("--tenant-name", required=False,
+                        help="Override the expected tenant name for --readback-only (targets a live tenant whose name intentionally deviates from the contract name).")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --co/--revision: run every check and fill the full form, then Cancel instead of Confirm (no create; does not consume the create gate).")
+    parser.add_argument("--duplicate-check", action="store_true",
+                        help="With --co: read-only duplicate check by CE tenant name and primary domain (no fill, submit, or create; does not consume the create gate).")
+    args = parser.parse_args()
+    if args.duplicate_check:
+        if not args.co:
+            parser.error("--co is required with --duplicate-check")
+        result = run_duplicate_check(args.co)
+        _record_check(args.co, "duplicate_check", result)
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.readback_only:
+        if not args.co:
+            parser.error("--co is required with --readback-only")
+        result = run_readback(args.co, tenant_name_override=args.tenant_name)
+        _record_check(args.co, "readback", result)
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.check_session:
+        result = check_leonardo_session()
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.reset_profile:
+        ok = reset_leonardo_profile()
+        result = "leonardo_profile_reset" if ok else "leonardo_profile_reset_unavailable"
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.bootstrap_session:
+        result = bootstrap_leonardo_session()
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.close_browser:
+        result = close_automation_browser()
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if not args.co or not args.revision:
+        parser.error("--co and --revision are required unless --check-session, --reset-profile, --bootstrap-session, --close-browser, or --readback-only is given")
+    result = run(args.co, args.revision, dry_run=args.dry_run)
+    print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

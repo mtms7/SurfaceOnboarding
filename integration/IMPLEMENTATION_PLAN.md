@@ -1,7 +1,7 @@
 # Direct Salesforce-to-Surface Onboarding Integration Plan
 
 **Date:** 2026-09-15
-**Status:** Planning baseline plus verified VM portability/session handoff. No Salesforce, Leonardo, Workato, OPA, or production account action occurred in the 2026-09-15 work.
+**Status (2026-09-29):** Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
 **Initial execution target:** Leonardo Development only  
 **Production target:** Permanently blocked until a separate, recorded approval
 
@@ -397,7 +397,7 @@ The requested final state is fully unattended. That cannot safely be implemented
 
 1. **Preferred:** official Leonardo API plus least-privilege workload identity and short-lived tokens;
 2. **Fallback:** a dedicated automation identity with an approved TOTP mechanism whose seed is held by an enterprise secret manager and never exposed to the application database, files, environment dumps, logs, or UI;
-3. **Temporary development bridge:** a persisted user browser session refreshed manually when it expires. This is not fully unattended and cannot be accepted as the final design.
+3. **Temporary development bridge:** a persisted user browser session refreshed manually when it expires. This is not fully unattended and cannot be accepted as the final design. **Selected for the attended pilot (2026-09-24):** the runner uses a dedicated persisted Leonardo automation profile on the operator's desktop. The first run performs SSO/MFA once; later runs reuse the session until expiry. A "Reset Leonardo session" button wipes the profile. The profile is never stored on the VM, in Git, in logs, or in backups, and is isolated from the operator's main Chrome profile.
 
 MFA must not be disabled. The implementation must expose an authentication-health state and stop before any form activity when authentication cannot be established safely. CAPTCHA, WAF, unexpected SSO prompts, permission changes, or UI drift are hard stops.
 
@@ -560,3 +560,365 @@ The next local-only implementation slice should create:
 The first slice should also define the on-demand synchronization command and HTTP contract using a mock Salesforce adapter; it must not call a live Salesforce org until the read-only service identity and test scope are approved.
 
 This slice requires no external access or mutation. Salesforce reads, Slack ingestion, Leonardo authentication, browser form filling, VM deployment, and Salesforce writeback must each cross their documented approval and verification gate later.
+
+## 18. Attended Local Pilot Handoff — 2026-09-17/18
+
+### Completed and verified
+
+- The local attended dashboard runs on `127.0.0.1:8012` under the desktop user's Salesforce CLI session. It must not be run on the Ubuntu OPA VM for browser/MFA work.
+- CO-0741 has a revision-bound Salesforce comment-repair flow with fresh source reads and readback verification.
+- CO-0745 has a read-only renewal-term evaluator and an exact production tenant-name policy of `<Account Name> - CE Only`; production lookup remains read-only and is not connected to a create action.
+- CO-0702 now has a local CE-new-product Email Domains preflight. The current owner decision is deliberately narrow: it validates only one valid `Email_Domains__c` value. Empty, malformed, or multiple values produce `exactly_one_email_domain_required`. It does not validate product, subscription, dates, country, primary domain, or user data.
+- The CE-only Guru card `Surface Customer Onboarding - New Credential Exposure only` was read in the operator's authenticated Chrome session on 2026-09-18. It was visibly **Verified** and updated four months earlier. Key guidance observed: CE/Core Plus entitlement review; one CE scanned domain per license; Customer account type; clear `- CE Only` naming when team practice requires it; operator as Primary User; no Operator Account; Surface scanning None; Scan now and advanced options disabled; Leaked Credentials enabled/Weekly; prepaid annual license with Provisioning and subdomains on, one domain, expiration from Salesforce; then read back UUID and mark User Created. This guidance is evidence, not an authorization to create.
+- Playwright `1.63.0` and its Chromium runtime were installed on the Windows desktop runtime after user approval. They were not installed on `172.26.37.20`.
+- Leonardo Development Tenant Management and a blank Add Account form were inspected read-only. The blank form was cancelled without entering values or submitting. Observed controls include account type, company/primary/alternate/subdomain/email-domain fields, country, primary-user fields, MFA, distinct Operator Account selector, Surface/CE settings, license block, dates, and disabled Confirm button.
+
+### CE-only owner decisions for the attended pilot
+
+- Company naming: exactly `<Salesforce Account Name> - CE Only`, using a regular hyphen, not an em dash. For CO-0702 the intended name is `Sample Company - CE Only`.
+- Primary User: `Milton Stevenson`; no Operator Account; phone number and job title remain blank.
+- Primary-user email: `milton.stevenson+<alias>@pentera.io`.
+  - Account names of 15 characters or fewer: remove spaces and symbols; `Sample Company` becomes `SampleCompany`.
+  - Longer names: use word initials; `First Main Bank & Trust` becomes `fmbt`.
+- CE-only validation gate: only `Email Domains` is a pass/fail validation. The values needed to fill Leonardo (company, primary domain, country, and approved alternate/subdomains) may still be read from Salesforce, but are not additional commercial-validation gates.
+- Manual SSO/MFA remains required. Browser profiles, credentials, cookies, tokens, and MFA material must not be copied, logged, or persisted.
+
+### Not complete / no external creation
+
+- The dashboard's current **Start manual onboarding** handler still opens Tenant Management only and displays the manual-workflow message. It has not been connected to Playwright.
+- No desktop CE runner has been written, no duplicate search has run, no Leonardo field has been filled, no tenant has been created, no UUID has been read back, and no Salesforce writeback occurred.
+- The local dashboard must not reuse the operator's existing Chrome profile. A future runner must launch a fresh temporary profile, wait for the operator's manual Leonardo Dev SSO/MFA, then destroy its context on completion/error.
+- The Ubuntu VM remains a no-browser OPA/validator host. Do not deploy Playwright, Chromium, browser sessions, or Leonardo interactive authentication there.
+
+### Exact next implementation steps
+
+1. Add a desktop-only `attended_ce_only_playwright` runner with pure unit-tested helpers for the CE-only naming and primary-user alias rules.
+2. Have the runner perform a fresh Salesforce read for the fill values, while applying the Email Domains-only preflight rule. Fail closed on missing required form data or source-revision drift.
+3. Launch an isolated temporary Chromium context at `https://leonardo.dev.app.pentera.io/login`; wait for manual SSO/MFA and Tenant Management. Never read/reuse the existing Chrome session.
+4. Perform exact duplicate checks using the derived CE-only company name and primary domain before opening Add Account. Any match, partial-match, schema failure, timeout, or ambiguity must stop without filling/submitting.
+5. Fill the reviewed CE-only mapping, explicitly leave Operator Account/phone/job title blank, and verify every selector/control state. UI drift or unavailable controls must stop.
+6. Bind **Start Onboarding** (renamed from Start manual onboarding) to a one-time source-revision acknowledgement. The user requested that this action be the attended Dev creation authorization; retain a visible, explicit final state/result and never retry an uncertain creation.
+7. After a successful Confirm, search/read back the exact tenant, capture Surface Account ID, Account UUID, and Account Scanning state into the existing minimal local readback evidence format. Do not update Salesforce in this phase.
+8. Add focused runner/dashboard tests plus the full integration suite, then ask the operator to restart `tools/start_attended_dashboard.ps1 -Restart` once. Only then perform the separately attended CO-0702 Dev run.
+9. After all runner work is verified, update this plan again with commit hash, test results, actual Dev outcome, readback state, and any blockers.
+
+### Progress — 2026-09-21 (steps 6–8 complete locally)
+
+- Steps 6 and 7 are implemented in `tools/attended_ce_only_playwright.py` (revision-bound one-time start, post-Confirm readback capture) and wired into the dashboard: the POST `start-co0702-ce-only-runner` handler now enforces the revision/one-time gate via `evaluate_ce_only_start`, records the start with `record_runner_start`, and fails closed on state-file or preflight unavailability; the GET preflight handler loads and displays the runner state. The runner never clicks Confirm and never updates Salesforce.
+- Step 8 focused tests are added: `integration/tests/test_attended_ce_only_runner.py` (state-file round-trip, one-time/supersede, first-writer-wins result, corrupt-file fail-closed, readback evidence schema/preserve/reject, `ce_only_names` 15-char boundary, `one_email_domain` edge cases, `source_for_fill` failure modes, `_exact_tenant_rows` and `_readback_details` classification, and end-to-end `run()` with an injected fake `playwright.sync_api` covering drift-stop-before-browser, login timeout, operator cancel, readback-verified, and value-mismatch) plus dashboard tests for `evaluate_ce_only_start` and the revision-bound preflight page rendering.
+- Local test result on 2026-09-21 (Windows, Python 3.12): the CE-only runner and attended-dashboard suites pass in full. The full `python -m unittest discover` run is recorded at commit time; the only expected failures are the 7 pre-existing `invalid_poll_timezone` errors in `integration/tests/test_scaffold.py` (Windows Python 3.12 missing `tzdata`; unrelated to this work).
+- The attended CO-0702 Dev run (step 9) is still pending. It is a separate operator-attended action that requires the RND VPN for Leonardo Development access, an explicit restart of `tools/start_attended_dashboard.ps1 -Restart`, and explicit approval. It has not been performed. Step 9 will record the commit hash, actual Dev outcome, readback state, and any blockers after the run.
+
+### Progress — 2026-09-21 (encoding fixes, CE Primary Domain rule, run unblocked)
+
+- Dashboard encoding fix (commit `1400b6e`): `sf_json`/`sf_write_json` in `tools/serve_attended_open_onboardings_dashboard.py` now decode Salesforce CLI `--json` output as UTF-8 (`encoding="utf-8", errors="replace"`) instead of the locale code page, and fail closed when `stdout is None`. Four `SalesforceCliEncodingTests` cover the cp1252-on-UTF-8 failure mode and the `None`-stdout gate.
+- Runner encoding fix (commit `c6f9b06`): the same UTF-8 decode + `None`-stdout fail-closed was applied to `source_for_fill` in `tools/attended_ce_only_playwright.py`; `test_none_stdout_fails_closed` added.
+- "Browser never opened" diagnosis: the runner died at the source read (`salesforce_fill_source_unavailable`) before Playwright launched, so no browser ever appeared. Playwright itself was verified working from the dashboard's Python (`C:\Users\Milton Stevenson\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`) with a throwaway diagnostic. The many Chrome processes observed were the operator's regular browser, not ms-playwright.
+- CO-0702 live source read (read-only): revision `2026-09-21T18:24:55.000+0000`, `Account_Name__c='Sample Company'`, `Main_Domain__c` empty, `Email_Domains__c='sample-co.example'`. The dashboard preflight (`evaluate_co0702_ce_only_fill_preflight`) validates only Email Domains by design, so the record is "eligible" despite the empty `Main_Domain__c`.
+- Owner business-rule clarification (no Salesforce data change needed): for a Credential Exposure, `Main_Domain__c` is NOT used — the Leonardo "Primary Domain" must be the single Email Domains value (`sample-co.example` for CO-0702). The runner logic was wrong, not the data.
+- CE-only Primary Domain fix (commit `1c4c565`): `source_for_fill` no longer selects or validates `Main_Domain__c`; it returns the normalized single Email Domains value as the Primary Domain (and as the Email Domains value). `SourceForFillTests` updated (mocked rows no longer carry `Main_Domain__c`) and `test_main_domain_field_is_ignored_for_ce_only` added to lock the rule. Expected CO-0702 fill values: Company Name `Sample Company - CE Only`, Primary Domain `sample-co.example`, Email Domains `sample-co.example`, Primary User Email `milton.stevenson+sampleCompany@pentera.io` (name ≤15 chars → spaces removed).
+- Full suite on 2026-09-21 (Windows, codex runtime Python 3.12): `python -m unittest discover` → 302 tests, OK (skipped=1), no failures/errors. The 7 pre-existing `invalid_poll_timezone`/`ZoneInfoNotFoundError` errors in `integration/tests/test_scaffold.py` no longer reproduce because `tzdata` is now installed in this Python (verified: `import tzdata` succeeds, `ZoneInfo('America/New_York')` resolves).
+- Run unblocked: the stale `integration/attended_ce_only_runner_state.json` (written by an earlier failed diagnostic run) was deleted so the revision-bound one-time gate allows a start for revision `2026-09-21T18:24:55.000+0000`. The gate itself is unchanged: it still blocks any re-run for a revision that already has a record, result or not.
+- RND VPN routing: the local model host `10.0.0.202` remains reachable over the RND VPN via the more-specific connected `/24` route on the Wi-Fi adapter; no routing change was needed. Documented fallback if it ever drops: `route add 10.0.0.202 mask 255.255.255.255 10.0.0.1 metric 10`.
+- Step 9 (attended CO-0702 Dev run) remains pending and is the next action: operator runs fill preflight → Start Onboarding → manual SSO/MFA → review + Confirm on `127.0.0.1:8012` with the RND VPN connected. After the run, this plan must record the commit hash, actual Dev outcome, readback state (Surface Account ID / Account UUID / Account Scanning), and any blockers.
+
+### Progress — 2026-09-22 (attended-run browser defects fixed; run re-armed, pending operator SSO/MFA)
+
+Two browser defects were found and fixed while running the attended CO-0702 Dev run. Both live attempts timed out in the login-wait loop (no Leonardo mutation occurred). The run is now re-armed (fix committed, gate cleared) and pending the operator's SSO/MFA.
+
+- **Defect 1 — Playwright launch flags kill the browser over the RND VPN (commit `06da5b3`).** Playwright's own `launch()` flag set terminates the browser process when it reaches the Leonardo Development host over the RND (Fortinet) VPN. The runner now launches an isolated Chrome (fresh temp profile, CDP port) via `subprocess` and attaches with `connect_over_cdp`. Focused tests added for `_free_port`, `_chrome_executable`, and `_wait_for_cdp`.
+- **Defect 2 — the SSO redirect replaces the CDP target; a held page reference goes stale (commit `cad993f`).** The cross-origin Leonardo SSO redirect replaces the underlying CDP target, so a page reference held from `connect_over_cdp` attach time never advances past the login URL. The runner re-resolved the live page from `context.pages` each poll via `_find_live_page`. This proved insufficient: the held CDP connection's `context.pages` list is also stale across the target replacement, so the re-scan never found the post-login page and the run timed out.
+- **Defect 3 fix — detect login via the CDP `/json` endpoint, then attach after login (commit `01be423`).** The runner now polls the CDP `/json` HTTP endpoint (which always reflects the live target list — verified to show the operator's logged-in page) to detect SSO/MFA completion, then attaches via `connect_over_cdp` only after the operator reaches tenant-management, yielding a fresh, valid page object for the in-app automation. A dedicated `LoginTimeout` maps to `development_login_timeout`, and the temp profile is cleaned up on the failure path. Focused tests added for `_cdp_page_urls` and `_wait_for_tenant_management`; end-to-end fakes updated for the new attach signature.
+- **Live run history (both timed out in the login-wait loop; no Leonardo mutation occurred).** First run started 20:37:30 and timed out 20:52:38 with `development_login_timeout` (defect 2: stale held page reference). The gate was cleared and the run re-triggered at 21:01:23 on the `cad993f` code; it timed out 21:16:31 with `development_login_timeout` (the `context.pages` re-scan was insufficient). Both runs tore down cleanly (no orphaned Chrome, no leftover `attended_ce_chrome_*` profiles).
+- **Tests (2026-09-22, codex runtime Python 3.12):** runner file `integration/tests/test_attended_ce_only_runner.py` → 65 tests OK; `integration` discover → 221 OK (skipped=1); `phase2_leonardo` and `phase1_validator` suites OK. No failures or errors.
+- **Gate cleared and run re-armed.** The consumed `integration/attended_ce_only_runner_state.json` (holding the 21:16:31 timeout) was deleted — safe because no Leonardo mutation occurred. The revision-bound one-time gate is unchanged and now allows a fresh start for revision `2026-09-21T18:24:55.000+0000`. The dashboard (`127.0.0.1:8012`) is still running and spawns the runner as a subprocess, so it picks up the `01be423` runner without a restart; it reads the gate state fresh per request.
+- **Next action (operator, tomorrow):** on `127.0.0.1:8012` with the RND VPN connected, run the fill preflight → **Start Onboarding** → complete manual SSO/MFA in the fresh isolated Chrome window → review the filled Add Account form → click **Confirm** manually. The runner never clicks Confirm and never updates Salesforce. Expected fill values: Company Name `Sample Company - CE Only`, Primary Domain `sample-co.example`, Email Domains `sample-co.example`, Primary User Email `milton.stevenson+sampleCompany@pentera.io`, Operator Account/phone/job title blank. After Confirm the runner reads back Surface Account ID / Account UUID / Account Scanning into `integration/attended_leonardo_readbacks.json`.
+- **Blockers:** none in code. The remaining step is the operator-attended SSO/MFA plus the manual Confirm, which cannot be performed unattended. After a verified readback, this plan must be updated with the readback values (Surface Account ID / Account UUID / Account Scanning).
+
+### Progress — 2026-09-23 (CO-0702 Onboard automation made primary; fill diagnostics hardened; run re-armed)
+
+The 2026-09-22 "next action" (fill preflight → Start Onboarding) was refined. The CO-0702 detail page now presents the attended CE-only fill-and-pause runner as the **primary Onboard action** (a single **Start Onboarding** button), so the operator no longer has to find a buried preflight step. The manual tab-open flow is removed for CO-0702 only and retained as a fallback for all other COs. A live run was attempted and failed at the form-fill stage (no Leonardo mutation); the fill diagnostics were hardened so the next failure is diagnosable. The run is re-armed and pending the operator's attended SSO/MFA plus manual Confirm.
+
+**Commit:** `676d62f` (Make CO-0702 Onboard automation primary; harden CE-only fill selectors and diagnostics). The baseline before this commit was `23eab01`.
+
+- **Dashboard rewiring (CO-0702 Onboard as primary).** `tools/serve_attended_open_onboardings_dashboard.py`: the CO-0702 detail page (`page_detail`) now inlines the automation via a new `_co0702_onboard_section()` helper and no longer offers the separate "Run fill preflight" step or the manual tab-open flow. The Onboard panel shows the live source revision, the Email Domains count, local blockers, any prior-run result, and — when no run is recorded for the current revision — the one-time, revision-bound authorization checkbox plus the **Start Onboarding** button (POST `/attended/start-co0702-ce-only-runner`). The manual flow (`/attended/start-manual-onboarding`) is retained for all other COs.
+- **Why the operator saw the manual flow before (root cause, resolved).** The CO-0702 detail page previously presented the MANUAL flow as the primary action; the CE-only automation was buried behind a separate preflight step. The operator's earlier click triggered the manual tab-open, not the automation. The new Onboard button makes the automation the only CO-0702 action.
+- **Live run attempted and failed at form fill (no Leonardo mutation).** A run started 2026-09-23T18:53:43 (on the `23eab01` code) reached the Add Account form and failed at 18:55:28 with `fill_form_schema_unavailable`. The Add Account form inputs have UUID ids and no `aria-label`s, so `get_by_label("Account Name")` did not resolve; the `data-am` fallback also did not resolve. No tenant was created and no Salesforce write occurred.
+- **Fill diagnostics hardened (the fix was previously "blind").** The prior diagnostics did not capture `data-*` attributes or associated label text, so the selector failure could not be diagnosed. `_capture_search_diagnostics` in `tools/attended_ce_only_playwright.py` now records, per input, the `data-am` attribute and the associated `<label>` text (resolved in-page from `label[for]`, a wrapping `<label>`, or `aria-labelledby`) via a single in-page evaluation. It still records only control metadata — never form values, tenant names, or table contents — and still swallows all failures so diagnostics can never change the fail-closed outcome.
+- **Fill robustness.** `_locate_form_field` now has a third fallback, `_form_field_id_by_label`, which resolves a field by its associated label text and returns the element id only when exactly one input matches (fails closed on zero or ambiguous matches). A bounded 5-second wait was added after opening Add Account (defensive only; the field lookup still fails closed if the form or a field is absent).
+- **Tests (2026-09-23, codex runtime Python 3.12).** `integration/tests/test_attended_ce_only_runner.py` → 73 tests OK (added `test_falls_back_to_the_associated_label_text`, `test_returns_none_when_label_lookup_is_ambiguous`, and a `CaptureSearchDiagnosticsTests` class covering `data-am`/label capture and swallowed `evaluate` failures; the `_LocatePage` mock now supports `evaluate`/`get_by_id`). `integration/tests/test_attended_open_onboardings_dashboard.py` → 52 tests OK (removed the stale "Run fill preflight" assertion; added `test_co0702_detail_shows_onboard_automation_as_primary_for_approved_source` and `test_co0702_detail_onboard_panel_shows_prior_result_instead_of_rerun`). Full `python -m unittest discover -s integration/tests -t .` → **236 tests OK (skipped=1)**.
+- **Gate re-armed and dashboard restarted.** The consumed `integration/attended_ce_only_runner_state.json` (holding the 18:55:28 `fill_form_schema_unavailable` result) was reset to `{}` — safe because no Leonardo mutation occurred. `tools/start_attended_dashboard.ps1 -Restart` was run (new listener PID 40552; Salesforce queue read succeeded). The CO-0702 detail page was verified live: it renders the Onboard panel (source revision `2026-09-21T18:24:55.000+0000`, Email Domains configured: 1, Blockers: none, **Start Onboarding** button) and no manual flow.
+
+**State of the one-time gate:** re-armed (empty). Each attended run consumes it; after any failed run with no Leonardo mutation, reset the state file to `{}` to re-arm. The revision-bound gate is unchanged.
+
+**Remaining blocker for a successful run (selector uncertainty).** The form-fill selectors are not yet confirmed against the live Add Account form. The prior failure (`fill_form_schema_unavailable`) is not fully root-caused because the old diagnostics were blind to `data-*`. The enhanced diagnostics will capture `data-am` and label text on the next failure, so the selectors can then be fixed definitively. The HAR `n2n` definitions indicate the fields carry `data-am` values (`Input_Field-addCustomerAccountForm_0_accountName`, `Input_Field-addCustomerAccountForm_1_accountDomain`), but the live DOM was not confirmed.
+
+**Next action (operator, tomorrow):**
+1. Ensure the dashboard is running on `127.0.0.1:8012` (if not, run `tools/start_attended_dashboard.ps1 -Restart`). With the RND VPN connected, open `http://127.0.0.1:8012/co/CO-0702`.
+2. Confirm the Onboard panel shows source revision `2026-09-21T18:24:55.000+0000`, Email Domains configured: 1, Blockers: none, and the **Start Onboarding** button.
+3. Tick the authorization checkbox and click **Start Onboarding**.
+4. In the isolated Chrome window: complete SSO/MFA, review the filled Add Account form, then click **Confirm** yourself. The runner never clicks Confirm and never updates Salesforce.
+5. Expected fill values: Company Name `Sample Company - CE Only`, Primary Domain `sample-co.example`, Email Domains `sample-co.example`, Primary User Email `milton.stevenson+sampleCompany@pentera.io`; Operator Account/phone/job title blank.
+6. On `readback_verified`: verify `integration/attended_leonardo_readbacks.json` has a CO-0702 entry (Surface Account ID / Account UUID / Account Scanning), then update this plan with the readback values.
+7. On another `fill_form_schema_unavailable`: read `integration/attended_ce_only_diagnostics.json` (now includes `data-am` + label text), fix the selectors in the fill plan (`build_ce_only_fill`) / `_locate_form_field` accordingly, re-run the runner + integration suites, re-arm the gate to `{}`, restart the dashboard if the page changed, and retry. (Note: the `CE_FORM_FIELDS` constant named here no longer exists; the fill contract is built by `build_ce_only_fill` — see the 2026-09-25 progress entry.)
+
+**Boundaries preserved:** no Salesforce, Leonardo, Workato, OPA, or production action occurred in this work beyond the one attended Dev run attempt that failed at form fill (no tenant created, no write). No browser profile, cookie, token, password, MFA value, or raw payload was copied, logged, or persisted. The runner never clicks Confirm and never updates Salesforce.
+
+### Progress — 2026-09-24 (auto-confirm, persisted Leonardo session, generalization to all approved CE-only COs)
+
+The attended pilot was changed from a single-CO (CO-0702) manual-Confirm flow to a dashboard that surfaces all COs with `Onboarding_Approval_Status__c == "Approved"` and can onboard them automatically (auto-confirm), creating Credential Exposure tenants in Leonardo Development. A Leonardo session/connection check was added to the main dashboard's connection page.
+
+**Runner (`tools/attended_ce_only_playwright.py`):**
+
+- **Path-based login detection.** `_wait_for_tenant_management` and `_find_live_page` now detect login completion by checking whether the page path contains `TENANT_MANAGEMENT_PATH` (`/backoffice/tenantManagement`) instead of requiring an exact URL match. This was the likely cause of the repeated `development_login_timeout` results (the SSO redirect could land on a URL with query parameters or a trailing segment that broke the exact match).
+- **Persisted Leonardo automation profile (Plan §10 option 3 — temporary development bridge).** `leonardo_profile()` returns `(profile_dir, persist)`. The first run performs SSO/MFA once; later runs reuse the persisted session (no MFA until expiry). The profile is stored on the operator's desktop (never VM, Git, logs, or backups) and is isolated from the operator's main Chrome profile. `reset_leonardo_profile()` wipes the profile so the operator can force a fresh SSO/MFA.
+- **Session check.** `check_leonardo_session()` launches Chrome with the persisted profile, classifies the session via CDP (`_classify_leonardo_session`), and closes Chrome. Returns a result code: `leonardo_session_active`, `leonardo_session_expired`, or `leonardo_profile_unavailable`.
+- **Auto-confirm.** `run()` now clicks Confirm itself after a clear duplicate check (zero matches). `_locate_confirm_button(page)` uses `page.get_by_role("button", name="Confirm", exact=True)` and fails closed (returns `None`) on zero or multiple matches. No retry on an uncertain submit. The runner never updates Salesforce.
+- **Reset.** `reset_runner_record(reference)` re-arms a completed, non-successful run (refuses in-flight runs and `readback_verified` results). This makes a failed auto-confirm run retryable.
+- **`main()` CLI:** `--check-session` and `--reset-profile` flags added.
+- **`run()` exception handling:** `except RuntimeError` added between `except LoginTimeout` and `except Exception` to preserve specific browser-failure codes (`browser_cdp_unavailable`, `leonardo_profile_unavailable`, `login_page_schema_unavailable`) instead of collapsing them to `attended_ce_runner_unavailable`.
+
+**Dashboard (`tools/serve_attended_open_onboardings_dashboard.py`):**
+
+- **Leonardo session check panel (Step 2 Part A).** A "Leonardo Development session" panel was added to the `/connection` page (desktop only; hidden in VM mode) with Check and Reset buttons. POST handlers `/attended/leonardo-dev-session-check` and `/attended/leonardo-dev-session-reset` were added (wired before the reference check; vm-mode returns 503). These do NOT require a `reference` parameter. `LEONARDO_SESSION_MESSAGES` and `page_leonardo_session_result(result)` render the result.
+- **Generalized CE-only Onboard (Step 2 Part B).** The CE-only Onboard action is no longer restricted to CO-0702. Any approved CO with exactly one valid `Email_Domains__c` value (and not a renewal) now shows the automated CE-only Onboard section. The manual flow is retained for non-CE-only COs. Case 4 COs remain blocked.
+  - `evaluate_ce_only_fill_preflight(reference)` (was `evaluate_co0702_ce_only_fill_preflight()`).
+  - `start_attended_ce_only_runner(reference, revision)` — removed the CO-0702 restriction.
+  - `evaluate_ce_only_start` — state lookup by `evaluation.reference`.
+  - `_ce_only_start_form(evaluation)` — action URL `/attended/start-ce-only-runner`; label "auto-confirm run".
+  - `page_ce_only_fill_preflight(evaluation, state)` — body uses `evaluation.reference`.
+  - `_ce_only_onboard_section(reference)` (was `_co0702_onboard_section()`) — includes a reset button for completed non-successful runs.
+  - `page_ce_only_runner_status(state, reference)` (was `page_co0702_runner_status(state)`).
+  - `ce_only_eligible(row)` helper — mirrors the Email-Domains-only gate on the detail row.
+  - `page_detail` — order: Case 4 blocked → CE-only Onboard (if eligible and not renewal) → manual flow.
+- **Routes generalized:** `/attended/ce-only-runner-status?ref=`, `/attended/rerun-ce-only-fill-preflight`, `/attended/start-ce-only-runner`, `/attended/reset-ce-only-runner` (with `reset_authorized` checkbox). Old CO-0702 routes retained for backward compatibility.
+- **New result codes** in `RUNNER_RESULT_MESSAGES`: `leonardo_profile_unavailable`, `browser_cdp_unavailable`, `login_page_schema_unavailable`, `confirm_button_schema_unavailable`, `confirm_button_not_enabled`, `confirm_no_create`.
+
+**Tests:**
+
+- Runner: 92 tests OK (`integration/tests/test_attended_ce_only_runner.py`).
+- Dashboard: 54 tests OK (`integration/tests/test_attended_open_onboardings_dashboard.py`), including new tests for `ce_only_eligible` and the non-CE-only detail path.
+
+**CE-only gate (unchanged owner decision):** exactly one valid `Email_Domains__c` value only. No product, subscription, date, country, primary-domain, or user checks. The operator is the human-in-the-loop who triggers each attended run.
+
+**Writeback:** Leonardo Development only. No Salesforce writeback.
+
+**Next action (operator):** restart the dashboard (`tools/start_attended_dashboard.ps1 -Restart`), run a live session check from the `/connection` page, then trigger each attended run from the CO detail page. The runner auto-confirms after a clear duplicate check. On the first run, complete SSO/MFA in the isolated Chrome window (subsequent runs reuse the session until expiry).
+
+### Progress — 2026-09-24 (HAR analysis; duplicate-check and session-stability fixes; session bootstrap)
+
+The 2026-09-24 14:55 CO-0702 run failed with `duplicate_schema_unavailable`. Analysis of the operator-provided HAR (`gdleonardo.dev.app.pentera.io.har`, 12 entries) plus a read-only live table diagnostic and a read-only code audit confirmed the root cause and drove four fixes.
+
+**Root cause (confirmed):** the tenant table is a MUIDataTable fed by `POST /api/v1/backoffice/getAllDetailedAccounts` (`items_per_page:1000`, client-side search — no server search API calls in the HAR). When a search filters to 0 results (the expected no-duplicate case), MUIDataTable renders one empty-state row `<td colSpan=N>No records found</td>` (a single cell). `_exact_tenant_rows` failed closed on ANY row with fewer than 2 `td` cells, so the clean no-duplicate case was misclassified as `duplicate_schema_unavailable`.
+
+**Runner (`tools/attended_ce_only_playwright.py`):**
+
+- **Empty-state row handling.** `_exact_tenant_rows` now treats a genuine empty-state row (the table's only row, a single cell with `colspan > 1`) as `duplicate_clear` — a zero-result search is by definition a clean duplicate check. Any other short-row shape stays fail-closed. New helpers: `_row_text_cells` (row text cells, skipping leading checkbox-only cells) and `_is_empty_state_row`.
+- **Checkbox-column robustness (audit finding).** MUIDataTable renders a leading checkbox column when rows are selectable; comparing it as the company name would silently false-clear a real duplicate and break the readback. `_row_text_cells` skips leading cells that contain a checkbox input and no text, so the company/domain columns are compared against the right cells. `_readback_details` uses the same helper when locating the created tenant's row.
+- **Stability-based session wait/check (race fix).** `_wait_for_tenant_management` and `_classify_leonardo_session` now require the tenant-management URL to be observed on 5 consecutive 1-second CDP polls before counting. The app can briefly show the tenant-management URL before a client-side auth redirect sends an expired session to `/login`; a pre-redirect sighting no longer classifies the session as active. (The 14:55-era session check had returned `leonardo_session_active` while the page was actually at `/login` ~74 minutes later.)
+- **`bootstrap_leonardo_session()` + `--bootstrap-session` CLI.** Opens the dedicated persisted automation profile at tenant-management and waits (bounded, 15 min) until a page is stably there. With a valid session it returns almost immediately; with an expired session the operator completes SSO/MFA once in the visible window and the wait then succeeds. It never fills, submits, or creates.
+- **Diagnostics on table-schema failure.** `_capture_search_diagnostics` now also records redacted table-structure metadata (per-row cell count, colspan, checkbox-cell count — never row contents), and `run()` captures it on the `duplicate_schema_unavailable` / `duplicate_ambiguous` paths (pre-create and post-confirm re-search). The `duplicate_schema_unavailable` failure no longer leaves no diagnostic trail.
+
+**Dashboard (`tools/serve_attended_open_onboardings_dashboard.py`):**
+
+- **Re-establish session button.** The `/connection` Leonardo panel (desktop only) now offers "Re-establish Leonardo session (SSO/MFA)" → POST `/attended/leonardo-dev-session-bootstrap` → `bootstrap_leonardo_session()` (vm mode returns 503). The operator completes SSO/MFA once before any mutation; the page confirms when the session is stable.
+- **New result codes in `RUNNER_RESULT_MESSAGES`:** `duplicate_schema_unavailable` (blocked; diagnostics captured). **New code in `LEONARDO_SESSION_MESSAGES`:** `leonardo_session_bootstrapped` (success).
+
+**Tests:**
+
+- Runner: 103 tests OK (was 92): empty-state row is clear; single-cell row without colspan stays unavailable; empty-state row among data rows stays unavailable; checkbox column skipped for match/clear; readback with checkbox column; wait/classify require a stable URL (pre-redirect sighting is not active); bootstrap success/timeout/CDP-unavailable.
+- Dashboard: 58 tests OK (was 54): connection page offers the bootstrap action (desktop) and hides the panel (vm); `duplicate_schema_unavailable` and `leonardo_session_bootstrapped` messages covered.
+- Full integration suite: OK (skipped=1).
+
+**Live evidence still required (operator action):** the table diagnostic (`tools/attended_ce_only_table_diagnostic.py` → `integration/attended_ce_only_table_diagnostics.json`) last ran against an expired session (page at `/login`), so the live table-structure evidence (checkbox column? empty-state colspan? active tab? Add Account form `accountType` default) is not yet captured. The checkbox-column handling above is structural and safe either way, but the diagnostic should be re-run after the session is re-established to confirm the layout before the next creation.
+
+**Next action (operator):**
+1. From the dashboard `/connection` page, click **Re-establish Leonardo session (SSO/MFA)**; complete SSO/MFA once in the automation browser window that opens (this is the dedicated persisted automation profile — a separate Chrome window, isolated from the operator's main browser, retaining the Leonardo session per §10 option 3).
+2. Re-run the read-only table diagnostic to capture the live table structure.
+3. Reset the CO-0702 runner record (dashboard reset button), then trigger the attended run from the CO-0702 detail page; verify `readback_verified` and `integration/attended_leonardo_readbacks.json`.
+
+### Progress — 2026-09-24 (confirm_button_not_enabled root cause; full CE form contract; HAR decision)
+
+The 2026-09-24 18:41 CO-0702 run **passed the duplicate check** (the empty-state fix worked), opened the Add Account form, filled Company name and Company primary domain, then failed with `confirm_button_not_enabled`. The operator's screenshot confirmed it: the Confirm button is disabled while "Account Type" and "Country" are still unset.
+
+**Root cause:** the runner fills only 2 of the form's ~20 controls. The form keeps Confirm disabled until the required controls are set. The full live form inventory was captured read-only at 19:04 (`tools/attended_ce_only_table_diagnostic.py` → `integration/attended_ce_only_table_diagnostics.json`, session still valid from the 18:41 run):
+
+- **Selects (live options):** `accountType` → `customer`/`demo` (default unset); `accountCountry` → ISO country codes, `FR` = France (default unset); `scanningInterval` → `NONE` (default) / DAILY / WEEKLY / MONTHLY; `leakedCredentialsScanningInterval` → `NONE` (default) / DAILY / WEEKLY / MONTHLY; `licenseType` → `Evaluation` (default) / Trial / `prepaid monthly subscription` / `prepaid annual subscription` / `PAYG monthly subscription`.
+- **Checkbox defaults:** `mfaRequired` ON, `notificationsAllowed` ON, `multipleUsersAllowed` ON, `apiAccessAllowed` ON, `phishingEnabled` OFF, `leakedCredentialsAllowed` OFF, `provisioningEnabled` ON, `subDomainsNumberAllowed` ON, "Scan now" (aria-label "primary checkbox") ON.
+- **Confirm:** disabled in the blank form (as expected).
+- **Table view:** the main tenant table loads **all** accounts (588 total, 10/page, no `accountType` filter, sorted by `lastReconScan`). The `accountType==Operator` (66 accounts, `items_per_page:1000`, `projection:[accountName]`) query seen in the operator HAR is the Add Account form's "Select Operator Accounts" list fetch, triggered when the form opens — not a table filter. **Known gap to verify with the creation HAR:** the search box is client-side over the loaded page (10 rows), so duplicate-check coverage may be limited to the first page; the post-creation re-search has the same exposure.
+
+**Salesforce evidence (read-only, 2026-09-24):** CO-0702 `Account_Country__c = 'France'` (→ `FR`), `Main_Domain__c`/`Alternate_Domains__c`/`Primary_User_Name__c`/`Primary_User_Email__c` empty, `CE_Subscription_Information__c` empty (no expiration data in Salesforce), `Onboarding_Product__c = 'Credential Exposure'`, `Onboarding_Approval_Status__c = 'Approved'`.
+
+**Owner decisions (2026-09-24, operator):**
+
+- Toggle contract per the Guru card `Surface Customer Onboarding - New Credential Exposure only`: **everything disabled, only Leaked Credentials enabled**. (This supersedes the 2026-09-18 plan summary's "Provisioning and subdomains on" reading; the creation HAR is the definitive evidence.)
+- The operator will **manually create the CO-0702 tenant** in Leonardo Development with a **DevTools HAR capture** of the creation request; the runner will be implemented to replicate that exact contract, and a readback-only path will verify the manually created tenant.
+- Exact license quantities (assets/subdomains) and the expiration date come from the operator (also contained in the HAR).
+
+**Next actions:**
+
+1. **Operator:** create the CO-0702 tenant manually in Leonardo Development (Guru card as reference) with HAR capture: DevTools → Network → check **Preserve log** → clear the log → create the tenant → after it appears, right-click the request list → **Save all as HAR with content** → save to the Downloads folder.
+2. **Assistant:** parse the HAR (creation endpoint, exact request body: accountType, country, primary user, toggles, license, quantities, dates), implement the full CE form fill in `tools/attended_ce_only_playwright.py` plus a readback-only mode for the manually created CO-0702, update tests, and verify the CO-0702 readback.
+3. **Operator:** trigger attended runs for the remaining approved CE-only COs; assistant verifies each readback.
+
+### Progress — 2026-09-25 (full CE form contract implemented; readback-only mode; readback column-mapping fix + tenant-name override)
+
+**Authoritative handoff for continuing tomorrow.** This section supersedes the "Next actions" of the 2026-09-24 entries: the full CE form contract is implemented, the readback-only path is live, and the CO-0702 readback root cause is fixed. The remaining work is the operator-attended runs (CO-0702 readback, then the three create runs).
+
+**Status of the 2026-09-24 "Next actions":**
+- Step 1 (operator manual create + HAR) — **done.** The operator created the CO-0702 tenant manually; the creation HAR (`gdleonardo.dev.app.pentera.io.har`, entry [15] = `POST /api/v1/backoffice/account/add`) and the rename HAR (`secoundpart-gdleonardo.dev.app.pentera.io.har`, entry [24] = edit) were both parsed.
+- Step 2 (assistant implement full fill + readback-only) — **done** (this entry).
+- Step 3 (operator trigger attended runs) — **pending**, the next action tomorrow.
+
+**Runner (`tools/attended_ce_only_playwright.py`) — full CE form contract (owner-confirmed 2026-09-25, per the CO-0702 creation HAR):**
+
+- **`build_ce_only_fill(source)`** builds the full Add Account fill plan (the `CE_FORM_FIELDS` constant no longer exists). Contract: company name `<Account> - CE Only` (regular hyphen); `Account Type` = Customer; primary domain = the single `Email_Domains__c` value; user email domains `["pentera.io"]`; primary user Milton Stevenson with organization email `milton.stevenson+<lowercase alias>@pentera.io`; country from Salesforce; `Scanning interval` None; `Leaked Credentials scanning interval` Weekly on the primary domain; license `Prepaid annual subscription` with 1/1/1 quantities.
+- **Toggle contract (owner, 9/25):** everything OFF except Leaked Credentials, Provisioning, and Subdomains → `mfaRequired` OFF, `scan_now` OFF, `notificationsAllowed`/`multipleUsersAllowed`/`apiAccessAllowed`/`phishingEnabled` OFF, `leakedCredentialsAllowed` ON, `provisioningEnabled` ON, `subDomainsNumberAllowed` ON.
+  - **License start date — superseded 2026-09-29 (owner decision, operator):** Leonardo Development silently refuses a license start date after the current day (verified by no-submit probes: yesterday accepted; tomorrow and 2026-10-24 refused). The license therefore **starts on the day the attended onboarding runs**; the expiration keeps the contract rule `min(Salesforce Core Plus start + 1 year − 1 day, subscription end)` (CO-0679: 2026-09-29 → 2027-10-23). A run whose expiration is not after the run day stops before the browser opens (`ce_license_dates_unavailable`). The date inputs are readonly Material-UI picker fields displayed as `Sep 29, 2026`; the runner selects dates through the picker.
+  - **Superseded 2026-09-29 (owner decision, operator):** `mfaRequired` is **ON** (tenant MFA required). Evidence: the CO-0702 manual-creation HAR (`account/add`) carried `mfaRequired: true`, and it is the Leonardo form default. "Everything off" applies to the feature toggles only. All other toggles are unchanged.
+- **Email alias casing: lowercase** (per HAR). `ce_only_names` casefolds the alias in both branches (≤15 chars → spaces/symbols removed; longer → word initials).
+- **License source:** the Salesforce DealHub subscription. `select_ce_subscription` prefers `Pentera Core Plus Commercial` rows (casefolded prefix match), explicitly excludes product names containing `bulk` or `additional` (casefolded), and fails closed on missing/ambiguous (`ce_subscription_unavailable` / `ce_subscription_ambiguous`). It does NOT filter on `DealHub_Status__c`.
+- **CE license date rule (operator-confirmed):** `startDate = Core Plus subscription start`; `expirationDate = min(start + 1 year − 1 day, subscription end)`. For CE renewals the start date is never modified. `ce_license_dates` implements this.
+- **Country select contract:** option label = country name, value = ISO code → filled via `select_option(label=<Account_Country__c>)`.
+- **Checkbox location:** by `name` attribute; "Scan now" has no name/id → `get_by_role("checkbox", name="primary checkbox", exact=True)`.
+- **License date control contract (resolved via the 9/25 extended diagnostic):** the date controls are plain text inputs identified only by `data-am` = `AddEditTenantModal-date-startDate` / `AddEditTenantModal-date-expirationDate`; form display format `YYYY-MM-DD` (`LICENSE_DATE_INPUT_FORMAT = "%Y-%m-%d"`); the `data-am` locator is primary with label candidates as fallback; the read-after-write guard fails closed on a picker reformat.
+- **`run()`** uses the richer `ce_fill_source(reference)` read (frozen dataclass, drift check by dataclass equality); `source_for_fill` is retained.
+- **Readback-only mode:** `run_readback(reference, tenant_name_override=None)` — ungated, no runner-state write, no create/confirm/fill. CLI: `--readback-only --co <ref> [--tenant-name <name>]` (no `--revision`). It records the observed scan state verbatim; an empty control → `"No scan started"`. `READBACK_STATES = {"Account Scanning", "No scan started"}` (fail closed otherwise). It never consumes the create gate or touches the runner state file.
+
+**Readback column-mapping fix (root cause of CO-0702 `readback_only_tenant_not_found`):**
+
+- **Tenant table column contract (9/25 probe):** rows use a repeating **label / value / empty** pattern — `texts[0]` = `"Company name"` (label), `texts[1]` = actual company name, `texts[2]` = `""`, `texts[3]` = `"Company primary domain"` (label), `texts[4]` = actual domain, `texts[5]` = `""`, `texts[6]` = `"Account Type"` (label), `texts[7]` = value, `texts[8]` = `""`, `texts[9]` = `"License Type"` (label), `texts[10]` = value, `texts[11]` = `""`.
+- **Root cause:** the old `_exact_tenant_rows` compared the fixed first two cells (`texts[0]` = the literal label `"Company name"`, `texts[1]` = the company value) against the expected name/domain, so it could never match → every real tenant was misclassified as `duplicate_clear` (and the readback as `readback_only_tenant_not_found`). This affected both the readback and the create-run duplicate check.
+- **Fix:** new helper `_tenant_row_values(texts)` resolves the company (cell after the `"Company name"` label) and domain (cell after the `"Company primary domain"` label) by label, robust to column reordering, returning `(None, None)` when a label is absent so the caller fails closed. `_exact_tenant_rows` and `_open_tenant_details` (the details-row clicker) both use it; missing labels → `duplicate_schema_unavailable`.
+- **Tenant-name override for the readback:** `run_readback(..., tenant_name_override=...)` and CLI `--tenant-name` replace the computed contract name for the search, the row classification, and the details lookup (the email domain still comes from the Salesforce source). A blank override is ignored (falls back to the contract name).
+
+**Dashboard (`tools/serve_attended_open_onboardings_dashboard.py`):**
+
+- Readback wiring complete: `start_attended_ce_only_readback(reference)`, POST route `/attended/ce-only-readback`, the readback button on the CO detail page, and the readback result messages. The dashboard launches the runner as a subprocess (picks up runner code changes without a restart); dashboard code changes require a restart.
+- **Note:** the dashboard readback button uses the standard contract name, so it is correct for the auto-created tenants (CO-0679/0728/0762). The one-off CO-0702 readback (intentional ` test` suffix) is run via the CLI with `--tenant-name` (see Next actions). The dashboard route does not take a tenant-name override.
+
+**Tests (2026-09-25, codex runtime Python 3.12):**
+
+- Runner `integration/tests/test_attended_ce_only_runner.py` → **151 tests OK** (was 146). New/updated: label-based column mapping (missing labels fail closed; company resolved by label not position), `_RPRow`/`_ReadbackPage`/checkbox mocks emit the label/value/empty pattern, and the readback tenant-name override (override verifies; no override on a ` test`-suffixed tenant is `duplicate_ambiguous`; blank override falls back to the contract name).
+- Full `python -m unittest discover -s integration -p "test_*.py"` → **327 tests OK (skipped=1), exit 0.** (Was 322; +5 new tests.) The dashboard suite remains green (65 OK).
+- Note: a daemon-thread `OSError [WinError 10038]` can appear intermittently during interpreter shutdown from the CDP HTTP-server tests; it is a known Python quirk, does not fail any test, and the suite exit code is 0 on a clean run.
+
+**CO-0702 live tenant facts (9/25 probe, read-only):** name `Sample Company - CE Only test` (trailing ` test` — an **intentional operator exception**, not a contract value), domain `sample-cotest.example`, Account Type `Customer`, License Type `prepaid annual subscription`. Surface Account ID `000000000000000000000001`, Account UUID `00000000000000000000000000000001`, `lastReconScan: null`. The ` test` suffix means the contract name `Sample Company - CE Only` is a strict prefix of the live name, so a readback without the override fails closed as `duplicate_ambiguous` (correct — it does not verify a mismatched tenant).
+
+**Eligible CE-only auto-run candidates (read-only Salesforce recon, 9/25):** **CO-0679** (Tango, `tango.example`, Israel), **CO-0728** (Bravoblox, `bravo.example`, Germany), **CO-0762** (SIERRA, `sierra.example`, Sweden). Blocked: CO-0686/CO-0719 (8 domains), CO-0712/CO-0756/CO-0763 (leading `@`), CO-0754 (malformed, no approval), CO-0755 (Pending), CO-0748 (5 domains, Pending). All eligible COs have a `Pentera Core Plus Commercial - 500 End Points` subscription (Tango also has a Bulk row, same dates — excluded by the selector). CE license dates: Tango 2026-10-24→2027-10-23, Bravoblox 2026-10-01→2027-09-30, SIERRA 2026-10-01→2027-09-30, Sample Company 2026-09-28→2027-09-27.
+
+**Work state (uncommitted):**
+
+- All code changes are **uncommitted**; the repo was clean at `fc86b43` before this work. Changed files: `tools/attended_ce_only_playwright.py` (full fill contract, readback-only, column-mapping fix, tenant-name override), `tools/attended_ce_only_table_diagnostic.py` (extended input-metadata capture), `tools/serve_attended_open_onboardings_dashboard.py` (readback wiring), `integration/tests/test_attended_ce_only_runner.py`, `integration/tests/test_attended_open_onboardings_dashboard.py`.
+- Dashboard: **PID 38676** on `127.0.0.1:8012`, HTTP 200, readback button live on the CO-0702 detail page.
+- `integration/attended_ce_only_runner_state.json`: the CO-0702 create gate is **consumed** (`confirm_button_not_enabled`) — **leave as-is.** The tenant was already created manually; leaving the gate consumed prevents an accidental duplicate create. The three create-run COs (CO-0679/0728/0762) have unconsumed gates.
+- `integration/attended_leonardo_readbacks.json`: only CO-0740 present; **CO-0702 pending** (the readback has not yet succeeded).
+- Scratch probe `tmp/probe_tenant_search.py` deleted.
+
+**Blockers:**
+
+- **Leonardo session TTL is very short** (it expired between a passing `--check-session` and the next probe). Mitigation (proven): bootstrap (or check) then launch the run **immediately, in the background** (the runner's `_attach_attended_browser` waits up to `MAX_WAIT_SECONDS = 900` plus a leading Salesforce query; foreground timeouts kill runs mid-flight). Not a hard blocker.
+- **CO-0702 readback pending:** needs a fresh session plus the `--tenant-name` override.
+
+**Next actions (tomorrow):**
+
+1. **Operator:** connect the RND VPN and re-establish the Leonardo session (dashboard `/connection` → **Re-establish Leonardo session (SSO/MFA)**, or `--bootstrap-session`). The session TTL is short, so do this immediately before each run.
+2. **Assistant/operator:** re-run the CO-0702 readback in the **background** with the override: `python tools/attended_ce_only_playwright.py --readback-only --co CO-0702 --tenant-name "Sample Company - CE Only test"`. Expect `readback_only_verified`.
+3. **Verify:** `integration/attended_leonardo_readbacks.json` records a CO-0702 entry with `surface_account_id` `000000000000000000000001`, `account_uuid` `00000000000000000000000000000001`, and `leonardo_state` `"No scan started"`.
+4. **Operator:** trigger the attended auto-creation runs, one at a time, from the CO detail page (the runner auto-confirms after a clear duplicate check; the operator completes SSO/MFA on the first run and the manual Confirm is the runner's, not the operator's — the operator only triggers). Bootstrap immediately before each run. Order and expected CE dates: **CO-0679 Tango** first (2026-10-24→2027-10-23), then **CO-0728 Bravoblox** and **CO-0762 SIERRA** (both 2026-10-01→2027-09-30). Verify each readback into `integration/attended_leonardo_readbacks.json`.
+5. **Assistant:** update this plan with the commit hash(es), each run's outcome, readback state, and any blockers.
+
+**Boundaries preserved:** no Salesforce, Leonardo, Workato, OPA, or production action occurred in this work beyond read-only recon and the readback attempts (no tenant created by the runner, no write). No browser profile, cookie, token, password, MFA value, or raw payload was copied, logged, or persisted. The runner never clicks Confirm without the attended gate and never updates Salesforce. Production BackOffice writes remain blocked without separate explicit approval.
+
+### Progress — 2026-09-29 (reused automation browser: one window, one new tab per run; local code + tests only)
+
+- **Behavior:** each attended operation (`run`, `run_readback`, `check_leonardo_session`, `bootstrap_leonardo_session`, the table diagnostic) now opens a **new tab** in the already-running automation Chrome instead of launching a new window, and closes **only that tab** afterwards. The window and its Leonardo session stay open for the next run. It is still only the dedicated persisted profile from `leonardo_profile()` (never the operator's main Chrome profile).
+- **Discovery/verification:** the running instance is found via `DevToolsActivePort` in the automation user-data-dir and trusted only when loopback `/json/version` returns a browser WebSocket URL whose port and per-instance path match the file. Missing, corrupt, or stale entries mean "not running" (nothing is deleted) and a fresh launch follows.
+- **Launch:** `--remote-debugging-port=0` (Chrome picks a free loopback port and records it in `DevToolsActivePort`) plus a neutral `about:blank` anchor tab, so closing the run tab never exits the reused browser. No `--remote-debugging-address` (loopback only).
+- **Tab ownership:** tabs are opened with `PUT /json/new` and tracked by CDP target id; if the SSO redirect replaces the target, only a single new, not-preexisting target is adopted, otherwise the run fails closed. Another tab at tenant-management is never used.
+- **Temporary (non-persisted) profiles** keep the old full teardown (terminate Chrome, delete the temp profile) and are never reused.
+- **Close/Reset:** new `close_automation_browser()` / `--close-browser` and a dashboard "Close automation browser" button (`/attended/leonardo-dev-browser-close`, desktop only). `reset_leonardo_profile()` first closes the running automation browser (CDP `Browser.close`) and fails closed (nothing wiped) if it cannot.
+- **Security trade-off:** while the automation window stays open, its loopback CDP port lets any local process on the desktop drive that Leonardo Development session. The operator closes the automation browser at the end of the day.
+- No live run, browser launch, or external system contact was performed for this change.
+- **Verified live later on 2026-09-29:** the CO-0702 readback, the no-submit form probes, the CO-0679 dry run and create, and the CO-0728 create each opened a new tab in the one reused automation window and closed only that tab.
+
+### Handoff — 2026-09-29 (first fully automated CE-only onboardings; all fixes; next steps)
+
+**Authoritative handoff for the next session.** It supersedes the "Next actions" of the 2026-09-25 entry. Work was done with the operator attended, one step at a time, with explicit confirmation before each Leonardo write. Everything is committed locally on `main` (**not pushed**); HEAD is `154846a`; the working tree is clean.
+
+#### Outcome
+
+| CO | Account | Result (2026-09-29) | Surface Account ID | Account UUID | Leonardo state |
+| --- | --- | --- | --- | --- | --- |
+| CO-0702 | Sample Company | Manually created 9/25; **read-only verified** (`readback_only_verified`, name override `Sample Company - CE Only test`) | `000000000000000000000001` | `00000000000000000000000000000001` | No scan started |
+| CO-0679 | Tango Group Ltd. | **Created by the runner** 13:39:53–13:40:37 (`readback_verified`), `account/add` 200 | `000000000000000000000002` | `00000000000000000000000000000002` | No scan started |
+| CO-0728 | Bravoblox | **Created by the runner** 14:52:35–14:53:20 (`readback_verified`), `account/add` 200, Advanced toggles OFF | `000000000000000000000003` | `00000000000000000000000000000003` | No scan started |
+| CO-0762 | SIERRA | **Created by the runner** 15:27:41–15:28:27 (`readback_verified`), `account/add` 200, Advanced toggles OFF, license 2026-09-29 → 2027-09-30 | `000000000000000000000004` | `00000000000000000000000000000004` | No scan started |
+
+**Route-gate fix (`3f487a1`, after the table above was first written):** an audit found that the CE-only Start action, its preflight, and the runner's source read chose the route from the email-domain count alone. An approved **Surface** or **Surface & Credential Exposure** CO with one email domain (for example CO-0757) could therefore have been created as a CE-only tenant. All three layers now require exactly `Onboarding_Product__c = "Credential Exposure"` and `Onboarding_Type__c = "New Product Onboarding"`; the runner stops with `ce_route_mismatch` before any browser work. Verified live: CO-0757 and CO-0649 no longer show the CE card. Tests: 423 OK.
+
+Evidence: `integration/attended_leonardo_readbacks.json` (per-CO IDs), `integration/attended_ce_only_runner_state.json` (CO-0679 and CO-0728 are `readback_verified` and can never be re-run; CO-0702's gate stays consumed on purpose), and `integration/attended_ce_only_run_log.json` (redacted step log per run). All three files are gitignored. Salesforce was **not** updated for any CO.
+
+**Known deviation on CO-0679 (created before two fixes landed):** the tenant name is `Tango Group Ltd. - CE Only` (trailing period), and **Automated discovery, Recon Subdomains, and Web dictionary brute force are ON**. The runner has no edit mode. **Operator action pending:** in Leonardo, rename the tenant to `Tango Group Ltd - CE Only` and turn those three toggles off under **Advanced options**; afterwards run `--readback-only --co CO-0679` (the contract name now has no period) to refresh the local evidence. CO-0728 was created with both fixes applied.
+
+#### Root causes found and fixed today (in order)
+
+1. **`duplicate_schema_unavailable` (CO-0679 run 1):** the tenant table uses MUIDataTable's *stacked* layout, where the zero-result row renders as two cells (label + "No matching records found", no colspan). `_is_empty_state_row` now accepts a 2–3-cell row whose only non-empty text is an allowlisted empty-state message; the 1-cell colspan rule is unchanged (`05c53fa`).
+2. **`fill_form_schema_unavailable` (run 2):** the five `<select>` controls have no associated `<label>`. `_locate_select` locates them by `name` (`accountType`, `accountCountry`, `scanningInterval`, `leakedCredentialsScanningInterval`, `licenseType`) (`0ea4b05`).
+3. **Duplicate check could read a stale table (QA review):** the tenant search is **server-side** (`getAllDetailedAccounts` per edit, HAR-verified; this also settles the old "first page only" concern). `_search_tenants` clears the box and waits for the response that carries *this* lookup; the server rows are also classified independently (`_api_duplicate`: an exact name or domain match, or `total_count` > rows, blocks) (`741a48e`, `55f3043`).
+4. **Details view has no labelled ID/UUID controls:** the readback now reads `id`, `accountUuid`, `lastReconScan` from the single exact row in the search response (details view is the fallback) (`55f3043`).
+5. **`fill_form_schema_unavailable` (run 3) — license dates:** the date inputs are `readonly`, display `Sep 29, 2026`, and are set only through a Material-UI v3/v4 picker (`MuiPickersModal-dialogRoot`, auto-accepts on day click). `_pick_license_date` steps months with the header settled between slide transitions, clicks the single enabled day, and verifies the displayed value (`cd6b9b6`).
+6. **Leonardo refuses a start date after today** (silently; no-submit probes: yesterday accepted, tomorrow and 2026-10-24 refused). See the owner decision below (`b8840d7`).
+7. **Advanced options:** Automated discovery, Recon Subdomains, and Web dictionary brute force sit under a collapsed **Advanced options** section and default **ON**. The runner expands it (idempotently), sets them OFF, pins the other enabled advanced toggles OFF, and re-verifies before Confirm (`b6fb327`).
+8. **`duplicate_schema_unavailable` on CO-0728 (14:30):** the session had expired — the tab still showed Tenant Management but the API answered **401**. A 401/403 now stops every mode with **`leonardo_session_expired`** (`d2c42c5`).
+
+#### Owner decisions recorded 2026-09-29 (operator)
+
+- **Tenant MFA required = ON** (matches the CO-0702 manual-creation HAR and the Leonardo default). "Everything off" in the 9/25 contract applies to feature toggles only.
+- **License start = the day the attended onboarding runs** (Leonardo Development refuses future starts). Expiration keeps the contract rule `min(Core Plus start + 1 year − 1 day, subscription end)`. A run whose expiration is not after the run day stops before the browser opens (`ce_license_dates_unavailable`).
+- **Tenant name:** a trailing period is removed from the Salesforce account name (`Tango Group Ltd.` → `Tango Group Ltd - CE Only`); internal periods stay; the email alias is unchanged.
+- **Advanced options OFF:** Automated discovery, Recon Subdomains, Web dictionary brute force (plus Web dorking, Nuclei, Authenticated Testing, Static outbound IP, AI, Multiple attack stacks). MAS for subdomains and Web Agent are disabled by the form and left alone.
+- **Dashboard UX:** one **Start Onboarding** action per CO; the duplicate check is part of the run; a duplicate returns to the CO as "Already exists — duplicate"; Pentera platform styling.
+
+#### Current CE-only contract (what one run does)
+
+1. Fresh fixed-field Salesforce read (`ce_fill_source`); revision must equal the acknowledged revision; license dates computed (start = run day).
+2. Open a new tab in the reused automation window; wait until Tenant Management is stable (operator does SSO/MFA only if the session expired).
+3. Duplicate check by **tenant name** and **primary domain** (table + server rows). Any match → `duplicate_found` (nothing created).
+4. Re-read Salesforce (drift check), open Add Account, then fill in this order: Account Type / License Type / Scanning interval → expand Advanced options → all toggles → Country / Leaked Credentials interval → text fields → license dates (picker) → re-verify every toggle, select, and date.
+5. Confirm once (never retried); record the `account/add` status; wait for the form to close (unknown ≠ closed).
+6. Re-search, read back ID/UUID/state from the server row, write local evidence (`readback_verified`). Never updates Salesforce.
+
+Values: company `<Account without trailing period> - CE Only`; Customer; primary domain = the single Email Domains value; user email domain `pentera.io`; primary user Milton Stevenson, `milton.stevenson+<alias>@pentera.io`; country from Salesforce; Scanning None; Leaked Credentials Weekly on the primary domain; Prepaid annual subscription, 1/1/1; MFA ON; Scan now OFF; Notifications/Multiple users/API/Phishing OFF; Leaked Credentials, Provisioning, Subdomains ON; Advanced options OFF as above.
+
+#### Runner and dashboard features added today
+
+- **Run log** `integration/attended_ce_only_run_log.json` (gitignored, last 20 runs): every step and field outcome, console errors, failed requests, API method/path/status, and failure diagnostics. Redacted: no cookies, headers, bodies, query strings, or source values.
+- **One reused automation window** (a new tab per run; "Close automation browser" on `/connection`). Close it at the end of the day (loopback CDP port trade-off).
+- **CLI modes** (`tools/attended_ce_only_playwright.py`): `--co X --revision R` (create), `--dry-run` (everything up to Confirm, then Cancel; never touches the gate), `--duplicate-check`, `--readback-only [--tenant-name]`, `--bootstrap-session`, `--check-session`, `--close-browser`, `--reset-profile`. The last read-only check per CO is recorded in `integration/attended_ce_only_check_state.json` (gitignored).
+- **Dashboard:** Pentera-style shell for the CO and status pages; status chip beside the CO number (Ready / Running / Onboarded / Duplicate / Failed); a green ✓ or red ✗ outcome banner; a finished run returns to the CO after 6 s; re-posting an already-run revision shows its outcome instead of a dead end; the separate duplicate/readback buttons and routes were removed; unknown POST routes return 404 before any form parse, Salesforce read, or launch.
+- **Tests:** full `python -m unittest discover -s integration -p "test_*.py"` → **420 tests OK (skipped=1)**, stable across three consecutive runs (codex runtime Python 3.12.14). The test fakes now mirror the live DOM (no labels on selects, readonly picker dates, collapsed Advanced options, server-side search responses), which is how earlier bugs had slipped past the tests.
+
+#### Commits since `fc86b43` (local `main`, not pushed)
+
+`bbc36f6` 9/25 slice · `05c53fa` stacked empty-state row · `0ea4b05` run log + selects by name · `741a48e` QA hardening · `ee4a72e`/`dc3aa4b` single automation window · `ea1a062` MFA ON · `55f3043` API readback + API duplicate check · `cd6b9b6` date picker · `b8840d7` run-day start + dry run · `b6fb327` trailing period + Advanced toggles · `ae2d030` outcome banner + redirect · `c844786` read-only duplicate check · `d2c42c5` session-expired result · `f4994d3` single action + Pentera styling · `154846a` stale note removed + deterministic route test.
+
+#### Blockers and cautions
+
+- **Leonardo session TTL is short** and an expired session can still show Tenant Management. Mitigation: re-establish the session on `/connection` right before a run; an expired session now reports `leonardo_session_expired`, never a false result.
+- **Dashboard lifetime:** when the assistant starts the dashboard from its tool shell it can stop when the session restarts (observed after a model switch). The operator should start it from their own terminal: `powershell -ExecutionPolicy Bypass -File tools\start_attended_dashboard.ps1 -Restart`.
+- **No edit mode:** fixing an existing tenant (CO-0679) is manual until a guarded edit mode is designed and approved.
+- **Readback evidence label:** `attended_leonardo_readbacks.json` still says `"source": "Leonardo Development Details readback"` even when the values come from the search response. Cosmetic; worth renaming in a later slice.
+- **HAR files** in the operator's Downloads folder (`gdleonardo…`, `secoundpart-gdleonardo…`) contain session material. They were read for structure only (boolean setting names/values, endpoint paths). Recommend deleting them once no longer needed.
+
+#### Next steps
+
+1. **Operator:** start the dashboard from your own terminal, connect the RND VPN, and on `/connection` click **Re-establish Leonardo session** if needed.
+2. **Operator:** on `http://127.0.0.1:8012/co/CO-0762`, tick the box and click **Start Onboarding**. Expect `SIERRA - CE Only`, license run day → 2027-09-30, `readback_verified` and a green Onboarded chip. Optionally run `--dry-run` first.
+3. **Operator:** fix the CO-0679 tenant manually in Leonardo (rename; three Advanced toggles OFF). **Assistant:** then run `--readback-only --co CO-0679` to refresh its evidence.
+4. **Assistant:** re-run the Salesforce recon for newly approved CE-only COs. **CO-0755** was Approved with one Email Domain at 9/29 and has not been reviewed yet; CO-0686/0712/0719/0756 remain blocked by the Email Domains gate.
+5. **Owner decisions still needed:** (a) whether and when to write the verified Surface Account ID / Account UUID, onboarding dates, and stage back to Salesforce (§7, §16 — blocked today); (b) whether to build a guarded **edit** mode for correcting existing tenants; (c) whether to push the local commits to `mtms7/SurfaceOnboarding`.
+6. **Assistant (small follow-ups):** rename the readback evidence `source` label; update `README.md` and `LOCAL_IMPLEMENTATION_STATUS.md`, which still describe the 9/11–9/12 scaffold and do not mention the attended CE-only runner.
+
+**Boundaries preserved:** Leonardo Development only. Tenant creation happened only on explicit operator clicks (CO-0679, CO-0728). All diagnostic probes were no-submit and cancelled the form. No Salesforce write, no production action, and no Workato/OPA/VM change. No password, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
