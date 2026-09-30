@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -91,6 +92,263 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIsNotNone(grant_manual_start_ack("CO-0717", row, now=100))
         self.assertFalse(manual_start_ack_is_active("CO-0717", row, now=100 + 15 * 60))
 
+    def test_history_month_keys_cover_thirteen_months_ending_this_month(self):
+        from datetime import date
+        keys = dashboard.history_month_keys(date(2026, 9, 29))
+        self.assertEqual(len(keys), 13)
+        self.assertEqual((keys[0], keys[-1]), ((2025, 9), (2026, 9)))
+        self.assertEqual(dashboard.history_month_keys(date(2026, 1, 5))[-2:], [(2025, 12), (2026, 1)])
+
+    def test_closed_history_zero_fills_orders_series_and_folds_unknown_products(self):
+        from datetime import date
+        completed = [
+            {"y": 2026, "m": 9, "p": "Credential Exposure", "n": 20},
+            {"y": 2026, "m": 9, "p": "Surface", "n": 2},
+            {"y": 2026, "m": 8, "p": "Surface & Credential Exposure", "n": 24},
+            {"y": 2026, "m": 8, "p": None, "n": 1},
+            {"y": 2024, "m": 1, "p": "Surface", "n": 99},  # outside the window: ignored
+        ]
+        created = [{"y": 2026, "m": 9, "n": 40}, {"y": 2026, "m": 8, "n": 43}]
+        history = dashboard.build_closed_history(completed, created, date(2026, 9, 29))
+        self.assertEqual(history.series, ("Credential Exposure", "Surface & Credential Exposure", "Surface", "Other"))
+        self.assertEqual(len(history.months), 13)
+        self.assertEqual(history.months[-1].completed, (20, 0, 2, 0))
+        self.assertEqual(history.months[-2].completed, (0, 24, 0, 1))
+        self.assertEqual(history.months[0].completed, (0, 0, 0, 0))
+        self.assertEqual((history.months[-1].created, history.months[-2].created), (40, 43))
+        self.assertEqual(history.completed_total, 47)
+        self.assertEqual(history.months[-1].label, "Sep 2026")
+
+    def test_closed_history_has_no_other_series_when_every_product_is_known(self):
+        from datetime import date
+        history = dashboard.build_closed_history([{"y": 2026, "m": 9, "p": "Surface", "n": 3}], [], date(2026, 9, 29))
+        self.assertEqual(history.series, dashboard.HISTORY_PRODUCTS)
+        self.assertEqual(history.months[-1].completed, (0, 0, 3))
+
+    def test_closed_history_rejects_malformed_aggregate_rows(self):
+        from datetime import date
+        for bad in ({"y": 2026, "m": 9, "p": "Surface", "n": -1}, {"y": "2026", "m": 9, "n": 1},
+                    {"y": 2026, "m": 9, "n": 1.5}, {"y": 2026, "m": 9, "n": True}, "not-a-row"):
+            with self.subTest(bad=bad), self.assertRaises(dashboard.ReadUnavailable):
+                dashboard.build_closed_history([bad], [], date(2026, 9, 29))
+
+    @staticmethod
+    def _fake_history_sf(calls):
+        def fake_sf_json(args):
+            calls.append(args[3])
+            if args[3] == dashboard.REJECTED_TOTAL_QUERY:
+                return {"status": 0, "result": {"records": [{"n": 99}]}}
+            return {"status": 0, "result": {"records": []}}
+        return fake_sf_json
+
+    def test_closed_history_is_cached_and_uses_only_the_fixed_queries(self):
+        from datetime import date, datetime, timezone
+        calls = []
+        now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
+        with patch.object(dashboard, "sf_json", side_effect=self._fake_history_sf(calls)), \
+                patch.object(dashboard, "_history_cache", None):
+            first = dashboard.closed_history(now=1000.0, today=date(2026, 9, 29), wall_clock=now)
+            second = dashboard.closed_history(now=1000.0 + 60, today=date(2026, 9, 29), wall_clock=now)
+            self.assertIs(first, second)
+            self.assertEqual(calls, [dashboard.COMPLETED_HISTORY_QUERY, dashboard.CREATED_HISTORY_QUERY,
+                                     dashboard.COMPLETION_DURATIONS_QUERY, dashboard.REJECTED_TOTAL_QUERY])
+            dashboard.closed_history(now=1000.0 + dashboard.HISTORY_CACHE_SECONDS + 1, today=date(2026, 9, 29), wall_clock=now)
+            self.assertEqual(len(calls), 8)
+            # The cache holds only derived, frozen numbers.
+            cached = dashboard._history_cache[1]
+            self.assertIsInstance(cached, dashboard.ClosedHistory)
+            self.assertEqual(cached.kpis.rejected_total, 99)
+        for query in (dashboard.COMPLETED_HISTORY_QUERY, dashboard.CREATED_HISTORY_QUERY, dashboard.REJECTED_TOTAL_QUERY):
+            self.assertIn("COUNT(Id)", query)
+        # The per-record query selects only the two timestamps.
+        self.assertTrue(dashboard.COMPLETION_DURATIONS_QUERY.startswith(
+            "SELECT CreatedDate, Completed_Time_Stamp__c FROM Customer_Onboarding__c"))
+        self.assertIn("LIMIT 2000", dashboard.COMPLETION_DURATIONS_QUERY)
+
+    def test_closed_history_failure_is_cached_briefly_and_raises(self):
+        calls = []
+
+        def failing(args):
+            calls.append(args)
+            raise dashboard.ReadUnavailable()
+
+        with patch.object(dashboard, "sf_json", side_effect=failing), \
+                patch.object(dashboard, "_history_cache", None):
+            with self.assertRaises(dashboard.ReadUnavailable):
+                dashboard.closed_history(now=5.0)
+            with self.assertRaises(dashboard.ReadUnavailable):
+                dashboard.closed_history(now=5.0 + 30)  # cached failure: no second Salesforce call
+            self.assertEqual(len(calls), 1)
+            with self.assertRaises(dashboard.ReadUnavailable):
+                dashboard.closed_history(now=5.0 + dashboard.HISTORY_FAILURE_CACHE_SECONDS + 1)
+            self.assertEqual(len(calls), 2)
+
+    def test_closed_kpis_counts_windows_median_and_rejected(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
+
+        def pair(created, completed):
+            return {"CreatedDate": created, "Completed_Time_Stamp__c": completed}
+
+        records = [
+            pair("2026-09-01T12:00:00.000+0000", "2026-09-11T12:00:00.000+0000"),  # 10 days, in last 30
+            pair("2026-09-20T12:00:00.000+0000", "2026-09-22T12:00:00.000+0000"),  # 2 days, in last 30
+            pair("2026-07-20T12:00:00.000+0000", "2026-08-15T12:00:00.000+0000"),  # 26 days, previous 30
+        ]
+        kpis = dashboard.build_closed_kpis(records, [{"n": 99}], now)
+        self.assertEqual((kpis.completed_30d, kpis.completed_prev_30d), (2, 1))
+        self.assertEqual(kpis.median_days_90d, 10.0)
+        self.assertEqual((kpis.median_sample, kpis.rejected_total), (3, 99))
+        # A read that hit the row limit reports no median instead of a biased one.
+        full = [records[0]] * dashboard.HISTORY_DURATION_LIMIT
+        self.assertIsNone(dashboard.build_closed_kpis(full, [{"n": 1}], now).median_days_90d)
+        with self.assertRaises(dashboard.ReadUnavailable):
+            dashboard.build_closed_kpis([pair("not-a-date", "2026-09-11T12:00:00.000+0000")], [{"n": 1}], now)
+
+    @staticmethod
+    def _history_fixture():
+        from datetime import date
+        completed = [{"y": 2026, "m": m, "p": p, "n": n} for m, p, n in (
+            (6, "Credential Exposure", 35), (6, "Surface & Credential Exposure", 23), (6, "Surface", 2),
+            (8, "Credential Exposure", 26), (8, "Surface & Credential Exposure", 24), (8, "Surface", 9),
+            (9, "Credential Exposure", 20), (9, "Surface", 2))]
+        created = [{"y": 2026, "m": 6, "n": 37}, {"y": 2026, "m": 8, "n": 43}, {"y": 2026, "m": 9, "n": 40}]
+        history = dashboard.build_closed_history(completed, created, date(2026, 9, 29))
+        kpis = dashboard.ClosedKpis(41, 35, 12.4, 131, 99)
+        return dashboard.ClosedHistory(history.series, history.months, history.as_of, kpis)
+
+    def test_history_chart_renders_stacked_months_ticks_legend_and_table(self):
+        html = dashboard.render_closed_history(self._history_fixture(), "20:45")
+        self.assertIn("<svg viewBox='0 0 880 200' role='img'", html)
+        self.assertIn("Closed onboardings per month", html)
+        for name in ("Credential Exposure", "Surface &amp; Credential Exposure", "Surface", "New COs created"):
+            self.assertIn(name, html)
+        self.assertEqual(html.count("class='qh-hit'"), 13)  # one hover band per month
+        self.assertIn("to date", html)  # the current month is marked partial
+        self.assertIn("Sep 2026 · to 29 Sep", html)
+        self.assertIn("<details class='qh-table'><summary>Table view</summary>", html)
+        self.assertIn("99 COs rejected all time", html)
+        self.assertIn("41", html)
+        self.assertIn("+6 vs previous 30 days", html)
+        self.assertIn("12 days", html)
+        # The hover overlay is hidden from assistive tech (the table carries the values).
+        self.assertIn("class='qh-hits' aria-hidden='true'", html)
+        self.assertNotIn("tabindex", html)
+        self.assertNotIn("<script", html)
+
+    def test_history_chart_labels_selectively_and_never_the_partial_month(self):
+        html = dashboard.render_closed_history(self._history_fixture(), "20:45")
+        labels = re.findall(r"<text class='cap'[^>]*>([0-9,]+)</text>", html)
+        self.assertLessEqual(len(labels), 2)
+        self.assertNotIn("22", labels)  # September (partial, 22 completed) is never labelled
+
+    def test_history_chart_empty_state_and_nice_ticks(self):
+        from datetime import date
+        empty = dashboard.build_closed_history([], [], date(2026, 9, 29))
+        html = dashboard.render_closed_history(empty, "20:45")
+        self.assertIn("No onboardings were completed or created", html)
+        self.assertNotIn("<svg", html)
+        self.assertEqual(dashboard.nice_ticks(94), (0, 20, 40, 60, 80, 100))
+        self.assertEqual(dashboard.nice_ticks(3), (0, 1, 2, 3))
+        self.assertEqual(dashboard.nice_ticks(0), (0, 1))
+
+    def test_history_card_unavailable_state_keeps_the_queue(self):
+        card = dashboard.history_card(None, "20:45", failed=True)
+        self.assertIn("History unavailable", card)
+        self.assertIn("The queue above is unaffected", card)
+
+    def test_queue_classification_rules(self):
+        base = {"Name": "CO-9001", "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
+        cases = [
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="Request Approved"), None,
+             "ready", "Start onboarding", "you"),
+            (dict(base, Onboarding_Product__c="Surface", Onboarding_Approval_Status__c="Approved",
+                  Onboarding_Stage__c="Request Approved"), None, "ready", "Review scope, start", "you"),
+            (dict(base, Onboarding_Type__c="Renewal of Existing Product", Onboarding_Approval_Status__c="Approved",
+                  Onboarding_Stage__c="Request Approved"), None, "ready", "Onboard manually", "you"),
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="Request Approved"),
+             {"source_revision": "r", "result": "readback_verified"}, "scanning", "Update Salesforce", "you"),
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="Request Approved"),
+             {"source_revision": "r", "result": "duplicate_found"}, "review", "Review existing tenant", "you"),
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="Request Approved"),
+             {"source_revision": "r", "result": "fill_form_schema_unavailable"}, "review", "Review failed run", "you"),
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="Request Approved"),
+             {"source_revision": "r", "started_on": "2026-09-29T10:00:00"}, "ready", "Waiting · runner", "runner"),
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="Account Scanning"), None,
+             "scanning", "Waiting · Leonardo scan", "leonardo"),
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="Scan Completed Successfully"), None,
+             "scanning", "Create customer user", "you"),
+            (dict(base, Onboarding_Approval_Status__c="Approved", Onboarding_Stage__c="User Created"), None,
+             "scanning", "Complete onboarding", "you"),
+            (dict(base, Onboarding_Approval_Status__c="Pending", Onboarding_Stage__c="New"), None,
+             "validation", "Validate DealHub term", "you"),
+            (dict(base, Onboarding_Stage__c="New"), None, "review", "Set approval status", "you"),
+            (dict(base, Onboarding_Approval_Status__c="Pending", Onboarding_Stage__c="Request Approved"), None,
+             "review", "Review source record", "you"),
+        ]
+        for row, record, key, step, owner in cases:
+            with self.subTest(step=step, key=key):
+                got_key, got_step, got_owner = dashboard.classify_queue_row(row, record)
+                self.assertEqual((got_key, got_owner), (key, owner))
+                self.assertIn(step, got_step)
+
+    def test_dashboard_page_uses_the_shell_tiles_tables_and_history(self):
+        rows = [
+            {"Name": "CO-9002", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+             "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding",
+             "Account__r.Name": "Example Account 02", "Submission_Date__c": "2026-09-10"},
+            {"Name": "CO-9003", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+             "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding",
+             "Account__r.Name": "Example Account 03", "Submission_Date__c": "2026-09-12", "Local_Leonardo_State": "No scan started"},
+        ]
+        from datetime import date
+        page = page_queue(rows, runner_state={"CO-9003": {"source_revision": "r", "result": "readback_verified"}},
+                          history=self._history_fixture(), read_at="20:45", today=date(2026, 9, 29))
+        self.assertIn("class='side'", page)  # the shared Pentera shell
+        self.assertIn("<nav class='tiles' aria-label='Queues'>", page)
+        self.assertIn("aria-current='page'", page)  # "All open" tile is current
+        self.assertIn("<table class='q'>", page)
+        self.assertIn("Start onboarding", page)
+        self.assertIn("Update Salesforce", page)  # an onboarded CO is a follow-up, not "ready" again
+        self.assertIn("chip chip-ok'>Onboarded", page)
+        self.assertIn("19 d", page)
+        self.assertIn("Read from Salesforce at 20:45", page)
+        self.assertIn("id='history'", page)
+        self.assertNotIn("<script", page)
+        filtered = page_queue(rows, "ready", history=self._history_fixture(), read_at="20:45")
+        self.assertNotIn("id='history'", filtered)  # the chart shows only on the unfiltered view
+        self.assertIn("<h1>Ready to onboard</h1>", filtered)
+
+    def test_dashboard_page_degrades_when_run_records_are_unreadable(self):
+        page = page_queue([{"Name": "CO-9002", "Onboarding_Approval_Status__c": "Approved",
+                            "Onboarding_Stage__c": "Request Approved"}], runner_state_unavailable=True)
+        self.assertIn("Local run results unavailable", page)
+
+    def test_empty_queue_and_empty_bucket_states(self):
+        self.assertIn("No open onboardings", page_queue([]))
+        page = page_queue([{"Name": "CO-9002", "Onboarding_Approval_Status__c": "Pending", "Onboarding_Stage__c": "New"}], "ready")
+        self.assertIn("Nothing in Ready to onboard right now", page)
+
+    def test_render_dashboard_isolates_history_failures(self):
+        rows = [{"Name": "CO-9002", "Onboarding_Approval_Status__c": "Pending", "Onboarding_Stage__c": "New"}]
+        with patch.object(dashboard, "queue_rows", return_value=rows), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "closed_history", side_effect=dashboard.ReadUnavailable()):
+            page = dashboard.render_dashboard("")
+        self.assertIn("History unavailable", page)
+        self.assertIn("CO-9002", page)
+        with patch.object(dashboard, "queue_rows", return_value=rows), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "closed_history", side_effect=AssertionError("filtered views skip the history read")):
+            dashboard.render_dashboard("validation")
+
+    def test_connection_page_only_claims_a_failure_on_the_failure_path(self):
+        with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "desktop"}, clear=False):
+            self.assertIn("Connection required", page_salesforce_unavailable())
+            navigated = page_salesforce_unavailable(failed=False)
+        self.assertNotIn("Connection required", navigated)
+        self.assertIn("class='side'", navigated)
+
     def test_account_scanning_uses_a_distinct_local_queue(self):
         page = page_queue([{"Name": "CO-0740", "Submission_Date__c": "2026-09-13", "Local_Leonardo_State": "Account Scanning"}])
         self.assertIn("Account Scanning", page)
@@ -102,7 +360,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
             {"Name": "CO-0747", "Onboarding_Approval_Status__c": "Pending", "Onboarding_Stage__c": "New"},
         ], "validation")
         self.assertIn("CO-0747", page)
-        self.assertNotIn("CO-0740</span>", page)
+        self.assertNotIn("/co/CO-0740", page)
         self.assertIn("/?queue=validation", page)
 
     def test_blank_approval_status_is_labelled_as_a_manual_review_condition(self):
