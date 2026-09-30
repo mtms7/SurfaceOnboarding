@@ -898,17 +898,24 @@ def build_surface_only_fill(source: SurfaceFillSource, run_day: date | None = No
         "Number of subdomains": str(source.entitlement.licensed_subdomains),
     })
     blank_texts.extend((NETWORKS_LABEL, "Phone number", "Job title"))
+    # Live form (2026-09-29 probe): the "Scan now" control exists only while
+    # Scanning interval is None; a Weekly/Monthly schedule removes it. With a
+    # schedule it is verified absent instead of being set.
+    interval = source.entitlement.scanning_interval
+    scan_now = {"scan_now": True} if interval == "None" else {}
+    absent_checkboxes = () if scan_now else ("scan_now",)
     return {
         "texts": texts,
         "selects": {
             "Account Type": "Customer",
             "Country": source.country,
-            "Scanning interval": source.entitlement.scanning_interval,
+            "Scanning interval": interval,
             "Type": "Prepaid annual subscription",
         },
+        "absent_checkboxes": absent_checkboxes,
         "checkboxes": {
             "mfaRequired": True,
-            "scan_now": True,
+            **scan_now,
             **SURFACE_ADVANCED_TOGGLES,
             "notificationsAllowed": True,
             "multipleUsersAllowed": True,
@@ -2997,6 +3004,13 @@ def _fill_add_account_form(page: Any, plan: dict[str, Any]) -> tuple[str | None,
         failure = _fill_select(page, label, option)
         if failure:
             return failure, None
+    # Controls the plan expects the form to have removed (e.g. Scan now once a
+    # scanning schedule is set) must really be gone.
+    for key in plan.get("absent_checkboxes") or ():
+        if _checkbox_count(page, key) != 0:
+            log.event("absent_toggle", "present", key)
+            return "fill_form_schema_unavailable", None
+        log.event("absent_toggle", "ok", key)
     if not _expand_advanced_options(page, plan["checkboxes"]):
         return "fill_form_schema_unavailable", None
     for key, target in plan["checkboxes"].items():
@@ -3068,8 +3082,22 @@ def _fill_add_account_form(page: Any, plan: dict[str, Any]) -> tuple[str | None,
             return "fill_value_mismatch", None
     if plan.get("operator_account_empty") and _verify_operator_account_empty(page) is not None:
         return "fill_value_mismatch", None
+    for key in plan.get("absent_checkboxes") or ():
+        if _checkbox_count(page, key) != 0:
+            log.event("verify_absent", "present", key)
+            return "fill_value_mismatch", None
     log.event("verify_form", "ok")
     return None, company_control
+
+
+def _checkbox_count(page: Any, key: str) -> int:
+    """How many controls match one checkbox key (-1 when the lookup fails)."""
+    try:
+        if key == "scan_now":
+            return page.get_by_role("checkbox", name="primary checkbox", exact=True).count()
+        return page.locator(f'input[type=checkbox][name="{key}"]').count()
+    except Exception:
+        return -1
 
 
 # The CE-only name is kept for callers and tests; the CE plan has none of the

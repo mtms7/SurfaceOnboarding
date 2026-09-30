@@ -1238,6 +1238,10 @@ class _RPCheckboxControl:
         # Advanced toggles exist only once "Advanced options" is expanded.
         if self.key in runner.ADVANCED_TOGGLES_OFF and not self.page.advanced_open:
             return 0
+        # Live form (2026-09-29): "Scan now" exists only while Scanning
+        # interval is None; a Weekly/Monthly schedule removes it.
+        if self.key == "scan_now" and self.page.selected.get("Scanning interval") not in (None, "None"):
+            return 0
         return 1
 
     def is_checked(self) -> bool:
@@ -3620,8 +3624,11 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
         })
         self.assertEqual(plan["selects"], {"Account Type": "Customer", "Country": "France",
                                            "Scanning interval": "Monthly", "Type": "Prepaid annual subscription"})
+        # Scan now only exists while Scanning interval is None (live probe
+        # 2026-09-29); with the Monthly schedule it is verified absent.
+        self.assertEqual(plan["absent_checkboxes"], ("scan_now",))
         self.assertEqual(plan["checkboxes"], {
-            "mfaRequired": True, "scan_now": True,
+            "mfaRequired": True,
             "automatedDiscoveryEnabled": False, "subDomainsReconEnabled": True,
             "webDictionaryBruteForceEnabled": True, "webDorkingEnabled": False,
             "fullNucleiScanEnabled": True, "authenticatedTestingEnabled": False,
@@ -3767,6 +3774,20 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertIn(("verify_blank", "ok"), steps)
         lookups = [e.get("field") for e in log["events"] if e["step"] == "duplicate_check"]
         self.assertEqual(lookups, ["tenant_name", "primary_domain"])
+        # Scan now is removed by the Monthly schedule and verified absent.
+        self.assertIn(("absent_toggle", "ok"), steps)
+        self.assertNotIn(("fill_toggle", "ok"), [(e["step"], e["outcome"]) for e in log["events"]
+                                                 if e.get("field") == "scan_now"])
+
+    def test_scan_now_still_present_with_a_schedule_fails_closed(self):
+        # If the form ever kept Scan now visible under a schedule, the plan's
+        # assumption is wrong: stop before Confirm instead of guessing.
+        original = _RPCheckboxControl.count
+        with patch.object(_RPCheckboxControl, "count",
+                          lambda control: 1 if control.key == "scan_now" else original(control)):
+            result, page = self._run(self._scenario())
+        self.assertEqual(result, "fill_form_schema_unavailable")
+        self.assertFalse(page.confirmed)
 
     def test_run_log_redacts_every_surface_source_value(self):
         source = _surface_source()
