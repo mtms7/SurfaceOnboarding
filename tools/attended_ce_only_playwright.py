@@ -3179,6 +3179,7 @@ def _confirm_enabled(page: Any, confirm: Any) -> bool:
         invalid = []
     _log().event("confirm_enable", "disabled", detail="invalid=" + ",".join(str(i) for i in (invalid or [])))
     _log_form_validation(page)
+    _log_form_field_errors(page)
     return False
 
 
@@ -3430,6 +3431,79 @@ def _log_react_component_keys(page: Any, stage: str = "") -> None:
         log.event("react_component_keys", "shape", stage, str(item))
 
 
+def _log_form_field_errors(page: Any, stage: str = "") -> None:
+    """Log the Add Account component's own per-field error slots, without values.
+
+    Live 2026-09-30: the Add Account component keeps the whole form in one
+    hook state object with a "<field>Error" key beside each field. For every
+    such object above the Confirm button this logs (a) each error slot that
+    is set, with its message (domain-redacted), and (b) the names of fields
+    whose value is empty (never the values themselves). One event per item
+    so nothing is truncated.
+    """
+    log = _log()
+    try:
+        found = page.evaluate(
+            """() => {
+                const button = Array.from(document.querySelectorAll('button'))
+                    .find(b => (b.textContent || '').trim() === 'Confirm');
+                if (!button) return {note: 'no-confirm-button'};
+                const key = Object.keys(button).find(k => k.startsWith('__reactFiber$')
+                    || k.startsWith('__reactInternalInstance$'));
+                if (!key) return {note: 'no-react-fiber'};
+                const isEmpty = (v) => v === undefined || v === null || v === ''
+                    || (Array.isArray(v) && v.length === 0);
+                const states = [];
+                let fiber = button[key];
+                for (let depth = 0; fiber && depth < 30; depth++, fiber = fiber.return) {
+                    let hook = fiber.memoizedState;
+                    for (let i = 0; hook && typeof hook === 'object' && 'next' in hook && i < 60; i++, hook = hook.next) {
+                        const v = hook.memoizedState;
+                        if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+                        const keys = Object.keys(v);
+                        const errorKeys = keys.filter(k => /Error$/.test(k));
+                        if (!errorKeys.length) continue;
+                        const set = errorKeys.filter(k => !isEmpty(v[k]) && v[k] !== false).map(k => {
+                            const e = v[k];
+                            const msg = typeof e === 'string' ? e
+                                : (e && typeof e.message === 'string') ? e.message
+                                : (typeof e === 'boolean' ? String(e) : typeof e);
+                            return k + ': ' + String(msg).slice(0, 120);
+                        });
+                        const empty = keys.filter(k => !/Error$/.test(k) && isEmpty(v[k]));
+                        states.push({where: depth + ':hook' + i, fields: keys.length - errorKeys.length,
+                                     errorSlots: errorKeys.length, set: set, empty: empty.slice(0, 80)});
+                    }
+                }
+                return {states: states.slice(0, 5)};
+            }""")
+    except Exception as exc:
+        log.error("form_field_errors", stage or "report", exc)
+        return
+    if not isinstance(found, dict):
+        log.event("form_field_errors", "unreadable", stage)
+        return
+    if found.get("note"):
+        log.event("form_field_errors", "unavailable", stage, str(found["note"]))
+        return
+    states = found.get("states") if isinstance(found.get("states"), list) else []
+    if not states:
+        log.event("form_field_errors", "no_error_state", stage)
+    for state in states:
+        if not isinstance(state, dict):
+            continue
+        where = str(state.get("where", ""))
+        log.event("form_field_errors", "state", stage,
+                  f"{where} fields={state.get('fields')} error_slots={state.get('errorSlots')} "
+                  f"set={len(state.get('set') or [])} empty={len(state.get('empty') or [])}")
+        for item in state.get("set") or []:
+            text = str(item)
+            name, _sep, message = text.partition(": ")
+            log.event("form_field_errors", "error_set", stage, f"{where} {name}: {_redact_domains(message)}")
+        for name in state.get("empty") or []:
+            log.event("form_field_errors", "empty_field", stage, f"{where} {name}")
+
+
 def _diagnose_cumulative(page: Any, confirm: Any, plan: dict[str, Any]) -> list[str]:
     """Apply CE-like changes in cumulative groups (never Leaked Credentials or
     Phishing), checking Confirm after each group. Not undone: the form is
@@ -3542,6 +3616,7 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
         if not restored:
             log.event("diagnose_probe", "undo_failed", name)
 
+    _log_form_field_errors(page)
     _log_react_form_state(page)
     _log_react_component_keys(page)
     # 1. Touch every field: surfaces the form's own per-field errors, if any.
@@ -3607,6 +3682,7 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
               lambda: _fill_select(page, "Scanning interval", "None") is None,
               lambda: _fill_select(page, "Scanning interval", interval) is None)
     log.event("diagnose_confirm", "found" if found else "unknown", detail=",".join(found))
+    _log_form_field_errors(page, "after_probes")
     if found:
         return "diagnose_confirm_blocker_found"
     # No single change helped: try cumulative CE-like groups (last; the form

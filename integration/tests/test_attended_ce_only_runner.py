@@ -3867,6 +3867,21 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertEqual(groups["numbers_ce_like"], "no_change")
         self.assertEqual(groups["alternate_domains_blank"], "enables_confirm")
 
+    def test_disabled_confirm_logs_the_component_error_slots_and_empty_fields(self):
+        # Live shape 2026-09-30: one hook state object with "<field>Error" keys.
+        found = {"states": [{"where": "17:hook8", "fields": 30, "errorSlots": 12,
+                             "set": ["leakedCredentialsDomainsError: Invalid domain " + SURFACE_ALT],
+                             "empty": ["leakedCredentialsDomains", "accountNetworks"]}]}
+        with self._confirm_enabled_when(lambda page: False), \
+                patch.object(_RPPage, "evaluate", lambda self, script, *a: found if "Error$" in script else None,
+                             create=True):
+            result, _page = self._run(self._scenario(), dry_run=True)
+        self.assertEqual(result, "dry_run_confirm_not_enabled")
+        self.assertNotIn(SURFACE_ALT, runner.RUN_LOG_PATH.read_text(encoding="utf-8"))
+        events = [(e["outcome"], e.get("detail", "")) for e in self._events() if e["step"] == "form_field_errors"]
+        self.assertIn(("error_set", "17:hook8 leakedCredentialsDomainsError: Invalid domain <domain>"), events)
+        self.assertIn(("empty_field", "17:hook8 leakedCredentialsDomains"), events)
+
     def test_diagnose_logs_the_react_form_errors_without_values(self):
         state = {"errors": ["leakedCredentialsScanningInterval: Required", "licenseDomains: Invalid " + SURFACE_ALT],
                  "flags": ["7:Formik.props.isValid=false"], "props": ["2:Button.disabled=true"],
