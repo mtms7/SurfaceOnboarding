@@ -9,7 +9,7 @@ import tempfile
 import contextlib
 import types
 import unittest
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -3796,6 +3796,45 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertFalse(self.state.exists())  # the one-time gate is untouched
         steps = [(e["step"], e["outcome"]) for e in self._events()]
         self.assertIn(("confirm_enable", "disabled"), steps)
+
+    def _accepts_start(self, accepted: date):
+        return self._confirm_enabled_when(lambda page: page.filled.get("Start date") == accepted.isoformat())
+
+    def test_create_retries_the_start_one_day_earlier_when_confirm_stays_disabled(self):
+        # Live 2026-09-30 (CO-0649): Leonardo kept Confirm disabled with the
+        # run day as start and enabled it with the day before (operator check).
+        earlier = RUN_DAY - timedelta(days=1)
+        with self._accepts_start(earlier):
+            result, page = self._run(self._scenario())
+        self.assertEqual(result, "readback_verified")
+        self.assertTrue(page.confirmed)
+        self.assertEqual(page.filled["Start date"], earlier.isoformat())
+        plan = runner.build_surface_only_fill(_surface_source(), RUN_DAY)
+        self.assertEqual(page.filled["Expiration date"], plan["license_end"].isoformat())  # unchanged
+        steps = [(e["step"], e["outcome"]) for e in self._events()]
+        self.assertIn(("license_start_fallback", "confirm_enabled"), steps)
+
+    def test_run_day_start_is_kept_when_confirm_enables(self):
+        with self._accepts_start(RUN_DAY):
+            result, page = self._run(self._scenario())
+        self.assertEqual(result, "readback_verified")
+        self.assertEqual(page.filled["Start date"], RUN_DAY.isoformat())
+        self.assertNotIn("license_start_fallback", [e["step"] for e in self._events()])
+
+    def test_fallback_is_bounded_to_one_day_and_fails_closed(self):
+        with self._accepts_start(RUN_DAY - timedelta(days=2)):
+            result, page = self._run(self._scenario())
+        self.assertEqual(result, "confirm_button_not_enabled")
+        self.assertFalse(page.confirmed)
+        self.assertIn(("license_start_fallback", "still_disabled"),
+                      [(e["step"], e["outcome"]) for e in self._events()])
+
+    def test_dry_run_uses_the_same_start_fallback(self):
+        with self._accepts_start(RUN_DAY - timedelta(days=1)):
+            result, page = self._run(self._scenario(), dry_run=True)
+        self.assertEqual(result, "dry_run_fill_verified")
+        self.assertFalse(page.confirmed)
+        self.assertTrue(page.cancelled)
 
     def test_dry_run_requires_and_logs_an_enabled_confirm(self):
         result, page = self._run(self._scenario(), dry_run=True)

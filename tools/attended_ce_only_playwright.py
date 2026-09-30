@@ -3236,6 +3236,55 @@ def _confirm_enabled(page: Any, confirm: Any) -> bool:
     return False
 
 
+LICENSE_START_FALLBACK_DAYS = 1
+
+
+def _license_date_value(page: Any, key: str) -> date | None:
+    control = _locate_license_date(page, key)
+    try:
+        return _parse_display_date(control.first.input_value()) if control is not None else None
+    except Exception:
+        return None
+
+
+def _ensure_confirm_enabled(page: Any, confirm: Any, plan: dict[str, Any]) -> bool:
+    """Wait for Confirm; if it stays disabled, retry once with the start one day earlier.
+
+    Live 2026-09-30 (CO-0649, operator-verified by hand): Leonardo Development
+    accepted the run day (Sep 30) in the start-date picker but kept Confirm
+    disabled with no field error; Sep 29 enabled it. Owner decision
+    2026-09-30 (option D): use the latest day Leonardo accepts, at most
+    LICENSE_START_FALLBACK_DAYS before the run day. The start is re-picked,
+    both dates are re-read (the expiration must be unchanged), and the runner
+    continues only if Confirm then enables. The plan's license_start is
+    updated to the date actually entered. Confirm is never clicked here.
+    """
+    if _confirm_enabled(page, confirm):
+        return True
+    log = _log()
+    start, end = plan.get("license_start"), plan.get("license_end")
+    if not isinstance(start, date) or not isinstance(end, date):
+        return False
+    for back in range(1, LICENSE_START_FALLBACK_DAYS + 1):
+        earlier = start - timedelta(days=back)
+        log.event("license_start_fallback", "retry", detail=f"start={earlier.isoformat()}")
+        if not _fill_license_date(page, "license_start", earlier):
+            log.event("license_start_fallback", "pick_failed", detail=f"start={earlier.isoformat()}")
+            return False
+        shown_start, shown_end = _license_date_value(page, "license_start"), _license_date_value(page, "license_end")
+        if shown_start != earlier or shown_end != end:
+            log.event("license_start_fallback", "dates_mismatch",
+                      detail=f"start_ok={shown_start == earlier} end_ok={shown_end == end}")
+            return False
+        if _confirm_enabled(page, confirm):
+            plan["license_start"] = earlier
+            log.event("license_start_fallback", "confirm_enabled",
+                      detail=f"start={earlier.isoformat()} end={end.isoformat()}")
+            return True
+    log.event("license_start_fallback", "still_disabled")
+    return False
+
+
 # Domains and email addresses in form messages are redacted before logging,
 # on top of the run log's own redaction of every known source value.
 _DOMAIN_TOKEN = re.compile(r"(?i)[\w.+-]+@[\w-]+(?:\.[\w-]+)+|\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b")
@@ -4094,7 +4143,7 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                     if confirm is None:
                         _capture_search_diagnostics(page)
                         result = "confirm_button_schema_unavailable"
-                    elif _confirm_enabled(page, confirm):
+                    elif _ensure_confirm_enabled(page, confirm, plan):
                         log.event("confirm_enable", "enabled")
                         result = "dry_run_fill_verified"
                     elif diagnose:
@@ -4115,7 +4164,7 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                 if confirm is None:
                     _capture_search_diagnostics(page)
                     return _finish(reference, acknowledged_revision, "confirm_button_schema_unavailable")
-                if not _confirm_enabled(page, confirm):
+                if not _ensure_confirm_enabled(page, confirm, plan):
                     _capture_search_diagnostics(page)
                     return _finish(reference, acknowledged_revision, "confirm_button_not_enabled")
                 create_status = None
