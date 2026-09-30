@@ -3867,6 +3867,42 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertEqual(groups["numbers_ce_like"], "no_change")
         self.assertEqual(groups["alternate_domains_blank"], "enables_confirm")
 
+    def test_lc_prefill_probe_finds_the_blocker_and_leaves_lc_off(self):
+        # Live 2026-09-30 hypothesis: Confirm needs the dormant LC domain even
+        # with Leaked Credentials OFF. The approved probe sets it and ends OFF.
+        def needs_dormant_lc_domain(page):
+            return (page.filled.get(runner.LC_SCANNED_DOMAINS_LABEL) == SURFACE_MAIN
+                    and not page.checkbox_states["leakedCredentialsAllowed"])
+        with self._confirm_enabled_when(needs_dormant_lc_domain):
+            result, page = self._run(self._scenario(), diagnose=True, lc_prefill_probe=True)
+        self.assertEqual(result, "diagnose_confirm_blocker_found")
+        self.assertFalse(page.confirmed)
+        self.assertTrue(page.cancelled)
+        self.assertFalse(page.checkbox_states["leakedCredentialsAllowed"])
+        self.assertFalse(page.checkbox_states["phishingEnabled"])
+        steps = [(e["step"], e["outcome"], e.get("field", "")) for e in self._events()]
+        self.assertIn(("diagnose_lc_prefill", "lc_off_verified", ""), steps)
+        self.assertIn(("diagnose_probe", "enables_confirm", "lc_domains_prefill_lc_off"), steps)
+
+    def test_diagnose_without_the_flag_never_touches_lc(self):
+        touched = []
+        original_click = _RPCheckboxControl.click
+
+        def click(control, **kwargs):
+            touched.append(control.key)
+            original_click(control, **kwargs)
+
+        with self._confirm_enabled_when(lambda page: False), patch.object(_RPCheckboxControl, "click", click):
+            self._run(self._scenario(), diagnose=True)
+        self.assertNotIn("leakedCredentialsAllowed", touched)
+
+    def test_cli_lc_prefill_probe_requires_diagnose(self):
+        with patch.object(runner, "run", side_effect=AssertionError("must not run")), \
+                patch.object(sys, "argv", ["runner", "--co", "CO-0649", "--revision", SURFACE_REVISION,
+                                           "--route", runner.SURFACE_ENGINE, "--probe-lc-prefill"]), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            runner.main()
+
     def test_disabled_confirm_logs_the_component_error_slots_and_empty_fields(self):
         # Live shape 2026-09-30: one hook state object with "<field>Error" keys.
         found = {"states": [{"where": "17:hook8", "fields": 30, "errorSlots": 12,

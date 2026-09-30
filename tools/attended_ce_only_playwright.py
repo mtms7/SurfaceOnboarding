@@ -3580,7 +3580,45 @@ def _touch_form_fields(page: Any) -> bool:
         return False
 
 
-def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
+LC_SCANNED_DOMAINS_LABEL = "Leaked Credentials scanned domains (Comma Separated Values)"
+
+
+def _prefill_dormant_lc_domains(page: Any, domain: str, step: str = "lc_domains_prefill") -> bool:
+    """Set the dormant Leaked Credentials domain while keeping LC OFF.
+
+    Live 2026-09-30 (CO-0649): Leonardo's Confirm check requires
+    leakedCredentialsScannedDomains even with Leaked Credentials OFF, and the
+    field is disabled while LC is OFF. The toggle is switched ON only inside
+    the unsaved form to make the field editable, the primary domain is
+    entered, and the toggle is switched back OFF and re-verified OFF. Returns
+    True only when LC is OFF again and the field kept the domain; whatever
+    happens, it tries to leave LC OFF.
+    """
+    log = _log()
+    ok = False
+    try:
+        if not _set_checkbox(page, "leakedCredentialsAllowed", True):
+            log.event(step, "lc_toggle_unavailable")
+            return False
+        filled = _set_text_value(page, LC_SCANNED_DOMAINS_LABEL, domain)
+        log.event(step, "domain_set" if filled else "domain_not_set")
+        ok = filled
+    except Exception as exc:
+        log.error(step, "fill", exc)
+    finally:
+        off = _set_checkbox(page, "leakedCredentialsAllowed", False)
+        control = _locate_checkbox(page, "leakedCredentialsAllowed")
+        try:
+            off = off and control is not None and not control.first.is_checked()
+        except Exception:
+            off = False
+        log.event(step, "lc_off_verified" if off else "lc_off_failed")
+    kept = _text_control_value(page, LC_SCANNED_DOMAINS_LABEL) == domain
+    log.event(step, "domain_kept" if kept else "domain_lost")
+    return ok and off and kept
+
+
+def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any], lc_prefill_probe: bool = False) -> str:
     """No-submit probes for a disabled Confirm: try one change at a time.
 
     Each probe changes one control, checks whether Confirm enables, and puts
@@ -3619,6 +3657,18 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any]) -> str:
     _log_form_field_errors(page)
     _log_react_form_state(page)
     _log_react_component_keys(page)
+    if lc_prefill_probe:
+        # Owner-approved (2026-09-30, option A) single no-submit probe: the
+        # dormant LC domain is set while LC ends OFF; nothing is submitted.
+        primary = texts.get("Company primary domain", "")
+        prefilled = bool(primary) and _prefill_dormant_lc_domains(page, primary, "diagnose_lc_prefill")
+        enabled = prefilled and _confirm_is_enabled_now(page, confirm)
+        log.event("diagnose_probe", "enables_confirm" if enabled else ("no_change" if prefilled else "skipped"),
+                  "lc_domains_prefill_lc_off")
+        _log_form_field_errors(page, "after_lc_prefill")
+        if enabled:
+            log.event("diagnose_confirm", "found", detail="lc_domains_prefill_lc_off")
+            return "diagnose_confirm_blocker_found"
     # 1. Touch every field: surfaces the form's own per-field errors, if any.
     touched = _touch_form_fields(page)
     enabled = touched and _confirm_is_enabled_now(page, confirm)
@@ -3842,7 +3892,8 @@ def _api_readback(result: TenantSearchResult, tenant_name: str,
 
 
 def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float = MAX_WAIT_SECONDS,
-        dry_run: bool = False, route: str = CE_ENGINE, diagnose: bool = False) -> str:
+        dry_run: bool = False, route: str = CE_ENGINE, diagnose: bool = False,
+        lc_prefill_probe: bool = False) -> str:
     """Run one attended auto-confirm session.  Never writes back to Salesforce.
 
     ``route`` selects the route contract (ROUTES); the default is the CE-only
@@ -3861,7 +3912,7 @@ def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: floa
         if contract is None:
             return _finish(reference, acknowledged_revision, "route_unsupported")
         return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run,
-                    contract=contract, diagnose=diagnose)
+                    contract=contract, diagnose=diagnose, lc_prefill_probe=diagnose and lc_prefill_probe)
     finally:
         _ACTIVE_RUN_LOG = None
 
@@ -3884,7 +3935,7 @@ def _cancel_add_account(page: Any) -> bool:
 
 
 def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float, dry_run: bool = False,
-         contract: RouteContract = CE_ROUTE, diagnose: bool = False) -> str:
+         contract: RouteContract = CE_ROUTE, diagnose: bool = False, lc_prefill_probe: bool = False) -> str:
     log = _log()
     log.event("source_read", "start")
     try:
@@ -3971,7 +4022,7 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                         log.event("confirm_enable", "enabled")
                         result = "dry_run_fill_verified"
                     elif diagnose:
-                        result = _diagnose_confirm(page, confirm, plan)
+                        result = _diagnose_confirm(page, confirm, plan, lc_prefill_probe=lc_prefill_probe)
                     else:
                         _capture_search_diagnostics(page)
                         result = "dry_run_confirm_not_enabled"
@@ -4259,6 +4310,8 @@ def main() -> int:
                         help="With --co/--revision: run every check and fill the full form, then Cancel instead of Confirm (no create; does not consume the create gate).")
     parser.add_argument("--diagnose-confirm", action="store_true",
                         help="With --co/--revision: a dry run that, if Confirm stays disabled, logs the form's value-free validation state and tries one no-submit change at a time to find the blocking field, then Cancels (no create; does not consume the create gate).")
+    parser.add_argument("--probe-lc-prefill", action="store_true",
+                        help="With --diagnose-confirm: first try the owner-approved no-submit probe that sets the dormant Leaked Credentials domain to the primary domain and leaves Leaked Credentials OFF.")
     parser.add_argument("--duplicate-check", action="store_true",
                         help="With --co: read-only duplicate check by CE tenant name and primary domain (no fill, submit, or create; does not consume the create gate).")
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
@@ -4297,7 +4350,13 @@ def main() -> int:
         return 0
     if not args.co or not args.revision:
         parser.error("--co and --revision are required unless --check-session, --reset-profile, --bootstrap-session, --close-browser, or --readback-only is given")
-    result = run(args.co, args.revision, dry_run=args.dry_run, route=args.route, diagnose=args.diagnose_confirm)
+    if args.probe_lc_prefill and not args.diagnose_confirm:
+        parser.error("--probe-lc-prefill requires --diagnose-confirm")
+    if args.probe_lc_prefill:
+        result = run(args.co, args.revision, dry_run=args.dry_run, route=args.route, diagnose=True,
+                     lc_prefill_probe=True)
+    else:
+        result = run(args.co, args.revision, dry_run=args.dry_run, route=args.route, diagnose=args.diagnose_confirm)
     print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
     return 0
 
