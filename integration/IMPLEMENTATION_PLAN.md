@@ -1,7 +1,7 @@
 # Direct Salesforce-to-Surface Onboarding Integration Plan
 
 **Date:** 2026-09-15
-**Status (2026-09-29, end of day):** CE-only onboarding works end to end (CO-0679, CO-0728, CO-0762 created and read back). The Surface-only route is merged and its CO-0649 dry run passed live; the **first real Surface create (CO-0649) is the next action** — see "Handoff — 2026-09-29 end of day" at the end of §18. Earlier status: Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
+**Status (2026-09-29, late evening):** CE-only onboarding works end to end (CO-0679, CO-0728, CO-0762 created and read back). The Surface-only route is merged and its CO-0649 dry run passed live; the **first real Surface create (CO-0649) is the next action** — see "Handoff — 2026-09-29 end of day" at the end of §18. The operator dashboard was redesigned the same evening (Pentera styling, queue tiles, a **History** tab for closed onboardings; commits `626c58a`, `f48094d`) — see "Dashboard redesign" in that handoff. Earlier status: Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
 **Initial execution target:** Leonardo Development only  
 **Production target:** Permanently blocked until a separate, recorded approval
 
@@ -945,8 +945,9 @@ Values: company `<Account without trailing period> - CE Only`; Customer; primary
 | Surface route | Merged (`32f3a04` via merge `40d6c2b`) plus the Scan-now fix `668b829`. Tests: **497 integration OK (1 skipped)**, 55 `phase1_validator` OK. |
 | CO-0649 (Surface Prime 1000, 1 + 7 domains, Core Plus Enterprise on account) | **Dry run passed** 20:09:51–20:10:31 (`dry_run_fill_verified`); gate **unused**; ready for the first real create. |
 | CO-0735 (Surface Prime 1000) | **Blocked** `surface_domains_invalid`: `Alternate_Domains__c` holds 5 valid roots plus a free-text line ("IOT Domains e.g. …"). Needs a Salesforce data correction by the CSM/owner; the runner will not guess. |
-| GitHub | `origin/main` = `e854101` (sanitized squash, pushed by the operator). Local `main` is **6 commits ahead** (`71bc251`, `ebd0746`, `a4c021b`, `32f3a04`, `40d6c2b`, `668b829`); a pre-push scan of the Surface branch found no customer names, IDs, real domains, or secrets. The local-only branch `backup/local-history-2026-09-29` holds the unsanitized history — **never push it**. The assistant's `git push` is blocked by the safety classifier; the operator pushes (`git push origin main`). |
-| Runtime | Dashboard on `127.0.0.1:8012` and one automation Chrome window were left running from the assistant's shell. Close the automation browser at the end of the day (dashboard `/connection` → **Close automation browser**), and start the dashboard from your own terminal tomorrow. |
+| GitHub | `origin/main` = `e854101` (sanitized squash, pushed by the operator). Local `main` is **10 commits ahead** (`71bc251`, `ebd0746`, `a4c021b`, `32f3a04`, `40d6c2b`, `668b829`, `f109a3a`, `626c58a`, `f48094d`, plus the commit that records this update). A pre-push scan of the Surface branch found no customer names, IDs, real domains, or secrets. The three later commits (`f109a3a` handoff, `626c58a` and `f48094d` dashboard) were scanned the same way: the code and tests contain no customer names, email addresses, or Salesforce IDs, and the plan uses only the sanitized placeholders already on `origin`. The local-only branch `backup/local-history-2026-09-29` holds the unsanitized history — **never push it**. The assistant's `git push` is blocked by the safety classifier; the operator pushes (`git push origin main`). |
+| Dashboard | Redesigned (see "Dashboard redesign" below). **518 integration tests OK (1 skipped).** Restarted at about 21:26 to load `f48094d`; `/`, `/?queue=ready`, `/history`, and `/connection` return 200 live. |
+| Runtime | Dashboard on `127.0.0.1:8012` and one automation Chrome window were left running from the assistant's shell (the dashboard stops if that session ends). Close the automation browser at the end of the day (dashboard `/connection` → **Close automation browser**), and start the dashboard from your own terminal tomorrow. |
 
 #### Surface-only contract (owner decisions 2026-09-29; Guru notes in `docs/37_CASE1_SURFACE_ONLY_GURU_NOTES_2026-09-29.md`)
 
@@ -964,22 +965,58 @@ Duplicate check clear (name + domain); selects set (Customer, Weekly, Prepaid an
 
 Still not verified live: the post-Confirm readback on a **scanning** tenant (`lastReconScan` as the scan-started signal; `lastScanStatusEnum` values), and the Surface dashboard reminders after a real create.
 
+#### Dashboard redesign (late evening; commits `626c58a`, `f48094d`; local code only)
+
+Designed with two expert reviews (a UX/queue review and a data-visualisation review) and built to their shared recommendation, matching the Pentera platform and the CO page.
+
+- **Shell:** every page (queue, History, CO, runner status, Connection) uses the Pentera shell. It has a navy sidebar (**Onboardings · History · Connection**) and a light canvas with white cards. On narrow screens the sidebar becomes a top bar. No JavaScript is used, so the CSP is unchanged (`default-src 'none'; style-src 'unsafe-inline'`); every page is rendered on the server with inline SVG and CSS-only hover.
+- **Queue page (`/`):** six tiles.
+  - Five are both counts and filters: **All open**, **Manual review**, **Ready to onboard**, **Needs validation**, **Follow-up** (`/?queue=review|ready|validation|scanning`).
+  - The sixth, **Completed**, shows onboardings completed in the last 30 days and the change against the previous 30. It opens the History tab.
+  - Below the tiles, each queue has one aligned table: Onboarding + account; Product/type; Automation chip (CE-only / Surface-only / Manual, plus the run result); Salesforce stage/approval; Next step; Age in days.
+- **Queue rules** (`classify_queue_row`, first match wins):
+  1. A failed or duplicate run → Manual review.
+  2. A tenant already exists (verified run, local readback, or a stage past approval) → Follow-up. The next step is one of: Update Salesforce, Create customer user, Complete onboarding, or Waiting · Leonardo scan.
+  3. A run in progress → Ready, "Waiting · runner".
+  4. Approval status missing → Manual review.
+  5. Approved + New/Request Approved → Ready. The next step is Start onboarding, Review scope, start, or Onboard manually.
+  6. Pending + New → Needs validation (DealHub term check).
+  7. Anything else → Manual review.
+
+  **Fix:** an onboarded CO is no longer shown as "ready" again.
+- **History tab (`/history`):**
+  - Chart: completed onboardings per month for 13 months (the last 12 plus this month, marked "to date"), stacked by product in a fixed, validated colour order. The order is Credential Exposure, Surface & Credential Exposure, Surface, then Other (unknown products). New COs created per month appear as a tick on the same count axis; there is never a second axis.
+  - Stat strip: completed in the last 30 days with the change, and the median days from created to completed over the last 90 days.
+  - Hover shows each month's values; a **Table view** lists all of them.
+  - A footnote gives the rejected-all-time count, because Salesforce has no rejection date to chart.
+  - Data: four fixed, read-only aggregate SOQL queries (`COMPLETED_HISTORY_QUERY`, `CREATED_HISTORY_QUERY`, `COMPLETION_DURATIONS_QUERY`, `REJECTED_TOTAL_QUERY`). Results are cached in memory for 10 minutes (a failure for 60 s) and never written to disk or logs. The page shows the cached read time.
+  - In narrow windows the chart opens on the newest months.
+  - A history failure degrades only its own card or tile; the open queue is unaffected.
+- **Queue-page reads:** the unfiltered queue page warms the history cache. The filtered queue views only peek at it (`cached_closed_history`), so they never add a Salesforce read.
+- **Connection page:** it is in the shell and says "Connection required" only on the failure path.
+- **Verified:** 518 integration tests OK (1 skipped). After the restart, the live pages return 200 and were checked visually at about 800 px and 1400 px.
+- **Boundaries:** Salesforce reads only (aggregate counts plus the existing open-queue read); no Leonardo, Salesforce-write, Workato, OPA, or VM action.
+
 #### Open owner questions
 
 1. **API access for Surface:** (a) always ON (Verified "New Surface Account Only" card; current setting), or (b) ON only when the account has Core Plus ("Surface License Tiers Breakdown" card, Unverified: "API depends on Core Plus"). One switch: `SURFACE_API_ACCESS_REQUIRES_CORE_PLUS`. CO-0649 gets API ON either way.
 2. **Scan now vs. schedule:** Guru says "enable Scan now", but the form hides Scan now once a schedule is set. Current behaviour: schedule only. Confirm this is acceptable.
 3. Earlier, still open: Salesforce writeback timing (§7/§16); a guarded edit mode for existing tenants (CO-0679 fix); CO-0755 CE review.
+4. **Dashboard address:** keep `http://127.0.0.1:8012/`, or serve it at `http://127.0.0.1/` (port 80)?
+   - Port 80 needs three changes: `listener_address()` must allow exactly port 80 on the desktop (it currently enforces 1024–65535), the start script's default must change, and the tests and docs must be updated.
+   - Windows does not reserve low ports, but IIS/HTTP.sys or another service may already hold port 80. Check that first (`netstat -ano | findstr :80`).
+   - Either way, the listener stays on loopback.
 
 #### Next steps (tomorrow, in order)
 
 1. **Operator:** start the dashboard from your own terminal (`powershell -ExecutionPolicy Bypass -File tools\start_attended_dashboard.ps1 -Restart`), connect the RND VPN, and re-establish the Leonardo session on `/connection`.
-2. **Operator:** answer the API-access question (the default is fine for CO-0649).
+2. **Operator:** answer the API-access question (the default is fine for CO-0649) and the dashboard-address question (keep `:8012` or move to port 80). Look over the redesigned queue page and the **History** tab.
 3. **Operator:** on `http://127.0.0.1:8012/co/CO-0649`, check the scope summary (Prime, Weekly, 8 domains, 1000 subdomains, 10000 assets, 2026-09-29 → 2027-09-30, Core Plus yes), tick both boxes, click **Start Onboarding**. This is a real create and the Weekly schedule starts scanning the customer's real domains from Dev. Note: the licence start will be the run day (tomorrow), so a fresh dry run first is optional but cheap: `python tools\attended_ce_only_playwright.py --route case_1_new_surface_only --co CO-0649 --revision "2026-07-22T12:00:05.000+0000" --dry-run`.
 4. **Assistant:** verify the result from the run log, `account/add` status, readback (`leonardo_state` expected "Account Scanning" or "No scan started"), and the two amber reminders on the CO page; record the outcome here.
 5. **Operator/CSM:** correct CO-0735's `Alternate_Domains__c` in Salesforce (remove or replace the free-text IoT note); then CO-0735 can follow the same flow.
 6. **Assistant:** build the **scan-status sweep** (phase 2): a read-only runner mode that, in the signed-in automation tab, reads each onboarded tenant's `id`, `accountUuid`, `lastReconScan`, `lastScanStatusEnum`, `lastReconScanDurationMilliseconds` from the tenant search response, stores Surface-only observations with `observed_at`/`expires_at` (plan §5), and shows *No scan started → Scanning → Scan completed* on the dashboard with a Refresh action (optionally a scheduled task); an expired session reports `leonardo_session_expired` and waits for the operator.
 7. **Operator:** fix the CO-0679 tenant manually; **assistant** re-reads it.
-8. **Operator:** push the local commits (`git push origin main`); keep the backup branch local.
-9. **Assistant (small follow-ups):** update `README.md` / `LOCAL_IMPLEMENTATION_STATUS.md`; rename the readback evidence `source` label; review the builder's flagged choices (blank DealHub product name fails closed; add-ons use the same Active/Pending-14-day rule; unknown-status Core Plus still flags; subdomains not checked against their roots).
+8. **Operator:** push the 10 local commits (`git push origin main`); keep the backup branch local.
+9. **Assistant (small follow-ups):** update `README.md` / `LOCAL_IMPLEMENTATION_STATUS.md` (including the queue tiles and the History tab); rename the readback evidence `source` label; review the builder's flagged choices (blank DealHub product name fails closed; add-ons use the same Active/Pending-14-day rule; unknown-status Core Plus still flags; subdomains not checked against their roots).
 
 **Boundaries preserved (Surface work):** only no-submit probes and two dry runs touched Leonardo Development (all cancelled, nothing created). Salesforce reads only. No production, Workato, OPA, or VM change. No credential, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
