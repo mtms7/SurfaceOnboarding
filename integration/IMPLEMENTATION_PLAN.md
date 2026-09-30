@@ -1,7 +1,7 @@
 # Direct Salesforce-to-Surface Onboarding Integration Plan
 
 **Date:** 2026-09-15
-**Status (2026-09-29):** Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
+**Status (2026-09-29, end of day):** CE-only onboarding works end to end (CO-0679, CO-0728, CO-0762 created and read back). The Surface-only route is merged and its CO-0649 dry run passed live; the **first real Surface create (CO-0649) is the next action** — see "Handoff — 2026-09-29 end of day" at the end of §18. Earlier status: Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
 **Initial execution target:** Leonardo Development only  
 **Production target:** Permanently blocked until a separate, recorded approval
 
@@ -930,3 +930,56 @@ Values: company `<Account without trailing period> - CE Only`; Customer; primary
 - **Surface fill**: account name without trailing periods (no suffix); Customer; primary/alternate/subdomain CSVs; `pentera.io`; Networks/phone/job title verified empty; Operator Account verified empty (Dev skip); MFA ON; Scanning interval per tier; Scan now ON; Advanced profile + Maximum scan Duration 90 h (live default 24); Notifications/Multiple users/API ON (API behind `SURFACE_API_ACCESS_REQUIRES_CORE_PLUS`, open owner question); Phishing/LC OFF; Provisioning/Subdomains ON; Prepaid annual; 10000 assets; domains = 1 + alternate roots; subdomains = baseline + add-ons; CE date rule. Readback accepts a scanning tenant (`allow_scan_started`).
 - **Dashboard**: `route_for(row)`; Surface card with counts-only scope summary, two required checkboxes (authorization + "I reviewed the scope for this source revision"), start bound to revision and scope digest (`/attended/start-surface-runner`; 409 `scope_review_missing` / `scope_changed`); runner state records `route` and `scope_reviewed_on`; reminders with local acknowledgements in gitignored `integration/attended_scan_reminders.json` (`/attended/mark-scan-settings-off`, `/attended/mark-ce-enabled`).
 - **Not verified live**: the max-duration control lookup, the Operator Account selected-chip check, Prime/older product names beyond the shapes supplied by the operator, the CSV separator accepted by Leonardo, and `lastReconScan` as the only scan-started signal (`lastScanStatusEnum` unused). No Leonardo, Salesforce, or browser action was performed for this change.
+- *Superseded in part by the end-of-day handoff below* (Scan now behaviour; controls since verified by the CO-0649 dry run).
+
+### Handoff — 2026-09-29 end of day (Surface-only route ready for its first live create; continue here tomorrow)
+
+**Authoritative handoff for the next session.** It supersedes the "Next steps" of the earlier 2026-09-29 handoff. The CE-only route is complete for today's COs. The Surface-only route (`case_1_new_surface_only`) is merged, its dry run on **CO-0649 passed live**, and the **first real Surface create has not been run yet**. Nothing was created in Leonardo for any Surface CO. No Salesforce write happened today.
+
+#### Where things stand
+
+| Item | State |
+| --- | --- |
+| CE-only COs | CO-0679, CO-0728, CO-0762 created and read back (`readback_verified`); CO-0702 verified read-only. Gates permanently consumed. Real IDs are in the local gitignored `integration/attended_leonardo_readbacks.json`; the table in the earlier handoff shows placeholders (sanitized before publishing). |
+| CO-0679 tenant | Still named with a trailing period and has Automated discovery / Recon Subdomains / Web dictionary brute force ON (created before those fixes). **Manual fix pending** in Leonardo, then `--readback-only --co CO-0679`. |
+| Surface route | Merged (`32f3a04` via merge `40d6c2b`) plus the Scan-now fix `668b829`. Tests: **497 integration OK (1 skipped)**, 55 `phase1_validator` OK. |
+| CO-0649 (Surface Prime 1000, 1 + 7 domains, Core Plus Enterprise on account) | **Dry run passed** 20:09:51–20:10:31 (`dry_run_fill_verified`); gate **unused**; ready for the first real create. |
+| CO-0735 (Surface Prime 1000) | **Blocked** `surface_domains_invalid`: `Alternate_Domains__c` holds 5 valid roots plus a free-text line ("IOT Domains e.g. …"). Needs a Salesforce data correction by the CSM/owner; the runner will not guess. |
+| GitHub | `origin/main` = `e854101` (sanitized squash, pushed by the operator). Local `main` is **6 commits ahead** (`71bc251`, `ebd0746`, `a4c021b`, `32f3a04`, `40d6c2b`, `668b829`); a pre-push scan of the Surface branch found no customer names, IDs, real domains, or secrets. The local-only branch `backup/local-history-2026-09-29` holds the unsanitized history — **never push it**. The assistant's `git push` is blocked by the safety classifier; the operator pushes (`git push origin main`). |
+| Runtime | Dashboard on `127.0.0.1:8012` and one automation Chrome window were left running from the assistant's shell. Close the automation browser at the end of the day (dashboard `/connection` → **Close automation browser**), and start the dashboard from your own terminal tomorrow. |
+
+#### Surface-only contract (owner decisions 2026-09-29; Guru notes in `docs/37_CASE1_SURFACE_ONLY_GURU_NOTES_2026-09-29.md`)
+
+- **Route:** exactly `Onboarding_Product__c = "Surface"` and `Onboarding_Type__c = "New Product Onboarding"`. The CE route keeps its own exact gate (`Credential Exposure` / `New Product Onboarding`, fix `3f487a1`).
+- **Licence:** one Surface baseline row that is Active, or Pending starting within 14 days. Tier → interval: Prime / old Enterprise = Weekly; Go / old Essentials / Professional = Monthly. Subdomains = number in the product name (Go 500, Prime 1000) + subdomain add-on rows. Assets 10,000. Number of domains = main + alternate roots. Dates = CE rule (start = run day; expiration = min(contract start + 1 year − 1 day, subscription end)).
+- **Core Plus** row (Commercial or Enterprise) on the account: do **not** block; Leaked Credentials stays OFF; amber reminder "enable Credential Exposure later" with a local acknowledgement.
+- **Form:** company name = account name without trailing period (no suffix); Customer; primary domain; Alternate Domains / SubDomains CSVs from Salesforce (verified empty when none); User email domains `pentera.io`; Networks, phone, job title empty; primary user Milton Stevenson with the shared alias rule; MFA ON; **Operator Account empty (Dev skip)**; Scanning interval per tier; Advanced options: **Maximum scan Duration 90 h** (live default 24), Automated discovery OFF, Recon Subdomains ON, Multiple attack stacks OFF, Web dictionary brute force ON, Web dorking OFF, **Nuclei ON** (live default OFF), Authenticated Testing OFF, Static outbound IP OFF, AI OFF; Notifications / Multiple users / API access ON; Phishing OFF; Leaked Credentials OFF; Provisioning ON; Subdomains ON; Prepaid annual subscription; Number of subdomains overwritten (live default 50000).
+- **Scan now (live finding, fix `668b829`):** the Scan now control exists **only while Scanning interval is None**; a Weekly/Monthly schedule removes it. The Surface plan therefore does not set Scan now; it verifies the control is absent after the interval is set and again before Confirm. The schedule itself drives scanning; the dashboard shows an amber "turn scanning off later" reminder after a Surface create (owner decision: scanning ON in Dev, turned off later).
+- **Manual scope review (owner option b):** every Surface CO shows a counts-only scope summary and needs two ticks (authorization + "I reviewed the scope for this source revision"); the start is bound to the revision and a scope digest.
+- **v1 scope:** create + readback now; **scan-status sweep next**. Salesforce updates and customer-user creation stay manual.
+
+#### Verified live on CO-0649 (dry run, no submit)
+
+Duplicate check clear (name + domain); selects set (Customer, Weekly, Prepaid annual, Country); **Scan now verified absent**; Advanced options expanded; **max scan duration 90 set and re-read**; all toggles set as above; 7 alternate domains, `pentera.io`, primary user, **assets 10000, domains 8, subdomains 1000**; SubDomains / Networks / Phone / Job title verified empty; **Operator Account verified empty**; license dates 2026-09-29 → 2027-09-30 via the picker; final re-verification passed; form cancelled.
+
+Still not verified live: the post-Confirm readback on a **scanning** tenant (`lastReconScan` as the scan-started signal; `lastScanStatusEnum` values), and the Surface dashboard reminders after a real create.
+
+#### Open owner questions
+
+1. **API access for Surface:** (a) always ON (Verified "New Surface Account Only" card; current setting), or (b) ON only when the account has Core Plus ("Surface License Tiers Breakdown" card, Unverified: "API depends on Core Plus"). One switch: `SURFACE_API_ACCESS_REQUIRES_CORE_PLUS`. CO-0649 gets API ON either way.
+2. **Scan now vs. schedule:** Guru says "enable Scan now", but the form hides Scan now once a schedule is set. Current behaviour: schedule only. Confirm this is acceptable.
+3. Earlier, still open: Salesforce writeback timing (§7/§16); a guarded edit mode for existing tenants (CO-0679 fix); CO-0755 CE review.
+
+#### Next steps (tomorrow, in order)
+
+1. **Operator:** start the dashboard from your own terminal (`powershell -ExecutionPolicy Bypass -File tools\start_attended_dashboard.ps1 -Restart`), connect the RND VPN, and re-establish the Leonardo session on `/connection`.
+2. **Operator:** answer the API-access question (the default is fine for CO-0649).
+3. **Operator:** on `http://127.0.0.1:8012/co/CO-0649`, check the scope summary (Prime, Weekly, 8 domains, 1000 subdomains, 10000 assets, 2026-09-29 → 2027-09-30, Core Plus yes), tick both boxes, click **Start Onboarding**. This is a real create and the Weekly schedule starts scanning the customer's real domains from Dev. Note: the licence start will be the run day (tomorrow), so a fresh dry run first is optional but cheap: `python tools\attended_ce_only_playwright.py --route case_1_new_surface_only --co CO-0649 --revision "2026-07-22T12:00:05.000+0000" --dry-run`.
+4. **Assistant:** verify the result from the run log, `account/add` status, readback (`leonardo_state` expected "Account Scanning" or "No scan started"), and the two amber reminders on the CO page; record the outcome here.
+5. **Operator/CSM:** correct CO-0735's `Alternate_Domains__c` in Salesforce (remove or replace the free-text IoT note); then CO-0735 can follow the same flow.
+6. **Assistant:** build the **scan-status sweep** (phase 2): a read-only runner mode that, in the signed-in automation tab, reads each onboarded tenant's `id`, `accountUuid`, `lastReconScan`, `lastScanStatusEnum`, `lastReconScanDurationMilliseconds` from the tenant search response, stores Surface-only observations with `observed_at`/`expires_at` (plan §5), and shows *No scan started → Scanning → Scan completed* on the dashboard with a Refresh action (optionally a scheduled task); an expired session reports `leonardo_session_expired` and waits for the operator.
+7. **Operator:** fix the CO-0679 tenant manually; **assistant** re-reads it.
+8. **Operator:** push the local commits (`git push origin main`); keep the backup branch local.
+9. **Assistant (small follow-ups):** update `README.md` / `LOCAL_IMPLEMENTATION_STATUS.md`; rename the readback evidence `source` label; review the builder's flagged choices (blank DealHub product name fails closed; add-ons use the same Active/Pending-14-day rule; unknown-status Core Plus still flags; subdomains not checked against their roots).
+
+**Boundaries preserved (Surface work):** only no-submit probes and two dry runs touched Leonardo Development (all cancelled, nothing created). Salesforce reads only. No production, Workato, OPA, or VM change. No credential, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
