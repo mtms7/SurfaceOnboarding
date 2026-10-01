@@ -2450,12 +2450,24 @@ class LeonardoSessionBridgeTests(unittest.TestCase):
         self.assertEqual(profile_dir, target)
         self.assertTrue(persist)
 
+    @unittest.skipUnless(os.name == "nt", "the persisted profile exists only on the Windows operator desktop")
     def test_profile_default_on_nt_is_persisted(self):
         with patch.dict(os.environ, {"LOCALAPPDATA": str(self._temp_path("base"))}):
             profile_dir, persist = leonardo_profile()
         self.assertTrue(persist)
         self.assertIn("SurfaceOnboarding", str(profile_dir))
         self.assertIn("leonardo-automation", str(profile_dir))
+
+    def test_profile_default_off_windows_is_temporary(self):
+        # Plan §0/§10: no Leonardo session is ever retained on the VM.
+        env = {k: v for k, v in os.environ.items() if k != "SURFACE_LEONARDO_PROFILE_DIR"}
+        with patch.dict(os.environ, env, clear=True), patch.object(runner.os, "name", "posix"):
+            profile_dir, persist = leonardo_profile()
+        try:
+            self.assertFalse(persist)
+            self.assertNotIn("leonardo-automation", str(profile_dir))
+        finally:
+            profile_dir.rmdir()
 
     def test_is_tenant_management_url(self):
         self.assertTrue(_is_tenant_management_url(runner.TENANT_MANAGEMENT))
