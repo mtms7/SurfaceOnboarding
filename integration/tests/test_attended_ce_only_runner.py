@@ -4473,8 +4473,16 @@ class Case3RouteTests(unittest.TestCase):
         self.assertIn(CASE3_EMAIL, runner.CASE3_ROUTE.redactions(source))
 
     def test_term_mismatch_stops_a_run_before_the_browser(self):
+        import sys
         import tempfile
-        with tempfile.TemporaryDirectory() as folder, \
+        import types
+        # Stand-in Playwright: the VM has none, and the runner imports it before the term check.
+        fake = types.ModuleType("playwright.sync_api")
+        fake.sync_playwright = lambda: (_ for _ in ()).throw(AssertionError("no browser"))
+        package = types.ModuleType("playwright")
+        package.sync_api = fake
+        with patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": fake}), \
+                tempfile.TemporaryDirectory() as folder, \
                 patch.object(runner, "RUNNER_STATE_PATH", Path(folder) / "state.json"), \
                 patch.object(runner, "case3_fill_source", return_value=_case3_source(ce_end=date(2027, 6, 30))), \
                 patch.object(runner, "_run_day", return_value=RUN_DAY), \
