@@ -47,7 +47,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -89,8 +89,17 @@ RUNNER_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "atten
 # Latest read-only check per CO (duplicate check / readback): local evidence
 # for the dashboard only; it never gates or consumes a create run.
 CHECK_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_check_state.json"
-CHECK_KINDS = frozenset({"duplicate_check", "readback"})
+CHECK_KINDS = frozenset({"duplicate_check", "readback", "scan_status"})
 READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
+# Surface-only scan observations (plan §5: Surface-owned, short-lived, never in Salesforce).
+SCAN_STATUS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_status.json"
+SCAN_STATUS_TTL = timedelta(hours=6)
+# lastScanStatusEnum values whose meaning has been confirmed from a live read.
+# Empty until the first live sweep is reviewed: until then a set status shows
+# raw and the tenant is "Scan started", never "Scan completed" (fail closed).
+SCAN_STATUS_COMPLETED: frozenset[str] = frozenset()
+SCAN_STATUS_FAILED: frozenset[str] = frozenset()
+SCAN_STATUS_ENUM_PATTERN = r"[A-Za-z][A-Za-z0-9_]{0,39}"
 DIAGNOSTICS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_diagnostics.json"
 READBACK_SOURCE = "Leonardo Development Details readback"
 READBACK_STATE = "Account Scanning"
@@ -4362,6 +4371,138 @@ def run_readback(reference: str, tenant_name_override: str | None = None, route:
             return "attended_ce_runner_unavailable"
 
 
+def _scan_time(value: Any) -> str | None:
+    """Normalize lastReconScan (ISO text or epoch milliseconds) to ISO seconds, else None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat(timespec="seconds")
+        if isinstance(value, str) and value.strip():
+            return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).isoformat(timespec="seconds")
+    except (ValueError, OverflowError, OSError):
+        return None
+    return None
+
+
+def scan_status_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Derive a minimal, value-checked scan observation from one tenant search row.
+
+    state is "no_scan", "scan_started", "scan_completed", "scan_failed", or
+    "unrecognized". Only statuses in SCAN_STATUS_COMPLETED/FAILED (confirmed
+    from a live read) are interpreted; any other set status is "scan_started"
+    with the raw value kept for review. A malformed value is "unrecognized".
+    """
+    raw_last, raw_status = row.get("lastReconScan"), row.get("lastScanStatusEnum")
+    raw_duration = row.get("lastReconScanDurationMilliseconds")
+    last = _scan_time(raw_last)
+    status = raw_status if isinstance(raw_status, str) and re.fullmatch(SCAN_STATUS_ENUM_PATTERN, raw_status) else None
+    duration = (raw_duration if isinstance(raw_duration, int) and not isinstance(raw_duration, bool)
+                and raw_duration >= 0 else None)
+    observation: dict[str, Any] = {"last_recon_scan": last, "status_enum": status, "duration_ms": duration}
+    if (raw_last is not None and last is None) or (raw_status is not None and status is None):
+        observation["state"] = "unrecognized"
+    elif status in SCAN_STATUS_COMPLETED:
+        observation["state"] = "scan_completed"
+    elif status in SCAN_STATUS_FAILED:
+        observation["state"] = "scan_failed"
+    elif last is None and status is None:
+        observation["state"] = "no_scan"
+    else:
+        observation["state"] = "scan_started"
+    return observation
+
+
+def write_scan_status(reference: str, observation: dict[str, Any], observed_at: datetime) -> None:
+    """Store one CO's latest observation with observed_at/expires_at (replaces its previous one)."""
+    if not REFERENCE.fullmatch(reference):
+        raise ValueError("invalid_scan_status_reference")
+    try:
+        state = json.loads(SCAN_STATUS_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    state[reference] = {**observation, "observed_at": observed_at.isoformat(timespec="seconds"),
+                        "expires_at": (observed_at + SCAN_STATUS_TTL).isoformat(timespec="seconds")}
+    _write_json_atomic(SCAN_STATUS_PATH, state)
+
+
+def _scan_status_tenant_name(reference: str) -> str:
+    """Tenant name for the search, from one fixed, minimal Salesforce read (values stay in memory)."""
+    rows = _sf_records(
+        "SELECT Name, Account_Name__c, Onboarding_Product__c, Onboarding_Type__c "
+        "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+    if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+        raise ValueError()
+    row = rows[0]
+    account_name = row.get("Account_Name__c")
+    if not isinstance(account_name, str) or not " ".join(account_name.split()):
+        raise ValueError()
+    product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
+    if product == SURFACE_ROUTE_PRODUCT and onboarding_type == SURFACE_ROUTE_TYPE:
+        return surface_names(account_name).tenant_name
+    if product == CE_ROUTE_PRODUCT and onboarding_type == CE_ROUTE_TYPE:
+        return ce_only_names(account_name).tenant_name
+    raise SurfaceSourceError("scan_status_route_unsupported")
+
+
+def run_scan_status(reference: str) -> str:
+    """Read-only scan-status sweep for one onboarded CO (never fills, submits, or creates).
+
+    Requires a local readback (the captured Surface Account ID and Account
+    UUID). Searches Leonardo Development for the tenant name and accepts
+    exactly one row whose id AND accountUuid equal the captured values, then
+    stores a minimal scan observation. It does not touch the create gate,
+    the runner state, the readback evidence, or Salesforce.
+    """
+    if not REFERENCE.fullmatch(reference):
+        return "invalid_co_reference"
+    try:
+        readback = json.loads(READBACK_PATH.read_text(encoding="utf-8")).get(reference)
+    except (OSError, ValueError, AttributeError):
+        readback = None
+    if (not isinstance(readback, dict) or not isinstance(readback.get("surface_account_id"), str)
+            or not isinstance(readback.get("account_uuid"), str)):
+        return "scan_status_not_onboarded"
+    try:
+        tenant_name = _scan_status_tenant_name(reference)
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    except SurfaceSourceError as error:
+        return str(error)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, json.JSONDecodeError):
+        return "scan_status_source_unavailable"
+    with sync_playwright() as playwright:
+        try:
+            with _attended_page(playwright) as page:
+                search = _open_search(page)
+                if search is None:
+                    return "duplicate_search_schema_unavailable"
+                searched = _search_tenants(page, search, tenant_name)
+                if searched is None:
+                    return "scan_status_schema_unavailable"
+                matches = [row for row in searched.rows
+                           if row.get("id") == readback["surface_account_id"]
+                           and isinstance(row.get("accountUuid"), str)
+                           and row["accountUuid"].casefold() == readback["account_uuid"].casefold()]
+                if len(matches) != 1:
+                    return "scan_status_tenant_not_found"
+                observation = scan_status_from_row(matches[0])
+                try:
+                    write_scan_status(reference, observation, datetime.now())
+                except (OSError, ValueError):
+                    return "scan_status_write_unavailable"
+                return "scan_status_recorded"
+        except LoginTimeout:
+            return "development_login_timeout"
+        except RuntimeError as error:
+            return str(error)
+        except Exception:
+            return "attended_ce_runner_unavailable"
+
+
 def _combine_duplicate(ui: str, api: str) -> str:
     """Combine the table and server-row classifications (worst outcome wins)."""
     for outcome in ("duplicate_schema_unavailable", "duplicate_found", "duplicate_ambiguous"):
@@ -4469,6 +4610,8 @@ def main() -> int:
                         help="With --diagnose-confirm: first try the owner-approved no-submit probe that sets the dormant Leaked Credentials domain to the primary domain and leaves Leaked Credentials OFF.")
     parser.add_argument("--duplicate-check", action="store_true",
                         help="With --co: read-only duplicate check by CE tenant name and primary domain (no fill, submit, or create; does not consume the create gate).")
+    parser.add_argument("--scan-status", action="store_true",
+                        help="With --co: read-only scan-status read of an onboarded tenant (matches the captured IDs; no fill, submit, or create).")
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
@@ -4477,6 +4620,13 @@ def main() -> int:
             parser.error("--co is required with --duplicate-check")
         result = run_duplicate_check(args.co, route=args.route)
         _record_check(args.co, "duplicate_check", result)
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.scan_status:
+        if not args.co:
+            parser.error("--co is required with --scan-status")
+        result = run_scan_status(args.co)
+        _record_check(args.co, "scan_status", result)
         print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0
     if args.readback_only:

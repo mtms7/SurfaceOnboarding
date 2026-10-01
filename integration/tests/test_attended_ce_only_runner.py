@@ -4312,3 +4312,87 @@ class EnteredLicenceDatesTests(unittest.TestCase):
         with patch.object(runner, "RUNNER_STATE_PATH", self.state):
             with self.assertRaises(runner.RunnerStateUnavailable):
                 runner.load_runner_state()
+
+
+class ScanStatusTests(unittest.TestCase):
+    """Read-only scan-status sweep (2026-10-01): exact-ID match, fail-closed mapping."""
+
+    ID, UUID = "a" * 24, "b" * 32
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        base = Path(self._dir.name)
+        self.status_path, self.readbacks = base / "scan.json", base / "readbacks.json"
+        self.readbacks.write_text(json.dumps({"CO-0649": {"surface_account_id": self.ID, "account_uuid": self.UUID}}),
+                                  encoding="utf-8")
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_mapping_is_fail_closed_until_statuses_are_confirmed(self):
+        self.assertEqual(runner.scan_status_from_row({})["state"], "no_scan")
+        started = runner.scan_status_from_row({"lastReconScan": "2026-10-01T03:00:00Z", "lastScanStatusEnum": "DONE",
+                                               "lastReconScanDurationMilliseconds": 5_400_000})
+        self.assertEqual(started, {"last_recon_scan": "2026-10-01T03:00:00+00:00", "status_enum": "DONE",
+                                   "duration_ms": 5_400_000, "state": "scan_started"})
+        epoch = runner.scan_status_from_row({"lastReconScan": 1_790_000_000_000})
+        self.assertEqual(epoch["state"], "scan_started")
+        self.assertTrue(epoch["last_recon_scan"].endswith("+00:00"))
+        for bad in ({"lastReconScan": "yesterday"}, {"lastScanStatusEnum": "<script>"}, {"lastScanStatusEnum": 7}):
+            with self.subTest(bad=bad):
+                self.assertEqual(runner.scan_status_from_row(bad)["state"], "unrecognized")
+        self.assertIsNone(runner.scan_status_from_row({"lastReconScanDurationMilliseconds": True})["duration_ms"])
+
+    def test_confirmed_statuses_map_to_completed_and_failed(self):
+        with patch.object(runner, "SCAN_STATUS_COMPLETED", frozenset({"COMPLETED"})), \
+                patch.object(runner, "SCAN_STATUS_FAILED", frozenset({"FAILED"})):
+            self.assertEqual(runner.scan_status_from_row({"lastScanStatusEnum": "COMPLETED"})["state"], "scan_completed")
+            self.assertEqual(runner.scan_status_from_row({"lastScanStatusEnum": "FAILED"})["state"], "scan_failed")
+
+    def test_write_scan_status_sets_a_six_hour_expiry(self):
+        from datetime import datetime as _dt
+        with patch.object(runner, "SCAN_STATUS_PATH", self.status_path):
+            runner.write_scan_status("CO-0649", {"state": "no_scan"}, _dt(2026, 10, 1, 12, 0, 0))
+        stored = json.loads(self.status_path.read_text(encoding="utf-8"))["CO-0649"]
+        self.assertEqual((stored["observed_at"], stored["expires_at"]), ("2026-10-01T12:00:00", "2026-10-01T18:00:00"))
+
+    def test_not_onboarded_co_never_reads_salesforce_or_leonardo(self):
+        with patch.object(runner, "READBACK_PATH", self.readbacks), \
+                patch.object(runner, "_sf_records", side_effect=AssertionError("no Salesforce read")):
+            self.assertEqual(runner.run_scan_status("CO-0999"), "scan_status_not_onboarded")
+
+    def _run_with_rows(self, rows):
+        import contextlib, sys, types
+        fake = types.ModuleType("playwright.sync_api")
+        fake.sync_playwright = lambda: contextlib.nullcontext(object())
+        pkg = types.ModuleType("playwright")
+        pkg.sync_api = fake
+
+        @contextlib.contextmanager
+        def page(_playwright):
+            yield object()
+        with patch.dict(sys.modules, {"playwright": pkg, "playwright.sync_api": fake}), \
+                patch.object(runner, "READBACK_PATH", self.readbacks), \
+                patch.object(runner, "SCAN_STATUS_PATH", self.status_path), \
+                patch.object(runner, "_scan_status_tenant_name", return_value="Sample Surface Co"), \
+                patch.object(runner, "_attended_page", page), \
+                patch.object(runner, "_open_search", return_value=object()), \
+                patch.object(runner, "_search_tenants", return_value=runner.TenantSearchResult(rows, len(rows))):
+            return runner.run_scan_status("CO-0649")
+
+    def test_exact_id_and_uuid_match_records_the_observation(self):
+        rows = [{"id": "c" * 24, "accountUuid": "d" * 32, "lastReconScan": None},
+                {"id": self.ID, "accountUuid": self.UUID.upper(), "lastReconScan": "2026-10-01T03:00:00Z",
+                 "lastScanStatusEnum": "RUNNING"}]
+        self.assertEqual(self._run_with_rows(rows), "scan_status_recorded")
+        stored = json.loads(self.status_path.read_text(encoding="utf-8"))["CO-0649"]
+        self.assertEqual((stored["state"], stored["status_enum"]), ("scan_started", "RUNNING"))
+        self.assertNotIn("id", stored)
+        self.assertNotIn("accountName", stored)
+
+    def test_name_match_with_a_different_id_is_not_accepted(self):
+        rows = [{"id": "c" * 24, "accountUuid": self.UUID, "accountName": "Sample Surface Co"}]
+        self.assertEqual(self._run_with_rows(rows), "scan_status_tenant_not_found")
+        self.assertFalse(self.status_path.exists())
+

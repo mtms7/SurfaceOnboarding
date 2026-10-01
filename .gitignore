@@ -55,3 +55,4 @@ integration/attended_ce_only_check_state.json
 integration/attended_scan_reminders.json
 # Locally built release archives and checksums
 release/
+integration/attended_scan_status.json

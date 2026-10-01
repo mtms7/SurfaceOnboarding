@@ -38,6 +38,7 @@ from phase2_leonardo.case4_comment_validation import (
     validate_case4_onboarding_comments,
 )
 from tools.attended_ce_only_playwright import (
+    SCAN_STATUS_PATH,
     RunnerStateUnavailable,
     bootstrap_leonardo_session,
     check_leonardo_session,
@@ -260,6 +261,90 @@ def start_attended_surface_runner(reference: str, revision: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def start_attended_scan_status(reference: str) -> bool:
+    """Launch one desktop-only, read-only scan-status read (no fill, submit, or create)."""
+    if not REFERENCE.fullmatch(reference) or not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
+        return False
+    try:
+        subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--co", reference, "--scan-status"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+SCAN_STATES = {
+    "no_scan": ("", "No scan started", "Leonardo shows no recon scan yet; the schedule starts it."),
+    "scan_started": ("source-warn", "Scan started", "A recon scan has run or is running. Completion is not confirmed yet."),
+    "scan_completed": ("source-ready", "Scan completed", "Assign the Operator Account and turn the scanning settings off."),
+    "scan_failed": ("source-blocked", "Scan failed", "Review the tenant in Leonardo Development."),
+    "unrecognized": ("source-blocked", "Unrecognized scan status", "Leonardo returned a value this dashboard does not recognize. Check the tenant in Leonardo Development."),
+}
+
+
+def attended_scan_statuses() -> dict[str, dict[str, object]]:
+    """Load the local scan observations; absence means none. Malformed entries are dropped."""
+    try:
+        raw = json.loads(SCAN_STATUS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    statuses: dict[str, dict[str, object]] = {}
+    for reference, value in raw.items():
+        try:
+            if not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict):
+                continue
+            if value.get("state") not in SCAN_STATES:
+                continue
+            observed, expires = datetime.fromisoformat(value["observed_at"]), datetime.fromisoformat(value["expires_at"])
+            status_enum = value.get("status_enum")
+            if status_enum is not None and not (isinstance(status_enum, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,39}", status_enum)):
+                continue
+            last = value.get("last_recon_scan")
+            if last is not None:
+                datetime.fromisoformat(str(last))
+            duration = value.get("duration_ms")
+            if duration is not None and (not isinstance(duration, int) or isinstance(duration, bool) or duration < 0):
+                continue
+            statuses[reference] = {"state": value["state"], "status_enum": status_enum, "last_recon_scan": last,
+                                   "duration_ms": duration, "observed_at": observed, "expires_at": expires}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return statuses
+
+
+def _scan_status_section(reference: str, notice: str = "", now: datetime | None = None) -> str:
+    """Leonardo scan-status card for an onboarded CO (local, read-only observation)."""
+    observation = attended_scan_statuses().get(reference)
+    now = now or datetime.now()
+    refresh = ("<form method='post' action='/attended/scan-status-refresh'><input type='hidden' name='reference' value='"
+               + escape(reference) + "'><button type='submit' class='ghost'>Refresh scan status</button></form>")
+    started = ("<p class='note'>A read-only scan-status read was started in the automation browser. "
+               "Reload this page in about 30 seconds.</p>" if notice == "started" else "")
+    if observation is None:
+        return ("<section class='login-preflight' aria-labelledby='scan-status-title'><div><h2 id='scan-status-title'>Leonardo scan status</h2>"
+                "<p>Not read yet. Refresh reads the tenant's scan fields from Leonardo Development (read-only).</p>" + started + "</div>"
+                + refresh + "</section>")
+    cls, title, message = SCAN_STATES[str(observation["state"])]
+    stale = now > observation["expires_at"]  # type: ignore[operator]
+    icon_style = "" if cls else " style='background:#9aa1ad'"
+    icon = {"source-ready": "✓", "source-blocked": "!", "source-warn": "!"}.get(cls, "–")
+    duration = observation["duration_ms"]
+    rows = (f"<dt>Last recon scan</dt><dd>{escape(str(observation['last_recon_scan'] or 'None'))}</dd>"
+            f"<dt>Leonardo status</dt><dd><code>{escape(str(observation['status_enum'] or 'None'))}</code></dd>"
+            f"<dt>Last scan duration</dt><dd>{escape(f'{duration / 3_600_000:.1f} h' if isinstance(duration, int) else 'None')}</dd>"
+            f"<dt>Observed</dt><dd>{escape(observation['observed_at'].strftime('%Y-%m-%d %H:%M'))}"  # type: ignore[union-attr]
+            + (" · <b>stale, refresh</b>" if stale else "") + "</dd>")
+    return ("<section class='readiness" + (" " + cls if cls else "") + "' aria-labelledby='scan-status-title'><div class='readiness-heading'>"
+            f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span><div>"
+            f"<h2 id='scan-status-title'>Leonardo scan status · {escape(title)}</h2><p>{escape(message)}</p>"
+            "<p class='login-safety'>Local observation from Leonardo Development; Salesforce is not changed.</p>" + started
+            + "</div></div><dl>" + rows + "</dl>" + refresh + "</section>")
 
 
 def route_for(row: dict[str, str | None]) -> str | None:
@@ -944,10 +1029,14 @@ def queue_rows() -> list[dict[str, str | None]]:
     """Open-queue rows plus the local readback state (read fresh on every call)."""
     rows = queue_source_rows()
     readbacks = attended_leonardo_readbacks()
+    scans = attended_scan_statuses()
     for row in rows:
         readback = readbacks.get(row["Name"] or "")
         if readback is not None:
             row["Local_Leonardo_State"] = readback["leonardo_state"]
+        scan = scans.get(row["Name"] or "")
+        if scan is not None:
+            row["Local_Scan_State"] = str(scan["state"])
     return rows
 
 
@@ -1515,6 +1604,9 @@ def classify_queue_row(row: dict[str, str | None], record: dict[str, str] | None
         return "review", "<b>Review failed run</b><span class='sub'>Nothing was created</span>", "you"
     local_state = row.get("Local_Leonardo_State")
     if result in _TENANT_RESULTS or local_state is not None or stage in _TENANT_STAGES:
+        if row.get("Local_Scan_State") == "scan_completed" and stage in ("New", "Request Approved", "Account Scanning"):
+            return "scanning", ("<b>Assign Operator, scanning off</b>"
+                                "<span class='sub'>Leonardo scan completed</span>"), "you"
         if stage in ("New", "Request Approved"):
             return "scanning", "<b>Update Salesforce</b><span class='sub'>IDs and stage → Account Scanning</span>", "you"
         if stage == "Scan Completed Successfully":
@@ -1855,6 +1947,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                           f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
                           f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></section>")
     local_readback = _salesforce_ids_section(route_for(row), readback, row) + local_readback
+    if readback is not None:
+        local_readback = _scan_status_section(reference, notification) + local_readback
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
     if notification in notifications:
@@ -2616,7 +2710,7 @@ POST_ROUTES = frozenset({
     "/attended/start-ce-only-runner", "/attended/start-co0702-ce-only-runner", "/attended/reset-ce-only-runner",
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
-    "/attended/leonardo-session-check", "/attended/start-manual-onboarding",
+    "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh",
 })
 
 
@@ -2658,6 +2752,7 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/co/(CO-[0-9]{4,10})", path)
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
+            if parse_qs(parsed.query).get("scan", [""])[0] == "started": notice = "started"
             if match:
                 # Overlap the onboarding preflight with the CO read when the
                 # cached queue already tells us the route.
@@ -2854,6 +2949,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
                 return
             self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+            return
+        if path == "/attended/scan-status-refresh":
+            # Read-only: launches the runner's --scan-status mode for an onboarded CO.
+            if reference not in attended_leonardo_readbacks():
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not onboarded</title><p>No local readback exists for " + escape(reference) + ". Nothing was started.</p>")
+                return
+            if not start_attended_scan_status(reference):
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Scan status unavailable</title><p>The read-only scan-status read could not be started on this desktop.</p>")
+                return
+            self.send_redirect("/co/" + reference + "?scan=started")
             return
         if path in ("/attended/mark-scan-settings-off", "/attended/mark-ce-enabled", "/attended/mark-operator-assigned"):
             # Local acknowledgements only: no Leonardo, browser, or Salesforce write.

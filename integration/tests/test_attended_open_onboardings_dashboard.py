@@ -659,6 +659,74 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("action='/co/CO-0717'><input type='hidden' name='refresh' value='1'>", page)
         self.assertIn("name='refresh' value='1'", page_queue([]))
 
+    # Leonardo scan-status card (2026-10-01).
+    def _scan_file(self, entries):
+        import tempfile
+        handle = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8")
+        json.dump(entries, handle)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        from pathlib import Path
+        return patch.object(dashboard, "SCAN_STATUS_PATH", Path(handle.name))
+
+    def test_scan_status_loader_drops_malformed_entries(self):
+        good = {"state": "scan_started", "status_enum": "RUNNING", "last_recon_scan": "2026-10-01T03:00:00+00:00",
+                "duration_ms": 5_400_000, "observed_at": "2026-10-01T12:00:00", "expires_at": "2026-10-01T18:00:00"}
+        with self._scan_file({"CO-0649": good, "CO-0650": dict(good, state="done"),
+                              "CO-0651": dict(good, status_enum="<b>"), "bad": good}):
+            statuses = dashboard.attended_scan_statuses()
+        self.assertEqual(list(statuses), ["CO-0649"])
+
+    def test_scan_status_card_states_and_staleness(self):
+        from datetime import datetime as _dt
+        entry = {"state": "scan_started", "status_enum": "RUNNING", "last_recon_scan": "2026-10-01T03:00:00+00:00",
+                 "duration_ms": 5_400_000, "observed_at": "2026-10-01T12:00:00", "expires_at": "2026-10-01T18:00:00"}
+        with self._scan_file({"CO-0649": entry}):
+            fresh = dashboard._scan_status_section("CO-0649", now=_dt(2026, 10, 1, 13, 0))
+            stale = dashboard._scan_status_section("CO-0649", now=_dt(2026, 10, 1, 19, 0))
+            missing = dashboard._scan_status_section("CO-0700")
+        self.assertIn("Leonardo scan status · Scan started", fresh)
+        self.assertIn("<code>RUNNING</code>", fresh)
+        self.assertIn("1.5 h", fresh)
+        self.assertNotIn("stale", fresh)
+        self.assertIn("stale, refresh", stale)
+        self.assertIn("Not read yet", missing)
+        self.assertIn("action='/attended/scan-status-refresh'", missing)
+
+    def test_queue_shows_operator_step_after_a_completed_scan(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+               "Local_Leonardo_State": "Account Scanning", "Local_Scan_State": "scan_completed",
+               "Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding"}
+        queue, step, owner = dashboard.classify_queue_row(row, {"result": "readback_verified"})
+        self.assertEqual((queue, owner), ("scanning", "you"))
+        self.assertIn("Assign Operator, scanning off", step)
+        started = dict(row, Local_Scan_State="scan_started")
+        self.assertIn("Update Salesforce", dashboard.classify_queue_row(started, {"result": "readback_verified"})[1])
+
+    def test_scan_status_refresh_requires_an_onboarded_co(self):
+        class _FakeRequest:
+            def __init__(self):
+                self.path, self.sent, self.redirects = "/attended/scan-status-refresh", [], []
+            def send_page(self, status, page):
+                self.sent.append(status)
+            def send_redirect(self, location):
+                self.redirects.append(location)
+        for readbacks, launched, expected in (({}, True, "conflict"), ({"CO-0649": self._IDS}, True, "redirect"),
+                                              ({"CO-0649": self._IDS}, False, "unavailable")):
+            request = _FakeRequest()
+            with self.subTest(expected=expected), \
+                    patch.object(dashboard, "post_form", return_value={"reference": ["CO-0649"]}), \
+                    patch.object(dashboard, "attended_leonardo_readbacks", return_value=readbacks), \
+                    patch.object(dashboard, "start_attended_scan_status", return_value=launched) as start:
+                dashboard.Handler.do_POST(request)
+            if expected == "conflict":
+                self.assertEqual(request.sent, [409]); start.assert_not_called()
+            elif expected == "redirect":
+                self.assertEqual(request.redirects, ["/co/CO-0649?scan=started"])
+            else:
+                self.assertEqual(request.sent, [503])
+
+
     def test_list_view_identifier_is_the_only_process_cached_salesforce_value(self):
         dashboard._open_onboardings_view_id = None
         response = {"status": 0, "result": {"records": [{"Id": "00B000000000001AAA"}]}}
