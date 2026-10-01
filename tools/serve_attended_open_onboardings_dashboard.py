@@ -351,6 +351,75 @@ def evaluate_ce_only_start(acknowledged_revision: str | None, evaluation: Creden
     return "start"
 
 
+# Owner decision 2026-10-01: which Leonardo identifier belongs in which
+# Salesforce CO field, per route. Routes not listed have no decided mapping
+# and fail closed. Display only; no Salesforce write uses this yet.
+SALESFORCE_ID_MAPPING: dict[str, tuple[str, str, str]] = {
+    # route: (readback key, Salesforce field, label)
+    CE_ENGINE: ("account_uuid", "Account_UUID__c", "Account UUID"),
+    SURFACE_ENGINE: ("surface_account_id", "Surface_Account_ID__c", "Surface Account ID"),
+}
+
+
+def salesforce_id_writeback_plan(route: str | None, readback: dict[str, str] | None,
+                                 row: dict[str, str | None]) -> dict[str, str]:
+    """Compare the captured Leonardo identifier with the CO's Salesforce field.
+
+    Status is one of "mapping_not_decided", "not_captured", "ready_to_write"
+    (Salesforce field empty), "matches_salesforce", or "conflict" (Salesforce
+    holds a different value). It never writes anything.
+    """
+    mapping = SALESFORCE_ID_MAPPING.get(route or "")
+    if mapping is None:
+        return {"status": "mapping_not_decided"}
+    key, field, label = mapping
+    plan = {"field": field, "label": label, "salesforce_value": (row.get(field) or "").strip()}
+    leonardo_value = (readback or {}).get(key)
+    if not leonardo_value:
+        return {**plan, "status": "not_captured"}
+    plan["leonardo_value"] = leonardo_value
+    current = plan["salesforce_value"]
+    # The UUID is hexadecimal, so letter case does not change its identity.
+    same = current.casefold() == leonardo_value.casefold() if key == "account_uuid" else current == leonardo_value
+    if not current:
+        return {**plan, "status": "ready_to_write"}
+    return {**plan, "status": "matches_salesforce" if same else "conflict"}
+
+
+SALESFORCE_ID_STATUS = {
+    "ready_to_write": ("source-ready", "✓", "Ready to write", "Captured from Leonardo Development; the Salesforce field is empty."),
+    "matches_salesforce": ("source-ready", "✓", "Matches Salesforce", "The Salesforce field already holds the captured value."),
+    "conflict": ("source-blocked", "!", "Conflict", "Salesforce holds a different value. Do not overwrite it; reconcile manually."),
+    "not_captured": ("", "–", "Not captured yet", "No local Leonardo readback for this CO yet. It is captured when the tenant is created, or by a read-only readback of an existing tenant."),
+}
+
+
+def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, row: dict[str, str | None]) -> str:
+    plan = salesforce_id_writeback_plan(route, readback, row)
+    status = plan["status"]
+    head = "<section class='readiness{cls}' aria-labelledby='salesforce-ids-title'><div class='readiness-heading'>"
+    if status == "mapping_not_decided":
+        if readback is None:
+            return ""
+        return (head.format(cls="") + "<span class='readiness-icon' aria-hidden='true' style='background:#9aa1ad'>–</span><div>"
+                "<h2 id='salesforce-ids-title'>Salesforce IDs · Mapping not decided</h2>"
+                "<p>No owner-approved Salesforce field mapping exists for this route. Nothing is proposed for Salesforce.</p></div></div></section>")
+    cls, icon, title, message = SALESFORCE_ID_STATUS[status]
+    icon_style = "" if cls else " style='background:#9aa1ad'"
+    rows = f"<dt>Salesforce field</dt><dd><code>{escape(plan['field'])}</code></dd>"
+    if "leonardo_value" in plan:
+        rows += f"<dt>{escape(plan['label'])} (Leonardo)</dt><dd><code style='user-select:all'>{escape(plan['leonardo_value'])}</code></dd>"
+    rows += f"<dt>Current Salesforce value</dt><dd>{escape(plan['salesforce_value']) if plan['salesforce_value'] else 'Empty'}</dd>"
+    other = {"account_uuid": "surface_account_id", "surface_account_id": "account_uuid"}[SALESFORCE_ID_MAPPING[route or ""][0]]
+    if readback is not None and readback.get(other):
+        other_label = "Surface Account ID" if other == "surface_account_id" else "Account UUID"
+        rows += f"<dt>Also captured (not written)</dt><dd>{other_label}: <code>{escape(readback[other])}</code></dd>"
+    return (head.format(cls=" " + cls if cls else "") + f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span><div>"
+            f"<h2 id='salesforce-ids-title'>Salesforce IDs · {escape(title)}</h2><p>{escape(message)}</p>"
+            "<p class='login-safety'>Not written. Salesforce updates are manual for now.</p></div></div>"
+            "<dl>" + rows + "</dl></section>")
+
+
 def attended_leonardo_readbacks() -> dict[str, dict[str, str]]:
     """Load optional local evidence; absence means no evidence, never a source failure."""
     try:
@@ -1660,9 +1729,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         local_readback = ("<section class='readiness' aria-labelledby='leonardo-readback-title'><h2 id='leonardo-readback-title'>Leonardo Development readback</h2>"
                           "<p>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
                           f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
-                          f"<dt>Surface Account ID</dt><dd>{escape(readback['surface_account_id'])}</dd>"
-                          f"<dt>Account UUID</dt><dd>{escape(readback['account_uuid'])}</dd>"
                           f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></section>")
+    local_readback = _salesforce_ids_section(route_for(row), readback, row) + local_readback
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
     if notification in notifications:

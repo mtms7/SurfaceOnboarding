@@ -487,6 +487,82 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("Leonardo Development readback", page)
         self.assertIn("No scan started", page)
 
+    # Salesforce IDs panel (owner decision 2026-10-01): CE-only -> Account_UUID__c,
+    # Surface-only -> Surface_Account_ID__c only; every other route fails closed.
+    _IDS = {"surface_account_id": "A" * 16, "account_uuid": "b" * 32,
+            "leonardo_state": "Account Scanning", "observed_on": "2026-10-01",
+            "source": "Leonardo Development Details readback"}
+    _CE = {"Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
+    _SURFACE = {"Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding"}
+
+    def test_salesforce_id_plan_maps_ce_to_account_uuid(self):
+        plan = dashboard.salesforce_id_writeback_plan(dashboard.route_for(self._CE), self._IDS, self._CE)
+        self.assertEqual((plan["status"], plan["field"], plan["leonardo_value"]),
+                         ("ready_to_write", "Account_UUID__c", "b" * 32))
+
+    def test_salesforce_id_plan_maps_surface_to_account_id_only(self):
+        plan = dashboard.salesforce_id_writeback_plan(dashboard.route_for(self._SURFACE), self._IDS, self._SURFACE)
+        self.assertEqual((plan["status"], plan["field"], plan["leonardo_value"]),
+                         ("ready_to_write", "Surface_Account_ID__c", "A" * 16))
+        self.assertNotIn("Account_UUID__c", plan.values())
+
+    def test_salesforce_id_plan_matches_and_conflicts(self):
+        route = dashboard.route_for(self._CE)
+        same = dashboard.salesforce_id_writeback_plan(route, self._IDS, {**self._CE, "Account_UUID__c": " " + "B" * 32 + " "})
+        self.assertEqual(same["status"], "matches_salesforce")
+        other = dashboard.salesforce_id_writeback_plan(route, self._IDS, {**self._CE, "Account_UUID__c": "c" * 32})
+        self.assertEqual(other["status"], "conflict")
+        surface = dashboard.route_for(self._SURFACE)
+        # The Surface Account ID is compared exactly, including letter case.
+        cased = dashboard.salesforce_id_writeback_plan(surface, self._IDS, {**self._SURFACE, "Surface_Account_ID__c": "a" * 16})
+        self.assertEqual(cased["status"], "conflict")
+
+    def test_salesforce_id_plan_not_captured_and_unmapped_routes(self):
+        self.assertEqual(dashboard.salesforce_id_writeback_plan(dashboard.route_for(self._CE), None, self._CE)["status"],
+                         "not_captured")
+        renewal = {"Onboarding_Product__c": "Surface", "Onboarding_Type__c": "Renewal"}
+        self.assertEqual(dashboard.salesforce_id_writeback_plan(dashboard.route_for(renewal), self._IDS, renewal),
+                         {"status": "mapping_not_decided"})
+
+    def test_detail_page_shows_salesforce_ids_panel_for_surface(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Account Scanning", **self._SURFACE}
+        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+                   return_value={"CO-0649": self._IDS}):
+            page = page_detail("CO-0649", row)
+        self.assertIn("Salesforce IDs · Ready to write", page)
+        self.assertIn("<code>Surface_Account_ID__c</code>", page)
+        self.assertIn("A" * 16, page)
+        self.assertIn("Also captured (not written)", page)
+        self.assertIn("Not written. Salesforce updates are manual for now.", page)
+        self.assertIn("Leonardo Development readback", page)
+
+    def test_detail_page_shows_conflict_for_different_salesforce_value(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", "Account_UUID__c": "c" * 32, **self._CE}
+        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+                   return_value={"CO-0702": self._IDS}):
+            page = page_detail("CO-0702", row)
+        self.assertIn("Salesforce IDs · Conflict", page)
+        self.assertIn("Do not overwrite it", page)
+
+    def test_detail_page_unmapped_route_proposes_nothing(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Product__c": "Surface",
+               "Onboarding_Type__c": "Renewal"}
+        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+                   return_value={"CO-0740": self._IDS}):
+            page = page_detail("CO-0740", row)
+        self.assertIn("Salesforce IDs · Mapping not decided", page)
+        self.assertNotIn("Ready to write", page)
+
+    def test_salesforce_ids_panel_adds_no_salesforce_write(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", **self._CE}
+        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+                   return_value={"CO-0702": self._IDS}), \
+                patch("tools.serve_attended_open_onboardings_dashboard.sf_json") as sf:
+            page = page_detail("CO-0702", row)
+        sf.assert_not_called()
+        self.assertNotIn("Account_UUID__c' method='post'", page)
+        self.assertNotRegex(page, r"<form[^>]*salesforce-ids")
+
     def test_list_view_identifier_is_the_only_process_cached_salesforce_value(self):
         dashboard._open_onboardings_view_id = None
         response = {"status": 0, "result": {"records": [{"Id": "00B000000000001AAA"}]}}
