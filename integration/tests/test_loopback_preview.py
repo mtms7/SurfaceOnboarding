@@ -30,3 +30,31 @@ class LoopbackPreviewTests(unittest.TestCase):
         for value in (["80"], ["70000"], ["not-a-port"], ["8001", "extra"]):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_port(value)
+
+    def test_preview_renders_the_current_design_without_any_backend(self):
+        import re
+        import subprocess
+        from unittest.mock import patch
+        import tools.serve_attended_open_onboardings_dashboard as dashboard
+        import tools.attended_ce_only_playwright as runner
+        originals = (dashboard.sf_json, dashboard.load_runner_state, runner._sf_records)
+        paths = ["/", "/?queue=ready", "/?queue=scanning", "/history", "/connection"] + [
+            f"/co/CO-DEMO-000{i}" for i in range(1, 7)]
+        with patch.object(subprocess, "run", side_effect=AssertionError("no subprocess")),                 patch.object(subprocess, "Popen", side_effect=AssertionError("no process launch")):
+            pages = {path: preview_response(path) for path in paths}
+        for path, (status, body, _type) in pages.items():
+            with self.subTest(path=path):
+                self.assertEqual(status, 200)
+                text = body.decode("utf-8")
+                self.assertIn("Read-only design preview · synthetic data · Not deployed.", text)
+                self.assertIn("PENTERA.", text)  # the current Pentera shell
+                self.assertEqual(re.findall(r"<button(?![^>]*\bdisabled\b)", text), [])
+                self.assertNotIn("Read from Salesforce at", text)
+        self.assertEqual((dashboard.sf_json, dashboard.load_runner_state, runner._sf_records), originals)
+        self.assertIn(b"case3_term_mismatch", pages["/co/CO-DEMO-0003"][1])
+        self.assertIn("Salesforce IDs · Ready to write", pages["/co/CO-DEMO-0002"][1].decode("utf-8"))
+        self.assertIn(b"<code>COMPLETED</code>", pages["/co/CO-DEMO-0004"][1])
+        self.assertEqual(preview_response("/?queue=nope")[0], 404)
+        self.assertEqual(preview_response("/co/CO-DEMO-0007")[0], 404)
+        self.assertEqual(preview_response("/history?x=1")[0], 404)
+
