@@ -53,3 +53,5 @@ Surface_Workato_OPA_Handover_2026-08-26/
 integration/attended_ce_only_run_log.json
 integration/attended_ce_only_check_state.json
 integration/attended_scan_reminders.json
+# Locally built release archives and checksums
+release/
