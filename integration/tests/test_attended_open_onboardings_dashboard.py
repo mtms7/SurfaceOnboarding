@@ -495,6 +495,16 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
     _CE = {"Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
     _SURFACE = {"Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding"}
 
+    def _offline_co_page(self):
+        """Stub every section reader that would reach Salesforce or Leonardo."""
+        import contextlib
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=_surface_evaluation()))
+        stack.enter_context(patch.object(dashboard, "evaluate_ce_only_fill_preflight", side_effect=dashboard.ReadUnavailable()))
+        stack.enter_context(patch.object(dashboard, "load_runner_state", return_value={}))
+        stack.enter_context(patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce call in unit tests")))
+        return stack
+
     def test_salesforce_id_plan_maps_ce_to_account_uuid(self):
         plan = dashboard.salesforce_id_writeback_plan(dashboard.route_for(self._CE), self._IDS, self._CE)
         self.assertEqual((plan["status"], plan["field"], plan["leonardo_value"]),
@@ -526,19 +536,20 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_detail_page_shows_salesforce_ids_panel_for_surface(self):
         row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Account Scanning", **self._SURFACE}
-        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+        with self._offline_co_page(), patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0649": self._IDS}):
             page = page_detail("CO-0649", row)
         self.assertIn("Salesforce IDs · Ready to write", page)
         self.assertIn("<code>Surface_Account_ID__c</code>", page)
         self.assertIn("A" * 16, page)
         self.assertIn("Also captured (not written)", page)
-        self.assertIn("Not written. Salesforce updates are manual for now.", page)
+        self.assertIn("Pilot rule: a Leonardo Development ID is written only into an empty field", page)
+        self.assertIn("action='/attended/salesforce-id-writeback-review'><input type='hidden' name='reference' value='CO-0649'>", page)
         self.assertIn("Leonardo Development readback", page)
 
     def test_detail_page_shows_conflict_for_different_salesforce_value(self):
         row = {"Onboarding_Approval_Status__c": "Approved", "Account_UUID__c": "c" * 32, **self._CE}
-        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+        with self._offline_co_page(), patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0702": self._IDS}):
             page = page_detail("CO-0702", row)
         self.assertIn("Salesforce IDs · Salesforce already has an ID", page)
@@ -548,7 +559,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
     def test_detail_page_unmapped_route_proposes_nothing(self):
         row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Product__c": "Surface",
                "Onboarding_Type__c": "Renewal"}
-        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+        with self._offline_co_page(), patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0740": self._IDS}):
             page = page_detail("CO-0740", row)
         self.assertIn("Salesforce IDs · Mapping not decided", page)
@@ -556,7 +567,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_salesforce_ids_panel_adds_no_salesforce_write(self):
         row = {"Onboarding_Approval_Status__c": "Approved", **self._CE}
-        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+        with self._offline_co_page(), patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0702": self._IDS}), \
                 patch("tools.serve_attended_open_onboardings_dashboard.sf_json") as sf:
             page = page_detail("CO-0702", row)
@@ -566,7 +577,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_detail_page_labels_captured_ids_as_leonardo_development(self):
         row = {"Onboarding_Approval_Status__c": "Approved", **self._SURFACE}
-        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+        with self._offline_co_page(), patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0649": self._IDS}):
             page = page_detail("CO-0649", row)
         self.assertIn("Surface Account ID (<b>Leonardo Development</b>)", page)
@@ -1678,3 +1689,129 @@ class SalesforceCliEncodingTests(unittest.TestCase):
                 patch("tools.serve_attended_open_onboardings_dashboard.salesforce_cli_command", return_value="sf"):
             with self.assertRaises(dashboard.WriteUnavailable):
                 dashboard.sf_write_json(["data", "update", "record", "Customer_Onboarding__c", "id", "--json"])
+
+
+class SalesforceIdWritebackTests(unittest.TestCase):
+    """Pilot ID writeback (decision (b) 2026-10-01): empty field only, confirmed, read back."""
+
+    SURFACE_ID, UUID = "0123456789abcdef01234567", "0123456789abcdef0123456789abcdef"
+    READBACKS = {"CO-0801": {"surface_account_id": SURFACE_ID, "account_uuid": UUID,
+                             "leonardo_state": "Account Scanning", "observed_on": "2026-10-01",
+                             "source": "Leonardo Development Details readback"}}
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        from pathlib import Path as _Path
+        for patcher in (patch.object(dashboard, "ID_WRITEBACK_PATH", _Path(self._dir.name) / "writebacks.json"),
+                        patch.object(dashboard, "attended_leonardo_readbacks", return_value=self.READBACKS)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        dashboard._id_writeback_acks.clear()
+
+    @staticmethod
+    def _co(**fields):
+        record = {"Id": "a0X000000000001AAA", "Name": "CO-0801", "LastModifiedDate": "2026-10-01T10:00:00.000+0000",
+                  "Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding",
+                  "Surface_Account_ID__c": None, "Account_UUID__c": None}
+        record.update(fields)
+        return {"status": 0, "result": {"records": [record]}}
+
+    def _evaluate(self, **fields):
+        with patch.object(dashboard, "sf_json", return_value=self._co(**fields)):
+            return dashboard.evaluate_id_writeback("CO-0801")
+
+    def test_ready_surface_co_maps_to_surface_account_id_only(self):
+        evaluation = self._evaluate()
+        self.assertEqual((evaluation.blocker, evaluation.field, evaluation.value),
+                         ("", "Surface_Account_ID__c", self.SURFACE_ID))
+
+    def test_non_empty_field_or_missing_readback_blocks(self):
+        self.assertEqual(self._evaluate(Surface_Account_ID__c=self.SURFACE_ID).blocker, "matches_salesforce")
+        self.assertEqual(self._evaluate(Surface_Account_ID__c="f" * 24).blocker, "conflict")
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
+            self.assertEqual(self._evaluate().blocker, "not_captured")
+        self.assertEqual(self._evaluate(Onboarding_Type__c="Renewal").blocker, "mapping_not_decided")
+
+    def test_malformed_captured_value_blocks(self):
+        bad = {"CO-0801": dict(self.READBACKS["CO-0801"], surface_account_id="A" * 24)}
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value=bad):
+            self.assertEqual(self._evaluate().blocker, "value_invalid")
+
+    def _confirm(self, evaluation, nonce, write=None, readback=None):
+        write = write if write is not None else {"status": 0}
+        readback = readback if readback is not None else {
+            "status": 0, "result": {"records": [{"Name": "CO-0801", "Surface_Account_ID__c": self.SURFACE_ID}]}}
+        writer = patch.object(dashboard, "sf_write_json", return_value=write) if not isinstance(write, Exception) \
+            else patch.object(dashboard, "sf_write_json", side_effect=write)
+        with writer as sf_write, patch.object(dashboard, "sf_json", return_value=readback):
+            result = dashboard.write_salesforce_id_after_confirmation(evaluation, nonce)
+        return result, sf_write
+
+    def test_happy_path_writes_one_field_and_verifies(self):
+        evaluation = self._evaluate()
+        nonce = dashboard.issue_id_writeback_ack(evaluation)
+        result, sf_write = self._confirm(evaluation, nonce)
+        self.assertEqual(result, "written_verified")
+        args = sf_write.call_args.args[0]
+        self.assertEqual(args[:6], ["data", "update", "record", "--sobject", "Customer_Onboarding__c", "--record-id"])
+        self.assertEqual(args[args.index("--values") + 1], "Surface_Account_ID__c=" + self.SURFACE_ID)
+        record = dashboard.salesforce_id_writebacks()["CO-0801"]
+        self.assertEqual(record["result"], "written_verified")
+        self.assertNotIn(self.SURFACE_ID, json.dumps(record))  # only a hash is stored
+
+    def test_confirmation_is_single_use_and_bound_to_the_revision(self):
+        evaluation = self._evaluate()
+        nonce = dashboard.issue_id_writeback_ack(evaluation)
+        changed = self._evaluate(LastModifiedDate="2026-10-01T10:05:00.000+0000")
+        result, sf_write = self._confirm(changed, nonce)
+        self.assertEqual(result, "write_blocked")
+        sf_write.assert_not_called()
+        result, sf_write = self._confirm(evaluation, nonce)  # the code was consumed
+        self.assertEqual(result, "write_blocked")
+        sf_write.assert_not_called()
+
+    def test_expired_confirmation_blocks(self):
+        evaluation = self._evaluate()
+        nonce = dashboard.issue_id_writeback_ack(evaluation, now=0.0)
+        with patch.object(dashboard, "sf_write_json") as sf_write:
+            ok = dashboard.consume_id_writeback_ack(evaluation, nonce, now=dashboard.ID_WRITEBACK_ACK_TTL_SECONDS + 1.0)
+        self.assertFalse(ok)
+        sf_write.assert_not_called()
+
+    def test_rejected_and_uncertain_outcomes(self):
+        evaluation = self._evaluate()
+        result, _ = self._confirm(evaluation, dashboard.issue_id_writeback_ack(evaluation), write={"status": 1})
+        self.assertEqual(result, "write_rejected")
+        evaluation = self._evaluate()
+        result, _ = self._confirm(evaluation, dashboard.issue_id_writeback_ack(evaluation),
+                                  readback={"status": 0, "result": {"records": [{"Name": "CO-0801", "Surface_Account_ID__c": None}]}})
+        self.assertEqual(result, "write_uncertain")
+        # An uncertain write is never offered again while the field is still empty.
+        self.assertEqual(self._evaluate().blocker, "previous_write_uncertain")
+
+    def test_cli_failure_after_send_is_uncertain(self):
+        evaluation = self._evaluate()
+        result, _ = self._confirm(evaluation, dashboard.issue_id_writeback_ack(evaluation), write=dashboard.WriteUnavailable())
+        self.assertEqual(result, "write_uncertain")
+
+    def test_review_route_shows_confirmation_or_refuses(self):
+        class _FakeRequest:
+            def __init__(self):
+                self.path, self.pages = "/attended/salesforce-id-writeback-review", []
+            def send_page(self, status, page):
+                self.pages.append((status, page))
+        for fields, status in (({}, 200), ({"Surface_Account_ID__c": "f" * 24}, 409)):
+            request = _FakeRequest()
+            with self.subTest(status=status), \
+                    patch.object(dashboard, "post_form", return_value={"reference": ["CO-0801"]}), \
+                    patch.object(dashboard, "sf_json", return_value=self._co(**fields)), \
+                    patch.object(dashboard, "sf_write_json") as sf_write:
+                dashboard.Handler.do_POST(request)
+            sf_write.assert_not_called()  # reviewing never writes
+            self.assertEqual(request.pages[0][0], status)
+            if status == 200:
+                self.assertIn("action='/attended/salesforce-id-writeback-confirm'", request.pages[0][1])
+                self.assertIn("Surface_Account_ID__c", request.pages[0][1])
+

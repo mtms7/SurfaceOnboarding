@@ -589,7 +589,165 @@ SALESFORCE_ID_STATUS = {
 }
 
 
-def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, row: dict[str, str | None]) -> str:
+# Salesforce ID writeback (owner decision (b) 2026-10-01): during the pilot a
+# captured Leonardo Development ID may be written into its EMPTY mapped field
+# only. One operator review + one confirmation per write, bound to the fresh
+# source revision; a read-after-write must show the exact value. An uncertain
+# outcome is recorded and never retried automatically.
+ID_WRITEBACK_ACK_TTL_SECONDS = 10 * 60
+ID_WRITEBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_salesforce_id_writebacks.json"
+ID_VALUE_PATTERNS = {"Surface_Account_ID__c": r"[a-f0-9]{24}", "Account_UUID__c": r"[a-f0-9]{32}"}
+_id_writeback_acks: dict[str, tuple[str, str, float]] = {}
+_id_writeback_lock = Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class IdWritebackEvaluation:
+    reference: str
+    co_id: str
+    source_revision: str
+    field: str
+    value: str
+    blocker: str = ""
+
+    @property
+    def binding(self) -> str:
+        return sha256("|".join((self.reference, self.co_id, self.source_revision, self.field, self.value)).encode()).hexdigest()
+
+
+def salesforce_id_writebacks() -> dict[str, dict[str, str]]:
+    """Local writeback records (field, value hash, time, result); absence means none."""
+    try:
+        raw = json.loads(ID_WRITEBACK_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and REFERENCE.fullmatch(k) and isinstance(v, dict)
+            and all(isinstance(item, str) for item in v.values())}
+
+
+def _record_id_writeback(reference: str, field: str, value: str, result: str) -> None:
+    records = salesforce_id_writebacks()
+    records[reference] = {"field": field, "value_sha256": sha256(value.encode()).hexdigest(),
+                          "recorded_at": datetime.now().isoformat(timespec="seconds"), "result": result}
+    ID_WRITEBACK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ID_WRITEBACK_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(records, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, ID_WRITEBACK_PATH)
+
+
+def evaluate_id_writeback(reference: str) -> IdWritebackEvaluation:
+    """Fresh, fixed-field read; the write is allowed only for a Ready-to-write plan."""
+    if not REFERENCE.fullmatch(reference):
+        raise ReadUnavailable()
+    response = sf_json(["data", "query", "--query",
+                        "SELECT Id, Name, LastModifiedDate, Onboarding_Product__c, Onboarding_Type__c, "
+                        "Surface_Account_ID__c, Account_UUID__c FROM Customer_Onboarding__c WHERE Name = '"
+                        + reference + "' LIMIT 2", "--json"])
+    try:
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:  # type: ignore[index]
+            raise ReadUnavailable()
+        record = records[0]
+        if record.get("Name") != reference:
+            raise ReadUnavailable()
+        row = {key: (value if isinstance(value, str) else None) for key, value in record.items() if key != "attributes"}
+    except (KeyError, TypeError, AttributeError):
+        raise ReadUnavailable() from None
+    co_id, revision = row.get("Id") or "", row.get("LastModifiedDate") or ""
+    readback = attended_leonardo_readbacks().get(reference)
+    plan = salesforce_id_writeback_plan(route_for(row), readback, row)
+    field, value = plan.get("field", ""), plan.get("leonardo_value", "")
+    blocker = ""
+    if plan["status"] != "ready_to_write":
+        blocker = plan["status"]
+    elif not re.fullmatch(r"[A-Za-z0-9]{15,18}", co_id) or not revision:
+        blocker = "source_invalid"
+    elif not re.fullmatch(ID_VALUE_PATTERNS.get(field, r"(?!)"), value):
+        blocker = "value_invalid"
+    elif salesforce_id_writebacks().get(reference, {}).get("result") == "write_uncertain":
+        blocker = "previous_write_uncertain"
+    return IdWritebackEvaluation(reference, co_id, revision, field, value, blocker)
+
+
+def issue_id_writeback_ack(evaluation: IdWritebackEvaluation, *, now: float | None = None) -> str:
+    nonce = token_urlsafe(24)
+    with _id_writeback_lock:
+        _id_writeback_acks[evaluation.reference] = (evaluation.binding, nonce,
+                                                     (monotonic() if now is None else now) + ID_WRITEBACK_ACK_TTL_SECONDS)
+    return nonce
+
+
+def consume_id_writeback_ack(evaluation: IdWritebackEvaluation, nonce: str, *, now: float | None = None) -> bool:
+    with _id_writeback_lock:
+        ack = _id_writeback_acks.pop(evaluation.reference, None)
+    return bool(ack and isinstance(nonce, str) and ack[0] == evaluation.binding and ack[1] == nonce
+                and ack[2] > (monotonic() if now is None else now))
+
+
+def write_salesforce_id_after_confirmation(evaluation: IdWritebackEvaluation, nonce: str) -> str:
+    """Write the one mapped field, then read it back.
+
+    Returns "written_verified", "write_blocked" (nothing was sent),
+    "write_rejected" (Salesforce refused the update), or "write_uncertain"
+    (the update may have been applied; never retried automatically).
+    """
+    if evaluation.blocker or not consume_id_writeback_ack(evaluation, nonce):
+        return "write_blocked"
+    field, value = evaluation.field, evaluation.value
+    try:
+        update = sf_write_json(["data", "update", "record", "--sobject", "Customer_Onboarding__c",
+                                "--record-id", evaluation.co_id, "--values", field + "=" + value, "--json"])
+        if update.get("status") != 0:  # type: ignore[union-attr]
+            result = "write_rejected"
+            _record_id_writeback(evaluation.reference, field, value, result)
+            return result
+    except (WriteUnavailable, AttributeError):
+        result = "write_uncertain"
+        _record_id_writeback(evaluation.reference, field, value, result)
+        return result
+    try:
+        readback = sf_json(["data", "query", "--query", "SELECT Name, " + field + " FROM Customer_Onboarding__c WHERE Id = '"
+                            + evaluation.co_id + "' LIMIT 2", "--json"])
+        rows = readback["result"]["records"]  # type: ignore[index]
+        verified = bool(readback["status"] == 0 and isinstance(rows, list) and len(rows) == 1  # type: ignore[index]
+                        and rows[0].get("Name") == evaluation.reference and rows[0].get(field) == value)
+    except (ReadUnavailable, KeyError, TypeError, AttributeError):
+        verified = False
+    result = "written_verified" if verified else "write_uncertain"
+    _record_id_writeback(evaluation.reference, field, value, result)
+    return result
+
+
+ID_WRITEBACK_RESULTS = {
+    "written_verified": ("verified", "Written to Salesforce and read back"),
+    "write_rejected": ("blocked", "Salesforce rejected the update; nothing was changed"),
+    "write_uncertain": ("blocked", "The update may or may not have been applied. Check the CO in Salesforce; it will not be retried"),
+    "write_blocked": ("blocked", "Not written: the confirmation expired, was already used, or the source changed. Review again"),
+}
+
+
+def page_id_writeback_confirmation(evaluation: IdWritebackEvaluation, nonce: str) -> str:
+    ref = escape(evaluation.reference)
+    body = ("<h2>Write the Leonardo Development ID to Salesforce</h2>"
+            "<dl><dt>CO</dt><dd>" + ref + "</dd>"
+            "<dt>Salesforce field</dt><dd><code>" + escape(evaluation.field) + "</code> (currently empty)</dd>"
+            "<dt>Value (Leonardo Development)</dt><dd><code>" + escape(evaluation.value) + "</code></dd>"
+            "<dt>Source revision</dt><dd>" + escape(evaluation.source_revision) + "</dd></dl>"
+            "<p class='note'>Confirming updates only this one field, then reads it back. It does not change the stage, "
+            "comments, or any other field. This confirmation expires in 10 minutes and is invalidated by any change to the CO.</p>"
+            "<form method='post' action='/attended/salesforce-id-writeback-confirm'>"
+            "<input type='hidden' name='reference' value='" + ref + "'><input type='hidden' name='nonce' value='" + escape(nonce) + "'>"
+            "<button type='submit'>Confirm write to Salesforce</button></form>"
+            "<p><a href='/co/" + ref + "'>Cancel and return to " + ref + "</a></p>")
+    return _app_shell(evaluation.reference + " Salesforce ID",
+                      "<a class='crumb' href='/co/" + ref + "'>&larr; " + ref + "</a><div class='page-head'><h1>" + ref
+                      + "</h1></div><section class='card'>" + body + "</section>", active="onboardings")
+
+
+def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, row: dict[str, str | None],
+                            reference: str = "") -> str:
     plan = salesforce_id_writeback_plan(route, readback, row)
     status = plan["status"]
     head = "<section class='readiness{cls}' aria-labelledby='salesforce-ids-title'><div class='readiness-heading'>"
@@ -609,10 +767,20 @@ def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, 
     if readback is not None and readback.get(other):
         other_label = "Surface Account ID" if other == "surface_account_id" else "Account UUID"
         rows += f"<dt>Also captured (not written)</dt><dd>{other_label} (Leonardo Development): <code>{escape(readback[other])}</code></dd>"
+    reference = reference or row.get("Name") or ""
+    last = salesforce_id_writebacks().get(reference) if REFERENCE.fullmatch(reference) else None
+    note = "Not written. Pilot rule: a Leonardo Development ID is written only into an empty field, after your review."
+    action = ""
+    if last is not None and last.get("result") in ID_WRITEBACK_RESULTS:
+        note = ("Last write " + ID_WRITEBACK_RESULTS[last["result"]][1].split(";")[0].split(".")[0].lower()
+                + " · " + last.get("recorded_at", ""))
+    if status == "ready_to_write" and (last is None or last.get("result") != "write_uncertain"):
+        action = ("<form method='post' action='/attended/salesforce-id-writeback-review'><input type='hidden' name='reference' value='"
+                  + escape(reference) + "'><button type='submit' class='ghost'>Review write to Salesforce</button></form>")
     return (head.format(cls=" " + cls if cls else "") + f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span><div>"
             f"<h2 id='salesforce-ids-title'>Salesforce IDs · {escape(title)}</h2><p>{escape(message)}</p>"
-            "<p class='login-safety'>Not written. Salesforce updates are manual for now.</p></div></div>"
-            "<dl>" + rows + "</dl></section>")
+            "<p class='login-safety'>" + escape(note) + "</p></div></div>"
+            "<dl>" + rows + "</dl>" + action + "</section>")
 
 
 def attended_leonardo_readbacks() -> dict[str, dict[str, str]]:
@@ -1946,11 +2114,14 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                           "<p>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
                           f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
                           f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></section>")
-    local_readback = _salesforce_ids_section(route_for(row), readback, row) + local_readback
+    local_readback = _salesforce_ids_section(route_for(row), readback, row, reference) + local_readback
     if readback is not None:
         local_readback = _scan_status_section(reference, notification) + local_readback
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
+    if notification.startswith("id-write:") and notification[9:] in ID_WRITEBACK_RESULTS:
+        kind, text = ID_WRITEBACK_RESULTS[notification[9:]]
+        notifications[notification] = ("Salesforce ID written" if kind == "verified" else "Salesforce ID not written", text + ".")
     if notification in notifications:
         title, message = notifications[notification]
         toast = "<section class='toast' role='status' aria-live='polite'><strong>" + escape(title) + "</strong><span>" + escape(message) + "</span></section>"
@@ -2711,6 +2882,7 @@ POST_ROUTES = frozenset({
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh",
+    "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
 })
 
 
@@ -2753,6 +2925,8 @@ class Handler(BaseHTTPRequestHandler):
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
             if parse_qs(parsed.query).get("scan", [""])[0] == "started": notice = "started"
+            id_write = parse_qs(parsed.query).get("id-write", [""])[0]
+            if id_write in ID_WRITEBACK_RESULTS: notice = "id-write:" + id_write
             if match:
                 # Overlap the onboarding preflight with the CO read when the
                 # cached queue already tells us the route.
@@ -2949,6 +3123,29 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
                 return
             self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+            return
+        if path == "/attended/salesforce-id-writeback-review":
+            # Read-only: a fresh read and a one-time, revision-bound confirmation page.
+            try:
+                evaluation = evaluate_id_writeback(reference)
+            except ReadUnavailable:
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable())
+                return
+            if evaluation.blocker:
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Write not available</title><p>Nothing can be written for "
+                               + escape(reference) + " (<code>" + escape(evaluation.blocker) + "</code>). Nothing was changed.</p>")
+                return
+            self.send_page(HTTPStatus.OK, page_id_writeback_confirmation(evaluation, issue_id_writeback_ack(evaluation)))
+            return
+        if path == "/attended/salesforce-id-writeback-confirm":
+            nonce = exact_form_value(form, "nonce")
+            try:
+                evaluation = evaluate_id_writeback(reference)
+            except ReadUnavailable:
+                self.send_redirect("/co/" + reference + "?id-write=write_blocked")
+                return
+            result = write_salesforce_id_after_confirmation(evaluation, nonce or "")
+            self.send_redirect("/co/" + reference + "?id-write=" + result)
             return
         if path == "/attended/scan-status-refresh":
             # Read-only: launches the runner's --scan-status mode for an onboarded CO.
