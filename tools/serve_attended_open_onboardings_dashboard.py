@@ -6,8 +6,13 @@ keeps data in memory only for rendering that response.
 """
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
+import contextvars
+import copy
 from html import escape
 from dataclasses import dataclass
+import functools
+from typing import Any
 from datetime import date, datetime
 from hashlib import sha256
 from http import HTTPStatus
@@ -267,6 +272,90 @@ def route_for(row: dict[str, str | None]) -> str | None:
     return None
 
 
+# Display-read cache (owner decision 2026-10-01, for page speed). Each `sf` CLI
+# call costs about 4 s, so GET pages reuse a Salesforce read for up to two
+# minutes. It applies only while a GET handler renders (_display_reads), keeps
+# results in memory only (never disk or logs), and is cleared by a Refresh or
+# any POST. Starts and the runner never use it: they re-read Salesforce and
+# re-check the source revision themselves.
+DISPLAY_READ_TTL_SECONDS = 120.0
+_display_reads: contextvars.ContextVar[bool] = contextvars.ContextVar("display_reads", default=False)
+_display_read_times: contextvars.ContextVar[list[float] | None] = contextvars.ContextVar("display_read_times", default=None)
+_display_cache: dict[tuple[object, ...], tuple[float, float, Future]] = {}
+_display_cache_lock = Lock()
+_display_prefetch_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="display-read")
+
+
+def clear_display_cache() -> None:
+    with _display_cache_lock:
+        _display_cache.clear()
+
+
+def _display_cached(fn: Any) -> Any:
+    """Cache fn(*args) for display GETs; outside a display GET, call fn directly.
+
+    Concurrent callers share one in-flight read. A failed read is not cached.
+    Callers get a deep copy, so a page cannot change a cached value.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args: Any) -> Any:
+        if not _display_reads.get():
+            return fn(*args)
+        key = (fn.__name__, *args)
+        now = monotonic()
+        with _display_cache_lock:
+            entry = _display_cache.get(key)
+            stale = (entry is None or entry[0] <= now
+                     or (entry[2].done() and entry[2].exception() is not None))
+            if stale:
+                entry = (now + DISPLAY_READ_TTL_SECONDS, datetime.now().timestamp(), Future())
+                _display_cache[key] = entry
+        _expires, read_at, future = entry
+        if stale:
+            try:
+                future.set_result(fn(*args))
+            except BaseException as error:
+                future.set_exception(error)
+                with _display_cache_lock:
+                    if _display_cache.get(key) is entry:
+                        del _display_cache[key]
+                raise
+        value = future.result(timeout=120)
+        times = _display_read_times.get()
+        if times is not None:
+            times.append(read_at)
+        return copy.deepcopy(value)
+    return wrapper
+
+
+def prefetch_display_read(fn: Any, *args: Any) -> None:
+    """Start a cached display read in the background so it overlaps other reads."""
+    def task() -> None:
+        _display_reads.set(True)
+        try:
+            fn(*args)
+        except Exception:
+            pass  # The page's own call re-raises the failure on the request thread.
+    _display_prefetch_pool.submit(task)
+
+
+def peek_display_cache(name: str, *args: Any) -> Any:
+    """A finished, unexpired cached value (deep copy), or None. Never reads Salesforce."""
+    with _display_cache_lock:
+        entry = _display_cache.get((name, *args))
+    if entry is None or entry[0] <= monotonic() or not entry[2].done() or entry[2].exception() is not None:
+        return None
+    return copy.deepcopy(entry[2].result())
+
+
+def display_read_at() -> str:
+    """Time of the oldest Salesforce read used by this page (HH:MM:SS)."""
+    times = _display_read_times.get()
+    stamp = min(times) if times else datetime.now().timestamp()
+    return datetime.fromtimestamp(stamp).strftime("%H:%M:%S")
+
+
+@_display_cached
 def evaluate_surface_fill_preflight(reference: str) -> SurfaceScopePreflight:
     """Fresh read of the Surface-only source through the runner's own reader.
 
@@ -701,6 +790,7 @@ def evaluate_co0745_renewal_comment() -> RenewalCommentEvaluation:
         raise ReadUnavailable() from None
 
 
+@_display_cached
 def evaluate_ce_only_fill_preflight(reference: str) -> CredentialExposureFillPreflight:
     """Validate only CE-only Email Domains for one approved CO (the owner gate).
 
@@ -851,6 +941,18 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
 
 
 def queue_rows() -> list[dict[str, str | None]]:
+    """Open-queue rows plus the local readback state (read fresh on every call)."""
+    rows = queue_source_rows()
+    readbacks = attended_leonardo_readbacks()
+    for row in rows:
+        readback = readbacks.get(row["Name"] or "")
+        if readback is not None:
+            row["Local_Leonardo_State"] = readback["leonardo_state"]
+    return rows
+
+
+@_display_cached
+def queue_source_rows() -> list[dict[str, str | None]]:
     try:
         view_id = open_onboardings_view_id()
         result = sf_json(["api", "request", "rest", f"/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/{view_id}/results", "--method", "GET"])
@@ -859,11 +961,6 @@ def queue_rows() -> list[dict[str, str | None]]:
             values = {column["fieldNameOrPath"]: column["value"] for column in record["columns"]}
             if not set(QUEUE_FIELDS) <= set(values) or not isinstance(values["Name"], str) or not REFERENCE.fullmatch(values["Name"]): raise ReadUnavailable()
             rows.append({field: value if isinstance(value, str) else None for field, value in values.items() if field in QUEUE_FIELDS})
-        readbacks = attended_leonardo_readbacks()
-        for row in rows:
-            readback = readbacks.get(row["Name"] or "")
-            if readback is not None:
-                row["Local_Leonardo_State"] = readback["leonardo_state"]
         return rows
     except (KeyError, TypeError):
         raise ReadUnavailable() from None
@@ -1103,6 +1200,7 @@ def cached_closed_history(*, now: float | None = None) -> ClosedHistory | None:
         return cached
 
 
+@_display_cached
 def detail_row(reference: str) -> dict[str, str | None]:
     if not REFERENCE.fullmatch(reference): raise ReadUnavailable()
     query = "SELECT " + ", ".join(DETAIL_FIELDS) + f" FROM Customer_Onboarding__c WHERE Name = '{reference}' LIMIT 2"
@@ -1558,7 +1656,7 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
         cards = ("<section class='card'><div class='card-head'><h2 class='pill'>Open onboardings</h2></div>"
                  f"<p class='empty'>No open onboardings. The Salesforce Open_Onboardings view returned 0 records at "
                  f"{escape(read_at)}.</p></section>")
-    hidden = f"<input type='hidden' name='queue' value='{escape(selected)}'>" if selected else ""
+    hidden = (f"<input type='hidden' name='queue' value='{escape(selected)}'>" if selected else "") + "<input type='hidden' name='refresh' value='1'>"
     title = next((label for key, label, _helper in QUEUE_DEFINITIONS if key == selected), "Open onboardings")
     head = (f"<div class='page-head'><h1>{escape(title)}</h1><div class='head-meta'><span>Read from Salesforce at "
             f"{escape(read_at)}</span><form method='get' action='/'>{hidden}<button class='ghost' type='submit'>Refresh"
@@ -1764,7 +1862,10 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         toast = "<section class='toast' role='status' aria-live='polite'><strong>" + escape(title) + "</strong><span>" + escape(message) + "</span></section>"
     details = "<section class='card'><div class='card-head'><span class='pill'>Salesforce record</span></div><dl>" + rows + "</dl></section>"
     main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>"
-                 "<div class='page-head'><h1>" + escape(reference) + "</h1>" + _onboarding_chip(reference) + "</div>"
+                 "<div class='page-head'><h1>" + escape(reference) + "</h1>" + _onboarding_chip(reference)
+                 + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
+                 "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
+                 "<button class='ghost' type='submit'>Refresh</button></form></div></div>"
                  + toast + case4_panel + comment_repair_action + renewal_comment_evaluation_action + renewal_preflight
                  + readiness + manual_action + local_readback + details)
     return _app_shell(reference, main_html, active="onboardings")
@@ -1796,7 +1897,7 @@ def render_dashboard(selected_queue: str = "") -> str:
         history = cached_closed_history()
     return page_queue(rows, selected_queue, runner_state=runner_state,
                       runner_state_unavailable=runner_state_unavailable,
-                      history=history, history_failed=history_failed, read_at=datetime.now().strftime("%H:%M"))
+                      history=history, history_failed=history_failed, read_at=display_read_at())
 
 
 def page_salesforce_unavailable(failed: bool = True) -> str:
@@ -2514,6 +2615,15 @@ class Handler(BaseHTTPRequestHandler):
     def send_redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER); self.send_header("Location", location); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.end_headers()
     def do_GET(self) -> None:
+        # Display reads may use the short in-memory cache; ?refresh=1 drops it.
+        if parse_qs(urlsplit(self.path).query).get("refresh", [""])[0] == "1":
+            clear_display_cache()
+        context = contextvars.copy_context()
+        context.run(Handler._display_get, self)
+
+    def _display_get(self) -> None:
+        _display_reads.set(True)
+        _display_read_times.set([])
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -2537,6 +2647,14 @@ class Handler(BaseHTTPRequestHandler):
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
             if match:
+                # Overlap the onboarding preflight with the CO read when the
+                # cached queue already tells us the route.
+                queued = next((r for r in peek_display_cache("queue_source_rows") or [] if r.get("Name") == match.group(1)), None)
+                queued_route = route_for(queued) if queued is not None else None
+                if queued_route == CE_ENGINE:
+                    prefetch_display_read(evaluate_ce_only_fill_preflight, match.group(1))
+                elif queued_route == SURFACE_ENGINE:
+                    prefetch_display_read(evaluate_surface_fill_preflight, match.group(1))
                 row = detail_row(match.group(1))
                 self.send_page(HTTPStatus.OK, page_detail(match.group(1), row, notice, surface_commercial_readiness(row)))
                 return
@@ -2545,6 +2663,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable())
 
     def do_POST(self) -> None:
+        # Any action may change Salesforce or local state; later pages read fresh.
+        clear_display_cache()
         path = urlsplit(self.path).path
         if path not in POST_ROUTES:
             # Unknown routes stop here: no form parse, Salesforce read, or launch.

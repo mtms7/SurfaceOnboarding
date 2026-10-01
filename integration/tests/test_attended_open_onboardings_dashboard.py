@@ -597,6 +597,68 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("Already has an ID in Salesforce", step)
         self.assertIn("salesforce_id_already_present", dashboard.RUNNER_RESULT_MESSAGES)
 
+    # Display-read cache (2026-10-01): GET pages only, 2 minutes, never for starts.
+    def _in_display_get(self, fn):
+        import contextvars
+        def run():
+            dashboard._display_reads.set(True)
+            dashboard._display_read_times.set([])
+            return fn()
+        return contextvars.copy_context().run(run)
+
+    def test_display_cache_applies_only_inside_a_display_get(self):
+        dashboard.clear_display_cache()
+        calls = []
+        cached = dashboard._display_cached(lambda ref: calls.append(ref) or {"Name": ref})
+        cached("CO-0001"); cached("CO-0001")
+        self.assertEqual(len(calls), 2)  # outside a GET (starts, runner, POST): always fresh
+        first = self._in_display_get(lambda: cached("CO-0001"))
+        first["Name"] = "changed"
+        second = self._in_display_get(lambda: cached("CO-0001"))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(second["Name"], "CO-0001")  # callers get copies
+        dashboard.clear_display_cache()
+        self._in_display_get(lambda: cached("CO-0001"))
+        self.assertEqual(len(calls), 4)
+
+    def test_display_cache_expires_and_never_caches_failures(self):
+        dashboard.clear_display_cache()
+        calls = []
+        def read(ref):
+            calls.append(ref)
+            if len(calls) == 1:
+                raise dashboard.ReadUnavailable()
+            return ref
+        cached = dashboard._display_cached(read)
+        with self.assertRaises(dashboard.ReadUnavailable):
+            self._in_display_get(lambda: cached("CO-0002"))
+        self.assertEqual(self._in_display_get(lambda: cached("CO-0002")), "CO-0002")
+        self.assertEqual(len(calls), 2)
+        with patch.object(dashboard, "monotonic", return_value=dashboard.monotonic() + 121):
+            self._in_display_get(lambda: cached("CO-0002"))
+        self.assertEqual(len(calls), 3)
+        dashboard.clear_display_cache()
+
+    def test_post_and_refresh_clear_the_display_cache(self):
+        class _FakeRequest:
+            def __init__(self, path):
+                self.path, self.sent = path, []
+            def send_page(self, status, page):
+                self.sent.append(status)
+        dashboard._display_cache[("x",)] = (dashboard.monotonic() + 100, 0.0, dashboard.Future())
+        dashboard.Handler.do_POST(_FakeRequest("/unknown"))
+        self.assertEqual(dashboard._display_cache, {})
+        dashboard._display_cache[("x",)] = (dashboard.monotonic() + 100, 0.0, dashboard.Future())
+        with patch.object(dashboard, "closed_history", return_value=self._history_fixture()):
+            dashboard.Handler.do_GET(_FakeRequest("/history?refresh=1"))
+        self.assertEqual(dashboard._display_cache, {})
+
+    def test_co_page_and_queue_offer_refresh(self):
+        page = page_detail("CO-0717", {"Onboarding_Approval_Status__c": "Approved"})
+        self.assertIn("Read from Salesforce at", page)
+        self.assertIn("action='/co/CO-0717'><input type='hidden' name='refresh' value='1'>", page)
+        self.assertIn("name='refresh' value='1'", page_queue([]))
+
     def test_list_view_identifier_is_the_only_process_cached_salesforce_value(self):
         dashboard._open_onboardings_view_id = None
         response = {"status": 0, "result": {"records": [{"Id": "00B000000000001AAA"}]}}
