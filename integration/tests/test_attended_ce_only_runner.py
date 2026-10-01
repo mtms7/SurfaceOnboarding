@@ -4490,3 +4490,43 @@ class Case3RouteTests(unittest.TestCase):
             result = runner.run("CO-0801", SURFACE_REVISION, route="case_3_combined_baseline")
         self.assertEqual(result, "case3_term_mismatch")
 
+
+class ScanStatusSweepRunnerTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.readbacks = Path(self._dir.name) / "readbacks.json"
+        self.readbacks.write_text(json.dumps({"CO-0002": {}, "CO-0001": {}, "CO-0003": {}}), encoding="utf-8")
+
+    def test_sweep_reads_each_co_in_order_and_skips_ce_only(self):
+        outcomes = {"CO-0001": "scan_status_recorded", "CO-0002": "scan_status_not_applicable",
+                    "CO-0003": "scan_status_recorded"}
+        calls = []
+        def fake(reference, surface_only=False):
+            calls.append((reference, surface_only))
+            return outcomes[reference]
+        with patch.object(runner, "READBACK_PATH", self.readbacks), patch.object(runner, "run_scan_status", fake), \
+                patch.object(runner, "_record_check") as record:
+            results = runner.run_scan_status_all()
+        self.assertEqual(results, outcomes)
+        self.assertEqual(calls, [("CO-0001", True), ("CO-0002", True), ("CO-0003", True)])
+        self.assertEqual([c.args[0] for c in record.call_args_list], ["CO-0001", "CO-0003"])
+
+    def test_session_problem_stops_the_sweep(self):
+        with patch.object(runner, "READBACK_PATH", self.readbacks), \
+                patch.object(runner, "run_scan_status", return_value="leonardo_session_expired") as single, \
+                patch.object(runner, "_record_check"):
+            results = runner.run_scan_status_all()
+        self.assertEqual(results, {"CO-0001": "leonardo_session_expired"})
+        self.assertEqual(single.call_count, 1)
+
+    def test_ce_only_tenant_is_not_applicable_for_the_sweep(self):
+        responses = [CeFillSourceTests._completed(CeFillSourceTests._sf_json([{
+            "Name": "CO-0679", "Account_Name__c": "Sample", "Onboarding_Product__c": "Credential Exposure",
+            "Onboarding_Type__c": "New Product Onboarding"}])) for _ in range(2)]
+        with patch.object(runner.subprocess, "run", side_effect=responses):
+            with self.assertRaisesRegex(runner.SurfaceSourceError, "scan_status_not_applicable"):
+                runner._scan_status_tenant_name("CO-0679", surface_only=True)
+            self.assertTrue(runner._scan_status_tenant_name("CO-0679").endswith("- CE Only"))
+

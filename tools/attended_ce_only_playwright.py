@@ -4577,7 +4577,7 @@ def write_scan_status(reference: str, observation: dict[str, Any], observed_at: 
     _write_json_atomic(SCAN_STATUS_PATH, state)
 
 
-def _scan_status_tenant_name(reference: str) -> str:
+def _scan_status_tenant_name(reference: str, surface_only: bool = False) -> str:
     """Tenant name for the search, from one fixed, minimal Salesforce read (values stay in memory)."""
     rows = _sf_records(
         "SELECT Name, Account_Name__c, Onboarding_Product__c, Onboarding_Type__c "
@@ -4594,11 +4594,13 @@ def _scan_status_tenant_name(reference: str) -> str:
     if product == CASE3_ROUTE_PRODUCT and onboarding_type == CASE3_ROUTE_TYPE:
         return surface_names(account_name).tenant_name
     if product == CE_ROUTE_PRODUCT and onboarding_type == CE_ROUTE_TYPE:
+        if surface_only:
+            raise SurfaceSourceError("scan_status_not_applicable")  # CE-only tenants never scan
         return ce_only_names(account_name).tenant_name
     raise SurfaceSourceError("scan_status_route_unsupported")
 
 
-def run_scan_status(reference: str) -> str:
+def run_scan_status(reference: str, surface_only: bool = False) -> str:
     """Read-only scan-status sweep for one onboarded CO (never fills, submits, or creates).
 
     Requires a local readback (the captured Surface Account ID and Account
@@ -4617,7 +4619,7 @@ def run_scan_status(reference: str) -> str:
             or not isinstance(readback.get("account_uuid"), str)):
         return "scan_status_not_onboarded"
     try:
-        tenant_name = _scan_status_tenant_name(reference)
+        tenant_name = _scan_status_tenant_name(reference, surface_only)
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return "playwright_runtime_unavailable"
@@ -4652,6 +4654,30 @@ def run_scan_status(reference: str) -> str:
             return str(error)
         except Exception:
             return "attended_ce_runner_unavailable"
+
+
+def run_scan_status_all() -> dict[str, str]:
+    """Read-only scan-status read for every onboarded Surface / Case 3 CO, one at a time.
+
+    CE-only tenants are skipped (scan_status_not_applicable). A Leonardo
+    session problem stops the sweep, since every later CO would fail the
+    same way. Returns {CO: result}; each CO's result is also recorded as its
+    latest read-only check.
+    """
+    try:
+        references = sorted(reference for reference in json.loads(READBACK_PATH.read_text(encoding="utf-8"))
+                            if isinstance(reference, str) and REFERENCE.fullmatch(reference))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
+    results: dict[str, str] = {}
+    for reference in references:
+        result = run_scan_status(reference, surface_only=True)
+        results[reference] = result
+        if result != "scan_status_not_applicable":
+            _record_check(reference, "scan_status", result)
+        if result in ("leonardo_session_expired", "development_login_timeout", "playwright_runtime_unavailable"):
+            break
+    return results
 
 
 def _combine_duplicate(ui: str, api: str) -> str:
@@ -4763,6 +4789,8 @@ def main() -> int:
                         help="With --co: read-only duplicate check by CE tenant name and primary domain (no fill, submit, or create; does not consume the create gate).")
     parser.add_argument("--scan-status", action="store_true",
                         help="With --co: read-only scan-status read of an onboarded tenant (matches the captured IDs; no fill, submit, or create).")
+    parser.add_argument("--scan-status-all", action="store_true",
+                        help="Read-only scan-status read for every onboarded Surface / Case 3 CO (no fill, submit, or create).")
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
@@ -4772,6 +4800,11 @@ def main() -> int:
         result = run_duplicate_check(args.co, route=args.route)
         _record_check(args.co, "duplicate_check", result)
         print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.scan_status_all:
+        results = run_scan_status_all()
+        print(json.dumps({"result": "scan_status_all_finished", "cos": results,
+                          "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0
     if args.scan_status:
         if not args.co:

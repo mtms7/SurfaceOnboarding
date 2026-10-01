@@ -1989,3 +1989,47 @@ class DashboardOnlyIdsTests(unittest.TestCase):
         import tools.attended_ce_only_playwright as runner_module
         self.assertEqual(runner_module.scan_status_from_row({"lastScanStatusEnum": "COMPLETED"})["state"], "scan_completed")
 
+
+class ScanStatusSweepTests(unittest.TestCase):
+    """Refresh all scan statuses (2026-10-01): read-only, Surface / Case 3 only."""
+
+    def test_queue_offers_the_sweep_and_the_started_note(self):
+        page = page_queue([])
+        self.assertIn("action='/attended/scan-status-refresh-all'", page)
+        self.assertIn("Refresh scan statuses", page)
+        self.assertNotIn("sweep of every onboarded Surface tenant was started", page)
+        self.assertIn("sweep of every onboarded Surface tenant was started", page_queue([], scan_started=True))
+
+    def test_sweep_route_launches_without_a_reference(self):
+        class _FakeRequest:
+            def __init__(self):
+                self.path, self.pages, self.redirects = "/attended/scan-status-refresh-all", [], []
+            def send_page(self, status, page):
+                self.pages.append(status)
+            def send_redirect(self, location):
+                self.redirects.append(location)
+        for launched, expected in ((True, "redirect"), (False, 503)):
+            request = _FakeRequest()
+            with self.subTest(launched=launched), \
+                    patch.object(dashboard, "post_form", side_effect=AssertionError("no form needed")), \
+                    patch.object(dashboard, "start_attended_scan_status_all", return_value=launched):
+                dashboard.Handler.do_POST(request)
+            if expected == "redirect":
+                self.assertEqual(request.redirects, ["/?queue=scanning&scan=started"])
+            else:
+                self.assertEqual(request.pages, [503])
+
+    def test_ce_only_co_page_has_no_scan_card(self):
+        ids = {"surface_account_id": "0123456789abcdef01234567", "account_uuid": "0123456789abcdef0123456789abcdef",
+               "leonardo_state": "No scan started", "observed_on": "2026-10-01",
+               "source": "Leonardo Development Details readback"}
+        row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Product__c": "Credential Exposure",
+               "Onboarding_Type__c": "New Product Onboarding"}
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value={"CO-0679": ids}), \
+                patch.object(dashboard, "evaluate_ce_only_fill_preflight", side_effect=dashboard.ReadUnavailable()), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce")):
+            page = page_detail("CO-0679", row)
+        self.assertNotIn("Leonardo scan status", page)
+        self.assertIn("Leonardo Development readback", page)
+

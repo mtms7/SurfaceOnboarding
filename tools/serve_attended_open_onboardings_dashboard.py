@@ -277,6 +277,18 @@ def start_attended_surface_runner(reference: str, revision: str, route: str = SU
         return False
 
 
+def start_attended_scan_status_all() -> bool:
+    """Launch one desktop-only, read-only scan-status sweep of every onboarded Surface / Case 3 CO."""
+    if not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
+        return False
+    try:
+        subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--scan-status-all"],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
 def start_attended_scan_status(reference: str) -> bool:
     """Launch one desktop-only, read-only scan-status read (no fill, submit, or create)."""
     if not REFERENCE.fullmatch(reference) or not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
@@ -1917,7 +1929,7 @@ def _age_days(submitted: str | None, today: date) -> str:
 def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
                runner_state: dict[str, dict[str, str]] | None = None, runner_state_unavailable: bool = False,
                history: ClosedHistory | None = None, history_failed: bool = False,
-               read_at: str | None = None, today: date | None = None) -> str:
+               read_at: str | None = None, today: date | None = None, scan_started: bool = False) -> str:
     """Render the open-onboardings dashboard: queue tiles, a closed-history tile
     that opens the History tab, and one aligned table per queue."""
     today = today or date.today()
@@ -2005,7 +2017,12 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
     title = next((label for key, label, _helper in QUEUE_DEFINITIONS if key == selected), "Open onboardings")
     head = (f"<div class='page-head'><h1>{escape(title)}</h1><div class='head-meta'><span>Read from Salesforce at "
             f"{escape(read_at)}</span><form method='get' action='/'>{hidden}<button class='ghost' type='submit'>Refresh"
-            "</button></form></div></div>")
+            "</button></form><form method='post' action='/attended/scan-status-refresh-all'>"
+            "<button class='ghost' type='submit' title='Read-only: reads each onboarded Surface tenant&#39;s scan status'>"
+            "Refresh scan statuses</button></form></div></div>")
+    if scan_started:
+        banner = ("<p class='note'>A read-only scan-status sweep of every onboarded Surface tenant was started in the "
+                  "automation browser. Reload in about a minute.</p>") + banner
     return _app_shell("Onboardings", head + tiles + banner + cards, active="onboardings")
 
 
@@ -2201,7 +2218,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                           f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
                           f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></section>")
     local_readback = _salesforce_ids_section(route_for(row), readback, row, reference) + local_readback
-    if readback is not None:
+    if readback is not None and route_for(row) != CE_ENGINE:
         local_readback = _scan_status_section(reference, notification) + local_readback
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
@@ -2222,7 +2239,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     return _app_shell(reference, main_html, active="onboardings")
 
 
-def render_dashboard(selected_queue: str = "") -> str:
+def render_dashboard(selected_queue: str = "", scan_started: bool = False) -> str:
     """Read the open queue (live), the local run records, and the cached
     closed-onboardings history for the history tile, then render the dashboard.
 
@@ -2248,7 +2265,8 @@ def render_dashboard(selected_queue: str = "") -> str:
         history = cached_closed_history()
     return page_queue(rows, selected_queue, runner_state=runner_state,
                       runner_state_unavailable=runner_state_unavailable,
-                      history=history, history_failed=history_failed, read_at=display_read_at())
+                      history=history, history_failed=history_failed, read_at=display_read_at(),
+                      scan_started=scan_started)
 
 
 def page_salesforce_unavailable(failed: bool = True) -> str:
@@ -2979,7 +2997,7 @@ POST_ROUTES = frozenset({
     "/attended/start-ce-only-runner", "/attended/start-co0702-ce-only-runner", "/attended/reset-ce-only-runner",
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
-    "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh",
+    "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
 })
 
@@ -3005,7 +3023,8 @@ class Handler(BaseHTTPRequestHandler):
             path = parsed.path
             if path == "/":
                 selected_queue = parse_qs(parsed.query).get("queue", [""])[0]
-                self.send_page(HTTPStatus.OK, render_dashboard(selected_queue)); return
+                scan_started = parse_qs(parsed.query).get("scan", [""])[0] == "started"
+                self.send_page(HTTPStatus.OK, render_dashboard(selected_queue, scan_started)); return
             if path == "/connection":
                 self.send_page(HTTPStatus.OK, page_salesforce_unavailable(failed=False)); return
             if path == "/history":
@@ -3084,6 +3103,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_leonardo_session_result("automation_browser_close_unavailable"))
                 return
             self.send_page(HTTPStatus.OK, page_leonardo_session_result(close_automation_browser()))
+            return
+        if path == "/attended/scan-status-refresh-all":
+            # Read-only sweep: no CO reference, no Salesforce write.
+            if not start_attended_scan_status_all():
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Scan status unavailable</title><p>The read-only scan-status sweep could not be started on this desktop.</p>")
+                return
+            self.send_redirect("/?queue=scanning&scan=started")
             return
         form = post_form(self)
         reference = exact_form_value(form, "reference")
