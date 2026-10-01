@@ -102,3 +102,32 @@ Observed with Advanced options expanded; the form was cancelled, nothing created
 - Operator Account assigned from TA/CSM (CE: none).
 - License quantities from Salesforce / defaults (CE: fixed 1/1/1).
 - The readback must tolerate a tenant whose scan has already started (CE tenants never scan).
+
+## Updates after the first live Surface create (2026-09-30 and 2026-10-01)
+
+These supersede the matching points above where they differ.
+
+- **Number of domains = licensed subdomains** (owner decision 2026-09-30): the number in the
+  product name plus DealHub subdomain add-ons, replacing "main + alternate domains". A CO whose
+  listed domains (main + alternates) exceed it fails closed (`surface_domains_exceed_license`).
+  The Guru licence example (Go 500 with **domains 10000**) also shows domains larger than the
+  listed domains; it is consistent with filling a licence quantity, not a count of listed roots.
+- **Operator Account timing** (owner decision 2026-09-30): left empty at create, as in the Guru
+  card's intent to use the TA/CSM, but assigned only **after the first scan finishes**. The CO
+  page shows a reminder with a local acknowledgement.
+- **Scan now vs. schedule** (live finding 2026-09-29): the Scan now control exists only while
+  Scanning interval is None. With the Weekly/Monthly interval the Guru card requires, Scan now
+  disappears; the schedule starts the scan. CO-0649 read back "No scan started" right after
+  create and "Account Scanning" the next day.
+- **Licence start-date quirk** (live finding 2026-09-30): Leonardo Development accepted the run
+  day in the start-date picker but kept **Confirm disabled with no error**; the day before
+  enabled it. The runner now enters the run day and, if Confirm stays disabled, re-picks the
+  start one day earlier (at most once) and records the dates actually entered; the CO page shows
+  them. To report to the Leonardo team.
+- **Already onboarded in production** (2026-10-01): CO-0649 already had a production Surface
+  Account ID in Salesforce, so the Dev create duplicated an onboarded customer. The runner now
+  refuses a create or dry run when the route's Salesforce ID field is already set
+  (`salesforce_id_already_present`).
+- **Salesforce ID mapping** (owner decision 2026-10-01; Guru step "update Salesforce with the UID
+  and UUID"): Surface-only → `Surface_Account_ID__c` only; CE-only → `Account_UUID__c`. During the
+  pilot, Leonardo Development IDs may be written into **empty** fields only.

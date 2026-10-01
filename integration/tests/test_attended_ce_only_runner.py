@@ -3847,6 +3847,10 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertEqual(page.filled["Expiration date"], plan["license_end"].isoformat())  # unchanged
         steps = [(e["step"], e["outcome"]) for e in self._events()]
         self.assertIn(("license_start_fallback", "confirm_enabled"), steps)
+        # The state records the start actually entered, not the planned run day.
+        record = json.loads(self.state.read_text(encoding="utf-8"))["CO-0801"]
+        self.assertEqual((record["license_start_entered"], record["license_end_entered"]),
+                         (earlier.isoformat(), plan["license_end"].isoformat()))
 
     def test_run_day_start_is_kept_when_confirm_enables(self):
         with self._accepts_start(RUN_DAY):
@@ -3854,6 +3858,8 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         self.assertEqual(result, "readback_verified")
         self.assertEqual(page.filled["Start date"], RUN_DAY.isoformat())
         self.assertNotIn("license_start_fallback", [e["step"] for e in self._events()])
+        record = json.loads(self.state.read_text(encoding="utf-8"))["CO-0801"]
+        self.assertEqual(record["license_start_entered"], RUN_DAY.isoformat())
 
     def test_fallback_is_bounded_to_one_day_and_fails_closed(self):
         with self._accepts_start(RUN_DAY - timedelta(days=2)):
@@ -4272,3 +4278,37 @@ class RouteCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnteredLicenceDatesTests(unittest.TestCase):
+    """The runner records the licence dates actually entered before Confirm."""
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        self.state = Path(self._dir.name) / "state.json"
+
+    def tearDown(self):
+        self._dir.cleanup()
+
+    def test_result_records_entered_dates_and_loader_validates_them(self):
+        with patch.object(runner, "RUNNER_STATE_PATH", self.state):
+            runner.record_runner_start("CO-0801", "rev-1", "2026-09-30T15:40:43")
+            runner.record_runner_result("CO-0801", "rev-1", "readback_verified", "2026-09-30T15:41:29",
+                                        (date(2026, 9, 29), date(2027, 9, 30)))
+            record = runner.load_runner_state()["CO-0801"]
+        self.assertEqual((record["license_start_entered"], record["license_end_entered"]), ("2026-09-29", "2027-09-30"))
+
+    def test_result_without_entered_dates_is_unchanged(self):
+        with patch.object(runner, "RUNNER_STATE_PATH", self.state):
+            runner.record_runner_result("CO-0801", "rev-1", "confirm_button_not_enabled", "2026-09-30T14:24:00")
+            record = runner.load_runner_state()["CO-0801"]
+        self.assertNotIn("license_start_entered", record)
+
+    def test_malformed_entered_date_fails_closed(self):
+        self.state.write_text(json.dumps({"CO-0801": {"source_revision": "rev-1", "result": "readback_verified",
+                                                      "completed_on": "2026-09-30T15:41:29",
+                                                      "license_start_entered": "29/09/2026"}}), encoding="utf-8")
+        with patch.object(runner, "RUNNER_STATE_PATH", self.state):
+            with self.assertRaises(runner.RunnerStateUnavailable):
+                runner.load_runner_state()

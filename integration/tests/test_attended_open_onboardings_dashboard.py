@@ -1346,11 +1346,20 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
         for label, value in (("Tier", "Prime"), ("Scanning interval", "Weekly"), ("Alternate root domains", "2"),
                              ("Requested subdomains", "3"), ("Assets", "10000"),
                              ("Licensed subdomains", "1400 (1000 baseline + 400 add-on)"),
-                             ("License dates", "2026-09-29 → 2027-09-28")):
+                             ("License dates (planned)", "2026-09-29 → 2027-09-28")):
             self.assertIn("<dt>" + label + "</dt><dd>" + value + "</dd>", page)
         self.assertNotIn("Why Leonardo creation is not enabled yet", page)
         self.assertNotIn("Start manual onboarding", page)
         self.assertNotIn("Credential Exposure onboarding", page)
+
+    def test_entered_licence_dates_show_after_a_create(self):
+        record = {"source_revision": _surface_evaluation().source_revision, "result": "readback_verified",
+                  "completed_on": "2026-09-30T15:41:29", "route": "case_1_new_surface_only",
+                  "license_start_entered": "2026-09-29", "license_end_entered": "2027-09-30"}
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=_surface_evaluation()),                 patch.object(dashboard, "load_runner_state", return_value={"CO-0801": record}),                 patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
+            page = page_detail("CO-0801", SURFACE_ROW)
+        self.assertIn("Licence dates entered in Leonardo Development: <b>2026-09-29 → 2027-09-30</b>", page)
+        self.assertEqual(dashboard._entered_license_note({"result": "readback_verified"}), "")
 
     def test_non_surface_cos_keep_todays_behaviour(self):
         row = dict(SURFACE_ROW, Onboarding_Product__c="Surface & Credential Exposure")

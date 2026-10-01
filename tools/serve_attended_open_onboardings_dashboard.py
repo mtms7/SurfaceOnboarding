@@ -2337,6 +2337,18 @@ def _outcome_banner(kind: str, message: str, result: str, completed: str | None 
     )
 
 
+def _entered_license_note(record: dict[str, str] | None) -> str:
+    """The licence dates the runner actually entered before Confirm (if recorded).
+
+    They can differ from the planned scope: Leonardo Development may refuse the
+    run day as start, and the runner then enters the day before (2026-09-30).
+    """
+    if not record or not record.get("license_start_entered") or not record.get("license_end_entered"):
+        return ""
+    return ("<p class='note'>Licence dates entered in Leonardo Development: <b>"
+            + escape(record["license_start_entered"]) + " → " + escape(record["license_end_entered"]) + "</b></p>")
+
+
 def _ce_only_onboard_section(reference: str) -> str:
     """Render the primary Onboard action for one approved CE-only CO.
 
@@ -2376,7 +2388,7 @@ def _ce_only_onboard_section(reference: str) -> str:
     start_action = ""
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
-        runner_note = _outcome_banner(kind, message, record["result"], record.get("completed_on"))
+        runner_note = _outcome_banner(kind, message, record["result"], record.get("completed_on")) + _entered_license_note(record)
     elif same_revision:
         started = " at " + escape(record["started_on"]) if record.get("started_on") else ""
         runner_note = ("<p class='note'>An attended run for this source revision was started" + started +
@@ -2452,7 +2464,7 @@ def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
         ("Number of domains", str(scope["number_of_domains"])),
         ("Licensed subdomains", licensed),
         ("Assets", str(scope["assets"])),
-        ("License dates", f"{scope['license_start']} → {scope['license_end']}"),
+        ("License dates (planned)", f"{scope['license_start']} → {scope['license_end']}"),
         ("Large scope (&gt;60)", "yes — review carefully" if scope["large_scope"] else "no"),
         ("Core Plus on account", "yes — CE to be enabled later" if scope.get("core_plus_present") else "no"),
     ]
@@ -2503,7 +2515,7 @@ def _surface_onboard_section(reference: str) -> str:
     start_action = ""
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
-        runner_note = _outcome_banner(kind, message, record["result"], record.get("completed_on"))
+        runner_note = _outcome_banner(kind, message, record["result"], record.get("completed_on")) + _entered_license_note(record)
     elif same_revision:
         started = " at " + escape(record["started_on"]) if record.get("started_on") else ""
         runner_note = ("<p class='note'>An attended run for this source revision was started" + started +
@@ -2511,8 +2523,8 @@ def _surface_onboard_section(reference: str) -> str:
                        "<a href='/attended/ce-only-runner-status?ref=" + ref + "'>View progress</a></p>")
     elif record is not None and record.get("result") == "readback_verified":
         # A verified tenant exists; a later source revision never re-creates it.
-        runner_note = _outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
-                                      "readback_verified", record.get("completed_on"))
+        runner_note = (_outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
+                                       "readback_verified", record.get("completed_on")) + _entered_license_note(record))
     else:
         if record is not None:
             runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +

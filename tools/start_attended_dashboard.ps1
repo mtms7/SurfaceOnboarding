@@ -106,14 +106,23 @@ if (-not $listener) {
 }
 
 Write-Host "Dashboard is ready at http://127.0.0.1:$Port/ (listener PID $($listener.OwningProcess))."
+# Liveness: /connection makes no Salesforce read, so it answers immediately.
 try {
-    $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 40 -Uri "http://127.0.0.1:$Port/"
+    $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 15 -Uri "http://127.0.0.1:$Port/connection"
+} catch {
+    throw 'Dashboard started but did not answer its local health read. Check the desktop firewall and the listener PID above.'
+}
+# Queue read: the first cold read runs several Salesforce CLI calls (about 4 s
+# each), so allow it time; a slow read is a warning, not a failed start.
+try {
+    $response = Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri "http://127.0.0.1:$Port/"
     $statusCode = [int]$response.StatusCode
 } catch {
     if ($_.Exception.Response) {
         $statusCode = [int]$_.Exception.Response.StatusCode
     } else {
-        throw 'Dashboard started but did not answer its local health read. Check the desktop firewall and the listener PID above.'
+        Write-Warning 'Dashboard is running, but the first Salesforce queue read is still slow. Open http://127.0.0.1:8012/ and refresh in a minute.'
+        exit 0
     }
 }
 

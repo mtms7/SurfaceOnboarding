@@ -1534,7 +1534,7 @@ def load_runner_state() -> dict[str, dict[str, str]]:
             if not isinstance(revision, str) or not revision:
                 raise ValueError()
             if set(value) - {"source_revision", "started_on", "result", "completed_on",
-                             "scope_reviewed_on", "route"}:
+                             "scope_reviewed_on", "route", "license_start_entered", "license_end_entered"}:
                 raise ValueError()
             record: dict[str, str] = {"source_revision": revision}
             if "route" in value:
@@ -1547,6 +1547,12 @@ def load_runner_state() -> dict[str, dict[str, str]]:
                     if not isinstance(value[key], str):
                         raise ValueError()
                     datetime.fromisoformat(value[key])
+                    record[key] = value[key]
+            for key in ("license_start_entered", "license_end_entered"):
+                if key in value:
+                    if not isinstance(value[key], str):
+                        raise ValueError()
+                    date.fromisoformat(value[key])
                     record[key] = value[key]
             if "completed_on" in record and "result" not in value:
                 raise ValueError()
@@ -1636,19 +1642,27 @@ def record_runner_start(reference: str, revision: str, started_on: str, *,
     _write_json_atomic(RUNNER_STATE_PATH, state)
 
 
-def record_runner_result(reference: str, revision: str, result: str, completed_on: str) -> None:
-    """Record the final result for the acknowledged revision; the first result wins."""
+def record_runner_result(reference: str, revision: str, result: str, completed_on: str,
+                         license_entered: tuple[date, date] | None = None) -> None:
+    """Record the final result for the acknowledged revision; the first result wins.
+
+    ``license_entered`` is the (start, end) actually entered before Confirm,
+    including the one-day-earlier start fallback, so the dashboard can show it.
+    """
     if not REFERENCE.fullmatch(reference) or not revision or not result:
         raise ValueError("invalid_runner_state_record")
     state = load_runner_state()
     record = state.get(reference)
     if record is None:
-        state[reference] = {"source_revision": revision, "result": result, "completed_on": completed_on}
+        record = state[reference] = {"source_revision": revision, "result": result, "completed_on": completed_on}
     elif record["source_revision"] == revision and "result" not in record:
         record["result"] = result
         record["completed_on"] = completed_on
     else:
         return
+    if license_entered is not None:
+        record["license_start_entered"] = license_entered[0].isoformat()
+        record["license_end_entered"] = license_entered[1].isoformat()
     _write_json_atomic(RUNNER_STATE_PATH, state)
 
 
@@ -1999,7 +2013,8 @@ def _finish(reference: str, acknowledged_revision: str, result: str) -> str:
     """
     if _ACTIVE_RUN_LOG is None or _ACTIVE_RUN_LOG.mode != DRY_RUN_MODE:
         try:
-            record_runner_result(reference, acknowledged_revision, result, datetime.now().isoformat(timespec="seconds"))
+            record_runner_result(reference, acknowledged_revision, result, datetime.now().isoformat(timespec="seconds"),
+                                 _ENTERED_LICENSE)
         except (OSError, ValueError, RunnerStateUnavailable):
             pass
     if _ACTIVE_RUN_LOG is not None:
@@ -2879,6 +2894,8 @@ class RunLog:
 
 
 _ACTIVE_RUN_LOG: RunLog | None = None
+# Licence (start, end) as entered just before Confirm in the current create run.
+_ENTERED_LICENSE: tuple[date, date] | None = None
 
 
 def _log() -> RunLog:
@@ -4030,8 +4047,9 @@ def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: floa
     (only the run log is written). ``diagnose`` implies ``dry_run`` and, when
     Confirm stays disabled, runs the no-submit probes (_diagnose_confirm).
     """
-    global _ACTIVE_RUN_LOG
+    global _ACTIVE_RUN_LOG, _ENTERED_LICENSE
     dry_run = dry_run or diagnose
+    _ENTERED_LICENSE = None
     _ACTIVE_RUN_LOG = RunLog(reference, DRY_RUN_MODE if dry_run else "create", route=route)
     _ACTIVE_RUN_LOG.timeline = diagnose
     try:
@@ -4063,6 +4081,7 @@ def _cancel_add_account(page: Any) -> bool:
 
 def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: float, dry_run: bool = False,
          contract: RouteContract = CE_ROUTE, diagnose: bool = False, lc_prefill_probe: bool = False) -> str:
+    global _ENTERED_LICENSE
     log = _log()
     log.event("source_read", "start")
     try:
@@ -4177,6 +4196,7 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                 if not _ensure_confirm_enabled(page, confirm, plan):
                     _capture_search_diagnostics(page)
                     return _finish(reference, acknowledged_revision, "confirm_button_not_enabled")
+                _ENTERED_LICENSE = (plan["license_start"], plan["license_end"])
                 create_status = None
                 try:
                     with page.expect_response(lambda r: ACCOUNT_ADD_API in r.url, timeout=30_000) as created:
