@@ -541,8 +541,9 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0702": self._IDS}):
             page = page_detail("CO-0702", row)
-        self.assertIn("Salesforce IDs · Conflict", page)
-        self.assertIn("Do not overwrite it", page)
+        self.assertIn("Salesforce IDs · Salesforce already has an ID", page)
+        self.assertIn("will never be written", page)
+        self.assertIn("source-warn", page)
 
     def test_detail_page_unmapped_route_proposes_nothing(self):
         row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Product__c": "Surface",
@@ -562,6 +563,39 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         sf.assert_not_called()
         self.assertNotIn("Account_UUID__c' method='post'", page)
         self.assertNotRegex(page, r"<form[^>]*salesforce-ids")
+
+    def test_detail_page_labels_captured_ids_as_leonardo_development(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", **self._SURFACE}
+        with patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
+                   return_value={"CO-0649": self._IDS}):
+            page = page_detail("CO-0649", row)
+        self.assertIn("Surface Account ID (<b>Leonardo Development</b>)", page)
+        self.assertIn("Account UUID (Leonardo Development):", page)
+
+    def test_salesforce_id_present_blocks_start_when_not_onboarded_locally(self):
+        for reference, base, field in (("CO-0702", {**self._CE, "Email_Domains__c": "company.example"}, "Account_UUID__c"),
+                                       ("CO-0801", self._SURFACE, "Surface_Account_ID__c")):
+            row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "New", field: "x" * 24, **base}
+            with self.subTest(reference=reference), \
+                    patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks", return_value={}):
+                page = page_detail(reference, row)
+            self.assertIn("Already has an ID in Salesforce", page)
+            self.assertIn("Start onboarding blocked", page)
+
+    def test_other_routes_field_does_not_block_start(self):
+        # A CE-only CO is gated on Account_UUID__c only, not on Surface_Account_ID__c.
+        self.assertFalse(dashboard.salesforce_id_already_present(
+            dashboard.route_for(self._CE), {**self._CE, "Surface_Account_ID__c": "x" * 24}))
+        self.assertTrue(dashboard.salesforce_id_already_present(
+            dashboard.route_for(self._SURFACE), {**self._SURFACE, "Surface_Account_ID__c": "x" * 24}))
+
+    def test_queue_row_for_salesforce_id_present_run_is_manual_review(self):
+        queue, step, owner = dashboard.classify_queue_row(
+            {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "New", **self._CE},
+            {"result": "salesforce_id_already_present"})
+        self.assertEqual((queue, owner), ("review", "you"))
+        self.assertIn("Already has an ID in Salesforce", step)
+        self.assertIn("salesforce_id_already_present", dashboard.RUNNER_RESULT_MESSAGES)
 
     def test_list_view_identifier_is_the_only_process_cached_salesforce_value(self):
         dashboard._open_onboardings_view_id = None

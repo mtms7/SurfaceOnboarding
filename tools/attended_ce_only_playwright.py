@@ -453,6 +453,8 @@ class CeFillSource:
     subscription_end: date
     tenant_name: str
     primary_user_alias: str
+    # True when Account_UUID__c already holds a value (pre-create gate).
+    salesforce_id_present: bool = False
 
 
 class RouteMismatch(RuntimeError):
@@ -475,7 +477,7 @@ def ce_fill_source(reference: str) -> CeFillSource:
     try:
         rows = _sf_records(
             "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, "
-            "Email_Domains__c, Account_Country__c, Onboarding_Product__c, Onboarding_Type__c "
+            "Email_Domains__c, Account_Country__c, Onboarding_Product__c, Onboarding_Type__c, Account_UUID__c "
             "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
             raise ValueError()
@@ -511,7 +513,8 @@ def ce_fill_source(reference: str) -> CeFillSource:
             reference, revision, account_id, " ".join(account_name.split()),
             email_domain, " ".join(country.split()),
             subscription_start, subscription_end,
-            names.tenant_name, names.primary_user_alias)
+            names.tenant_name, names.primary_user_alias,
+            salesforce_id_present=bool((row.get("Account_UUID__c") or "").strip()))
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("salesforce_fill_source_unavailable") from exc
 
@@ -792,6 +795,8 @@ class SurfaceFillSource:
     entitlement: SurfaceEntitlement
     tenant_name: str
     primary_user_alias: str
+    # True when Surface_Account_ID__c already holds a value (pre-create gate).
+    salesforce_id_present: bool = False
 
     @property
     def listed_domains(self) -> int:
@@ -833,7 +838,7 @@ def surface_fill_source(reference: str, run_day: date | None = None) -> SurfaceF
     try:
         rows = _sf_records(
             "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
-            "Main_Domain__c, Alternate_Domains__c, Onboarding_Product__c, Onboarding_Type__c "
+            "Main_Domain__c, Alternate_Domains__c, Onboarding_Product__c, Onboarding_Type__c, Surface_Account_ID__c "
             "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
             raise ValueError()
@@ -864,7 +869,8 @@ def surface_fill_source(reference: str, run_day: date | None = None) -> SurfaceF
             raise SurfaceSourceError("surface_domains_exceed_license")
         return SurfaceFillSource(
             reference, revision, account_id, " ".join(account_name.split()), " ".join(country.split()),
-            main, roots, subdomains, entitlement, names.tenant_name, names.primary_user_alias)
+            main, roots, subdomains, entitlement, names.tenant_name, names.primary_user_alias,
+            salesforce_id_present=bool((row.get("Surface_Account_ID__c") or "").strip()))
     except SurfaceSourceError:
         raise
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -4068,6 +4074,10 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
         return _finish(reference, acknowledged_revision, str(error))
     log.add_redactions(*contract.redactions(source))
     log.event("source_read", "ok")
+    # Owner decision 2026-10-01: a CO whose mapped Salesforce ID field is already
+    # set was onboarded before (usually in production). Never create or dry-run it.
+    if source.salesforce_id_present:
+        return _finish(reference, acknowledged_revision, "salesforce_id_already_present")
     if source.source_revision != acknowledged_revision:
         return _finish(reference, acknowledged_revision, "source_revision_drift")
     try:

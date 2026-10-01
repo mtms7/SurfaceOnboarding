@@ -386,10 +386,31 @@ def salesforce_id_writeback_plan(route: str | None, readback: dict[str, str] | N
     return {**plan, "status": "matches_salesforce" if same else "conflict"}
 
 
+def salesforce_id_already_present(route: str | None, row: dict[str, str | None]) -> bool:
+    """True when the route's mapped Salesforce ID field already holds a value.
+
+    Such a CO was onboarded before (usually in production); the runner refuses
+    to create or dry-run it (salesforce_id_already_present).
+    """
+    mapping = SALESFORCE_ID_MAPPING.get(route or "")
+    return mapping is not None and bool((row.get(mapping[1]) or "").strip())
+
+
+_SALESFORCE_ID_PRESENT_SECTION = (
+    "<section class='manual-action' aria-labelledby='sf-id-present-title'><div><h2 id='sf-id-present-title'>Already has an ID in Salesforce</h2>"
+    "<p>The Salesforce ID field for this route is already set, so this CO was probably onboarded in production. "
+    "The attended runner will not create or dry-run it.</p></div>"
+    "<button type='button' disabled aria-disabled='true'>Start onboarding blocked</button>"
+    "<p class='manual-blocker'>Review the existing tenant manually. Nothing was sent to Leonardo or Salesforce.</p></section>"
+)
+
+
 SALESFORCE_ID_STATUS = {
     "ready_to_write": ("source-ready", "✓", "Ready to write", "Captured from Leonardo Development; the Salesforce field is empty."),
-    "matches_salesforce": ("source-ready", "✓", "Matches Salesforce", "The Salesforce field already holds the captured value."),
-    "conflict": ("source-blocked", "!", "Conflict", "Salesforce holds a different value. Do not overwrite it; reconcile manually."),
+    "matches_salesforce": ("source-ready", "✓", "Matches Salesforce", "The Salesforce field already holds the captured Leonardo Development value."),
+    "conflict": ("source-warn", "!", "Salesforce already has an ID",
+                 "Salesforce holds a different ID (probably the production tenant). It stays authoritative; "
+                 "the Leonardo Development ID is test evidence only and will never be written."),
     "not_captured": ("", "–", "Not captured yet", "No local Leonardo readback for this CO yet. It is captured when the tenant is created, or by a read-only readback of an existing tenant."),
 }
 
@@ -408,12 +429,12 @@ def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, 
     icon_style = "" if cls else " style='background:#9aa1ad'"
     rows = f"<dt>Salesforce field</dt><dd><code>{escape(plan['field'])}</code></dd>"
     if "leonardo_value" in plan:
-        rows += f"<dt>{escape(plan['label'])} (Leonardo)</dt><dd><code style='user-select:all'>{escape(plan['leonardo_value'])}</code></dd>"
+        rows += f"<dt>{escape(plan['label'])} (<b>Leonardo Development</b>)</dt><dd><code style='user-select:all'>{escape(plan['leonardo_value'])}</code></dd>"
     rows += f"<dt>Current Salesforce value</dt><dd>{escape(plan['salesforce_value']) if plan['salesforce_value'] else 'Empty'}</dd>"
     other = {"account_uuid": "surface_account_id", "surface_account_id": "account_uuid"}[SALESFORCE_ID_MAPPING[route or ""][0]]
     if readback is not None and readback.get(other):
         other_label = "Surface Account ID" if other == "surface_account_id" else "Account UUID"
-        rows += f"<dt>Also captured (not written)</dt><dd>{other_label}: <code>{escape(readback[other])}</code></dd>"
+        rows += f"<dt>Also captured (not written)</dt><dd>{other_label} (Leonardo Development): <code>{escape(readback[other])}</code></dd>"
     return (head.format(cls=" " + cls if cls else "") + f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span><div>"
             f"<h2 id='salesforce-ids-title'>Salesforce IDs · {escape(title)}</h2><p>{escape(message)}</p>"
             "<p class='login-safety'>Not written. Salesforce updates are manual for now.</p></div></div>"
@@ -1391,6 +1412,8 @@ def classify_queue_row(row: dict[str, str | None], record: dict[str, str] | None
     if record is not None and result is not None and result not in _TENANT_RESULTS:
         if result in ("duplicate_found", "duplicate_ambiguous"):
             return "review", "<b>Review existing tenant</b><span class='sub'>Duplicate check stopped the run</span>", "you"
+        if result == "salesforce_id_already_present":
+            return "review", "<b>Review existing tenant</b><span class='sub'>Already has an ID in Salesforce</span>", "you"
         return "review", "<b>Review failed run</b><span class='sub'>Nothing was created</span>", "you"
     local_state = row.get("Local_Leonardo_State")
     if result in _TENANT_RESULTS or local_state is not None or stage in _TENANT_STAGES:
@@ -1665,6 +1688,9 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                 "<button type='button' disabled aria-disabled='true'>Case 4 route blocked</button>"
                 "<p class='manual-blocker'>Blocked independently from Salesforce source readiness: owner-approved Case 4 mapping is required.</p></section>"
             )
+        elif (ce_automated or surface_automated) and salesforce_id_already_present(route_for(row), row) \
+                and reference not in attended_leonardo_readbacks():
+            manual_action = _SALESFORCE_ID_PRESENT_SECTION
         elif ce_automated:
             manual_action = _ce_only_onboard_section(reference)
         elif surface_automated:
@@ -1922,6 +1948,7 @@ RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "duplicate_ambiguous": ("blocked", "A tenant with a similar name exists, or the search returned more results than could be checked. Nothing was created. Review it in Leonardo Development before retrying."),
     "duplicate_search_schema_unavailable": ("blocked", "The Tenant Management search control could not be found (page-layout/selector issue). No tenant was created."),
     "duplicate_schema_unavailable": ("blocked", "The tenant table could not be classified (unexpected row layout). No tenant was created. Diagnostics were captured; retry after review."),
+    "salesforce_id_already_present": ("blocked", "The Salesforce ID field for this route is already set, so this CO was probably onboarded in production. Nothing was created; review the existing tenant manually."),
     "source_revision_drift": ("blocked", "The Salesforce source changed during the run. No tenant was created. Re-run the fill preflight."),
     "development_login_timeout": ("blocked", "Tenant Management was not reached within the wait window. No tenant was created. Re-run and complete SSO/MFA."),
     "ce_route_mismatch": ("blocked", "This CO is not a new Credential Exposure onboarding (Onboarding Product and Type), so the CE-only runner stopped before opening the browser. Nothing was created."),
@@ -2075,6 +2102,7 @@ PENTERA_CSS = (
     ".readiness-heading{display:flex;gap:12px;align-items:flex-start}"
     ".readiness-icon{display:grid;place-items:center;flex:0 0 24px;height:24px;border-radius:50%;color:#fff;font-weight:800;font-size:13px}"
     ".source-ready .readiness-icon{background:#52a31f}.source-blocked .readiness-icon{background:#d92d20}"
+    ".source-warn .readiness-icon{background:#d4a106}"
     ".readiness details{margin:10px 0 0}.readiness summary{cursor:pointer;color:var(--primary);font-weight:600}"
     ".login-preflight,.manual-action{display:grid;grid-template-columns:1fr auto;gap:8px 18px;align-items:center}"
     ".login-preflight form{margin:0}.login-safety,.manual-blocker{grid-column:1/-1}"

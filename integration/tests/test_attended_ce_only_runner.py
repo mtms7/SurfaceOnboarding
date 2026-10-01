@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -474,6 +475,14 @@ class CeFillSourceTests(unittest.TestCase):
         self.assertEqual(source.subscription_end, date(2029, 9, 27))
         self.assertEqual(source.tenant_name, TENANT)
         self.assertEqual(source.primary_user_alias, "samplecompany")
+
+    def test_salesforce_account_uuid_sets_the_pre_create_flag(self):
+        with self._patch_sf([self.CO_RECORD], [self.SUBSCRIPTION_RECORD]):
+            self.assertFalse(ce_fill_source("CO-0702").salesforce_id_present)
+        with self._patch_sf([dict(self.CO_RECORD, Account_UUID__c="b" * 32)], [self.SUBSCRIPTION_RECORD]):
+            self.assertTrue(ce_fill_source("CO-0702").salesforce_id_present)
+        with self._patch_sf([dict(self.CO_RECORD, Account_UUID__c="  ")], [self.SUBSCRIPTION_RECORD]):
+            self.assertFalse(ce_fill_source("CO-0702").salesforce_id_present)
 
     def test_two_co_rows_fail_closed(self):
         with self._patch_sf([self.CO_RECORD, self.CO_RECORD], [self.SUBSCRIPTION_RECORD]):
@@ -1903,6 +1912,19 @@ class RunEndToEndTests(unittest.TestCase):
             result = runner.run("CO-0702", REVISION, review_wait_seconds=1)
         self.assertEqual(result, "source_revision_drift")
         self.assertFalse(tracker.get("launched", False))
+
+    def test_salesforce_id_already_present_stops_before_browser_launch(self):
+        tracker: dict = {}
+        scenario = {"url": runner.TENANT_MANAGEMENT, "tenants": [], "details": {}, "tenant": TENANT, "domain": MAIN_DOMAIN}
+        page = self._install_fake_playwright(scenario, tracker)
+        source = dataclasses.replace(self._source(), salesforce_id_present=True)
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run), patch.object(runner, "ce_fill_source", return_value=source), \
+                    patch.object(runner, "RUNNER_STATE_PATH", self._temp_path("state.json")), \
+                    patch.object(runner, "_attach_attended_browser", self._attach(page, tracker)):
+                result = runner.run("CO-0702", REVISION, review_wait_seconds=1, dry_run=dry_run)
+            self.assertEqual(result, "salesforce_id_already_present")
+            self.assertFalse(tracker.get("launched", False))
 
     def test_development_login_timeout(self):
         tracker: dict = {}
