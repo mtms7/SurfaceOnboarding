@@ -4188,7 +4188,7 @@ class SurfaceRunEndToEndTests(unittest.TestCase):
         with patch.object(runner, "RUNNER_STATE_PATH", self._temp_path("state.json")), \
                 patch.object(runner, "surface_fill_source", side_effect=AssertionError("no read")), \
                 patch.object(runner, "ce_fill_source", side_effect=AssertionError("no read")):
-            self.assertEqual(runner.run("CO-0801", SURFACE_REVISION, route="case_3_combined_baseline"),
+            self.assertEqual(runner.run("CO-0801", SURFACE_REVISION, route="case_4_renew_surface_new_ce"),
                              "route_unsupported")
             self.assertEqual(runner.run_readback("CO-0801", route="nope"), "route_unsupported")
             self.assertEqual(runner.run_duplicate_check("CO-0801", route="nope"), "route_unsupported")
@@ -4395,4 +4395,90 @@ class ScanStatusTests(unittest.TestCase):
         rows = [{"id": "c" * 24, "accountUuid": self.UUID, "accountName": "Sample Surface Co"}]
         self.assertEqual(self._run_with_rows(rows), "scan_status_tenant_not_found")
         self.assertFalse(self.status_path.exists())
+
+
+CASE3_EMAIL = "mail-sample.example"
+
+
+def _case3_source(*, ce_end=date(2027, 8, 31), surface_source=None) -> "runner.Case3FillSource":
+    return runner.Case3FillSource(surface_source or _surface_source(core_plus=True), CASE3_EMAIL,
+                                  date(2026, 9, 1), ce_end)
+
+
+class Case3RouteTests(unittest.TestCase):
+    """Case 3 (owner decisions 2026-10-01): Surface contract + CE Leaked Credentials, one tenant."""
+
+    CO = dict(SurfaceFillSourceTests.CO, Onboarding_Product__c="Surface & Credential Exposure",
+              Email_Domains__c=CASE3_EMAIL)
+
+    def _read(self, co, rows):
+        responses = [CeFillSourceTests._completed(CeFillSourceTests._sf_json([co])),
+                     CeFillSourceTests._completed(CeFillSourceTests._sf_json(rows))]
+        with patch.object(runner.subprocess, "run", side_effect=responses), \
+                patch.object(runner, "_run_day", return_value=RUN_DAY):
+            return runner.case3_fill_source("CO-0801")
+
+    ROWS = [_dealhub("Pentera Surface Go - 500 Subdomains"), _dealhub("Pentera Core Plus Commercial - 500 End Points")]
+
+    def test_valid_read_combines_both_sources(self):
+        source = self._read(self.CO, self.ROWS)
+        self.assertEqual((source.tenant_name, source.main_domain, source.ce_email_domain),
+                         (SURFACE_TENANT, SURFACE_MAIN, CASE3_EMAIL))
+        self.assertEqual((source.ce_subscription_start, source.ce_subscription_end), (date(2026, 9, 1), date(2029, 8, 31)))
+        self.assertFalse(source.salesforce_id_present)
+        self.assertTrue(self._read(dict(self.CO, Account_UUID__c="b" * 32), self.ROWS).salesforce_id_present)
+
+    def test_route_gate_and_ce_requirements_fail_closed(self):
+        cases = ((dict(self.CO, Onboarding_Product__c="Surface"), self.ROWS, "case3_route_mismatch"),
+                 (dict(self.CO, Email_Domains__c="a.example, b.example"), self.ROWS, "case3_ce_email_domain_invalid"),
+                 (self.CO, [_dealhub("Pentera Surface Go - 500 Subdomains")], "case3_core_plus_missing"))
+        for co, rows, code in cases:
+            with self.subTest(code=code), self.assertRaises(runner.SurfaceSourceError) as caught:
+                self._read(co, rows)
+            self.assertEqual(str(caught.exception), code)
+
+    def test_term_mismatch_fails_closed_with_a_plain_message(self):
+        source = _case3_source(ce_end=date(2027, 6, 30))
+        message = runner.case3_term_problem(source, RUN_DAY)
+        self.assertIn("Surface licence would end 2027-08-31", message)
+        self.assertIn("Core Plus (Credential Exposure) licence would end 2027-06-30", message)
+        with self.assertRaisesRegex(ValueError, "case3_term_mismatch"):
+            runner.case3_license_dates(source, RUN_DAY)
+        self.assertIsNone(runner.case3_term_problem(_case3_source(), RUN_DAY))
+
+    def test_fill_plan_is_the_surface_plan_plus_leaked_credentials(self):
+        source = _case3_source()
+        plan = runner.build_case3_fill(source, RUN_DAY)
+        surface = runner.build_surface_only_fill(source.surface, RUN_DAY)
+        self.assertEqual(plan["texts"]["Company name"], SURFACE_TENANT)  # no "- CE Only" suffix
+        self.assertEqual(plan["texts"]["Leaked Credentials scanned domains (Comma Separated Values)"], CASE3_EMAIL)
+        self.assertEqual(plan["selects"]["Leaked Credentials scanning interval"], "Weekly")
+        self.assertTrue(plan["checkboxes"]["leakedCredentialsAllowed"])
+        self.assertTrue(plan["checkboxes"]["apiAccessAllowed"])
+        self.assertFalse(plan["checkboxes"]["phishingEnabled"])
+        for key in ("Number of assets", "Number of domains", "Number of subdomains", "Company primary domain"):
+            self.assertEqual(plan["texts"][key], surface["texts"][key])
+        self.assertEqual(plan["selects"]["Scanning interval"], surface["selects"]["Scanning interval"])
+        self.assertTrue(plan["operator_account_empty"])
+
+    def test_duplicate_check_also_searches_the_ce_email_domain(self):
+        source = _case3_source()
+        self.assertEqual(runner.CASE3_ROUTE.duplicate_lookups(source),
+                         (("tenant_name", SURFACE_TENANT), ("primary_domain", SURFACE_MAIN),
+                          ("ce_email_domain", CASE3_EMAIL)))
+        self.assertEqual(runner.CASE3_ROUTE.lookup_domain(source, "ce_email_domain"), CASE3_EMAIL)
+        self.assertEqual(runner.CASE3_ROUTE.lookup_domain(source, "primary_domain"), SURFACE_MAIN)
+        # The other routes are unchanged.
+        self.assertEqual(len(runner.SURFACE_ROUTE.duplicate_lookups(_surface_source())), 2)
+        self.assertIn(CASE3_EMAIL, runner.CASE3_ROUTE.redactions(source))
+
+    def test_term_mismatch_stops_a_run_before_the_browser(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(runner, "RUNNER_STATE_PATH", Path(folder) / "state.json"), \
+                patch.object(runner, "case3_fill_source", return_value=_case3_source(ce_end=date(2027, 6, 30))), \
+                patch.object(runner, "_run_day", return_value=RUN_DAY), \
+                patch.object(runner, "_attach_attended_browser", side_effect=AssertionError("no browser")):
+            result = runner.run("CO-0801", SURFACE_REVISION, route="case_3_combined_baseline")
+        self.assertEqual(result, "case3_term_mismatch")
 

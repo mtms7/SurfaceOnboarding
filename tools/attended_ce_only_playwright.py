@@ -45,6 +45,7 @@ evidence.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -587,7 +588,7 @@ SURFACE_ENGINE = "case_1_new_surface_only"
 SURFACE_ROUTE_PRODUCT = "Surface"
 SURFACE_ROUTE_TYPE = "New Product Onboarding"
 # Engine values a runner-state record may carry in its optional "route" key.
-RUNNER_STATE_ROUTES = frozenset({CE_ENGINE, SURFACE_ENGINE})
+RUNNER_STATE_ROUTES = frozenset({CE_ENGINE, SURFACE_ENGINE, "case_3_combined_baseline"})
 # Core Plus detection lives behind is_core_plus_baseline_row so the rule can
 # change in one place: any "Pentera Core Plus ..." baseline row (Commercial,
 # Enterprise, any tier); "Bulk"/"Additional" rows are add-ons of a Core Plus
@@ -855,35 +856,155 @@ def surface_fill_source(reference: str, run_day: date | None = None) -> SurfaceF
         if (row.get("Onboarding_Product__c") != SURFACE_ROUTE_PRODUCT
                 or row.get("Onboarding_Type__c") != SURFACE_ROUTE_TYPE):
             raise SurfaceSourceError("surface_route_mismatch")
-        revision = row.get("LastModifiedDate")
-        account_id = row.get("Account__c")
-        account_name = row.get("Account_Name__c")
-        country = row.get("Account_Country__c")
-        if not isinstance(revision, str) or not revision:
-            raise ValueError()
-        if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
-            raise ValueError()
-        if not isinstance(account_name, str) or not " ".join(account_name.split()):
-            raise ValueError()
-        if not isinstance(country, str) or not " ".join(country.split()):
-            raise ValueError()
-        main, roots, subdomains = classify_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
-        names = surface_names(account_name)
-        subscription_rows = _sf_records(
-            "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
-            "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
-            "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
-        entitlement = select_surface_entitlement(subscription_rows, run_day)
-        if 1 + len(roots) > entitlement.licensed_subdomains:
-            raise SurfaceSourceError("surface_domains_exceed_license")
-        return SurfaceFillSource(
-            reference, revision, account_id, " ".join(account_name.split()), " ".join(country.split()),
-            main, roots, subdomains, entitlement, names.tenant_name, names.primary_user_alias,
-            salesforce_id_present=bool((row.get("Surface_Account_ID__c") or "").strip()))
+        source, _subscription_rows = _surface_source_from_row(reference, row, run_day)
+        return dataclasses.replace(
+            source, salesforce_id_present=bool((row.get("Surface_Account_ID__c") or "").strip()))
     except SurfaceSourceError:
         raise
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise SurfaceSourceError("surface_source_unavailable") from exc
+
+
+def _surface_source_from_row(reference: str, row: dict[str, Any],
+                             run_day: date | None = None) -> tuple[SurfaceFillSource, list[Any]]:
+    """Validate one CO row and read its DealHub rows into a Surface source.
+
+    Shared by the Surface-only and the combined (Case 3) routes; the caller
+    checks the route and wraps errors. Returns the source and the DealHub rows.
+    """
+    revision = row.get("LastModifiedDate")
+    account_id = row.get("Account__c")
+    account_name = row.get("Account_Name__c")
+    country = row.get("Account_Country__c")
+    if not isinstance(revision, str) or not revision:
+        raise ValueError()
+    if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
+        raise ValueError()
+    if not isinstance(account_name, str) or not " ".join(account_name.split()):
+        raise ValueError()
+    if not isinstance(country, str) or not " ".join(country.split()):
+        raise ValueError()
+    main, roots, subdomains = classify_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
+    names = surface_names(account_name)
+    subscription_rows = _sf_records(
+        "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
+        "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
+        "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
+    entitlement = select_surface_entitlement(subscription_rows, run_day)
+    if 1 + len(roots) > entitlement.licensed_subdomains:
+        raise SurfaceSourceError("surface_domains_exceed_license")
+    return SurfaceFillSource(
+        reference, revision, account_id, " ".join(account_name.split()), " ".join(country.split()),
+        main, roots, subdomains, entitlement, names.tenant_name, names.primary_user_alias), subscription_rows
+
+
+# --- Combined route (Case 3, engine case_3_combined_baseline) ----------------
+# Owner decisions 2026-10-01: Case 3 = the Surface-only contract plus the CE
+# contract's Leaked Credentials, on one tenant. The term rule fails closed:
+# the Surface and Core Plus (CE) expirations must agree (1a); LC scans the
+# single CE email domain (2a); both Salesforce IDs are written (3a); the
+# duplicate check also searches the CE email domain (4a).
+CASE3_ENGINE = "case_3_combined_baseline"
+CASE3_ROUTE_PRODUCT = "Surface & Credential Exposure"
+CASE3_ROUTE_TYPE = "New Product Onboarding"
+
+
+@dataclass(frozen=True)
+class Case3FillSource:
+    """Surface source plus the CE email domain and Core Plus term (in memory only)."""
+
+    surface: SurfaceFillSource
+    ce_email_domain: str
+    ce_subscription_start: date
+    ce_subscription_end: date
+    salesforce_id_present: bool = False
+
+    def __getattr__(self, name: str) -> Any:
+        # Surface fields (reference, source_revision, tenant_name, ...) by delegation.
+        if name == "surface":
+            raise AttributeError(name)
+        return getattr(self.surface, name)
+
+
+def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillSource:
+    """Fresh, fixed-field Case 3 source read (one CO read, one DealHub read).
+
+    The CO must be exactly "Surface & Credential Exposure" / "New Product
+    Onboarding" (case3_route_mismatch), carry exactly one valid CE email
+    domain (case3_ce_email_domain_invalid), and have a Core Plus row
+    (case3_core_plus_missing) with an unambiguous Core Plus Commercial term.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise RuntimeError("invalid_co_reference")
+    try:
+        rows = _sf_records(
+            "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
+            "Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Onboarding_Product__c, Onboarding_Type__c, "
+            "Surface_Account_ID__c, Account_UUID__c "
+            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+            raise ValueError()
+        row = rows[0]
+        if (row.get("Onboarding_Product__c") != CASE3_ROUTE_PRODUCT
+                or row.get("Onboarding_Type__c") != CASE3_ROUTE_TYPE):
+            raise SurfaceSourceError("case3_route_mismatch")
+        email_domain = one_email_domain(row.get("Email_Domains__c"))
+        if email_domain is None:
+            raise SurfaceSourceError("case3_ce_email_domain_invalid")
+        surface, subscription_rows = _surface_source_from_row(reference, row, run_day)
+        if not surface.entitlement.core_plus_present:
+            raise SurfaceSourceError("case3_core_plus_missing")
+        try:
+            ce_start, ce_end = select_ce_subscription(subscription_rows)
+        except SurfaceSourceError:
+            raise
+        except RuntimeError as error:
+            raise SurfaceSourceError(str(error)) from error
+        present = any((row.get(field) or "").strip() for field in ("Surface_Account_ID__c", "Account_UUID__c"))
+        return Case3FillSource(surface, email_domain, ce_start, ce_end, salesforce_id_present=present)
+    except SurfaceSourceError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise SurfaceSourceError("case3_source_unavailable") from exc
+
+
+def case3_term_problem(source: Case3FillSource, run_day: date | None = None) -> str | None:
+    """Plain-language explanation when the Surface and Core Plus terms disagree, else None."""
+    surface_start, surface_end = surface_run_license_dates(source.surface, run_day)
+    ce_start, ce_end = ce_run_license_dates(source.ce_subscription_start, source.ce_subscription_end, run_day)
+    if surface_end == ce_end:
+        return None
+    return (f"The Surface licence would end {surface_end.isoformat()} but the Core Plus (Credential Exposure) "
+            f"licence would end {ce_end.isoformat()}. One tenant has one licence term, so this CO needs a "
+            "manual review: correct the DealHub terms in Salesforce, or onboard it manually.")
+
+
+def case3_license_dates(source: Case3FillSource, run_day: date | None = None) -> tuple[date, date]:
+    """The shared licence dates; raises ValueError("case3_term_mismatch") when the terms disagree (1a)."""
+    if case3_term_problem(source, run_day) is not None:
+        raise ValueError("case3_term_mismatch")
+    return surface_run_license_dates(source.surface, run_day)
+
+
+def build_case3_fill(source: Case3FillSource, run_day: date | None = None) -> dict[str, Any]:
+    """The Surface-only plan with Leaked Credentials ON for the CE email domain."""
+    start, end = case3_license_dates(source, run_day)
+    plan = build_surface_only_fill(source.surface, run_day)
+    plan["texts"]["Leaked Credentials scanned domains (Comma Separated Values)"] = source.ce_email_domain
+    plan["selects"]["Leaked Credentials scanning interval"] = "Weekly"
+    plan["checkboxes"]["leakedCredentialsAllowed"] = True
+    plan["checkboxes"]["apiAccessAllowed"] = True  # Core Plus is required on this route
+    plan["license_start"], plan["license_end"] = start, end
+    return plan
+
+
+def case3_scope_summary(source: Case3FillSource, run_day: date | None = None) -> dict[str, Any]:
+    """Surface scope summary plus the CE overlay (counts only)."""
+    scope = surface_scope_summary(source.surface, run_day)
+    start, end = case3_license_dates(source, run_day)
+    scope.update({"license_start": start.isoformat(), "license_end": end.isoformat(),
+                  "leaked_credentials_domains": 1, "leaked_credentials_interval": "Weekly"})
+    return scope
 
 
 def surface_run_license_dates(source: SurfaceFillSource, run_day: date | None = None) -> tuple[date, date]:
@@ -1026,9 +1147,20 @@ class RouteContract:
     redactions: Any  # (source) -> tuple[str, ...]
     allow_scan_started: bool
 
+    extra_lookups: Any = None  # (source) -> tuple[(name, lookup, expected_domain), ...]
+
     def duplicate_lookups(self, source: Any) -> tuple[tuple[str, str], ...]:
-        """Duplicate check: tenant name, then primary domain (both routes)."""
-        return (("tenant_name", source.tenant_name), ("primary_domain", self.primary_domain(source)))
+        """Duplicate check: tenant name, then primary domain, then any route extras."""
+        lookups = (("tenant_name", source.tenant_name), ("primary_domain", self.primary_domain(source)))
+        extras = self.extra_lookups(source) if self.extra_lookups else ()
+        return lookups + tuple((name, lookup) for name, lookup, _domain in extras)
+
+    def lookup_domain(self, source: Any, lookup_name: str) -> str:
+        """The domain a lookup's rows are compared against (the primary domain by default)."""
+        for name, _lookup, domain in (self.extra_lookups(source) if self.extra_lookups else ()):
+            if name == lookup_name:
+                return domain
+        return self.primary_domain(source)
 
 
 def _ce_license_dates(source: CeFillSource, run_day: date | None = None) -> tuple[date, date]:
@@ -1058,7 +1190,20 @@ SURFACE_ROUTE = RouteContract(
                                surface_primary_user_email(source)),
     allow_scan_started=True,
 )
-ROUTES = {CE_ENGINE: CE_ROUTE, SURFACE_ENGINE: SURFACE_ROUTE}
+CASE3_ROUTE = RouteContract(
+    engine=CASE3_ENGINE,
+    load_source=lambda reference: case3_fill_source(reference),
+    license_dates=lambda source, run_day=None: case3_license_dates(source, run_day),
+    build_fill=lambda source, run_day=None: build_case3_fill(source, run_day),
+    primary_domain=lambda source: source.main_domain,
+    redactions=lambda source: (source.account_name, source.tenant_name, source.main_domain,
+                               *source.alternate_domains, *source.subdomains, source.ce_email_domain,
+                               surface_primary_user_email(source)),
+    allow_scan_started=True,
+    # 4a: an existing CE-only tenant for the customer is found by its email domain.
+    extra_lookups=lambda source: (("ce_email_domain", source.ce_email_domain, source.ce_email_domain),),
+)
+ROUTES = {CE_ENGINE: CE_ROUTE, SURFACE_ENGINE: SURFACE_ROUTE, CASE3_ENGINE: CASE3_ROUTE}
 
 
 def _format_date_for_placeholder(value: date, placeholder: Any) -> str:
@@ -4134,14 +4279,15 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                 if diagnose:
                     _diagnose_alternate_domain_searches(page, search, source, tenant_name)
                 for lookup_name, lookup in contract.duplicate_lookups(source):
+                    lookup_domain = contract.lookup_domain(source, lookup_name)
                     searched = _search_tenants(page, search, lookup)
                     if searched is None:
                         duplicate = "duplicate_schema_unavailable"
                     else:
-                        duplicate = _settled_tenant_rows(page, tenant_name, main_domain)
+                        duplicate = _settled_tenant_rows(page, tenant_name, lookup_domain)
                         if duplicate == "duplicate_clear":
                             # Independent check against the server's own rows.
-                            duplicate = _api_duplicate(searched, tenant_name, main_domain)
+                            duplicate = _api_duplicate(searched, tenant_name, lookup_domain)
                     log.event("duplicate_check", duplicate, lookup_name)
                     if duplicate != "duplicate_clear":
                         if duplicate in ("duplicate_schema_unavailable", "duplicate_ambiguous"):
@@ -4441,6 +4587,8 @@ def _scan_status_tenant_name(reference: str) -> str:
         raise ValueError()
     product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
     if product == SURFACE_ROUTE_PRODUCT and onboarding_type == SURFACE_ROUTE_TYPE:
+        return surface_names(account_name).tenant_name
+    if product == CASE3_ROUTE_PRODUCT and onboarding_type == CASE3_ROUTE_TYPE:
         return surface_names(account_name).tenant_name
     if product == CE_ROUTE_PRODUCT and onboarding_type == CE_ROUTE_TYPE:
         return ce_only_names(account_name).tenant_name

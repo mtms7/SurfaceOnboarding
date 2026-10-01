@@ -46,6 +46,12 @@ from tools.attended_ce_only_playwright import (
     CE_ROUTE_PRODUCT,
     CE_ROUTE_TYPE,
     SURFACE_ENGINE,
+    CASE3_ENGINE,
+    CASE3_ROUTE_PRODUCT,
+    CASE3_ROUTE_TYPE,
+    case3_fill_source,
+    case3_scope_summary,
+    case3_term_problem,
     SURFACE_ROUTE_PRODUCT,
     SURFACE_ROUTE_TYPE,
     close_automation_browser,
@@ -154,6 +160,8 @@ class SurfaceScopePreflight:
     blockers: tuple[str, ...]
     scope: dict[str, object] | None = None
     core_plus_present: bool = False
+    route: str = SURFACE_ENGINE
+    blocker_details: tuple[str, ...] = ()
 
     @property
     def eligible_for_fill_review(self) -> bool:
@@ -249,14 +257,18 @@ def start_attended_ce_only_runner(reference: str, revision: str) -> bool:
         return False
 
 
-def start_attended_surface_runner(reference: str, revision: str) -> bool:
-    """Launch one desktop-only Surface-only (Case 1) auto-confirm process."""
+# Routes that use the Surface scope review and Start card (Case 1 and Case 3).
+SURFACE_ROUTES = frozenset({SURFACE_ENGINE, CASE3_ENGINE})
+
+
+def start_attended_surface_runner(reference: str, revision: str, route: str = SURFACE_ENGINE) -> bool:
+    """Launch one desktop-only Surface-only (Case 1) or combined (Case 3) auto-confirm process."""
     if (not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
-            or not ATTENDED_CE_ONLY_RUNNER.is_file()):
+            or not ATTENDED_CE_ONLY_RUNNER.is_file() or route not in SURFACE_ROUTES):
         return False
     try:
         subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--co", reference, "--revision", revision,
-                          "--route", SURFACE_ENGINE],
+                          "--route", route],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except OSError:
@@ -354,6 +366,8 @@ def route_for(row: dict[str, str | None]) -> str | None:
         return CE_ENGINE
     if product == SURFACE_ROUTE_PRODUCT and onboarding_type == SURFACE_ROUTE_TYPE:
         return SURFACE_ENGINE
+    if product == CASE3_ROUTE_PRODUCT and onboarding_type == CASE3_ROUTE_TYPE:
+        return CASE3_ENGINE
     return None
 
 
@@ -441,7 +455,7 @@ def display_read_at() -> str:
 
 
 @_display_cached
-def evaluate_surface_fill_preflight(reference: str) -> SurfaceScopePreflight:
+def evaluate_surface_fill_preflight(reference: str, route: str = SURFACE_ENGINE) -> SurfaceScopePreflight:
     """Fresh read of the Surface-only source through the runner's own reader.
 
     The dashboard and the runner compute the scope with the same code. Any
@@ -449,6 +463,8 @@ def evaluate_surface_fill_preflight(reference: str) -> SurfaceScopePreflight:
     """
     if not REFERENCE.fullmatch(reference):
         raise ReadUnavailable()
+    if route == CASE3_ENGINE:
+        return _evaluate_case3_preflight(reference)
     try:
         source = surface_fill_source(reference)
     except RuntimeError as error:
@@ -459,6 +475,24 @@ def evaluate_surface_fill_preflight(reference: str) -> SurfaceScopePreflight:
         return SurfaceScopePreflight(reference, source.source_revision, (str(error),),
                                      core_plus_present=source.core_plus_present)
     return SurfaceScopePreflight(reference, source.source_revision, (), scope, source.core_plus_present)
+
+
+def _evaluate_case3_preflight(reference: str) -> SurfaceScopePreflight:
+    """Case 3: the Surface scope plus the CE overlay; a term mismatch says why (1a)."""
+    try:
+        source = case3_fill_source(reference)
+    except RuntimeError as error:
+        return SurfaceScopePreflight(reference, "", (str(error),), route=CASE3_ENGINE)
+    try:
+        problem = case3_term_problem(source)
+    except ValueError:
+        problem = None
+    try:
+        scope = case3_scope_summary(source)
+    except ValueError as error:
+        return SurfaceScopePreflight(reference, source.source_revision, (str(error),), core_plus_present=True,
+                                     route=CASE3_ENGINE, blocker_details=(problem,) if problem else ())
+    return SurfaceScopePreflight(reference, source.source_revision, (), scope, True, route=CASE3_ENGINE)
 
 
 def evaluate_surface_start(acknowledged_revision: str | None, scope_digest: str | None,
@@ -525,49 +559,68 @@ def evaluate_ce_only_start(acknowledged_revision: str | None, evaluation: Creden
     return "start"
 
 
-# Owner decision 2026-10-01: which Leonardo identifier belongs in which
-# Salesforce CO field, per route. Routes not listed have no decided mapping
-# and fail closed. Display only; no Salesforce write uses this yet.
-SALESFORCE_ID_MAPPING: dict[str, tuple[str, str, str]] = {
-    # route: (readback key, Salesforce field, label)
-    CE_ENGINE: ("account_uuid", "Account_UUID__c", "Account UUID"),
-    SURFACE_ENGINE: ("surface_account_id", "Surface_Account_ID__c", "Surface Account ID"),
+# Owner decisions 2026-10-01: which Leonardo identifier belongs in which
+# Salesforce CO field, per route (Case 3 writes both, decision 3a). Routes not
+# listed have no decided mapping and fail closed.
+SALESFORCE_ID_MAPPING: dict[str, tuple[tuple[str, str, str], ...]] = {
+    # route: ((readback key, Salesforce field, label), ...)
+    CE_ENGINE: (("account_uuid", "Account_UUID__c", "Account UUID"),),
+    SURFACE_ENGINE: (("surface_account_id", "Surface_Account_ID__c", "Surface Account ID"),),
+    CASE3_ENGINE: (("surface_account_id", "Surface_Account_ID__c", "Surface Account ID"),
+                   ("account_uuid", "Account_UUID__c", "Account UUID")),
 }
 
 
 def salesforce_id_writeback_plan(route: str | None, readback: dict[str, str] | None,
-                                 row: dict[str, str | None]) -> dict[str, str]:
-    """Compare the captured Leonardo identifier with the CO's Salesforce field.
+                                 row: dict[str, str | None]) -> dict[str, object]:
+    """Compare the captured Leonardo identifiers with the CO's mapped Salesforce fields.
 
     Status is one of "mapping_not_decided", "not_captured", "ready_to_write"
-    (Salesforce field empty), "matches_salesforce", or "conflict" (Salesforce
-    holds a different value). It never writes anything.
+    (at least one mapped field empty, none different), "matches_salesforce"
+    (all equal), or "conflict" (any field holds a different value). "items"
+    lists every mapped field; a single-field route also carries its field,
+    label, salesforce_value, and leonardo_value at the top level. It never
+    writes anything.
     """
     mapping = SALESFORCE_ID_MAPPING.get(route or "")
     if mapping is None:
         return {"status": "mapping_not_decided"}
-    key, field, label = mapping
-    plan = {"field": field, "label": label, "salesforce_value": (row.get(field) or "").strip()}
-    leonardo_value = (readback or {}).get(key)
-    if not leonardo_value:
-        return {**plan, "status": "not_captured"}
-    plan["leonardo_value"] = leonardo_value
-    current = plan["salesforce_value"]
-    # The UUID is hexadecimal, so letter case does not change its identity.
-    same = current.casefold() == leonardo_value.casefold() if key == "account_uuid" else current == leonardo_value
-    if not current:
-        return {**plan, "status": "ready_to_write"}
-    return {**plan, "status": "matches_salesforce" if same else "conflict"}
+    items: list[dict[str, str]] = []
+    for key, field, label in mapping:
+        item = {"key": key, "field": field, "label": label, "salesforce_value": (row.get(field) or "").strip()}
+        leonardo_value = (readback or {}).get(key)
+        if leonardo_value:
+            item["leonardo_value"] = leonardo_value
+            current = item["salesforce_value"]
+            # The UUID is hexadecimal, so letter case does not change its identity.
+            same = current.casefold() == leonardo_value.casefold() if key == "account_uuid" else current == leonardo_value
+            item["status"] = "ready_to_write" if not current else ("matches_salesforce" if same else "conflict")
+        else:
+            item["status"] = "not_captured"
+        items.append(item)
+    statuses = {item["status"] for item in items}
+    if "not_captured" in statuses:
+        status = "not_captured"
+    elif "conflict" in statuses:
+        status = "conflict"
+    elif "ready_to_write" in statuses:
+        status = "ready_to_write"
+    else:
+        status = "matches_salesforce"
+    plan: dict[str, object] = {"status": status, "items": items}
+    if len(items) == 1:
+        plan.update({k: v for k, v in items[0].items() if k in ("field", "label", "salesforce_value", "leonardo_value")})
+    return plan
 
 
 def salesforce_id_already_present(route: str | None, row: dict[str, str | None]) -> bool:
-    """True when the route's mapped Salesforce ID field already holds a value.
+    """True when any of the route's mapped Salesforce ID fields already holds a value.
 
     Such a CO was onboarded before (usually in production); the runner refuses
     to create or dry-run it (salesforce_id_already_present).
     """
-    mapping = SALESFORCE_ID_MAPPING.get(route or "")
-    return mapping is not None and bool((row.get(mapping[1]) or "").strip())
+    mapping = SALESFORCE_ID_MAPPING.get(route or "", ())
+    return any((row.get(field) or "").strip() for _key, field, _label in mapping)
 
 
 _SALESFORCE_ID_PRESENT_SECTION = (
@@ -606,13 +659,21 @@ class IdWritebackEvaluation:
     reference: str
     co_id: str
     source_revision: str
-    field: str
-    value: str
+    fields: tuple[str, ...]
+    values: tuple[str, ...]
     blocker: str = ""
 
     @property
+    def field(self) -> str:
+        return ", ".join(self.fields)
+
+    @property
+    def value(self) -> str:
+        return ", ".join(self.values)
+
+    @property
     def binding(self) -> str:
-        return sha256("|".join((self.reference, self.co_id, self.source_revision, self.field, self.value)).encode()).hexdigest()
+        return sha256("|".join((self.reference, self.co_id, self.source_revision, *self.fields, *self.values)).encode()).hexdigest()
 
 
 def salesforce_id_writebacks() -> dict[str, dict[str, str]]:
@@ -658,17 +719,19 @@ def evaluate_id_writeback(reference: str) -> IdWritebackEvaluation:
     co_id, revision = row.get("Id") or "", row.get("LastModifiedDate") or ""
     readback = attended_leonardo_readbacks().get(reference)
     plan = salesforce_id_writeback_plan(route_for(row), readback, row)
-    field, value = plan.get("field", ""), plan.get("leonardo_value", "")
+    pending = [item for item in plan.get("items", ()) if item["status"] == "ready_to_write"]  # type: ignore[union-attr]
+    fields = tuple(item["field"] for item in pending)
+    values = tuple(item["leonardo_value"] for item in pending)
     blocker = ""
     if plan["status"] != "ready_to_write":
-        blocker = plan["status"]
+        blocker = str(plan["status"])
     elif not re.fullmatch(r"[A-Za-z0-9]{15,18}", co_id) or not revision:
         blocker = "source_invalid"
-    elif not re.fullmatch(ID_VALUE_PATTERNS.get(field, r"(?!)"), value):
+    elif not fields or not all(re.fullmatch(ID_VALUE_PATTERNS.get(f, r"(?!)"), v) for f, v in zip(fields, values)):
         blocker = "value_invalid"
     elif salesforce_id_writebacks().get(reference, {}).get("result") == "write_uncertain":
         blocker = "previous_write_uncertain"
-    return IdWritebackEvaluation(reference, co_id, revision, field, value, blocker)
+    return IdWritebackEvaluation(reference, co_id, revision, fields, values, blocker)
 
 
 def issue_id_writeback_ack(evaluation: IdWritebackEvaluation, *, now: float | None = None) -> str:
@@ -696,9 +759,10 @@ def write_salesforce_id_after_confirmation(evaluation: IdWritebackEvaluation, no
     if evaluation.blocker or not consume_id_writeback_ack(evaluation, nonce):
         return "write_blocked"
     field, value = evaluation.field, evaluation.value
+    assignments = " ".join(f + "=" + v for f, v in zip(evaluation.fields, evaluation.values))
     try:
         update = sf_write_json(["data", "update", "record", "--sobject", "Customer_Onboarding__c",
-                                "--record-id", evaluation.co_id, "--values", field + "=" + value, "--json"])
+                                "--record-id", evaluation.co_id, "--values", assignments, "--json"])
         if update.get("status") != 0:  # type: ignore[union-attr]
             result = "write_rejected"
             _record_id_writeback(evaluation.reference, field, value, result)
@@ -708,11 +772,12 @@ def write_salesforce_id_after_confirmation(evaluation: IdWritebackEvaluation, no
         _record_id_writeback(evaluation.reference, field, value, result)
         return result
     try:
-        readback = sf_json(["data", "query", "--query", "SELECT Name, " + field + " FROM Customer_Onboarding__c WHERE Id = '"
-                            + evaluation.co_id + "' LIMIT 2", "--json"])
+        readback = sf_json(["data", "query", "--query", "SELECT Name, " + ", ".join(evaluation.fields)
+                            + " FROM Customer_Onboarding__c WHERE Id = '" + evaluation.co_id + "' LIMIT 2", "--json"])
         rows = readback["result"]["records"]  # type: ignore[index]
         verified = bool(readback["status"] == 0 and isinstance(rows, list) and len(rows) == 1  # type: ignore[index]
-                        and rows[0].get("Name") == evaluation.reference and rows[0].get(field) == value)
+                        and rows[0].get("Name") == evaluation.reference
+                        and all(rows[0].get(f) == v for f, v in zip(evaluation.fields, evaluation.values)))
     except (ReadUnavailable, KeyError, TypeError, AttributeError):
         verified = False
     result = "written_verified" if verified else "write_uncertain"
@@ -732,10 +797,11 @@ def page_id_writeback_confirmation(evaluation: IdWritebackEvaluation, nonce: str
     ref = escape(evaluation.reference)
     body = ("<h2>Write the Leonardo Development ID to Salesforce</h2>"
             "<dl><dt>CO</dt><dd>" + ref + "</dd>"
-            "<dt>Salesforce field</dt><dd><code>" + escape(evaluation.field) + "</code> (currently empty)</dd>"
-            "<dt>Value (Leonardo Development)</dt><dd><code>" + escape(evaluation.value) + "</code></dd>"
+            + "".join("<dt>Salesforce field</dt><dd><code>" + escape(f) + "</code> (currently empty)</dd>"
+                      "<dt>Value (Leonardo Development)</dt><dd><code>" + escape(v) + "</code></dd>"
+                      for f, v in zip(evaluation.fields, evaluation.values)) +
             "<dt>Source revision</dt><dd>" + escape(evaluation.source_revision) + "</dd></dl>"
-            "<p class='note'>Confirming updates only this one field, then reads it back. It does not change the stage, "
+            "<p class='note'>Confirming updates only the field(s) above, then reads them back. It does not change the stage, "
             "comments, or any other field. This confirmation expires in 10 minutes and is invalidated by any change to the CO.</p>"
             "<form method='post' action='/attended/salesforce-id-writeback-confirm'>"
             "<input type='hidden' name='reference' value='" + ref + "'><input type='hidden' name='nonce' value='" + escape(nonce) + "'>"
@@ -759,14 +825,17 @@ def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, 
                 "<p>No owner-approved Salesforce field mapping exists for this route. Nothing is proposed for Salesforce.</p></div></div></section>")
     cls, icon, title, message = SALESFORCE_ID_STATUS[status]
     icon_style = "" if cls else " style='background:#9aa1ad'"
-    rows = f"<dt>Salesforce field</dt><dd><code>{escape(plan['field'])}</code></dd>"
-    if "leonardo_value" in plan:
-        rows += f"<dt>{escape(plan['label'])} (<b>Leonardo Development</b>)</dt><dd><code style='user-select:all'>{escape(plan['leonardo_value'])}</code></dd>"
-    rows += f"<dt>Current Salesforce value</dt><dd>{escape(plan['salesforce_value']) if plan['salesforce_value'] else 'Empty'}</dd>"
-    other = {"account_uuid": "surface_account_id", "surface_account_id": "account_uuid"}[SALESFORCE_ID_MAPPING[route or ""][0]]
-    if readback is not None and readback.get(other):
-        other_label = "Surface Account ID" if other == "surface_account_id" else "Account UUID"
-        rows += f"<dt>Also captured (not written)</dt><dd>{other_label} (Leonardo Development): <code>{escape(readback[other])}</code></dd>"
+    rows = ""
+    for item in plan["items"]:  # type: ignore[union-attr]
+        rows += f"<dt>Salesforce field</dt><dd><code>{escape(item['field'])}</code></dd>"
+        if "leonardo_value" in item:
+            rows += (f"<dt>{escape(item['label'])} (<b>Leonardo Development</b>)</dt>"
+                     f"<dd><code style='user-select:all'>{escape(item['leonardo_value'])}</code></dd>")
+        rows += f"<dt>Current Salesforce value</dt><dd>{escape(item['salesforce_value']) if item['salesforce_value'] else 'Empty'}</dd>"
+    mapped = {key for key, _field, _label in SALESFORCE_ID_MAPPING[route or ""]}
+    for other, other_label in (("surface_account_id", "Surface Account ID"), ("account_uuid", "Account UUID")):
+        if other not in mapped and readback is not None and readback.get(other):
+            rows += f"<dt>Also captured (not written)</dt><dd>{other_label} (Leonardo Development): <code>{escape(readback[other])}</code></dd>"
     reference = reference or row.get("Name") or ""
     last = salesforce_id_writebacks().get(reference) if REFERENCE.fullmatch(reference) else None
     note = "Not written. Pilot rule: a Leonardo Development ID is written only into an empty field, after your review."
@@ -1790,7 +1859,7 @@ def classify_queue_row(row: dict[str, str | None], record: dict[str, str] | None
         return "review", "<b>Set approval status</b><span class='sub'>Approval status not populated</span>", "you"
     if approval == "Approved" and stage in ("New", "Request Approved"):
         route = route_for(row)
-        if route == SURFACE_ENGINE:
+        if route in SURFACE_ROUTES:
             return "ready", "<b>Review scope, start</b>", "you"
         if route == CE_ENGINE:
             return "ready", "<b>Start onboarding</b>", "you"
@@ -1819,6 +1888,8 @@ def _route_chip(row: dict[str, str | None]) -> str:
         return "<span class='chip chip-info'>CE-only</span>"
     if route == SURFACE_ENGINE:
         return "<span class='chip chip-info'>Surface-only</span>"
+    if route == CASE3_ENGINE:
+        return "<span class='chip chip-info'>Surface + CE</span>"
     return "<span class='chip chip-neutral'>Manual</span>"
 
 
@@ -2024,7 +2095,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         ce_automated = not is_case4 and ce_only_eligible(row) and not is_renewal
         # Surface-only (Case 1): exact Product "Surface" + Type "New Product
         # Onboarding" only; every other CO keeps its existing behaviour.
-        surface_automated = not is_case4 and not is_renewal and route_for(row) == SURFACE_ENGINE
+        surface_automated = not is_case4 and not is_renewal and route_for(row) in SURFACE_ROUTES
         # The "not enabled" explanation only applies to routes without an
         # automated onboarding; it is contradictory on a CE-only/Surface CO.
         not_enabled = ("" if ce_automated or surface_automated else
@@ -2052,7 +2123,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         elif ce_automated:
             manual_action = _ce_only_onboard_section(reference)
         elif surface_automated:
-            manual_action = _surface_onboard_section(reference)
+            manual_action = _surface_onboard_section(reference, route_for(row) or SURFACE_ENGINE)
         else:
             session_check = (
                 "<section class='login-preflight' aria-labelledby='login-preflight-title'><div><h2 id='login-preflight-title'>Leonardo Development session check</h2>"
@@ -2314,6 +2385,11 @@ RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "duplicate_ambiguous": ("blocked", "A tenant with a similar name exists, or the search returned more results than could be checked. Nothing was created. Review it in Leonardo Development before retrying."),
     "duplicate_search_schema_unavailable": ("blocked", "The Tenant Management search control could not be found (page-layout/selector issue). No tenant was created."),
     "duplicate_schema_unavailable": ("blocked", "The tenant table could not be classified (unexpected row layout). No tenant was created. Diagnostics were captured; retry after review."),
+    "case3_route_mismatch": ("blocked", "This CO is not a new Surface &amp; Credential Exposure onboarding. Nothing was started."),
+    "case3_ce_email_domain_invalid": ("blocked", "Case 3 needs exactly one valid CE email domain in Email Domains. Correct it in Salesforce."),
+    "case3_core_plus_missing": ("blocked", "No Core Plus (Credential Exposure) subscription was found on the account. Nothing was started."),
+    "case3_term_mismatch": ("blocked", "The Surface and Core Plus (Credential Exposure) licence terms differ, so one tenant cannot carry both. Manual review required; nothing was created."),
+    "case3_source_unavailable": ("blocked", "The Case 3 source could not be read. Nothing was started."),
     "salesforce_id_already_present": ("blocked", "The Salesforce ID field for this route is already set, so this CO was probably onboarded in production. Nothing was created; review the existing tenant manually."),
     "source_revision_drift": ("blocked", "The Salesforce source changed during the run. No tenant was created. Re-run the fill preflight."),
     "development_login_timeout": ("blocked", "Tenant Management was not reached within the wait window. No tenant was created. Re-run and complete SSO/MFA."),
@@ -2702,6 +2778,7 @@ def _surface_start_form(evaluation: SurfaceScopePreflight) -> str:
         return ""
     return ("<form class='start-form' method='post' action='/attended/start-surface-runner'>"
             "<input type='hidden' name='reference' value='" + escape(evaluation.reference) + "'>"
+            "<input type='hidden' name='route' value='" + escape(evaluation.route) + "'>"
             "<input type='hidden' name='source_revision' value='" + escape(evaluation.source_revision) + "'>"
             "<input type='hidden' name='scope_digest' value='" + escape(evaluation.scope_digest) + "'>"
             "<button type='submit'>Start Onboarding</button>"
@@ -2735,6 +2812,9 @@ def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
     ]
     if scope.get("product_domains") is not None:
         rows.insert(6, ("Product domain allowance", str(scope["product_domains"])))
+    if scope.get("leaked_credentials_domains") is not None:
+        rows.append(("Leaked Credentials", f"ON · {scope['leaked_credentials_interval']} · "
+                                           f"{scope['leaked_credentials_domains']} CE email domain"))
     return ("<dl class='scope'>" + "".join(
         "<dt>" + label + "</dt><dd>" + escape(value) + "</dd>" for label, value in rows) + "</dl>")
 
@@ -2748,7 +2828,7 @@ def _reminder(text: str, action: str, reference: str, button: str) -> str:
             "</div></div>")
 
 
-def _surface_onboard_section(reference: str) -> str:
+def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str:
     """Render the Surface-only (Case 1) Onboard card: scope review + one Start action.
 
     Mirrors the CE-only card (chip, outcome banner, reset for failed runs) and
@@ -2756,7 +2836,7 @@ def _surface_onboard_section(reference: str) -> str:
     review, and the local Scan-now / Credential Exposure reminders.
     """
     ref = escape(reference)
-    evaluation = evaluate_surface_fill_preflight(reference)
+    evaluation = evaluate_surface_fill_preflight(reference, route)
     try:
         state = load_runner_state()
     except RunnerStateUnavailable:
@@ -2800,6 +2880,7 @@ def _surface_onboard_section(reference: str) -> str:
         blockers = "".join(
             "<p class='note'>Blocked: <code>" + escape(code) + "</code> "
             + RUNNER_RESULT_MESSAGES.get(code, ("blocked", ""))[1] + "</p>" for code in evaluation.blockers)
+        blockers += "".join("<p class='note'><b>" + escape(detail) + "</b></p>" for detail in evaluation.blocker_details)
     try:
         reminders = load_attended_reminders().get(reference, {})
         reminder_error = ""
@@ -2807,13 +2888,13 @@ def _surface_onboard_section(reference: str) -> str:
         reminders = {}
         reminder_error = "<p class='note'>The local reminders file could not be read; reminders are shown until it is repaired.</p>"
     reminder_html = ""
-    if evaluation.core_plus_present and not reminders.get(REMINDER_FIELDS["ce_enabled"]):
+    if route == SURFACE_ENGINE and evaluation.core_plus_present and not reminders.get(REMINDER_FIELDS["ce_enabled"]):
         reminder_html += _reminder(CE_REMINDER_TEXT, "/attended/mark-ce-enabled", reference, "Mark CE enabled")
-    if (record is not None and record.get("route") == SURFACE_ENGINE and record.get("result") == "readback_verified"
+    if (record is not None and record.get("route") in SURFACE_ROUTES and record.get("result") == "readback_verified"
             and not reminders.get(REMINDER_FIELDS["scan_settings_off"])):
         reminder_html += _reminder(SCAN_REMINDER_TEXT, "/attended/mark-scan-settings-off", reference,
                                    "Mark scan settings turned off")
-    if (record is not None and record.get("route") == SURFACE_ENGINE and record.get("result") == "readback_verified"
+    if (record is not None and record.get("route") in SURFACE_ROUTES and record.get("result") == "readback_verified"
             and not reminders.get(REMINDER_FIELDS["operator_assigned"])):
         reminder_html += _reminder(OPERATOR_REMINDER_TEXT, "/attended/mark-operator-assigned", reference,
                                    "Mark Operator Account assigned")
@@ -2833,9 +2914,11 @@ def _surface_onboard_section(reference: str) -> str:
     revision = evaluation.source_revision or "unavailable"
     return (
         "<section class='card onboard' aria-labelledby='onboard-title'>"
-        "<div class='card-head'><h2 id='onboard-title' class='pill'>Surface onboarding</h2>" + status_chip + "</div>"
+        "<div class='card-head'><h2 id='onboard-title' class='pill'>"
+        + ("Surface + Credential Exposure onboarding" if route == CASE3_ENGINE else "Surface onboarding")
+        + "</h2>" + status_chip + "</div>"
         + runner_note + reminder_html + reminder_error +
-        "<div class='facts'><span>Route <b>" + escape(SURFACE_ENGINE) + "</b></span>"
+        "<div class='facts'><span>Route <b>" + escape(route) + "</b></span>"
         "<span>Source revision <b>" + escape(revision) + "</b></span></div>"
         + _surface_scope_facts(evaluation) + blockers + start_action + reset_action +
         "</section>"
@@ -2934,8 +3017,8 @@ class Handler(BaseHTTPRequestHandler):
                 queued_route = route_for(queued) if queued is not None else None
                 if queued_route == CE_ENGINE:
                     prefetch_display_read(evaluate_ce_only_fill_preflight, match.group(1))
-                elif queued_route == SURFACE_ENGINE:
-                    prefetch_display_read(evaluate_surface_fill_preflight, match.group(1))
+                elif queued_route in SURFACE_ROUTES:
+                    prefetch_display_read(evaluate_surface_fill_preflight, match.group(1), queued_route)
                 row = detail_row(match.group(1))
                 self.send_page(HTTPStatus.OK, page_detail(match.group(1), row, notice, surface_commercial_readiness(row)))
                 return
@@ -3084,8 +3167,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             acknowledged_revision = exact_form_value(form, "source_revision")
             scope_digest = exact_form_value(form, "scope_digest")
+            route = exact_form_value(form, "route") or SURFACE_ENGINE
+            if route not in SURFACE_ROUTES:
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>Unsupported route. No browser was launched.</p>" + back)
+                return
             try:
-                evaluation = evaluate_surface_fill_preflight(reference)
+                evaluation = evaluate_surface_fill_preflight(reference, route)
             except ReadUnavailable:
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Preflight unavailable</title><p>" + escape(reference) + " could not be freshly read. No browser was launched.</p>")
                 return
@@ -3112,13 +3199,13 @@ class Handler(BaseHTTPRequestHandler):
                 }[decision]
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>" + blocked + "</p>" + back)
                 return
-            if not start_attended_surface_runner(reference, evaluation.source_revision):
+            if not start_attended_surface_runner(reference, evaluation.source_revision, route):
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>The isolated desktop runner is unavailable. No Leonardo action was performed.</p>")
                 return
             now = datetime.now().isoformat(timespec="seconds")
             try:
                 record_runner_start(reference, evaluation.source_revision, now,
-                                    route=SURFACE_ENGINE, scope_reviewed_on=now)
+                                    route=route, scope_reviewed_on=now)
             except (OSError, ValueError, RunnerStateUnavailable):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
                 return
@@ -3165,7 +3252,7 @@ class Handler(BaseHTTPRequestHandler):
                     record = load_runner_state().get(reference)
                 except RunnerStateUnavailable:
                     record = None
-                allowed = (record is not None and record.get("route") == SURFACE_ENGINE
+                allowed = (record is not None and record.get("route") in SURFACE_ROUTES
                            and record.get("result") == "readback_verified")
             else:
                 kind = "ce_enabled"

@@ -1383,8 +1383,11 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard.route_for(SURFACE_ROW), "case_1_new_surface_only")
         self.assertEqual(dashboard.route_for({"Onboarding_Product__c": "Credential Exposure",
                                               "Onboarding_Type__c": "New Product Onboarding"}), "case_2_new_ce_only")
+        self.assertEqual(dashboard.route_for({"Onboarding_Product__c": "Surface & Credential Exposure",
+                                              "Onboarding_Type__c": "New Product Onboarding"}), "case_3_combined_baseline")
         for product, onboarding_type in (("Surface", "Renewal"), ("surface", "New Product Onboarding"),
-                                         ("Surface & Credential Exposure", "New Product Onboarding"), (None, None)):
+                                         ("Surface & Credential Exposure", "Renewal of Surface + New Credential Exposure Module"),
+                                         (None, None)):
             with self.subTest(product=product, type=onboarding_type):
                 self.assertIsNone(dashboard.route_for({"Onboarding_Product__c": product,
                                                        "Onboarding_Type__c": onboarding_type}))
@@ -1441,7 +1444,7 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
         self.assertEqual(dashboard._entered_license_note({"result": "readback_verified"}), "")
 
     def test_non_surface_cos_keep_todays_behaviour(self):
-        row = dict(SURFACE_ROW, Onboarding_Product__c="Surface & Credential Exposure")
+        row = dict(SURFACE_ROW, Onboarding_Product__c="Surface", Onboarding_Type__c="Renewal")
         with patch.object(dashboard, "evaluate_surface_fill_preflight", side_effect=AssertionError("no Surface")), \
                 patch.object(dashboard, "load_runner_state", return_value={}), \
                 patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
@@ -1524,7 +1527,7 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
         with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation), \
                 patch.object(dashboard, "load_runner_state", return_value={}), \
                 patch.object(dashboard, "start_attended_surface_runner",
-                             side_effect=lambda ref, rev: launched.append((ref, rev)) or True), \
+                             side_effect=lambda ref, rev, route="case_1_new_surface_only": launched.append((ref, rev, route)) or True), \
                 patch.object(dashboard, "start_attended_ce_only_runner", side_effect=AssertionError("not CE")), \
                 patch.object(dashboard, "record_runner_start",
                              side_effect=lambda *args, **kwargs: recorded.append((args, kwargs))):
@@ -1533,7 +1536,7 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
                 "reference=CO-0801&attended_create_authorized=1&scope_reviewed=1&source_revision=rev1&scope_digest="
                 + evaluation.scope_digest)
         self.assertEqual((status, location), (303, "/attended/ce-only-runner-status?ref=CO-0801"))
-        self.assertEqual(launched, [("CO-0801", "rev1")])
+        self.assertEqual(launched, [("CO-0801", "rev1", "case_1_new_surface_only")])
         (args, kwargs), = recorded
         self.assertEqual(args[:2], ("CO-0801", "rev1"))
         self.assertEqual(kwargs["route"], "case_1_new_surface_only")
@@ -1814,4 +1817,126 @@ class SalesforceIdWritebackTests(unittest.TestCase):
             if status == 200:
                 self.assertIn("action='/attended/salesforce-id-writeback-confirm'", request.pages[0][1])
                 self.assertIn("Surface_Account_ID__c", request.pages[0][1])
+
+
+class Case3DashboardTests(unittest.TestCase):
+    """Case 3 on the dashboard (owner decisions 2026-10-01: 1a 2a 3a 4a)."""
+
+    ROW = {"Name": "CO-0901", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+           "Onboarding_Product__c": "Surface & Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
+    IDS = {"surface_account_id": "0123456789abcdef01234567", "account_uuid": "0123456789abcdef0123456789abcdef",
+           "leonardo_state": "Account Scanning", "observed_on": "2026-10-01",
+           "source": "Leonardo Development Details readback"}
+
+    @staticmethod
+    def _evaluation(**overrides):
+        base = _surface_evaluation()
+        scope = dict(base.scope, leaked_credentials_domains=1, leaked_credentials_interval="Weekly")
+        values = {"reference": "CO-0901", "source_revision": base.source_revision, "blockers": (), "scope": scope,
+                  "core_plus_present": True, "route": "case_3_combined_baseline"}
+        values.update(overrides)
+        return dashboard.SurfaceScopePreflight(**values)
+
+    def _section(self, evaluation, state=None):
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value=state or {}), \
+                patch.object(dashboard, "load_attended_reminders", return_value={}):
+            return dashboard._surface_onboard_section("CO-0901", "case_3_combined_baseline")
+
+    def test_route_queue_and_chip(self):
+        self.assertEqual(dashboard.route_for(self.ROW), "case_3_combined_baseline")
+        self.assertIn("Surface + CE", dashboard._route_chip(self.ROW))
+        self.assertIn("Review scope, start", dashboard.classify_queue_row(self.ROW, None)[1])
+
+    def test_card_shows_the_combined_scope_and_a_route_bound_start(self):
+        section = self._section(self._evaluation())
+        self.assertIn("Surface + Credential Exposure onboarding", section)
+        self.assertIn("<dt>Leaked Credentials</dt><dd>ON · Weekly · 1 CE email domain</dd>", section)
+        self.assertIn("name='route' value='case_3_combined_baseline'", section)
+        self.assertNotIn("enable Credential Exposure later", section)  # CE is ON from the start
+
+    def test_term_mismatch_shows_the_error_and_why(self):
+        detail = ("The Surface licence would end 2027-08-31 but the Core Plus (Credential Exposure) licence "
+                  "would end 2027-06-30. One tenant has one licence term, so this CO needs a manual review: "
+                  "correct the DealHub terms in Salesforce, or onboard it manually.")
+        section = self._section(self._evaluation(scope=None, blockers=("case3_term_mismatch",), blocker_details=(detail,)))
+        self.assertIn("<code>case3_term_mismatch</code>", section)
+        self.assertIn("licence terms differ", section)
+        self.assertIn("would end 2027-06-30", section)
+        self.assertNotIn("Start Onboarding", section)
+
+    def test_preflight_reports_the_term_problem(self):
+        from datetime import date as _date
+        import tools.attended_ce_only_playwright as runner_module
+        source = runner_module.Case3FillSource(_surface_source_for_dashboard(), "mail.example",
+                                               _date(2026, 9, 1), _date(2027, 6, 30))
+        with patch.object(dashboard, "case3_fill_source", return_value=source), \
+                patch.object(runner_module, "_run_day", return_value=_date(2026, 10, 1)):
+            evaluation = dashboard.evaluate_surface_fill_preflight("CO-0901", "case_3_combined_baseline")
+        self.assertEqual(evaluation.blockers, ("case3_term_mismatch",))
+        self.assertIn("would end 2027-06-30", evaluation.blocker_details[0])
+
+    def test_start_rejects_an_unsupported_route(self):
+        class _FakeRequest:
+            def __init__(self):
+                self.path, self.pages = "/attended/start-surface-runner", []
+            def send_page(self, status, page):
+                self.pages.append(status)
+        request = _FakeRequest()
+        form = {"reference": ["CO-0901"], "attended_create_authorized": ["1"], "scope_reviewed": ["1"],
+                "source_revision": ["rev"], "scope_digest": ["x"], "route": ["case_4_renew_surface_new_ce"]}
+        with patch.object(dashboard, "post_form", return_value=form), \
+                patch.object(dashboard, "start_attended_surface_runner", side_effect=AssertionError("no launch")):
+            dashboard.Handler.do_POST(request)
+        self.assertEqual(request.pages, [409])
+
+    def test_ids_plan_maps_both_fields(self):
+        plan = dashboard.salesforce_id_writeback_plan("case_3_combined_baseline", self.IDS, self.ROW)
+        self.assertEqual(plan["status"], "ready_to_write")
+        self.assertEqual([item["field"] for item in plan["items"]], ["Surface_Account_ID__c", "Account_UUID__c"])
+        partial = dict(self.ROW, Surface_Account_ID__c=self.IDS["surface_account_id"])
+        self.assertEqual(dashboard.salesforce_id_writeback_plan("case_3_combined_baseline", self.IDS, partial)["status"],
+                         "ready_to_write")
+        other = dict(self.ROW, Account_UUID__c="f" * 32)
+        self.assertEqual(dashboard.salesforce_id_writeback_plan("case_3_combined_baseline", self.IDS, other)["status"],
+                         "conflict")
+        self.assertTrue(dashboard.salesforce_id_already_present("case_3_combined_baseline", other))
+        self.assertFalse(dashboard.salesforce_id_already_present("case_3_combined_baseline", self.ROW))
+
+    def test_writeback_writes_only_the_empty_fields_and_verifies_both(self):
+        import tempfile
+        from pathlib import Path as _Path
+        co = {"Id": "a0X000000000009AAA", "Name": "CO-0901", "LastModifiedDate": "2026-10-01T10:00:00.000+0000",
+              "Onboarding_Product__c": "Surface & Credential Exposure", "Onboarding_Type__c": "New Product Onboarding",
+              "Surface_Account_ID__c": None, "Account_UUID__c": None}
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(dashboard, "ID_WRITEBACK_PATH", _Path(folder) / "w.json"), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={"CO-0901": self.IDS}):
+            with patch.object(dashboard, "sf_json", return_value={"status": 0, "result": {"records": [co]}}):
+                evaluation = dashboard.evaluate_id_writeback("CO-0901")
+            self.assertEqual(evaluation.fields, ("Surface_Account_ID__c", "Account_UUID__c"))
+            nonce = dashboard.issue_id_writeback_ack(evaluation)
+            readback = {"status": 0, "result": {"records": [{"Name": "CO-0901",
+                                                             "Surface_Account_ID__c": self.IDS["surface_account_id"],
+                                                             "Account_UUID__c": self.IDS["account_uuid"]}]}}
+            with patch.object(dashboard, "sf_write_json", return_value={"status": 0}) as sf_write, \
+                    patch.object(dashboard, "sf_json", return_value=readback) as sf_read:
+                result = dashboard.write_salesforce_id_after_confirmation(evaluation, nonce)
+            self.assertEqual(result, "written_verified")
+            args = sf_write.call_args.args[0]
+            self.assertEqual(args[args.index("--values") + 1],
+                             "Surface_Account_ID__c=" + self.IDS["surface_account_id"] + " Account_UUID__c=" + self.IDS["account_uuid"])
+            self.assertIn("SELECT Name, Surface_Account_ID__c, Account_UUID__c", sf_read.call_args.args[0][3])
+            # A partially filled CO writes only the empty field.
+            partial = dict(co, Surface_Account_ID__c=self.IDS["surface_account_id"])
+            with patch.object(dashboard, "sf_json", return_value={"status": 0, "result": {"records": [partial]}}):
+                self.assertEqual(dashboard.evaluate_id_writeback("CO-0901").fields, ("Account_UUID__c",))
+
+
+def _surface_source_for_dashboard():
+    from datetime import date as _date
+    import tools.attended_ce_only_playwright as runner_module
+    entitlement = runner_module.SurfaceEntitlement("go", "Monthly", 500, 0, None, _date(2026, 9, 1), _date(2029, 8, 31), True)
+    return runner_module.SurfaceFillSource("CO-0901", "rev", "a123456789012345", "Sample Co", "France", "sample.example",
+                                           (), (), entitlement, "Sample Co", "sampleco")
 
