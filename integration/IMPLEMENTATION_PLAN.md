@@ -1,7 +1,7 @@
 # Direct Salesforce-to-Surface Onboarding Integration Plan
 
 **Date:** 2026-09-15
-**Status (2026-09-29, late evening):** CE-only onboarding works end to end (CO-0679, CO-0728, CO-0762 created and read back). The Surface-only route is merged and its CO-0649 dry run passed live; the **first real Surface create (CO-0649) is the next action** — see "Handoff — 2026-09-29 end of day" at the end of §18. The operator dashboard was redesigned the same evening (Pentera styling, queue tiles, a **History** tab for closed onboardings; commits `626c58a`, `f48094d`) — see "Dashboard redesign" in that handoff. Earlier status: Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
+**Status (2026-09-30, end of day):** **The first automated Surface-only onboarding succeeded.** CO-0649 was created in Leonardo Development and read back (`readback_verified`, `account/add` 200, ID and UUID captured, "No scan started"). The authoritative handoff and next steps are **"Handoff — 2026-09-30 end of day"** at the end of §18. **Earlier status (2026-09-29, late evening):** CE-only onboarding works end to end (CO-0679, CO-0728, CO-0762 created and read back). The Surface-only route is merged and its CO-0649 dry run passed live; the first real Surface create (CO-0649) was the next action — see "Handoff — 2026-09-29 end of day" at the end of §18. The operator dashboard was redesigned the same evening (Pentera styling, queue tiles, a **History** tab for closed onboardings; commits `626c58a`, `f48094d`) — see "Dashboard redesign" in that handoff. Earlier status: Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
 **Initial execution target:** Leonardo Development only  
 **Production target:** Permanently blocked until a separate, recorded approval
 
@@ -1020,3 +1020,57 @@ Designed with two expert reviews (a UX/queue review and a data-visualisation rev
 9. **Assistant (small follow-ups):** update `README.md` / `LOCAL_IMPLEMENTATION_STATUS.md` (including the queue tiles and the History tab); rename the readback evidence `source` label; review the builder's flagged choices (blank DealHub product name fails closed; add-ons use the same Active/Pending-14-day rule; unknown-status Core Plus still flags; subdomains not checked against their roots).
 
 **Boundaries preserved (Surface work):** only no-submit probes and two dry runs touched Leonardo Development (all cancelled, nothing created). Salesforce reads only. No production, Workato, OPA, or VM change. No credential, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
+
+### Handoff — 2026-09-30 end of day (first automated Surface-only onboarding succeeded; continue here tomorrow)
+
+**Authoritative handoff for the next session.** It supersedes the "Next steps" of the 2026-09-29 end-of-day handoff. **CO-0649 is onboarded:** the attended runner created it in Leonardo Development and read it back. Nothing was written to Salesforce.
+
+#### Result (verified from the run log, the local runner state and readback, and the CO page)
+
+| Item | Verified value |
+| --- | --- |
+| Run | 2026-09-30 15:40:43–15:41:29, route `case_1_new_surface_only`, source revision `2026-07-22T12:00:05.000+0000` (unchanged since the dry runs) |
+| Duplicate check | clear by tenant name and by primary domain |
+| Confirm | disabled with start = run day (2026-09-30) → automatic start fallback to **2026-09-29** → enabled → one click; `account/add` **200**; form closed |
+| Readback | `readback_verified`; Surface Account ID and Account UUID captured in the gitignored `integration/attended_leonardo_readbacks.json` (not reproduced here); state **"No scan started"** (expected right after create; the Weekly schedule starts the scan) |
+| Tenant settings | Prime · Weekly; Advanced: 90 h, Recon Subdomains / Web dictionary brute force / Nuclei / Notifications / Multiple users / API **ON**, the rest OFF; **Leaked Credentials and Phishing OFF**; Operator Account empty; Provisioning and Subdomains ON; Prepaid annual subscription; assets 10,000, **domains 1,000**, subdomains 1,000; licence **2026-09-29 → 2027-09-30** |
+| CO page | green "Onboarded successfully" plus three amber reminders: enable Credential Exposure later (Core Plus), turn scanning off later, assign the Operator Account after the first scan |
+
+#### What went wrong first, and the root cause
+
+1. 14:24 — the first real create stopped with `confirm_button_not_enabled`. **Nothing was created**; no `account/add` request was sent.
+2. **Gap found:** the dry runs on 09-29 and 09-30 had reported `dry_run_fill_verified` because they cancelled **before** checking Confirm. Fixed: dry runs now require an enabled Confirm (`dry_run_confirm_not_enabled` otherwise).
+3. The no-submit diagnosis (`--diagnose-confirm`, four Leonardo runs, all cancelled) ruled out every single field and every combination of CE-style changes. It also showed that Leonardo's Add Account component sets no field error. It ruled out the dormant Leaked Credentials domain too, through the one owner-approved probe that briefly turned LC on inside an unsaved form and ended with LC OFF.
+4. **Root cause, found by the operator by hand:** Leonardo Development accepts the run day (2026-09-30) in the start-date picker, without greying it out, but keeps Confirm disabled with no message; **2026-09-29 enables it**. On 2026-09-29 the run day itself had worked for the three CE creates. The exact Leonardo rule is unknown (a clock or timezone offset, or no current day allowed).
+
+#### Owner decisions 2026-09-30
+
+- **Surface Number of domains = licensed subdomains** (number in the product name + DealHub subdomain add-ons). This replaces "1 + alternate roots". A CO whose listed domains (main + alternates) exceed it fails closed with `surface_domains_exceed_license`. CE is unchanged (1).
+- **Operator Account stays empty**; it is assigned (TA/CSM from Salesforce) after the first scan finishes. The CO page shows a reminder with a local acknowledgement (`/attended/mark-operator-assigned`).
+- **No Credential Exposure on a Surface-only tenant:** Leaked Credentials and Phishing stay OFF. No diagnostic probe turns them on, except the one opt-in probe the owner approved (`--probe-lc-prefill`), which ends with LC OFF and never submits.
+- **Licence start (option D):** start = run day; if Confirm stays disabled, the runner re-picks the start **one day earlier** (at most one), re-reads both dates (expiration unchanged), and continues only if Confirm then enables. Applies to CE and Surface, create and dry run.
+
+#### Code (local commits, all tests passing)
+
+`6cef6dc` (dry runs require Confirm; `--diagnose-confirm`), `30633e5` (domains rule, Operator reminder, deeper diagnosis), `c90d284`, `6b2c30a`, `6b93ff9`, `f259694` (diagnostics: validation report, React form state, component error slots, cumulative probes, opt-in LC probe, timeline, alternate-domain searches), `3483369` (start-date fallback). **540 integration tests OK (1 skipped).** Diagnostics run only with `--diagnose-confirm` and log no field values: domains are redacted, and known source values are replaced. The dashboard was restarted at 15:26 with this code (listener on `127.0.0.1:8012`, started from the assistant's shell).
+
+#### Known follow-ups
+
+1. **Licence date on the CO page:** the scope summary shows the planned start (2026-09-30), not the date actually entered (2026-09-29, logged as `license_start_fallback confirm_enabled`). Show the entered start date (from the run log or runner state) after a create.
+2. **Guru notes** (`docs/37_CASE1_SURFACE_ONLY_GURU_NOTES_2026-09-29.md`): record the domains rule, the Operator Account timing, the start-date quirk, and that the card's licence example shows domains 10000 (Go 500).
+3. **Report to the Leonardo team:** Dev refuses the current day as licence start without an error (Confirm silently disabled).
+4. A stale CO page (opened before a dashboard restart) correctly refuses Start with a scope change; reload before starting.
+
+#### Next steps (tomorrow, in order)
+
+1. **Operator:** start the dashboard from your own terminal (`powershell -ExecutionPolicy Bypass -File tools\start_attended_dashboard.ps1 -Restart`), connect the RND VPN, and check the Leonardo session on `/connection` (re-establish with SSO/MFA if expired).
+2. **Assistant (read-only):** `python tools\attended_ce_only_playwright.py --route case_1_new_surface_only --co CO-0649 --readback-only` to see whether the first Weekly scan started or finished (`lastReconScan`, `lastScanStatusEnum`). Record the observed values here.
+3. **Operator, once the first scan finished:** in Leonardo, assign the Operator Account (TA/CSM from Salesforce) and turn the scanning settings off (owner decision 2026-09-29: scanning ON in Dev, turned off later). Then click **Mark Operator Account assigned** and **Mark scan settings turned off** on the CO page. CE stays off until it is enabled separately (**Mark CE enabled** when done).
+4. **Operator:** Salesforce updates stay manual (IDs and stage → Account Scanning, per the Guru card).
+5. **Assistant:** the small follow-ups above (CO-page start date, Guru notes), then build the **scan-status sweep** (phase 2, as described in the 2026-09-29 end-of-day handoff, step 6).
+6. **Operator/CSM:** CO-0735 still needs its `Alternate_Domains__c` corrected in Salesforce (free-text IoT note).
+7. **Operator:** fix the CO-0679 tenant by hand (trailing period; three Advanced toggles ON); the assistant then re-reads it.
+8. **Operator:** push the local commits (`git push origin main`; local is **17 commits ahead** of `origin/main` `e854101`, plus this handoff commit). Keep `backup/local-history-2026-09-29` local.
+9. Open owner questions carried over: API access for Surface (always ON vs Core Plus only); dashboard on port 80 (port 80 was free on 2026-09-30); Salesforce writeback timing.
+
+**Boundaries preserved (2026-09-30):** Leonardo Development only. There was one real create (CO-0649, from the operator's explicit Start click after a reset and scope review); everything else was session checks, dry runs, or no-submit diagnostic runs, all cancelled. Salesforce reads only; no production, Workato, OPA, or VM change. No credential, MFA value, cookie, token, or raw payload was copied, logged, or persisted. The automation Chrome window and one manually opened Leonardo tab were left open; close the automation browser at the end of the day (`/connection` → **Close automation browser**).
