@@ -52,7 +52,7 @@ class LoopbackPreviewTests(unittest.TestCase):
                 self.assertNotIn("Read from Salesforce at", text)
         self.assertEqual((dashboard.sf_json, dashboard.load_runner_state, runner._sf_records), originals)
         self.assertIn(b"case3_term_mismatch", pages["/co/CO-DEMO-0003"][1])
-        self.assertIn("Salesforce IDs · Ready to write", pages["/co/CO-DEMO-0002"][1].decode("utf-8"))
+        self.assertIn("Salesforce IDs · Captured (env dev)", pages["/co/CO-DEMO-0002"][1].decode("utf-8"))
         self.assertIn(b"<code>COMPLETED</code>", pages["/co/CO-DEMO-0004"][1])
         self.assertEqual(preview_response("/?queue=nope")[0], 404)
         self.assertEqual(preview_response("/co/CO-DEMO-0007")[0], 404)

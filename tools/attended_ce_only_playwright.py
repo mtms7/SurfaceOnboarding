@@ -98,7 +98,10 @@ SCAN_STATUS_TTL = timedelta(hours=6)
 # lastScanStatusEnum values whose meaning has been confirmed from a live read.
 # Empty until the first live sweep is reviewed: until then a set status shows
 # raw and the tenant is "Scan started", never "Scan completed" (fail closed).
-SCAN_STATUS_COMPLETED: frozenset[str] = frozenset()
+# COMPLETED confirmed 2026-10-01 (CO-0649: Leonardo UI showed the finished
+# weekly scan, Last Scan Sep 30 15:45 local, duration 03:08:12, matching the
+# read's lastReconScan and lastReconScanDurationMilliseconds).
+SCAN_STATUS_COMPLETED: frozenset[str] = frozenset({"COMPLETED"})
 SCAN_STATUS_FAILED: frozenset[str] = frozenset()
 SCAN_STATUS_ENUM_PATTERN = r"[A-Za-z][A-Za-z0-9_]{0,39}"
 DIAGNOSTICS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_diagnostics.json"

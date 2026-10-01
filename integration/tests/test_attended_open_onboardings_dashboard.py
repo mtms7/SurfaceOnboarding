@@ -539,12 +539,13 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         with self._offline_co_page(), patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0649": self._IDS}):
             page = page_detail("CO-0649", row)
-        self.assertIn("Salesforce IDs · Ready to write", page)
+        self.assertIn("Salesforce IDs · Captured (env dev)", page)
+        self.assertIn("<span class='chip chip-info'>dev</span> Leonardo Development", page)
         self.assertIn("<code>Surface_Account_ID__c</code>", page)
         self.assertIn("A" * 16, page)
         self.assertIn("Also captured (not written)", page)
-        self.assertIn("Pilot rule: a Leonardo Development ID is written only into an empty field", page)
-        self.assertIn("action='/attended/salesforce-id-writeback-review'><input type='hidden' name='reference' value='CO-0649'>", page)
+        self.assertIn("Dashboard only: Leonardo Development IDs (env dev) are never written to Salesforce.", page)
+        self.assertNotIn("/attended/salesforce-id-writeback-review", page)  # writeback is off
         self.assertIn("Leonardo Development readback", page)
 
     def test_detail_page_shows_conflict_for_different_salesforce_value(self):
@@ -552,8 +553,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         with self._offline_co_page(), patch("tools.serve_attended_open_onboardings_dashboard.attended_leonardo_readbacks",
                    return_value={"CO-0702": self._IDS}):
             page = page_detail("CO-0702", row)
-        self.assertIn("Salesforce IDs · Salesforce already has an ID", page)
-        self.assertIn("will never be written", page)
+        self.assertIn("Salesforce IDs · Salesforce has the production ID", page)
+        self.assertIn("is never written", page)
         self.assertIn("source-warn", page)
 
     def test_detail_page_unmapped_route_proposes_nothing(self):
@@ -563,7 +564,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
                    return_value={"CO-0740": self._IDS}):
             page = page_detail("CO-0740", row)
         self.assertIn("Salesforce IDs · Mapping not decided", page)
-        self.assertNotIn("Ready to write", page)
+        self.assertNotIn("Captured (env dev)", page)
 
     def test_salesforce_ids_panel_adds_no_salesforce_write(self):
         row = {"Onboarding_Approval_Status__c": "Approved", **self._CE}
@@ -1707,7 +1708,9 @@ class SalesforceIdWritebackTests(unittest.TestCase):
         self._dir = tempfile.TemporaryDirectory()
         self.addCleanup(self._dir.cleanup)
         from pathlib import Path as _Path
-        for patcher in (patch.object(dashboard, "ID_WRITEBACK_PATH", _Path(self._dir.name) / "writebacks.json"),
+        # The guarded write path is off by owner decision; these tests exercise it explicitly.
+        for patcher in (patch.object(dashboard, "ID_WRITEBACK_ENABLED", True),
+                        patch.object(dashboard, "ID_WRITEBACK_PATH", _Path(self._dir.name) / "writebacks.json"),
                         patch.object(dashboard, "attended_leonardo_readbacks", return_value=self.READBACKS)):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1910,6 +1913,7 @@ class Case3DashboardTests(unittest.TestCase):
               "Onboarding_Product__c": "Surface & Credential Exposure", "Onboarding_Type__c": "New Product Onboarding",
               "Surface_Account_ID__c": None, "Account_UUID__c": None}
         with tempfile.TemporaryDirectory() as folder, \
+                patch.object(dashboard, "ID_WRITEBACK_ENABLED", True), \
                 patch.object(dashboard, "ID_WRITEBACK_PATH", _Path(folder) / "w.json"), \
                 patch.object(dashboard, "attended_leonardo_readbacks", return_value={"CO-0901": self.IDS}):
             with patch.object(dashboard, "sf_json", return_value={"status": 0, "result": {"records": [co]}}):
@@ -1939,4 +1943,49 @@ def _surface_source_for_dashboard():
     entitlement = runner_module.SurfaceEntitlement("go", "Monthly", 500, 0, None, _date(2026, 9, 1), _date(2029, 8, 31), True)
     return runner_module.SurfaceFillSource("CO-0901", "rev", "a123456789012345", "Sample Co", "France", "sample.example",
                                            (), (), entitlement, "Sample Co", "sampleco")
+
+
+class DashboardOnlyIdsTests(unittest.TestCase):
+    """Owner decision 2026-10-01: IDs stay on the dashboard (env dev); no Salesforce write."""
+
+    def test_writeback_is_off_and_both_routes_refuse(self):
+        self.assertFalse(dashboard.ID_WRITEBACK_ENABLED)
+        for path in ("/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm"):
+            class _FakeRequest:
+                def __init__(self):
+                    self.path, self.pages = path, []
+                def send_page(self, status, page):
+                    self.pages.append((status, page))
+                def send_redirect(self, location):
+                    raise AssertionError("no redirect")
+            request = _FakeRequest()
+            with self.subTest(path=path), \
+                    patch.object(dashboard, "post_form", return_value={"reference": ["CO-0679"], "nonce": ["x"]}), \
+                    patch.object(dashboard, "sf_json", side_effect=AssertionError("no read")), \
+                    patch.object(dashboard, "sf_write_json", side_effect=AssertionError("no write")):
+                dashboard.Handler.do_POST(request)
+            self.assertEqual(request.pages[0][0], 409)
+            self.assertIn("dashboard only", request.pages[0][1])
+
+    def test_write_function_refuses_while_disabled(self):
+        evaluation = dashboard.IdWritebackEvaluation("CO-0679", "a0X000000000001AAA", "rev", ("Account_UUID__c",),
+                                                     ("0123456789abcdef0123456789abcdef",))
+        nonce = dashboard.issue_id_writeback_ack(evaluation)
+        with patch.object(dashboard, "sf_write_json", side_effect=AssertionError("no write")):
+            self.assertEqual(dashboard.write_salesforce_id_after_confirmation(evaluation, nonce), "write_blocked")
+
+    def test_completed_status_is_now_scan_completed_even_for_older_reads(self):
+        import tempfile
+        from pathlib import Path as _Path
+        entry = {"state": "scan_started", "status_enum": "COMPLETED", "last_recon_scan": "2026-09-30T22:45:00+00:00",
+                 "duration_ms": 11292919, "observed_at": "2026-10-01T14:55:52", "expires_at": "2026-10-01T20:55:52"}
+        with tempfile.TemporaryDirectory() as folder:
+            path = _Path(folder) / "scan.json"
+            path.write_text(json.dumps({"CO-0649": entry, "CO-0650": dict(entry, status_enum="RUNNING")}), encoding="utf-8")
+            with patch.object(dashboard, "SCAN_STATUS_PATH", path):
+                statuses = dashboard.attended_scan_statuses()
+        self.assertEqual(statuses["CO-0649"]["state"], "scan_completed")
+        self.assertEqual(statuses["CO-0650"]["state"], "scan_started")
+        import tools.attended_ce_only_playwright as runner_module
+        self.assertEqual(runner_module.scan_status_from_row({"lastScanStatusEnum": "COMPLETED"})["state"], "scan_completed")
 

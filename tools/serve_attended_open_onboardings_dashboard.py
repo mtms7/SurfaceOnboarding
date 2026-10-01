@@ -38,6 +38,8 @@ from phase2_leonardo.case4_comment_validation import (
     validate_case4_onboarding_comments,
 )
 from tools.attended_ce_only_playwright import (
+    SCAN_STATUS_COMPLETED,
+    SCAN_STATUS_FAILED,
     SCAN_STATUS_PATH,
     RunnerStateUnavailable,
     bootstrap_leonardo_session,
@@ -323,7 +325,12 @@ def attended_scan_statuses() -> dict[str, dict[str, object]]:
             duration = value.get("duration_ms")
             if duration is not None and (not isinstance(duration, int) or isinstance(duration, bool) or duration < 0):
                 continue
-            statuses[reference] = {"state": value["state"], "status_enum": status_enum, "last_recon_scan": last,
+            state = value["state"]
+            if state in ("scan_started", "scan_completed", "scan_failed"):
+                # Apply the current confirmed lists, so a newly confirmed value updates old reads.
+                state = ("scan_completed" if status_enum in SCAN_STATUS_COMPLETED
+                         else "scan_failed" if status_enum in SCAN_STATUS_FAILED else "scan_started")
+            statuses[reference] = {"state": state, "status_enum": status_enum, "last_recon_scan": last,
                                    "duration_ms": duration, "observed_at": observed, "expires_at": expires}
         except (KeyError, TypeError, ValueError):
             continue
@@ -633,11 +640,12 @@ _SALESFORCE_ID_PRESENT_SECTION = (
 
 
 SALESFORCE_ID_STATUS = {
-    "ready_to_write": ("source-ready", "✓", "Ready to write", "Captured from Leonardo Development; the Salesforce field is empty."),
+    "ready_to_write": ("source-ready", "✓", "Captured (env dev)",
+                       "Captured from Leonardo Development and shown here only. The Salesforce field stays empty."),
     "matches_salesforce": ("source-ready", "✓", "Matches Salesforce", "The Salesforce field already holds the captured Leonardo Development value."),
-    "conflict": ("source-warn", "!", "Salesforce already has an ID",
-                 "Salesforce holds a different ID (probably the production tenant). It stays authoritative; "
-                 "the Leonardo Development ID is test evidence only and will never be written."),
+    "conflict": ("source-warn", "!", "Salesforce has the production ID",
+                 "Salesforce holds a different ID (the production tenant). It stays authoritative; "
+                 "the Leonardo Development ID is test evidence only and is never written."),
     "not_captured": ("", "–", "Not captured yet", "No local Leonardo readback for this CO yet. It is captured when the tenant is created, or by a read-only readback of an existing tenant."),
 }
 
@@ -648,6 +656,11 @@ SALESFORCE_ID_STATUS = {
 # source revision; a read-after-write must show the exact value. An uncertain
 # outcome is recorded and never retried automatically.
 ID_WRITEBACK_ACK_TTL_SECONDS = 10 * 60
+# Owner decision 2026-10-01 (later the same day): Leonardo Development IDs stay
+# on the dashboard only, labelled env dev; nothing is written to Salesforce.
+# This replaces pilot decision (b). The guarded write path stays tested but off.
+ID_WRITEBACK_ENABLED = False
+ID_ENVIRONMENT_LABEL = "dev"
 ID_WRITEBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_salesforce_id_writebacks.json"
 ID_VALUE_PATTERNS = {"Surface_Account_ID__c": r"[a-f0-9]{24}", "Account_UUID__c": r"[a-f0-9]{32}"}
 _id_writeback_acks: dict[str, tuple[str, str, float]] = {}
@@ -756,7 +769,7 @@ def write_salesforce_id_after_confirmation(evaluation: IdWritebackEvaluation, no
     "write_rejected" (Salesforce refused the update), or "write_uncertain"
     (the update may have been applied; never retried automatically).
     """
-    if evaluation.blocker or not consume_id_writeback_ack(evaluation, nonce):
+    if not ID_WRITEBACK_ENABLED or evaluation.blocker or not consume_id_writeback_ack(evaluation, nonce):
         return "write_blocked"
     field, value = evaluation.field, evaluation.value
     assignments = " ".join(f + "=" + v for f, v in zip(evaluation.fields, evaluation.values))
@@ -825,7 +838,7 @@ def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, 
                 "<p>No owner-approved Salesforce field mapping exists for this route. Nothing is proposed for Salesforce.</p></div></div></section>")
     cls, icon, title, message = SALESFORCE_ID_STATUS[status]
     icon_style = "" if cls else " style='background:#9aa1ad'"
-    rows = ""
+    rows = f"<dt>Environment</dt><dd><span class='chip chip-info'>{escape(ID_ENVIRONMENT_LABEL)}</span> Leonardo Development</dd>"
     for item in plan["items"]:  # type: ignore[union-attr]
         rows += f"<dt>Salesforce field</dt><dd><code>{escape(item['field'])}</code></dd>"
         if "leonardo_value" in item:
@@ -838,12 +851,13 @@ def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, 
             rows += f"<dt>Also captured (not written)</dt><dd>{other_label} (Leonardo Development): <code>{escape(readback[other])}</code></dd>"
     reference = reference or row.get("Name") or ""
     last = salesforce_id_writebacks().get(reference) if REFERENCE.fullmatch(reference) else None
-    note = "Not written. Pilot rule: a Leonardo Development ID is written only into an empty field, after your review."
+    note = ("Dashboard only: Leonardo Development IDs (env " + ID_ENVIRONMENT_LABEL
+            + ") are never written to Salesforce.")
     action = ""
     if last is not None and last.get("result") in ID_WRITEBACK_RESULTS:
         note = ("Last write " + ID_WRITEBACK_RESULTS[last["result"]][1].split(";")[0].split(".")[0].lower()
                 + " · " + last.get("recorded_at", ""))
-    if status == "ready_to_write" and (last is None or last.get("result") != "write_uncertain"):
+    if ID_WRITEBACK_ENABLED and status == "ready_to_write" and (last is None or last.get("result") != "write_uncertain"):
         action = ("<form method='post' action='/attended/salesforce-id-writeback-review'><input type='hidden' name='reference' value='"
                   + escape(reference) + "'><button type='submit' class='ghost'>Review write to Salesforce</button></form>")
     return (head.format(cls=" " + cls if cls else "") + f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span><div>"
@@ -2183,6 +2197,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     if readback is not None:
         local_readback = ("<section class='readiness' aria-labelledby='leonardo-readback-title'><h2 id='leonardo-readback-title'>Leonardo Development readback</h2>"
                           "<p>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
+                          f"<dt>Environment</dt><dd><span class='chip chip-info'>{escape(ID_ENVIRONMENT_LABEL)}</span> Leonardo Development</dd>"
                           f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
                           f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></section>")
     local_readback = _salesforce_ids_section(route_for(row), readback, row, reference) + local_readback
@@ -3210,6 +3225,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
                 return
             self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+            return
+        if path in ("/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm") \
+                and not ID_WRITEBACK_ENABLED:
+            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Salesforce ID write disabled</title><p>Leonardo "
+                           "Development IDs stay on the dashboard only (owner decision 2026-10-01). Nothing was "
+                           "written to Salesforce.</p><p><a href='/co/" + escape(reference) + "'>Return</a></p>")
             return
         if path == "/attended/salesforce-id-writeback-review":
             # Read-only: a fresh read and a one-time, revision-bound confirmation page.
