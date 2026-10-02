@@ -4769,10 +4769,16 @@ def _row_value(row: dict[str, Any], path: str) -> Any:
     return value
 
 
+# Leonardo's stored spelling of a form option, where it differs beyond case and
+# separators (validate-all 2026-10-02: the form's "None" interval is NO_SCHEDULE).
+_ENUM_ALIASES = {"noschedule": "none"}
+
+
 def _norm_enum(value: Any) -> str:
-    """'Prepaid annual subscription' == 'PREPAID_ANNUAL_SUBSCRIPTION'; None/'' == 'none'."""
+    """'Prepaid annual subscription' == 'PREPAID_ANNUAL_SUBSCRIPTION'; None/''/'NO_SCHEDULE' == 'none'."""
     text = re.sub(r"[^a-z0-9]", "", str(value).casefold()) if value not in (None, "") else ""
-    return text or "none"
+    text = text or "none"
+    return _ENUM_ALIASES.get(text, text)
 
 
 def _norm_text(value: Any) -> str:

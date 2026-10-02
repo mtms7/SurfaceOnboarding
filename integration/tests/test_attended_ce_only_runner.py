@@ -4697,3 +4697,15 @@ class SurfaceValidationTests(unittest.TestCase):
         self.assertTrue(any(c["check"] == "Nuclei" and c["status"] == "ok" for c in stored["checks"]))
         self.assertEqual(stored["plan_note"], "")
 
+
+class ValidationEnumAliasTests(unittest.TestCase):
+    def test_no_schedule_is_the_stored_form_of_none(self):
+        # Live validate-all 2026-10-02: CE tenants store the "None" interval as NO_SCHEDULE.
+        self.assertEqual(runner._norm_enum("NO_SCHEDULE"), runner._norm_enum("None"))
+        self.assertEqual(runner._norm_enum(None), "none")
+        self.assertNotEqual(runner._norm_enum("WEEKLY"), runner._norm_enum("None"))
+        checks = runner.validate_row({"scanningInterval": "NO_SCHEDULE"}, {"selects": {"Scanning interval": "None"},
+                                                                       "texts": {}, "checkboxes": {}})
+        interval = next(c for c in checks if c["check"] == "Scanning interval")
+        self.assertEqual(interval["status"], "ok")
+
