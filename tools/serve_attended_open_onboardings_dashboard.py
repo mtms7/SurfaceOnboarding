@@ -60,6 +60,7 @@ from tools.attended_ce_only_playwright import (
     close_automation_browser,
     load_runner_state,
     start_blocker,
+    create_uncertain,
     record_runner_result,
     record_runner_start,
     reset_leonardo_profile,
@@ -1983,6 +1984,8 @@ def classify_queue_row(row: dict[str, str | None], record: dict[str, str] | None
     """
     approval, stage = row.get("Onboarding_Approval_Status__c"), row.get("Onboarding_Stage__c")
     result = record.get("result") if record else None
+    if create_uncertain(record):
+        return "review", "<b>Check Leonardo</b><span class='sub'>Create uncertain · verify read-only</span>", "you"
     if record is not None and result is not None and result not in _TENANT_RESULTS:
         if result in ("duplicate_found", "duplicate_ambiguous"):
             return "review", "<b>Review existing tenant</b><span class='sub'>Duplicate check stopped the run</span>", "you"
@@ -2027,6 +2030,8 @@ def _run_chip(record: dict[str, str] | None) -> str:
         return "<span class='chip chip-warn'>Running</span>"
     if result in _TENANT_RESULTS:
         return "<span class='chip chip-ok'>Onboarded</span>"
+    if create_uncertain(record):
+        return "<span class='chip chip-warn'>Create uncertain</span>"
     if result in ("duplicate_found", "duplicate_ambiguous"):
         return "<span class='chip chip-bad'>Duplicate</span>"
     return "<span class='chip chip-bad'>Onboarding failed</span>"
@@ -2820,6 +2825,8 @@ def _onboarding_chip(reference: str) -> str:
         return "<span class='chip chip-warn'>Running</span>"
     if result == "readback_verified":
         return "<span class='chip chip-ok'>Onboarded</span>"
+    if create_uncertain(record):
+        return "<span class='chip chip-warn'>Create uncertain</span>"
     if result in ("duplicate_found", "duplicate_ambiguous"):
         return "<span class='chip chip-bad'>Duplicate</span>"
     return "<span class='chip chip-bad'>Onboarding failed</span>"
@@ -2857,6 +2864,19 @@ def _entered_license_note(record: dict[str, str] | None) -> str:
         return ""
     return ("<p class='note'>Licence dates entered in Leonardo Development: <b>"
             + escape(record["license_start_entered"]) + " → " + escape(record["license_end_entered"]) + "</b></p>")
+
+
+def _uncertain_banner(ref: str, record: dict[str, str]) -> str:
+    """Amber banner for a failed run that may have created a tenant (review item 2)."""
+    return ("<div class='outcome outcome-info' role='status' aria-label='Create uncertain'>"
+            "<span class='outcome-icon' aria-hidden='true'>?</span><div><strong>Create uncertain — verify in Leonardo</strong>"
+            "<p>The run stopped after the licence dates were entered, at or after Confirm (<code>"
+            + escape(record.get("result", "")) + "</code>). A tenant may exist. Start and reset stay blocked until a "
+            "read-only check settles it: a found tenant is recorded as onboarded; no tenant re-arms the run.</p>"
+            "<form method='post' action='/attended/verify-uncertain'><input type='hidden' name='reference' value='" + ref + "'>"
+            "<button type='submit' class='ghost'>Verify in Leonardo (read-only)</button></form>"
+            "<span class='meta'>Result <code>" + escape(record.get("result", "")) + "</code>"
+            + (" · " + escape(record["completed_on"]) if record.get("completed_on") else "") + "</span></div></div>")
 
 
 _START_IN_PROGRESS_NOTE = (
@@ -2925,7 +2945,10 @@ def _ce_only_onboard_section(reference: str) -> str:
         blockers = ("<p class='note'>Blocked: " +
                     ", ".join(escape(item.replace("_", " ")) for item in evaluation.blockers) + "</p>")
     reset_action = ""
-    if record is not None and record.get("result") and record["result"] != "readback_verified":
+    if create_uncertain(record):
+        runner_note = _uncertain_banner(ref, record)
+        start_action = ""
+    elif record is not None and record.get("result") and record["result"] != "readback_verified":
         reset_action = (
             "<form class='reset-form' method='post' action='/attended/reset-ce-only-runner'>"
             "<input type='hidden' name='reference' value='" + ref + "'>"
@@ -3085,7 +3108,10 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str
         if reminders.get(REMINDER_FIELDS[kind]):
             reminder_html += "<p class='note'>" + label + " on " + escape(reminders[REMINDER_FIELDS[kind]]) + ".</p>"
     reset_action = ""
-    if record is not None and record.get("result") and record["result"] != "readback_verified":
+    if create_uncertain(record):
+        runner_note = _uncertain_banner(ref, record)
+        start_action = ""
+    elif record is not None and record.get("result") and record["result"] != "readback_verified":
         reset_action = (
             "<form class='reset-form' method='post' action='/attended/reset-ce-only-runner'>"
             "<input type='hidden' name='reference' value='" + ref + "'>"
@@ -3129,7 +3155,8 @@ def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, referenc
         # A finished run returns the operator to the CO page, where the same
         # green/red outcome is shown; the link works immediately.
         refresh = "<meta http-equiv='refresh' content='" + str(RUNNER_REDIRECT_SECONDS) + ";url=/co/" + ref + "'>"
-        body = (_outcome_banner(kind, message, result, completed) +
+        banner = _uncertain_banner(ref, record) if create_uncertain(record) else _outcome_banner(kind, message, result, completed)
+        body = (banner +
                 "<p class='note'>Returning to " + ref + " in " + str(RUNNER_REDIRECT_SECONDS) + " seconds. "
                 "<a href='/co/" + ref + "'>Return to " + ref + " now</a></p>")
     return _app_shell(reference + " onboarding",
@@ -3145,6 +3172,7 @@ START_BLOCKED_MESSAGES = {
     "scope_changed": "The computed scope changed since it was reviewed. No browser was launched. Review the scope again.",
     "run_in_progress": "A run for this CO (an earlier source revision) has not reported a result yet. No new run was started.",
     "tenant_already_verified": "A tenant was already created and verified for this CO. No new run was started.",
+    "create_uncertain": "An earlier run may have created a tenant. Verify it read-only on the CO page first. No new run was started.",
 }
 
 
@@ -3157,7 +3185,7 @@ POST_ROUTES = frozenset({
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
-    "/attended/validate", "/attended/validate-all",
+    "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
 })
 
@@ -3453,6 +3481,20 @@ class Handler(BaseHTTPRequestHandler):
             result = write_salesforce_id_after_confirmation(evaluation, nonce or "")
             self.send_redirect("/co/" + reference + "?id-write=" + result)
             return
+        if path == "/attended/verify-uncertain":
+            try:
+                record = load_runner_state().get(reference)
+            except RunnerStateUnavailable:
+                record = None
+            if not create_uncertain(record):
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Nothing to verify</title><p>" + escape(reference) + " has no uncertain create. Nothing was started.</p>")
+                return
+            route = (record or {}).get("route") or CE_ENGINE
+            if not _start_runner_mode("--co", reference, "--readback-only", "--route", route):
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Verify unavailable</title><p>The read-only check could not be started on this desktop.</p>")
+                return
+            self.send_redirect("/co/" + reference)
+            return
         if path == "/attended/validate":
             if reference not in attended_leonardo_readbacks():
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not onboarded</title><p>No local readback exists for " + escape(reference) + ". Nothing was started.</p>")
@@ -3512,6 +3554,7 @@ class Handler(BaseHTTPRequestHandler):
                     "invalid_runner_state_record": "The runner state record is invalid. No change was made.",
                     "runner_in_progress_cannot_be_reset": "An attended run is in progress and cannot be reset. Wait for it to finish.",
                     "runner_result_cannot_be_reset": "The run verified a created tenant and cannot be reset.",
+                    "create_uncertain_cannot_be_reset": "The run may have created a tenant. Verify it read-only on the CO page first; nothing was changed.",
                 }.get(str(error), "The runner record could not be reset. No change was made.")
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Reset blocked</title><p>" + escape(reset_message) + "</p>")
                 return

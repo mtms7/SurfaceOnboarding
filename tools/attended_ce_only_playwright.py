@@ -1696,7 +1696,8 @@ def load_runner_state() -> dict[str, dict[str, str]]:
             if not isinstance(revision, str) or not revision:
                 raise ValueError()
             if set(value) - {"source_revision", "started_on", "result", "completed_on",
-                             "scope_reviewed_on", "route", "license_start_entered", "license_end_entered"}:
+                             "scope_reviewed_on", "route", "license_start_entered", "license_end_entered",
+                             "settled", "settled_from", "settled_on"}:
                 raise ValueError()
             record: dict[str, str] = {"source_revision": revision}
             if "route" in value:
@@ -1716,6 +1717,19 @@ def load_runner_state() -> dict[str, dict[str, str]]:
                         raise ValueError()
                     date.fromisoformat(value[key])
                     record[key] = value[key]
+            if "settled" in value:
+                if value["settled"] != "no_tenant":
+                    raise ValueError()
+                record["settled"] = value["settled"]
+            if "settled_from" in value:
+                if not isinstance(value["settled_from"], str) or not value["settled_from"]:
+                    raise ValueError()
+                record["settled_from"] = value["settled_from"]
+            if "settled_on" in value:
+                if not isinstance(value["settled_on"], str):
+                    raise ValueError()
+                datetime.fromisoformat(value["settled_on"])
+                record["settled_on"] = value["settled_on"]
             if "completed_on" in record and "result" not in value:
                 raise ValueError()
             if "result" in value:
@@ -1777,6 +1791,37 @@ def record_check_result(reference: str, kind: str, result: str, completed_on: st
     _write_json_atomic(CHECK_STATE_PATH, state)
 
 
+def create_uncertain(record: dict[str, str] | None) -> bool:
+    """True when a failed run had already entered the licence dates (set right before Confirm).
+
+    Review item 2 (2026-10-01): such a run may have created a tenant, so it is
+    never "nothing was created". A read-only readback settles it: a found
+    tenant promotes the run to readback_verified; no tenant marks it settled.
+    """
+    return bool(record and record.get("license_start_entered") and record.get("result")
+                and record["result"] != "readback_verified" and record.get("settled") != "no_tenant")
+
+
+def settle_uncertain_create(reference: str, readback_result: str, settled_on: str) -> str | None:
+    """Apply a read-only readback outcome to an uncertain create; returns what changed, if anything."""
+    if not REFERENCE.fullmatch(reference):
+        return None
+    state = load_runner_state()
+    record = state.get(reference)
+    if not create_uncertain(record):
+        return None
+    if readback_result == "readback_only_verified":
+        record["settled_from"], record["result"], record["settled_on"] = record["result"], "readback_verified", settled_on
+        change = "tenant_found"
+    elif readback_result == "readback_only_tenant_not_found":
+        record["settled"], record["settled_on"] = "no_tenant", settled_on
+        change = "no_tenant"
+    else:
+        return None
+    _write_json_atomic(RUNNER_STATE_PATH, state)
+    return change
+
+
 def start_blocker(record: dict[str, str] | None) -> str | None:
     """Why a new attended start must not happen for a CO, whatever its revision, else None.
 
@@ -1791,6 +1836,8 @@ def start_blocker(record: dict[str, str] | None) -> str | None:
         return "run_in_progress"
     if record["result"] == "readback_verified":
         return "tenant_already_verified"
+    if create_uncertain(record):
+        return "create_uncertain"
     return None
 
 
@@ -2910,6 +2957,8 @@ def reset_runner_record(reference: str) -> bool:
         raise ValueError("runner_in_progress_cannot_be_reset")
     if record["result"] == "readback_verified":
         raise ValueError("runner_result_cannot_be_reset")
+    if create_uncertain(record):
+        raise ValueError("create_uncertain_cannot_be_reset")
     del state[reference]
     _write_json_atomic(RUNNER_STATE_PATH, state)
     return True
@@ -5176,6 +5225,11 @@ def main() -> int:
             parser.error("--co is required with --readback-only")
         result = run_readback(args.co, tenant_name_override=args.tenant_name, route=args.route)
         _record_check(args.co, "readback", result)
+        if not args.tenant_name:
+            try:
+                settle_uncertain_create(args.co, result, datetime.now().isoformat(timespec="seconds"))
+            except (OSError, ValueError, RunnerStateUnavailable):
+                pass
         print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0
     if args.check_session:

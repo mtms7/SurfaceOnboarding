@@ -4709,3 +4709,64 @@ class ValidationEnumAliasTests(unittest.TestCase):
         interval = next(c for c in checks if c["check"] == "Scanning interval")
         self.assertEqual(interval["status"], "ok")
 
+
+class CreateUncertainTests(unittest.TestCase):
+    """Review item 2 (2026-10-01): a failure after the licence dates were entered may have created a tenant."""
+
+    def setUp(self):
+        import tempfile
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.state = Path(self._dir.name) / "state.json"
+        patcher = patch.object(runner, "RUNNER_STATE_PATH", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _failed(self, result, entered=True):
+        runner.record_runner_start("CO-0801", "rev1", "2026-10-02T10:00:00")
+        dates = (date(2026, 10, 2), date(2027, 10, 1)) if entered else None
+        runner.record_runner_result("CO-0801", "rev1", result, "2026-10-02T10:01:00", dates)
+
+    def test_a_failure_after_the_dates_were_entered_is_uncertain_and_blocks_start_and_reset(self):
+        self._failed("confirm_no_create")
+        record = runner.load_runner_state()["CO-0801"]
+        self.assertTrue(runner.create_uncertain(record))
+        self.assertEqual(runner.start_blocker(record), "create_uncertain")
+        with self.assertRaisesRegex(ValueError, "create_uncertain_cannot_be_reset"):
+            runner.reset_runner_record("CO-0801")
+        with self.assertRaisesRegex(ValueError, "create_uncertain"):
+            runner.record_runner_start("CO-0801", "rev2", "2026-10-02T11:00:00")
+
+    def test_a_failure_before_the_dates_keeps_todays_behaviour(self):
+        self._failed("duplicate_search_schema_unavailable", entered=False)
+        record = runner.load_runner_state()["CO-0801"]
+        self.assertFalse(runner.create_uncertain(record))
+        self.assertTrue(runner.reset_runner_record("CO-0801"))
+
+    def test_a_found_tenant_promotes_the_run_to_verified(self):
+        self._failed("readback_schema_unavailable")
+        self.assertEqual(runner.settle_uncertain_create("CO-0801", "readback_only_verified", "2026-10-02T12:00:00"),
+                         "tenant_found")
+        record = runner.load_runner_state()["CO-0801"]
+        self.assertEqual((record["result"], record["settled_from"]), ("readback_verified", "readback_schema_unavailable"))
+        self.assertEqual(runner.start_blocker(record), "tenant_already_verified")
+
+    def test_no_tenant_settles_it_and_allows_reset(self):
+        self._failed("confirm_no_create")
+        self.assertEqual(runner.settle_uncertain_create("CO-0801", "readback_only_tenant_not_found", "2026-10-02T12:00:00"),
+                         "no_tenant")
+        record = runner.load_runner_state()["CO-0801"]
+        self.assertFalse(runner.create_uncertain(record))
+        self.assertTrue(runner.reset_runner_record("CO-0801"))
+
+    def test_other_readback_outcomes_change_nothing(self):
+        self._failed("confirm_no_create")
+        self.assertIsNone(runner.settle_uncertain_create("CO-0801", "leonardo_session_expired", "2026-10-02T12:00:00"))
+        self.assertTrue(runner.create_uncertain(runner.load_runner_state()["CO-0801"]))
+
+    def test_malformed_settle_value_fails_closed(self):
+        self.state.write_text(json.dumps({"CO-0801": {"source_revision": "rev1", "result": "x", "completed_on": "2026-10-02T10:01:00",
+                                                      "settled": "maybe"}}), encoding="utf-8")
+        with self.assertRaises(runner.RunnerStateUnavailable):
+            runner.load_runner_state()
+

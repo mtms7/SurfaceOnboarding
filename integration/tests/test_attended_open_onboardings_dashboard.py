@@ -2208,3 +2208,54 @@ class SurfaceValidationCardTests(unittest.TestCase):
         self.assertIn("⚠ 1 setting(s) differ", page)
         self.assertIn("action='/attended/validate-all'", page)
 
+
+class CreateUncertainDashboardTests(unittest.TestCase):
+    RECORD = {"source_revision": "rev1", "started_on": "2026-10-02T10:00:00", "result": "confirm_no_create",
+              "completed_on": "2026-10-02T10:01:00", "license_start_entered": "2026-10-02", "license_end_entered": "2027-10-01"}
+
+    def test_queue_card_and_chip_say_create_uncertain(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+               "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
+        queue, step, _owner = dashboard.classify_queue_row(row, dict(self.RECORD))
+        self.assertEqual(queue, "review")
+        self.assertIn("Create uncertain", step)
+        self.assertNotIn("Nothing was created", step)
+        self.assertIn("Create uncertain", dashboard._run_chip(dict(self.RECORD)))
+
+    def test_ce_card_shows_verify_and_no_reset_or_start(self):
+        evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev1", 1, ())
+        with patch.object(dashboard, "evaluate_ce_only_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value={"CO-0702": dict(self.RECORD)}):
+            section = dashboard._ce_only_onboard_section("CO-0702")
+        self.assertIn("Create uncertain — verify in Leonardo", section)
+        self.assertIn("action='/attended/verify-uncertain'", section)
+        self.assertNotIn("reset-ce-only-runner", section)
+        self.assertNotIn("Start Onboarding", section)
+        self.assertNotIn("nothing was created", section.lower())
+
+    def test_verify_route_launches_a_read_only_readback_with_the_route(self):
+        class _FakeRequest:
+            def __init__(self):
+                self.path, self.pages, self.redirects = "/attended/verify-uncertain", [], []
+            def send_page(self, status, page):
+                self.pages.append(status)
+            def send_redirect(self, location):
+                self.redirects.append(location)
+        for state, expected in (({}, 409), ({"CO-0801": dict(self.RECORD, route="case_1_new_surface_only")}, "redirect")):
+            request = _FakeRequest()
+            with self.subTest(expected=expected), \
+                    patch.object(dashboard, "post_form", return_value={"reference": ["CO-0801"]}), \
+                    patch.object(dashboard, "load_runner_state", return_value=state), \
+                    patch.object(dashboard, "_start_runner_mode", return_value=True) as start:
+                dashboard.Handler.do_POST(request)
+            if expected == 409:
+                self.assertEqual(request.pages, [409])
+                start.assert_not_called()
+            else:
+                start.assert_called_once_with("--co", "CO-0801", "--readback-only", "--route", "case_1_new_surface_only")
+                self.assertEqual(request.redirects, ["/co/CO-0801"])
+
+    def test_runner_status_page_uses_the_uncertain_banner(self):
+        page = dashboard.page_ce_only_runner_status({"CO-0702": dict(self.RECORD)}, "CO-0702")
+        self.assertIn("Create uncertain — verify in Leonardo", page)
+
