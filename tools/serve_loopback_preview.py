@@ -123,6 +123,24 @@ def _scan_statuses() -> dict[str, dict[str, object]]:
                              "observed_at": now - timedelta(minutes=5), "expires_at": now + timedelta(hours=6)}}
 
 
+def _validations() -> dict[str, dict[str, object]]:
+    now = datetime.now()
+    checks = [
+        {"group": "Account", "check": "Account enabled", "status": "ok", "expected": True, "found": True},
+        {"group": "Licence", "check": "Licence type", "status": "ok", "expected": "Prepaid annual subscription",
+         "found": "PREPAID_ANNUAL_SUBSCRIPTION"},
+        {"group": "Licence", "check": "Expiration date", "status": "ok", "expected": "2027-09-30", "found": "2027-09-30"},
+        {"group": "Settings", "check": "Nuclei", "status": "drift", "expected": True, "found": False},
+        {"group": "Settings", "check": "Maximum scan duration (h)", "status": "unknown", "expected": 90, "found": None},
+        {"group": "Domains", "check": "Alternate domains", "status": "ok", "expected": "1 item(s)", "found": "1 item(s)"},
+        {"group": "People", "check": "MFA required", "status": "ok", "expected": True, "found": True},
+        {"group": "People", "check": "Operator Account", "status": "info", "found": "not assigned"},
+        {"group": "Scan", "check": "Scan status", "status": "info", "found": "scan_completed"},
+    ]
+    return {"CO-DEMO-0004": {"checks": checks, "plan_note": "", "observed_at": now - timedelta(minutes=3),
+                             "expires_at": now + timedelta(hours=6)}}
+
+
 def _history() -> Any:
     today = date.today()
     completed, created = [], []
@@ -162,6 +180,7 @@ def synthetic_backends() -> Iterator[None]:
             "sf_json": _blocked, "sf_write_json": _blocked_write, "local_browser_launch_allowed": lambda: False,
             "attended_leonardo_readbacks": lambda: dict(READBACKS), "load_runner_state": lambda: dict(RUNNER_STATE),
             "attended_scan_statuses": _scan_statuses, "salesforce_id_writebacks": lambda: {},
+            "attended_validations": _validations,
             "load_attended_reminders": lambda: {}, "manual_start_ack_nonce": lambda *_a, **_k: None,
             "evaluate_surface_fill_preflight": _surface_preflight, "evaluate_ce_only_fill_preflight": _ce_preflight,
             "closed_history": _history, "cached_closed_history": _history, "detail_row": _blocked,

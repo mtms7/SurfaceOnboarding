@@ -4550,3 +4550,150 @@ class ScanStatusSweepRunnerTests(unittest.TestCase):
                 runner._scan_status_tenant_name("CO-0679", surface_only=True)
             self.assertTrue(runner._scan_status_tenant_name("CO-0679").endswith("- CE Only"))
 
+
+def _row_from_plan(plan, start_ms=None, end_ms=None):
+    """A tenant search row that exactly matches a fill plan (paths from the 2026-10-02 schema probe)."""
+    row = {"enabled": True, "isDeleted": False, "accountLicense": {"enabled": True}, "accountSettings": {"reconSettings": {}},
+           "campaignExecutionSettings": {"domainsMultiAttackStackSettings": {}}, "primaryUser": {},
+           "lastReconExecutionData": {"timedOutActions": []}, "pendingValidationAssets": 0}
+    def put(path, value):
+        node = row
+        parts = path.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    for key, target in plan["checkboxes"].items():
+        if key in runner.VALIDATION_TOGGLE_PATHS:
+            put(runner.VALIDATION_TOGGLE_PATHS[key], target)
+    for label, path in runner.VALIDATION_SELECT_PATHS.items():
+        if label in plan["selects"]:
+            put(path, plan["selects"][label].upper().replace(" ", "_"))
+    for label, path in runner.VALIDATION_NUMBER_PATHS.items():
+        if label in plan["texts"]:
+            put(path, int(plan["texts"][label]))
+    for label, (path, _name) in runner.VALIDATION_IDENTITY_PATHS.items():
+        if label in plan["texts"]:
+            put(path, plan["texts"][label])
+    for label, (path, _name) in runner.VALIDATION_LIST_PATHS.items():
+        if label in plan["texts"]:
+            put(path, [v.strip() for v in plan["texts"][label].split(",")])
+        elif label in (plan.get("blank_texts") or ()):
+            put(path, [])
+    put("userEmailDomains", ["pentera.io"])
+    import calendar
+    end = plan["license_end"]
+    put("accountLicense.expirationDate", end_ms if end_ms is not None else calendar.timegm(end.timetuple()) * 1000 + 43_200_000)
+    if start_ms is not None:
+        put("accountLicense.startDate", start_ms)
+    return row
+
+
+class SurfaceValidationTests(unittest.TestCase):
+    """Surface validation (2026-10-02): compare the tenant's own row with the route plan."""
+
+    def setUp(self):
+        self.plan = runner.build_surface_only_fill(_surface_source(), RUN_DAY)
+
+    def _by_name(self, checks):
+        return {c["check"]: c for c in checks}
+
+    def test_a_matching_tenant_has_no_drift(self):
+        checks = runner.validate_row(_row_from_plan(self.plan), self.plan)
+        drift = [c for c in checks if c["status"] == "drift"]
+        self.assertEqual(drift, [])
+        named = self._by_name(checks)
+        self.assertEqual(named["Nuclei"]["status"], "ok")
+        self.assertEqual(named["Licence type"]["status"], "ok")  # enum spelling differences are normalized
+        self.assertEqual(named["Expiration date"]["status"], "ok")
+        self.assertEqual(named["Maximum scan duration (h)"]["status"], "unknown")  # mapping unconfirmed
+
+    def test_a_changed_toggle_and_quantity_are_reported_with_values(self):
+        row = _row_from_plan(self.plan)
+        row["fullNucleiScanEnabled"] = False
+        row["accountLicense"]["subDomainsNumber"] = 50000
+        named = self._by_name(runner.validate_row(row, self.plan))
+        self.assertEqual((named["Nuclei"]["status"], named["Nuclei"]["expected"], named["Nuclei"]["found"]),
+                         ("drift", True, False))
+        self.assertEqual(named["Number of subdomains"]["found"], 50000)
+
+    def test_names_domains_and_emails_are_checked_but_never_stored(self):
+        row = _row_from_plan(self.plan)
+        row["accountName"] = "Someone Else Ltd"
+        row["alternateDomains"] = ["other.example"]
+        checks = runner.validate_row(row, self.plan)
+        named = self._by_name(checks)
+        self.assertEqual(named["Company name"]["status"], "drift")
+        self.assertNotIn("expected", named["Company name"])
+        self.assertEqual(named["Alternate domains"]["status"], "drift")
+        dumped = json.dumps(checks)
+        for value in (SURFACE_TENANT, SURFACE_MAIN, SURFACE_ALT, "Someone Else", "other.example", "@pentera.io"):
+            self.assertNotIn(value, dumped)
+
+    def test_status_scan_and_people_checks_run_without_a_plan(self):
+        row = {"enabled": False, "isDeleted": False, "accountLicense": {"enabled": True},
+               "lastScanStatusEnum": "COMPLETED", "lastReconScan": "2026-09-30T22:45:00Z",
+               "lastReconExecutionData": {"timedOutActions": [{}, {}]}, "operatorAccounts": None}
+        named = self._by_name(runner.validate_row(row, None))
+        self.assertEqual(named["Account enabled"]["status"], "drift")
+        self.assertEqual(named["Scan status"]["found"], "scan_completed")
+        self.assertEqual(named["Timed-out scan actions"]["found"], 2)
+        self.assertEqual(named["Operator Account"]["found"], "not assigned")
+        self.assertNotIn("Nuclei", named)
+
+    def test_recorded_start_date_is_compared(self):
+        import calendar
+        start_ms = calendar.timegm(date(2026, 9, 29).timetuple()) * 1000 + 43_200_000
+        named = self._by_name(runner.validate_row(_row_from_plan(self.plan, start_ms=start_ms), self.plan,
+                                                  ("2026-09-29", "2027-08-31")))
+        self.assertEqual(named["Start date"]["status"], "ok")
+        named = self._by_name(runner.validate_row(_row_from_plan(self.plan, start_ms=start_ms), self.plan,
+                                                  ("2026-09-30", "2027-08-31")))
+        self.assertEqual(named["Start date"]["status"], "drift")
+
+    def test_user_email_domains_only_need_to_include_the_plan(self):
+        row = _row_from_plan(self.plan)
+        row["userEmailDomains"] = ["pentera.io", "customer.example"]  # customer domain added with the user
+        self.assertEqual(self._by_name(runner.validate_row(row, self.plan))["User email domains include the plan"]["status"], "ok")
+
+    def test_not_onboarded_co_reads_nothing(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            readbacks = Path(folder) / "readbacks.json"
+            readbacks.write_text("{}", encoding="utf-8")
+            with patch.object(runner, "READBACK_PATH", readbacks), \
+                    patch.object(runner, "_sf_records", side_effect=AssertionError("no Salesforce")):
+                self.assertEqual(runner.run_validate("CO-0649"), "validation_not_onboarded")
+
+    def test_run_validate_matches_by_ids_and_records_checks(self):
+        import contextlib, sys, tempfile, types
+        fake = types.ModuleType("playwright.sync_api")
+        fake.sync_playwright = lambda: contextlib.nullcontext(object())
+        package = types.ModuleType("playwright")
+        package.sync_api = fake
+        @contextlib.contextmanager
+        def page(_playwright):
+            yield object()
+        row = dict(_row_from_plan(self.plan), id="a" * 24, accountUuid="B" * 32)
+        other = dict(row, id="c" * 24)
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            (base / "readbacks.json").write_text(json.dumps({"CO-0801": {"surface_account_id": "a" * 24,
+                                                                        "account_uuid": "b" * 32}}), encoding="utf-8")
+            with patch.dict(sys.modules, {"playwright": package, "playwright.sync_api": fake}), \
+                    patch.object(runner, "READBACK_PATH", base / "readbacks.json"), \
+                    patch.object(runner, "VALIDATION_PATH", base / "validation.json"), \
+                    patch.object(runner, "SCAN_STATUS_PATH", base / "scan.json"), \
+                    patch.object(runner, "RUNNER_STATE_PATH", base / "state.json"), \
+                    patch.object(runner, "_validation_route", return_value=(runner.SURFACE_ENGINE, SURFACE_TENANT)), \
+                    patch.object(runner, "surface_fill_source", return_value=_surface_source()), \
+                    patch.object(runner, "_attended_page", page), \
+                    patch.object(runner, "_open_search", return_value=object()), \
+                    patch.object(runner, "_search_tenants", return_value=runner.TenantSearchResult([other, row], 2)), \
+                    patch.object(runner, "_run_day", return_value=RUN_DAY):
+                result = runner.run_validate("CO-0801")
+            stored = json.loads((base / "validation.json").read_text(encoding="utf-8"))["CO-0801"]
+        self.assertEqual(result, "validation_recorded")
+        self.assertEqual(stored["route"], runner.SURFACE_ENGINE)
+        self.assertTrue(any(c["check"] == "Nuclei" and c["status"] == "ok" for c in stored["checks"]))
+        self.assertEqual(stored["plan_note"], "")
+

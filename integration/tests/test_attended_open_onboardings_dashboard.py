@@ -2134,3 +2134,77 @@ class StartGuardTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(request.pages[0][0], 409)
 
+
+class SurfaceValidationCardTests(unittest.TestCase):
+    CHECKS = [{"group": "Account", "check": "Account enabled", "status": "ok", "expected": True, "found": True},
+              {"group": "Settings", "check": "Nuclei", "status": "drift", "expected": True, "found": False},
+              {"group": "Settings", "check": "Maximum scan duration (h)", "status": "unknown", "expected": 90, "found": None},
+              {"group": "Account", "check": "Company name", "status": "ok"},
+              {"group": "Scan", "check": "Scan status", "status": "info", "found": "scan_completed"}]
+
+    def _file(self, entries):
+        import tempfile
+        from pathlib import Path as _Path
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        path = _Path(folder.name) / "validation.json"
+        path.write_text(json.dumps(entries), encoding="utf-8")
+        return patch.object(dashboard, "VALIDATION_PATH", path)
+
+    def test_loader_drops_malformed_entries(self):
+        good = {"checks": self.CHECKS, "plan_note": "", "observed_at": "2026-10-02T10:00:00", "expires_at": "2026-10-02T16:00:00"}
+        bad_status = dict(good, checks=[dict(self.CHECKS[0], status="maybe")])
+        with self._file({"CO-0649": good, "CO-0650": bad_status, "x": good}):
+            self.assertEqual(list(dashboard.attended_validations()), ["CO-0649"])
+
+    def test_card_shows_differences_with_values_and_unconfirmed_checks(self):
+        from datetime import datetime as _dt
+        good = {"checks": self.CHECKS, "plan_note": "", "observed_at": "2026-10-02T10:00:00", "expires_at": "2026-10-02T16:00:00"}
+        with self._file({"CO-0649": good}):
+            card = dashboard._validation_section("CO-0649", now=_dt(2026, 10, 2, 11, 0))
+            stale = dashboard._validation_section("CO-0649", now=_dt(2026, 10, 2, 17, 0))
+            missing = dashboard._validation_section("CO-0700")
+        self.assertIn("Surface validation · 1 difference(s) found", card)
+        self.assertIn("✗ Nuclei · expected ON, found OFF", card)
+        self.assertIn("? Maximum scan duration (h) · expected 90, found —", card)
+        self.assertIn("· Scan status · scan_completed", card)
+        self.assertIn("action='/attended/validate'", card)
+        self.assertIn("stale, validate again", stale)
+        self.assertIn("Not validated yet", missing)
+
+    def test_validate_routes(self):
+        class _FakeRequest:
+            def __init__(self, path):
+                self.path, self.pages, self.redirects = path, [], []
+            def send_page(self, status, page):
+                self.pages.append(status)
+            def send_redirect(self, location):
+                self.redirects.append(location)
+        ids = {"surface_account_id": "a" * 24, "account_uuid": "b" * 32, "leonardo_state": "Account Scanning",
+               "observed_on": "2026-10-02", "source": "Leonardo Development Details readback"}
+        request = _FakeRequest("/attended/validate")
+        with patch.object(dashboard, "post_form", return_value={"reference": ["CO-0649"]}), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
+                patch.object(dashboard, "start_attended_validation", side_effect=AssertionError("no launch")):
+            dashboard.Handler.do_POST(request)
+        self.assertEqual(request.pages, [409])
+        request = _FakeRequest("/attended/validate")
+        with patch.object(dashboard, "post_form", return_value={"reference": ["CO-0649"]}), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={"CO-0649": ids}), \
+                patch.object(dashboard, "start_attended_validation", return_value=True):
+            dashboard.Handler.do_POST(request)
+        self.assertEqual(request.redirects, ["/co/CO-0649?validation=started"])
+        request = _FakeRequest("/attended/validate-all")
+        with patch.object(dashboard, "post_form", side_effect=AssertionError("no form needed")), \
+                patch.object(dashboard, "start_attended_validation_all", return_value=True):
+            dashboard.Handler.do_POST(request)
+        self.assertEqual(request.redirects, ["/?queue=scanning&scan=started"])
+
+    def test_queue_marks_drift_and_offers_validate_all(self):
+        rows = [{"Name": "CO-0649", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Account Scanning",
+                 "Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding",
+                 "Local_Leonardo_State": "Account Scanning", "Local_Validation_Drift": "1"}]
+        page = page_queue(rows)
+        self.assertIn("⚠ 1 setting(s) differ", page)
+        self.assertIn("action='/attended/validate-all'", page)
+

@@ -58,3 +58,4 @@ release/
 integration/attended_scan_status.json
 integration/attended_salesforce_id_writebacks.json
 integration/attended_salesforce_id_writebacks.tmp
+integration/attended_surface_validation.json

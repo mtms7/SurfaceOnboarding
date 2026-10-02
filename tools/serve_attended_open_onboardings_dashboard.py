@@ -41,6 +41,7 @@ from tools.attended_ce_only_playwright import (
     SCAN_STATUS_COMPLETED,
     SCAN_STATUS_FAILED,
     SCAN_STATUS_PATH,
+    VALIDATION_PATH,
     RunnerStateUnavailable,
     bootstrap_leonardo_session,
     check_leonardo_session,
@@ -292,6 +293,116 @@ def start_attended_scan_status_all() -> bool:
         return True
     except OSError:
         return False
+
+
+def _start_runner_mode(*arguments: str) -> bool:
+    """Launch one desktop-only, read-only runner mode (no fill, submit, or create)."""
+    if not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
+        return False
+    try:
+        subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), *arguments],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+def start_attended_validation(reference: str) -> bool:
+    return REFERENCE.fullmatch(reference) is not None and _start_runner_mode("--co", reference, "--validate")
+
+
+def start_attended_validation_all() -> bool:
+    return _start_runner_mode("--validate-all")
+
+
+VALIDATION_STATUSES = frozenset({"ok", "drift", "unknown", "info"})
+VALIDATION_GROUPS = ("Account", "Licence", "Settings", "Domains", "People", "Scan")
+
+
+def attended_validations() -> dict[str, dict[str, object]]:
+    """Load the local Surface validation results; absence means none. Malformed entries are dropped."""
+    try:
+        raw = json.loads(VALIDATION_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    results: dict[str, dict[str, object]] = {}
+    for reference, value in raw.items():
+        try:
+            if not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict):
+                continue
+            checks = value.get("checks")
+            if not isinstance(checks, list) or not all(
+                    isinstance(c, dict) and c.get("status") in VALIDATION_STATUSES
+                    and isinstance(c.get("check"), str) and c.get("group") in VALIDATION_GROUPS for c in checks):
+                continue
+            results[reference] = {"checks": checks, "plan_note": str(value.get("plan_note") or ""),
+                                  "observed_at": datetime.fromisoformat(value["observed_at"]),
+                                  "expires_at": datetime.fromisoformat(value["expires_at"])}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return results
+
+
+def _validation_value(value: object) -> str:
+    if value is True:
+        return "ON"
+    if value is False:
+        return "OFF"
+    if value is None:
+        return "—"
+    return str(value)
+
+
+def _validation_section(reference: str, notice: str = "", now: datetime | None = None) -> str:
+    """Surface validation checklist for an onboarded CO (local, read-only observation)."""
+    result = attended_validations().get(reference)
+    now = now or datetime.now()
+    button = ("<form method='post' action='/attended/validate'><input type='hidden' name='reference' value='"
+              + escape(reference) + "'><button type='submit' class='ghost'>Validate in Surface</button></form>")
+    started = ("<p class='note'>A read-only validation was started in the automation browser. "
+               "Reload this page in about 30 seconds.</p>" if notice == "validation-started" else "")
+    if result is None:
+        return ("<section class='login-preflight' aria-labelledby='validation-title'><div><h2 id='validation-title'>Surface validation</h2>"
+                "<p>Not validated yet. Validate reads the tenant from Leonardo Development (read-only) and compares "
+                "it with the onboarding plan.</p>" + started + "</div>" + button + "</section>")
+    checks = result["checks"]  # type: ignore[assignment]
+    drift = [c for c in checks if c["status"] == "drift"]  # type: ignore[union-attr]
+    unknown = [c for c in checks if c["status"] == "unknown"]  # type: ignore[union-attr]
+    stale = now > result["expires_at"]  # type: ignore[operator]
+    cls, icon = ("source-blocked", "!") if drift else (("source-warn", "!") if unknown else ("source-ready", "✓"))
+    title = (f"{len(drift)} difference(s) found" if drift
+             else (f"Verified, {len(unknown)} check(s) unconfirmed" if unknown else "Everything matches"))
+    marks = {"ok": "✓", "drift": "✗", "unknown": "?", "info": "·"}
+    rows = ""
+    for group in VALIDATION_GROUPS:
+        items = [c for c in checks if c["group"] == group]  # type: ignore[union-attr]
+        if not items:
+            continue
+        lines = []
+        for item in items:
+            detail = ""
+            if "expected" in item or "found" in item:
+                if item["status"] == "info":
+                    detail = " · " + escape(_validation_value(item.get("found")))
+                else:
+                    detail = (" · expected " + escape(_validation_value(item.get("expected")))
+                              + ", found " + escape(_validation_value(item.get("found"))))
+            style = " style='color:var(--bad);font-weight:600'" if item["status"] == "drift" else ""
+            lines.append(f"<span{style}>{marks[item['status']]} {escape(item['check'])}{detail}</span>")
+        rows += f"<dt>{escape(group)}</dt><dd>{'<br>'.join(lines)}</dd>"
+    plan_note = ""
+    if result["plan_note"]:
+        plan_note = ("<p class='note'>The onboarding plan could not be rebuilt from Salesforce (<code>"
+                     + escape(str(result["plan_note"])) + "</code>); only account, people, and scan checks ran.</p>")
+    observed = result["observed_at"].strftime("%Y-%m-%d %H:%M")  # type: ignore[union-attr]
+    return ("<section class='readiness " + cls + "' aria-labelledby='validation-title'><div class='readiness-heading'>"
+            f"<span class='readiness-icon' aria-hidden='true'>{icon}</span><div>"
+            f"<h2 id='validation-title'>Surface validation · {escape(title)}</h2>"
+            f"<p>Observed {escape(observed)}" + (" · <b>stale, validate again</b>" if stale else "") + ". "
+            "Compared with the onboarding plan; names, domains, and emails are checked but not stored.</p>"
+            + plan_note + started + "</div></div><dl>" + rows + "</dl>" + button + "</section>")
 
 
 def start_attended_scan_status(reference: str) -> bool:
@@ -1308,6 +1419,11 @@ def queue_rows() -> list[dict[str, str | None]]:
         scan = scans.get(row["Name"] or "")
         if scan is not None:
             row["Local_Scan_State"] = str(scan["state"])
+    validations = attended_validations()
+    for row in rows:
+        result = validations.get(row["Name"] or "")
+        if result is not None:
+            row["Local_Validation_Drift"] = str(sum(1 for c in result["checks"] if c["status"] == "drift"))  # type: ignore[union-attr]
     return rows
 
 
@@ -2000,8 +2116,11 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
                 product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
                 leonardo = row.get("Local_Leonardo_State")
                 run = _run_chip(record)
+                drift = row.get("Local_Validation_Drift")
                 automation = (_route_chip(row) + (f"<span class='run'>{run}</span>" if run else "")
-                              + (f"<span class='sub'>Leonardo: {escape(leonardo)}</span>" if leonardo else ""))
+                              + (f"<span class='sub'>Leonardo: {escape(leonardo)}</span>" if leonardo else "")
+                              + (f"<span class='sub' style='color:var(--bad)'>⚠ {escape(drift)} setting(s) differ</span>"
+                                 if drift not in (None, "0") else ""))
                 body += (
                     f"<tr><td><a class='co' href='/co/{reference}'>{reference}"
                     f"<span class='sub'>{escape(row.get('Account__r.Name') or 'Account unavailable')}</span></a></td>"
@@ -2027,7 +2146,9 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
             f"{escape(read_at)}</span><form method='get' action='/'>{hidden}<button class='ghost' type='submit'>Refresh"
             "</button></form><form method='post' action='/attended/scan-status-refresh-all'>"
             "<button class='ghost' type='submit' title='Read-only: reads each onboarded Surface tenant&#39;s scan status'>"
-            "Refresh scan statuses</button></form></div></div>")
+            "Refresh scan statuses</button></form><form method='post' action='/attended/validate-all'>"
+            "<button class='ghost' type='submit' title='Read-only: compares each onboarded tenant with its plan'>"
+            "Validate all</button></form></div></div>")
     if scan_started:
         banner = ("<p class='note'>A read-only scan-status sweep of every onboarded Surface tenant was started in the "
                   "automation browser. Reload in about a minute.</p>") + banner
@@ -2228,6 +2349,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     local_readback = _salesforce_ids_section(route_for(row), readback, row, reference) + local_readback
     if readback is not None and route_for(row) != CE_ENGINE:
         local_readback = _scan_status_section(reference, notification) + local_readback
+    if readback is not None:
+        local_readback = _validation_section(reference, notification) + local_readback
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
     if notification.startswith("id-write:") and notification[9:] in ID_WRITEBACK_RESULTS:
@@ -3034,6 +3157,7 @@ POST_ROUTES = frozenset({
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
+    "/attended/validate", "/attended/validate-all",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
 })
 
@@ -3099,6 +3223,7 @@ class Handler(BaseHTTPRequestHandler):
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
             if parse_qs(parsed.query).get("scan", [""])[0] == "started": notice = "started"
+            if parse_qs(parsed.query).get("validation", [""])[0] == "started": notice = "validation-started"
             id_write = parse_qs(parsed.query).get("id-write", [""])[0]
             if id_write in ID_WRITEBACK_RESULTS: notice = "id-write:" + id_write
             if match:
@@ -3160,6 +3285,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_leonardo_session_result("automation_browser_close_unavailable"))
                 return
             self.send_page(HTTPStatus.OK, page_leonardo_session_result(close_automation_browser()))
+            return
+        if path == "/attended/validate-all":
+            # Read-only sweep: no CO reference, no Salesforce write.
+            if not start_attended_validation_all():
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Validation unavailable</title><p>The read-only validation could not be started on this desktop.</p>")
+                return
+            self.send_redirect("/?queue=scanning&scan=started")
             return
         if path == "/attended/scan-status-refresh-all":
             # Read-only sweep: no CO reference, no Salesforce write.
@@ -3320,6 +3452,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             result = write_salesforce_id_after_confirmation(evaluation, nonce or "")
             self.send_redirect("/co/" + reference + "?id-write=" + result)
+            return
+        if path == "/attended/validate":
+            if reference not in attended_leonardo_readbacks():
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not onboarded</title><p>No local readback exists for " + escape(reference) + ". Nothing was started.</p>")
+                return
+            if not start_attended_validation(reference):
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Validation unavailable</title><p>The read-only validation could not be started on this desktop.</p>")
+                return
+            self.send_redirect("/co/" + reference + "?validation=started")
             return
         if path == "/attended/scan-status-refresh":
             # Read-only: launches the runner's --scan-status mode for an onboarded CO.

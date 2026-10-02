@@ -90,7 +90,7 @@ RUNNER_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "atten
 # Latest read-only check per CO (duplicate check / readback): local evidence
 # for the dashboard only; it never gates or consumes a create run.
 CHECK_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_check_state.json"
-CHECK_KINDS = frozenset({"duplicate_check", "readback", "scan_status"})
+CHECK_KINDS = frozenset({"duplicate_check", "readback", "scan_status", "validation"})
 READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
 # Surface-only scan observations (plan §5: Surface-owned, short-lived, never in Salesforce).
 SCAN_STATUS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_status.json"
@@ -104,6 +104,11 @@ SCAN_STATUS_TTL = timedelta(hours=6)
 SCAN_STATUS_COMPLETED: frozenset[str] = frozenset({"COMPLETED"})
 SCAN_STATUS_FAILED: frozenset[str] = frozenset()
 SCAN_STATUS_ENUM_PATTERN = r"[A-Za-z][A-Za-z0-9_]{0,39}"
+# Surface validation (2026-10-02): checks of a tenant's own search row against
+# the route plan. Values are kept only for booleans, enums, numbers, and dates;
+# names, domains, and emails are reduced to ok/drift plus counts.
+VALIDATION_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_surface_validation.json"
+VALIDATION_TTL = timedelta(hours=6)
 DIAGNOSTICS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_diagnostics.json"
 READBACK_SOURCE = "Leonardo Development Details readback"
 READBACK_STATE = "Account Scanning"
@@ -4703,6 +4708,314 @@ def run_scan_status_all() -> dict[str, str]:
     return results
 
 
+# Plan control -> path in the tenant search row (schema probe 2026-10-02, CO-0649).
+VALIDATION_TOGGLE_PATHS = {
+    "mfaRequired": "primaryUser.isMfaRequired",
+    "automatedDiscoveryEnabled": "accountSettings.reconSettings.automatedDiscoveryEnabled",
+    "subDomainsReconEnabled": "subDomainsReconEnabled",
+    "webDictionaryBruteForceEnabled": "webDictionaryBruteForceEnabled",
+    "webDorkingEnabled": "webDorkingEnabled",
+    "fullNucleiScanEnabled": "fullNucleiScanEnabled",
+    "authenticatedTestingEnabled": "authenticatedTestingEnabled",
+    "staticOutboundIpEnabled": "staticOutboundIpEnabled",
+    "aiEnabled": "aiEnabled",
+    "multipleAttackStacksEnabled": "campaignExecutionSettings.domainsMultiAttackStackSettings.enabled",
+    "notificationsAllowed": "accountLicense.notificationsAllowed",
+    "multipleUsersAllowed": "accountLicense.multipleUsersAllowed",
+    "apiAccessAllowed": "accountLicense.apiAccessAllowed",
+    "phishingEnabled": "accountLicense.phishingEnabled",
+    "leakedCredentialsAllowed": "accountLicense.leakedCredentialsAllowed",
+    "provisioningEnabled": "accountLicense.provisioningEnabled",
+}
+VALIDATION_TOGGLE_LABELS = {
+    "mfaRequired": "MFA required", "automatedDiscoveryEnabled": "Automated discovery",
+    "subDomainsReconEnabled": "Recon Subdomains", "webDictionaryBruteForceEnabled": "Web dictionary brute force",
+    "webDorkingEnabled": "Web dorking", "fullNucleiScanEnabled": "Nuclei",
+    "authenticatedTestingEnabled": "Authenticated testing", "staticOutboundIpEnabled": "Static outbound IP",
+    "aiEnabled": "AI", "multipleAttackStacksEnabled": "Multiple attack stacks",
+    "notificationsAllowed": "Notifications", "multipleUsersAllowed": "Multiple users", "apiAccessAllowed": "API access",
+    "phishingEnabled": "Phishing", "leakedCredentialsAllowed": "Leaked Credentials", "provisioningEnabled": "Provisioning",
+}
+VALIDATION_SELECT_PATHS = {
+    "Account Type": "accountType", "Scanning interval": "scanningInterval",
+    "Leaked Credentials scanning interval": "leakedCredentialsScanningInterval", "Type": "accountLicense.licenseType",
+}
+VALIDATION_NUMBER_PATHS = {
+    "Number of assets": "accountLicense.assetsNumber", "Number of domains": "accountLicense.domainsNumber",
+    "Number of subdomains": "accountLicense.subDomainsNumber",
+}
+VALIDATION_LIST_PATHS = {
+    "Alternate Domains (Comma Separated Values)": ("alternateDomains", "Alternate domains"),
+    "SubDomains (Comma Separated Values)": ("subDomains", "Subdomains"),
+    "Leaked Credentials scanned domains (Comma Separated Values)": ("leakedCredentialsScannedDomains",
+                                                                   "Leaked Credentials domains"),
+    "Networks (Comma Separated Values)": ("additionalNetworks", "Networks"),
+}
+VALIDATION_IDENTITY_PATHS = {
+    "Company name": ("accountName", "Company name"), "Company primary domain": ("accountDomain", "Primary domain"),
+    "First name": ("primaryUser.firstName", "Primary user first name"),
+    "Last name": ("primaryUser.lastName", "Primary user last name"),
+    "Organization Email": ("primaryUser.email", "Primary user email"),
+}
+VALIDATION_BLANK_PATHS = {"Phone number": "primaryUser.phoneNumber", "Job title": "primaryUser.jobTitle"}
+
+
+def _row_value(row: dict[str, Any], path: str) -> Any:
+    value: Any = row
+    for part in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _norm_enum(value: Any) -> str:
+    """'Prepaid annual subscription' == 'PREPAID_ANNUAL_SUBSCRIPTION'; None/'' == 'none'."""
+    text = re.sub(r"[^a-z0-9]", "", str(value).casefold()) if value not in (None, "") else ""
+    return text or "none"
+
+
+def _norm_text(value: Any) -> str:
+    return " ".join(str(value).casefold().split()).rstrip(".") if value is not None else ""
+
+
+def _epoch_dates(value: Any) -> set[str]:
+    """An epoch-ms licence date as ISO dates in UTC and local time (a day boundary may fall between)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return set()
+    try:
+        return {datetime.fromtimestamp(value / 1000, tz=timezone.utc).date().isoformat(),
+                datetime.fromtimestamp(value / 1000).date().isoformat()}
+    except (OverflowError, OSError, ValueError):
+        return set()
+
+
+def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
+                 entered: tuple[str, str] | None = None) -> list[dict[str, Any]]:
+    """Compare one tenant search row with the route's fill plan (read-only, pure).
+
+    Each check is {"check", "group", "status"} with status ok / drift /
+    unknown / info, plus "expected"/"found" for booleans, enums, numbers and
+    dates only. Without a plan (source unavailable) only the account status,
+    scan, and people checks run.
+    """
+    checks: list[dict[str, Any]] = []
+
+    def add(group: str, name: str, status: str, expected: Any = None, found: Any = None, safe: bool = True) -> None:
+        item: dict[str, Any] = {"group": group, "check": name, "status": status}
+        if safe and (expected is not None or found is not None):
+            item["expected"], item["found"] = expected, found
+        checks.append(item)
+
+    # Account status.
+    for name, path, want in (("Account enabled", "enabled", True), ("Not deleted", "isDeleted", False),
+                             ("Licence enabled", "accountLicense.enabled", True)):
+        found = _row_value(row, path)
+        add("Account", name, "ok" if found is want else "drift", want, found)
+    if plan is not None:
+        for label, key in VALIDATION_SELECT_PATHS.items():
+            if label not in plan.get("selects", {}):
+                continue
+            want, found = plan["selects"][label], _row_value(row, key)
+            add("Licence" if label == "Type" else "Settings", label if label != "Type" else "Licence type",
+                "ok" if _norm_enum(want) == _norm_enum(found) else "drift", want, found)
+        for label, key in VALIDATION_NUMBER_PATHS.items():
+            if label not in plan.get("texts", {}):
+                continue
+            want, found = int(plan["texts"][label]), _row_value(row, key)
+            add("Licence", label, "ok" if found == want else "drift", want, found)
+        start, end = plan.get("license_start"), plan.get("license_end")
+        if end is not None:
+            found = sorted(_epoch_dates(_row_value(row, "accountLicense.expirationDate")))
+            add("Licence", "Expiration date", "ok" if end.isoformat() in found else "drift",
+                end.isoformat(), found[0] if found else None)
+        found_start = sorted(_epoch_dates(_row_value(row, "accountLicense.startDate")))
+        if entered is not None:
+            add("Licence", "Start date", "ok" if entered[0] in found_start else "drift",
+                entered[0], found_start[0] if found_start else None)
+        else:
+            add("Licence", "Start date", "info", None, found_start[0] if found_start else None)
+        for key, target in plan.get("checkboxes", {}).items():
+            path = VALIDATION_TOGGLE_PATHS.get(key)
+            if path is None:
+                continue  # not exposed in the search row (e.g. Scan now, Include subdomains)
+            found = _row_value(row, path)
+            add("People" if key == "mfaRequired" else "Settings", VALIDATION_TOGGLE_LABELS[key],
+                "ok" if found is target else "drift", target, found)
+        for label, (key, name) in VALIDATION_IDENTITY_PATHS.items():
+            if label not in plan.get("texts", {}):
+                continue
+            same = _norm_text(plan["texts"][label]) == _norm_text(_row_value(row, key))
+            add("People" if key.startswith("primaryUser") else "Account", name, "ok" if same else "drift", safe=False)
+        for label, (key, name) in VALIDATION_LIST_PATHS.items():
+            if label in plan.get("texts", {}):
+                want = {_norm_text(v) for v in str(plan["texts"][label]).split(",") if v.strip()}
+            elif label in (plan.get("blank_texts") or ()):
+                want = set()
+            else:
+                continue
+            found_list = _row_value(row, key)
+            found_set = {_norm_text(v) for v in found_list} if isinstance(found_list, list) else None
+            add("Domains", name, "ok" if found_set == want else "drift",
+                f"{len(want)} item(s)", f"{len(found_set)} item(s)" if found_set is not None else None)
+        if "User email domains  (Comma Separated Values)" in plan.get("texts", {}):
+            want = {_norm_text(v) for v in plan["texts"]["User email domains  (Comma Separated Values)"].split(",")}
+            found_list = _row_value(row, "userEmailDomains")
+            found_set = {_norm_text(v) for v in found_list} if isinstance(found_list, list) else set()
+            # The customer's domain is added later with the customer user, so "includes" is enough.
+            add("People", "User email domains include the plan", "ok" if want <= found_set else "drift",
+                f"{len(want)} required", f"{len(found_set)} present")
+        for label, key in VALIDATION_BLANK_PATHS.items():
+            if label in (plan.get("blank_texts") or ()):
+                add("People", f"{label} empty", "ok" if _row_value(row, key) in (None, "") else "drift", safe=False)
+        if plan.get("advanced_texts", {}).get("Maximum scan Duration (hours)"):
+            want, found = int(plan["advanced_texts"]["Maximum scan Duration (hours)"]), _row_value(row, "campaignsTimeoutInHours")
+            # Mapping unconfirmed (CO-0649 shows null although the form showed 90 h): never "ok" by assumption.
+            add("Settings", "Maximum scan duration (h)", "ok" if found == want else "unknown", want, found)
+    operators = _row_value(row, "operatorAccounts")
+    add("People", "Operator Account", "info", None, "assigned" if operators else "not assigned")
+    add("People", "Customer accepted terms of use", "info", None,
+        "yes" if _row_value(row, "termsOfUseApproval") else "not yet")
+    scan = scan_status_from_row(row)
+    add("Scan", "Scan status", "info", None, scan["state"])
+    timed_out = _row_value(row, "lastReconExecutionData.timedOutActions")
+    if isinstance(timed_out, list):
+        add("Scan", "Timed-out scan actions", "ok" if not timed_out else "drift", 0, len(timed_out))
+    pending = _row_value(row, "pendingValidationAssets")
+    if isinstance(pending, int) and not isinstance(pending, bool):
+        add("Scan", "Pending validation assets", "info", None, pending)
+    return checks
+
+
+def write_validation(reference: str, route: str, checks: list[dict[str, Any]], observed_at: datetime,
+                     plan_note: str = "") -> None:
+    if not REFERENCE.fullmatch(reference):
+        raise ValueError("invalid_validation_reference")
+    try:
+        state = json.loads(VALIDATION_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    state[reference] = {"route": route, "checks": checks, "plan_note": plan_note,
+                        "observed_at": observed_at.isoformat(timespec="seconds"),
+                        "expires_at": (observed_at + VALIDATION_TTL).isoformat(timespec="seconds")}
+    _write_json_atomic(VALIDATION_PATH, state)
+
+
+def _validation_route(reference: str) -> tuple[str, str]:
+    """(route engine, tenant name) from one fixed, minimal Salesforce read."""
+    rows = _sf_records(
+        "SELECT Name, Account_Name__c, Onboarding_Product__c, Onboarding_Type__c "
+        "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+    if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+        raise ValueError()
+    row = rows[0]
+    account_name = row.get("Account_Name__c")
+    if not isinstance(account_name, str) or not " ".join(account_name.split()):
+        raise ValueError()
+    pair = (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+    if pair == (SURFACE_ROUTE_PRODUCT, SURFACE_ROUTE_TYPE):
+        return SURFACE_ENGINE, surface_names(account_name).tenant_name
+    if pair == (CASE3_ROUTE_PRODUCT, CASE3_ROUTE_TYPE):
+        return CASE3_ENGINE, surface_names(account_name).tenant_name
+    if pair == (CE_ROUTE_PRODUCT, CE_ROUTE_TYPE):
+        return CE_ENGINE, ce_only_names(account_name).tenant_name
+    raise SurfaceSourceError("validation_route_unsupported")
+
+
+def run_validate(reference: str) -> str:
+    """Read-only Surface validation of one onboarded CO (never fills, submits, or creates).
+
+    Matches the tenant by the captured id AND accountUuid, recomputes the
+    route plan from a fresh Salesforce read, compares them with validate_row,
+    and also refreshes the scan observation. A plan that cannot be rebuilt
+    (source changed or unavailable) still records the account/scan checks.
+    """
+    if not REFERENCE.fullmatch(reference):
+        return "invalid_co_reference"
+    try:
+        readback = json.loads(READBACK_PATH.read_text(encoding="utf-8")).get(reference)
+    except (OSError, ValueError, AttributeError):
+        readback = None
+    if (not isinstance(readback, dict) or not isinstance(readback.get("surface_account_id"), str)
+            or not isinstance(readback.get("account_uuid"), str)):
+        return "validation_not_onboarded"
+    try:
+        route, tenant_name = _validation_route(reference)
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    except SurfaceSourceError as error:
+        return str(error)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
+        return "validation_source_unavailable"
+    plan: dict[str, Any] | None = None
+    plan_note = ""
+    entered: tuple[str, str] | None = None
+    try:
+        record = load_runner_state().get(reference) or {}
+        if record.get("license_start_entered") and record.get("license_end_entered"):
+            entered = (record["license_start_entered"], record["license_end_entered"])
+    except RunnerStateUnavailable:
+        record = {}
+    try:
+        contract = ROUTES[route]
+        source = contract.load_source(reference)
+        run_day = date.fromisoformat(entered[0]) if entered else None
+        plan = contract.build_fill(source, run_day)
+        if entered is None:
+            plan["license_start"] = None  # the creation day is not recorded for older runs
+    except (RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        plan, plan_note = None, str(error) or "plan_unavailable"
+    with sync_playwright() as playwright:
+        try:
+            with _attended_page(playwright) as page:
+                search = _open_search(page)
+                if search is None:
+                    return "duplicate_search_schema_unavailable"
+                searched = _search_tenants(page, search, tenant_name)
+                if searched is None:
+                    return "validation_schema_unavailable"
+                matches = [row for row in searched.rows
+                           if row.get("id") == readback["surface_account_id"]
+                           and isinstance(row.get("accountUuid"), str)
+                           and row["accountUuid"].casefold() == readback["account_uuid"].casefold()]
+                if len(matches) != 1:
+                    return "validation_tenant_not_found"
+                checks = validate_row(matches[0], plan, entered)
+                try:
+                    now = datetime.now()
+                    write_validation(reference, route, checks, now, plan_note)
+                    write_scan_status(reference, scan_status_from_row(matches[0]), now)
+                except (OSError, ValueError):
+                    return "validation_write_unavailable"
+                drift = sum(1 for check in checks if check["status"] == "drift")
+                return "validation_recorded" if not drift else "validation_drift_found"
+        except LoginTimeout:
+            return "development_login_timeout"
+        except RuntimeError as error:
+            return str(error)
+        except Exception:
+            return "attended_ce_runner_unavailable"
+
+
+def run_validate_all() -> dict[str, str]:
+    """Read-only validation of every onboarded CO, one at a time; stops on a session problem."""
+    try:
+        references = sorted(reference for reference in json.loads(READBACK_PATH.read_text(encoding="utf-8"))
+                            if isinstance(reference, str) and REFERENCE.fullmatch(reference))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
+    results: dict[str, str] = {}
+    for reference in references:
+        results[reference] = result = run_validate(reference)
+        _record_check(reference, "validation", result)
+        if result in ("leonardo_session_expired", "development_login_timeout", "playwright_runtime_unavailable"):
+            break
+    return results
+
+
 def _combine_duplicate(ui: str, api: str) -> str:
     """Combine the table and server-row classifications (worst outcome wins)."""
     for outcome in ("duplicate_schema_unavailable", "duplicate_found", "duplicate_ambiguous"):
@@ -4812,6 +5125,10 @@ def main() -> int:
                         help="With --co: read-only duplicate check by CE tenant name and primary domain (no fill, submit, or create; does not consume the create gate).")
     parser.add_argument("--scan-status", action="store_true",
                         help="With --co: read-only scan-status read of an onboarded tenant (matches the captured IDs; no fill, submit, or create).")
+    parser.add_argument("--validate", action="store_true",
+                        help="With --co: read-only Surface validation of an onboarded tenant against its route plan.")
+    parser.add_argument("--validate-all", action="store_true",
+                        help="Read-only Surface validation of every onboarded CO (no fill, submit, or create).")
     parser.add_argument("--scan-status-all", action="store_true",
                         help="Read-only scan-status read for every onboarded Surface / Case 3 CO (no fill, submit, or create).")
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
@@ -4822,6 +5139,18 @@ def main() -> int:
             parser.error("--co is required with --duplicate-check")
         result = run_duplicate_check(args.co, route=args.route)
         _record_check(args.co, "duplicate_check", result)
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.validate_all:
+        results = run_validate_all()
+        print(json.dumps({"result": "validation_all_finished", "cos": results,
+                          "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.validate:
+        if not args.co:
+            parser.error("--co is required with --validate")
+        result = run_validate(args.co)
+        _record_check(args.co, "validation", result)
         print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0
     if args.scan_status_all:
