@@ -362,12 +362,20 @@ def source_for_fill(reference: str) -> tuple[str, str, str, str, str]:
 
 
 def _sf_records(query: str) -> list[Any]:
-    """Run one read-only sf query and return its records, failing closed."""
-    completed = subprocess.run(
-        [sf_command(), "data", "query", "--query", query, "--json"],
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-        text=True, encoding="utf-8", errors="replace", timeout=45, check=False,
-    )
+    """Run one read-only sf query and return its records, failing closed.
+
+    A timeout (subprocess.TimeoutExpired is not an OSError) becomes a
+    ValueError, so every caller reports its normal "source unavailable" code
+    instead of crashing the run (review item 4, 2026-10-01).
+    """
+    try:
+        completed = subprocess.run(
+            [sf_command(), "data", "query", "--query", query, "--json"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            text=True, encoding="utf-8", errors="replace", timeout=45, check=False,
+        )
+    except subprocess.SubprocessError as exc:
+        raise ValueError("salesforce_cli_timeout") from exc
     if completed.stdout is None:
         raise ValueError()
     payload = json.loads(completed.stdout)
@@ -1898,6 +1906,13 @@ def record_runner_result(reference: str, revision: str, result: str, completed_o
     _write_json_atomic(RUNNER_STATE_PATH, state)
 
 
+class ReadbackConflict(ValueError):
+    """A readback found different IDs than the ones already captured for this CO; nothing is replaced."""
+
+    def __init__(self) -> None:
+        super().__init__("readback_id_conflict")
+
+
 def write_readback_evidence(reference: str, surface_account_id: str, account_uuid: str, observed_on: str,
                             state: str = READBACK_STATE) -> None:
     """Append one minimal local readback entry; never overwrites another CO's entry.
@@ -1922,6 +1937,11 @@ def write_readback_evidence(reference: str, surface_account_id: str, account_uui
         raw: dict[str, Any] = {}
     except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError("readback_evidence_unreadable") from exc
+    previous = raw.get(reference)
+    if isinstance(previous, dict) and (
+            previous.get("surface_account_id") != surface_account_id
+            or str(previous.get("account_uuid", "")).casefold() != account_uuid.casefold()):
+        raise ReadbackConflict()  # review item 3: refresh state/date only for the same tenant
     raw[reference] = {
         "surface_account_id": surface_account_id,
         "account_uuid": account_uuid,
@@ -2089,24 +2109,32 @@ def _detail_value(page: Any, label: str) -> str | None:
     return value or None
 
 
-def _open_tenant_details(page: Any, tenant_name: str) -> bool:
-    """Click the exact tenant's row to open its details page (read-only)."""
+def _open_tenant_details(page: Any, tenant_name: str, expected_domain: str | None = None) -> bool:
+    """Click the exact tenant's row to open its details page (read-only).
+
+    Requires exactly one row whose company name (and, when given, primary
+    domain) matches; zero or several matches return False (review item 3:
+    the first name match was clicked before, ignoring the domain).
+    """
     expected = " ".join(tenant_name.casefold().split())
+    domain_wanted = expected_domain.casefold().strip().rstrip(".") if expected_domain else None
     rows = page.locator("tbody tr")
     count = rows.count()
-    target = None
+    matches = []
     for index in range(min(count, 100)):
         cells = rows.nth(index).locator("td")
         texts = _row_text_cells(cells)
         if not texts:
             continue
-        company, _domain = _tenant_row_values(texts)
+        company, domain = _tenant_row_values(texts)
         if company is None or " ".join(company.casefold().split()) != expected:
             continue
-        target = rows.nth(index)
-        break
-    if target is None:
+        if domain_wanted is not None and (domain or "").casefold().strip().rstrip(".") != domain_wanted:
+            continue
+        matches.append(rows.nth(index))
+    if len(matches) != 1:
         return False
+    target = matches[0]
     links = target.locator("a")
     if links.count() == 1:
         links.first.click()
@@ -2114,6 +2142,45 @@ def _open_tenant_details(page: Any, tenant_name: str) -> bool:
         target.click()
     page.wait_for_timeout(1_500)
     return True
+
+
+def _unique_api_row(result: "TenantSearchResult", tenant_name: str, expected_domain: str | None) -> dict[str, Any] | None:
+    """The single server row with this exact name (and domain, when given), else None."""
+    name = " ".join(tenant_name.casefold().split())
+    rows = [row for row in result.rows
+            if isinstance(row.get("accountName"), str) and " ".join(row["accountName"].casefold().split()) == name]
+    if expected_domain is not None:
+        rows = [row for row in rows if isinstance(row.get("accountDomain"), str)
+                and row["accountDomain"].casefold().strip().rstrip(".") == expected_domain]
+    return rows[0] if len(rows) == 1 else None
+
+
+def _row_ids_valid(row: dict[str, Any]) -> bool:
+    return bool(isinstance(row.get("id"), str) and re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, row["id"])
+                and isinstance(row.get("accountUuid"), str) and re.fullmatch(ACCOUNT_UUID_PATTERN, row["accountUuid"]))
+
+
+def _details_fallback(page: Any, searched: "TenantSearchResult | None", tenant_name: str,
+                      expected_domain: str | None) -> tuple[tuple[str, str, str | None] | None, str | None]:
+    """Read the details view only when the tenant is provably unique; the IDs must equal the server row.
+
+    Returns (details, failure_code). With a server response, the name (and
+    domain) must match exactly one row, else readback_tenant_ambiguous. The
+    details view must then show that row's IDs, else readback_value_mismatch.
+    """
+    row = None
+    if searched is not None:
+        row = _unique_api_row(searched, tenant_name, expected_domain)
+        if row is None:
+            return None, "readback_tenant_ambiguous"
+        if not _row_ids_valid(row):
+            return None, "readback_value_mismatch"
+    details = _readback_details_optional_state(page, tenant_name, expected_domain)
+    if details is None:
+        return None, "readback_schema_unavailable"
+    if row is not None and (details[0] != row["id"] or details[1].casefold() != row["accountUuid"].casefold()):
+        return None, "readback_value_mismatch"
+    return details, None
 
 
 def _readback_details(page: Any, tenant_name: str) -> tuple[str, str, str] | None:
@@ -2128,14 +2195,15 @@ def _readback_details(page: Any, tenant_name: str) -> tuple[str, str, str] | Non
     return surface_account_id, account_uuid, state
 
 
-def _readback_details_optional_state(page: Any, tenant_name: str) -> tuple[str, str, str | None] | None:
+def _readback_details_optional_state(page: Any, tenant_name: str,
+                                     expected_domain: str | None = None) -> tuple[str, str, str | None] | None:
     """Read the tenant details, tolerating an empty Account Scanning state.
 
     A tenant with no scan yet has no observed state; the Surface Account ID
     and Account UUID are still required. Returns None when the row or either
     required value is unavailable.
     """
-    if not _open_tenant_details(page, tenant_name):
+    if not _open_tenant_details(page, tenant_name, expected_domain):
         return None
     surface_account_id = _detail_value(page, "Surface Account ID")
     account_uuid = _detail_value(page, "Account UUID")
@@ -4290,8 +4358,15 @@ def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: floa
         contract = ROUTES.get(route)
         if contract is None:
             return _finish(reference, acknowledged_revision, "route_unsupported")
-        return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run,
-                    contract=contract, diagnose=diagnose, lc_prefill_probe=diagnose and lc_prefill_probe)
+        try:
+            return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run,
+                        contract=contract, diagnose=diagnose, lc_prefill_probe=diagnose and lc_prefill_probe)
+        except Exception as error:  # noqa: BLE001 - the record must never stay "Running"
+            try:
+                _ACTIVE_RUN_LOG.error("run", "crashed", error)
+            except Exception:  # noqa: BLE001
+                pass
+            return _finish(reference, acknowledged_revision, "runner_crashed")
     finally:
         _ACTIVE_RUN_LOG = None
 
@@ -4494,9 +4569,9 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                            if searched is not None else None)
                 log.event("readback", "api" if details else "api_unavailable")
                 if details is None:
-                    details = _readback_details_optional_state(page, tenant_name)
-                if details is None:
-                    return _finish(reference, acknowledged_revision, "readback_schema_unavailable")
+                    details, failure = _details_fallback(page, searched, tenant_name, main_domain)
+                    if failure is not None:
+                        return _finish(reference, acknowledged_revision, failure)
                 surface_account_id, account_uuid, state = details
                 observed_state = state if state else "No scan started"
                 if not (re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, surface_account_id)
@@ -4506,6 +4581,8 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                 try:
                     write_readback_evidence(reference, surface_account_id, account_uuid,
                                             date.today().isoformat(), observed_state)
+                except ReadbackConflict:
+                    return _finish(reference, acknowledged_revision, "readback_id_conflict")
                 except (OSError, ValueError):
                     return _finish(reference, acknowledged_revision, "readback_write_unavailable")
                 return _finish(reference, acknowledged_revision, "readback_verified")
@@ -4573,9 +4650,9 @@ def run_readback(reference: str, tenant_name_override: str | None = None, route:
                 details = _api_readback(searched, tenant_name, expected_domain,
                                         allow_scan_started=contract.allow_scan_started)
                 if details is None:
-                    details = _readback_details_optional_state(page, tenant_name)
-                if details is None:
-                    return "readback_schema_unavailable"
+                    details, failure = _details_fallback(page, searched, tenant_name, expected_domain)
+                    if failure is not None:
+                        return failure
                 surface_account_id, account_uuid, state = details
                 if not (re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, surface_account_id)
                         and re.fullmatch(ACCOUNT_UUID_PATTERN, account_uuid)):
@@ -4586,6 +4663,8 @@ def run_readback(reference: str, tenant_name_override: str | None = None, route:
                 try:
                     write_readback_evidence(reference, surface_account_id, account_uuid,
                                             date.today().isoformat(), state=observed_state)
+                except ReadbackConflict:
+                    return "readback_id_conflict"
                 except (OSError, ValueError):
                     return "readback_write_unavailable"
                 return "readback_only_verified"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import io
 import json
+import subprocess
 import os
 import shutil
 import sys
@@ -10,6 +11,7 @@ import tempfile
 import contextlib
 import types
 import unittest
+import unittest.mock
 from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -4769,4 +4771,130 @@ class CreateUncertainTests(unittest.TestCase):
                                                       "settled": "maybe"}}), encoding="utf-8")
         with self.assertRaises(runner.RunnerStateUnavailable):
             runner.load_runner_state()
+
+
+class _FakeRows:
+    """tbody tr rows for _open_tenant_details; _row_text_cells is patched to read .texts."""
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def count(self):
+        return len(self.rows)
+
+    def nth(self, index):
+        return self.rows[index]
+
+
+class _FakeRow:
+    def __init__(self, company, domain, clicks):
+        self.texts = ["Company name", company, "", "Company primary domain", domain]
+        self.clicks = clicks
+
+    def locator(self, selector):
+        if selector == "td":
+            return self
+        return _FakeLinks(self)
+
+    def click(self):
+        self.clicks.append(self.texts[1])
+
+
+class _FakeLinks:
+    def __init__(self, row):
+        self.row = row
+        self.first = row
+
+    def count(self):
+        return 1
+
+
+class _FakeTablePage:
+    def __init__(self, rows):
+        self._rows = _FakeRows(rows)
+
+    def locator(self, selector):
+        assert selector == "tbody tr"
+        return self._rows
+
+    def wait_for_timeout(self, _ms):
+        pass
+
+
+class ReadbackIdentityTests(unittest.TestCase):
+    """Review item 3 (2026-10-01): a readback must never pick or record the wrong tenant."""
+
+    ID, UUID = "a" * 24, "b" * 32
+
+    def _row(self, name=TENANT, domain=MAIN_DOMAIN, surface_id=None, uuid=None):
+        return {"accountName": name, "accountDomain": domain, "id": surface_id or self.ID, "accountUuid": uuid or self.UUID}
+
+    def test_unique_row_requires_one_exact_name_and_domain(self):
+        result = runner.TenantSearchResult([self._row(), self._row(domain="other.example")], 2)
+        self.assertEqual(runner._unique_api_row(result, TENANT, MAIN_DOMAIN)["accountDomain"], MAIN_DOMAIN)
+        self.assertIsNone(runner._unique_api_row(result, TENANT, None))  # two rows with the same name
+        self.assertIsNone(runner._unique_api_row(result, TENANT, "third.example"))
+
+    def test_ambiguous_server_rows_never_reach_the_details_page(self):
+        result = runner.TenantSearchResult([self._row(), self._row(surface_id="c" * 24)], 2)
+        with patch.object(runner, "_readback_details_optional_state", side_effect=AssertionError("no details click")):
+            self.assertEqual(runner._details_fallback(object(), result, TENANT, None),
+                             (None, "readback_tenant_ambiguous"))
+
+    def test_details_ids_must_equal_the_unique_server_row(self):
+        result = runner.TenantSearchResult([self._row()], 1)
+        with patch.object(runner, "_readback_details_optional_state", return_value=("c" * 24, self.UUID, None)):
+            self.assertEqual(runner._details_fallback(object(), result, TENANT, MAIN_DOMAIN),
+                             (None, "readback_value_mismatch"))
+        with patch.object(runner, "_readback_details_optional_state", return_value=(self.ID, self.UUID.upper(), None)) as d:
+            details, failure = runner._details_fallback(object(), result, TENANT, MAIN_DOMAIN)
+        self.assertIsNone(failure)
+        self.assertEqual(details[0], self.ID)
+        d.assert_called_once_with(unittest.mock.ANY, TENANT, MAIN_DOMAIN)
+
+    def test_details_click_requires_exactly_one_name_and_domain_row(self):
+        clicks = []
+        rows = [_FakeRow(TENANT, MAIN_DOMAIN, clicks), _FakeRow(TENANT, "other.example", clicks)]
+        with patch.object(runner, "_row_text_cells", side_effect=lambda cells: cells.texts):
+            self.assertFalse(runner._open_tenant_details(_FakeTablePage(rows), TENANT))  # two name matches
+            self.assertEqual(clicks, [])
+            self.assertTrue(runner._open_tenant_details(_FakeTablePage(rows), TENANT, MAIN_DOMAIN))
+        self.assertEqual(clicks, [TENANT])
+
+    def test_evidence_is_never_replaced_by_different_ids(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(runner, "READBACK_PATH", Path(folder) / "readbacks.json"):
+            runner.write_readback_evidence("CO-0702", self.ID, self.UUID, "2026-10-01", "No scan started")
+            runner.write_readback_evidence("CO-0702", self.ID, self.UUID, "2026-10-02", "Account Scanning")
+            with self.assertRaises(runner.ReadbackConflict):
+                runner.write_readback_evidence("CO-0702", "c" * 24, self.UUID, "2026-10-02", "Account Scanning")
+            stored = json.loads((Path(folder) / "readbacks.json").read_text(encoding="utf-8"))["CO-0702"]
+        self.assertEqual((stored["surface_account_id"], stored["leonardo_state"]), (self.ID, "Account Scanning"))
+
+
+class SalesforceTimeoutAndCrashTests(unittest.TestCase):
+    """Review item 4 (2026-10-01): a CLI timeout or unexpected error must not leave a run "Running"."""
+
+    def test_cli_timeout_becomes_a_normal_unavailable_result(self):
+        timeout = subprocess.TimeoutExpired(cmd="sf", timeout=45)
+        with patch.object(runner.subprocess, "run", side_effect=timeout):
+            with self.assertRaisesRegex(ValueError, "salesforce_cli_timeout"):
+                runner._sf_records("SELECT Name FROM Customer_Onboarding__c LIMIT 1")
+            with self.assertRaisesRegex(RuntimeError, "salesforce_fill_source_unavailable"):
+                runner.ce_fill_source("CO-0702")
+            with self.assertRaisesRegex(runner.SurfaceSourceError, "surface_source_unavailable"):
+                runner.surface_fill_source("CO-0801")
+
+    def test_an_unexpected_error_is_recorded_as_runner_crashed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(runner, "RUNNER_STATE_PATH", Path(folder) / "state.json"), \
+                patch.object(runner, "RUN_LOG_PATH", Path(folder) / "log.json"), \
+                patch.object(runner, "_run", side_effect=KeyError("boom")):
+            runner.record_runner_start("CO-0702", "rev1", "2026-10-02T10:00:00")
+            result = runner.run("CO-0702", "rev1", review_wait_seconds=1)
+            record = runner.load_runner_state()["CO-0702"]
+        self.assertEqual(result, "runner_crashed")
+        self.assertEqual(record["result"], "runner_crashed")
 
