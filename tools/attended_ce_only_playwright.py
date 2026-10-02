@@ -1023,6 +1023,130 @@ def case3_scope_summary(source: Case3FillSource, run_day: date | None = None) ->
     return scope
 
 
+# --- Renewal plan (Cases 4-6), read-only, 2026-10-02 -------------------------
+# Proposed rules pending owner answers (docs/38 Q1, Q3, Q7, Q10, Q11): only
+# new-model rows (Surface Go/Prime + same-term add-ons, Core Plus) define the
+# new term; legacy rows are listed as ignored; both expiration options are
+# shown; the start date never changes (Renew card R4).
+RENEWAL_CASES = {
+    ("Surface & Credential Exposure", "Renewal of Existing Product"): ("case_6_renew_both", "Case 6 · renew Surface + CE", True, True),
+    ("Surface & Credential Exposure", "Renewal of Surface + New Credential Exposure Module"):
+        ("case_4_renew_surface_new_ce", "Case 4 · renew Surface + new CE", True, True),
+    ("Surface & Credential Exposure", "Renewal of Credential Exposure Module + New Surface Product"):
+        ("case_5_renew_ce_new_surface", "Case 5 · renew CE + new Surface", True, True),
+    ("Surface", "Renewal of Existing Product"): ("surface_renewal", "Surface renewal (not one of the six cases, Q10)", True, False),
+    ("Credential Exposure", "Renewal of Existing Product"): ("ce_renewal", "CE renewal (not one of the six cases, Q10)", False, True),
+}
+RENEWAL_NEW_MODEL_TIERS = frozenset({"go", "prime"})
+RENEWAL_APPLY_WINDOW_DAYS = 14  # Guide G8: a renewal may be applied up to two weeks before it starts
+_INACTIVE_STATUSES = ("expired", "cancelled", "canceled", "inactive")
+
+
+def renewal_case(product: Any, onboarding_type: Any) -> tuple[str, str, bool, bool] | None:
+    """(engine, label, renews Surface, renews CE) for a renewal CO, else None."""
+    return RENEWAL_CASES.get((product, onboarding_type))
+
+
+def _renewal_term(rows: list[dict[str, Any]], today: date) -> dict[str, Any]:
+    start, end = rows[0]["start"], rows[0]["end"]
+    annual = min(_add_one_year(start) - timedelta(days=1), end)
+    apply_from = start - timedelta(days=RENEWAL_APPLY_WINDOW_DAYS)
+    return {"products": [row["product"] for row in rows], "status": rows[0]["status"],
+            "start": start.isoformat(), "end": end.isoformat(), "annual_expiration": annual.isoformat(),
+            "apply_from": apply_from.isoformat(), "applicable_now": apply_from <= today}
+
+
+def build_renewal_plan(product: Any, onboarding_type: Any, subscription_rows: list[Any],
+                       today: date | None = None) -> dict[str, Any] | None:
+    """Read-only renewal plan for one CO from its DealHub rows (pure; values are not stored).
+
+    Returns None for a non-renewal CO. Blockers (never raised) explain why a
+    term cannot be planned: no_new_surface_term, no_core_plus_term,
+    surface_term_ambiguous, core_plus_term_ambiguous, terms_differ.
+    """
+    from phase1_validator.surface_source_readiness import classify_surface_product, surface_scanning_interval
+
+    case = renewal_case(product, onboarding_type)
+    if case is None:
+        return None
+    engine, label, renews_surface, renews_ce = case
+    today = today or _run_day()
+    baselines: list[dict[str, Any]] = []
+    addons: list[dict[str, Any]] = []
+    core_plus: list[dict[str, Any]] = []
+    ce_domain_addons: list[dict[str, Any]] = []
+    legacy: list[str] = []
+    for raw in subscription_rows:
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("Product_Full_Name__c")
+        status = _row_status(raw)
+        start = _parse_subscription_date(raw.get("DealHub_Subscription_Start_Date__c"))
+        end = _parse_subscription_date(raw.get("DealHub_Subscription_End_Date__c"))
+        if not isinstance(name, str) or status in _INACTIVE_STATUSES or start is None or end is None or end <= start:
+            continue
+        row = {"product": name, "status": status, "start": start, "end": end}
+        if is_core_plus_baseline_row(name):
+            core_plus.append(row)
+            continue
+        match = re.search(r"Credential Exposure - Additional (\d+) Email Domain", name)
+        if match:
+            ce_domain_addons.append(dict(row, count=int(match.group(1))))
+            continue
+        classified = classify_surface_product(name)
+        if classified is None:
+            continue
+        if classified.kind == "baseline" and classified.tier in RENEWAL_NEW_MODEL_TIERS:
+            baselines.append(dict(row, tier=classified.tier, subdomains=classified.subdomains))
+        elif classified.kind == "subdomain_addon" and any(tier in name.casefold() for tier in ("surface go", "surface prime")):
+            addons.append(dict(row, subdomains=classified.subdomains))
+        else:
+            legacy.append(name)  # older model, or an unrecognized legacy product (Q11)
+    blockers: list[str] = []
+    plan: dict[str, Any] = {"engine": engine, "label": label, "renews_surface": renews_surface, "renews_ce": renews_ce,
+                            "legacy_ignored": legacy, "blockers": blockers}
+    surface_term = ce_term = None
+    if renews_surface:
+        if not baselines:
+            blockers.append("no_new_surface_term")
+        else:
+            latest = max(row["start"] for row in baselines)
+            current = [row for row in baselines if row["start"] == latest]
+            if len({(row["tier"], row["subdomains"], row["end"]) for row in current}) != 1:
+                blockers.append("surface_term_ambiguous")
+            else:
+                surface_term = _renewal_term(current, today)
+                term_addons = [row for row in addons if row["start"] == latest]
+                subdomains = current[0]["subdomains"] + sum(row["subdomains"] for row in term_addons)
+                surface_term.update({
+                    "tier": current[0]["tier"], "scanning_interval": surface_scanning_interval(current[0]["tier"]),
+                    "baseline_subdomains": current[0]["subdomains"],
+                    "addon_subdomains": sum(row["subdomains"] for row in term_addons),
+                    "addon_products": [row["product"] for row in term_addons],
+                    "subdomains": subdomains, "domains": subdomains, "assets": int(SURFACE_LICENSE_ASSETS)})
+    if renews_ce:
+        if not core_plus:
+            blockers.append("no_core_plus_term")
+        else:
+            latest = max(row["start"] for row in core_plus)
+            current = [row for row in core_plus if row["start"] == latest]
+            if len({row["end"] for row in current}) != 1:
+                blockers.append("core_plus_term_ambiguous")
+            else:
+                ce_term = _renewal_term(current, today)
+                extra = sum(row["count"] for row in ce_domain_addons if row["start"] == latest)
+                ce_term.update({"leaked_credentials_interval": "Weekly", "ce_domains_included": 1,
+                                "ce_domains_addon": extra})
+    if surface_term and ce_term:
+        same_annual = surface_term["annual_expiration"] == ce_term["annual_expiration"]
+        same_end = surface_term["end"] == ce_term["end"]
+        plan["terms_agree"] = {"annual": same_annual, "term_end": same_end}
+        if not (same_annual and same_end):
+            blockers.append("terms_differ")
+    plan["surface_term"], plan["ce_term"] = surface_term, ce_term
+    return plan
+
+
 def surface_run_license_dates(source: SurfaceFillSource, run_day: date | None = None) -> tuple[date, date]:
     """Surface license dates: the CE rule (start = run day; expiration =
     min(subscription start + 1 year - 1 day, subscription end)).

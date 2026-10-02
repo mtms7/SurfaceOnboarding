@@ -4902,3 +4902,74 @@ class SalesforceTimeoutAndCrashTests(unittest.TestCase):
         self.assertEqual(result, "runner_crashed")
         self.assertEqual(record["result"], "runner_crashed")
 
+
+class RenewalPlanTests(unittest.TestCase):
+    """Read-only renewal plan (2026-10-02), modelled on the open renewal COs seen on 2026-10-01."""
+
+    TODAY = date(2026, 10, 2)
+    SCE, RENEW = "Surface & Credential Exposure", "Renewal of Existing Product"
+
+    def plan(self, rows, product=SCE, onboarding_type=RENEW):
+        return runner.build_renewal_plan(product, onboarding_type, rows, self.TODAY)
+
+    def test_non_renewal_cos_get_no_plan(self):
+        self.assertIsNone(self.plan([], "Surface", "New Product Onboarding"))
+
+    def test_case6_pending_new_term_with_legacy_rows(self):
+        # Like CO-0767: legacy products Active until the renewal, new Prime + Core Plus Pending.
+        rows = [_dealhub("Pentera Surface Software Enterprise - Up to 1000 Sub-Domains & 10 Domains", "Active", "2025-07-27", "2026-10-27"),
+                _dealhub("Credential Exposure Module - Core Up to 3000 Endpoints (1 Email Domain)", "Active", "2023-10-27", "2026-10-27"),
+                _dealhub("Pentera Surface Prime - 1000 Subdomains", "Pending", "2026-10-27", "2029-10-26"),
+                _dealhub("Pentera Core Plus Commercial - 500 End Points", "Pending", "2026-10-27", "2029-10-26"),
+                _dealhub("Pentera Core Plus Bulk - Additional 500 End Points", "Pending", "2026-10-27", "2029-10-26")]
+        plan = self.plan(rows)
+        self.assertEqual(plan["engine"], "case_6_renew_both")
+        self.assertEqual(plan["blockers"], [])
+        surface = plan["surface_term"]
+        self.assertEqual((surface["tier"], surface["scanning_interval"], surface["subdomains"]), ("prime", "Weekly", 1000))
+        self.assertEqual((surface["annual_expiration"], surface["end"]), ("2027-10-26", "2029-10-26"))
+        self.assertEqual((surface["apply_from"], surface["applicable_now"]), ("2026-10-13", False))
+        self.assertEqual(plan["terms_agree"], {"annual": True, "term_end": True})
+        self.assertEqual(len(plan["legacy_ignored"]), 1)  # the old Enterprise baseline
+
+    def test_case6_active_go_with_bulk_addon_and_ce_email_addon(self):
+        # Like CO-0770: old Professional rows expired; Go 500 + Go Bulk 500 + Core Plus Active.
+        rows = [_dealhub("Pentera Surface Software Professional - 1,800 Sub-Domains & 3 Domains", "Expired", "2023-09-19", "2026-09-18"),
+                _dealhub("Pentera Surface Go - 500 Subdomains", "Active", "2026-09-30", "2029-09-29"),
+                _dealhub("Pentera Surface Go Bulk - Additional 500 Subdomains", "Active", "2026-09-30", "2029-09-29"),
+                _dealhub("Pentera Core Plus Enterprise - 4000 End Points", "Active", "2026-09-30", "2029-09-29"),
+                _dealhub("Credential Exposure - Additional 100 Email Domain", "Active", "2026-09-30", "2029-09-29")]
+        plan = self.plan(rows)
+        surface, ce = plan["surface_term"], plan["ce_term"]
+        self.assertEqual((surface["baseline_subdomains"], surface["addon_subdomains"], surface["subdomains"]), (500, 500, 1000))
+        self.assertEqual(surface["scanning_interval"], "Monthly")
+        self.assertTrue(surface["applicable_now"])
+        self.assertEqual((ce["ce_domains_included"], ce["ce_domains_addon"]), (1, 100))
+        self.assertEqual(plan["legacy_ignored"], [])  # the expired legacy row is not counted at all
+
+    def test_only_legacy_rows_means_no_renewal_term_yet(self):
+        # Like CO-0771: only older-model products, no new-model renewal term.
+        rows = [_dealhub("Pentera Surface Software - Essentials - 150 Sub-Domains", "Active", "2022-02-01", "2027-01-31"),
+                _dealhub("Pentera Core Software - Up to 500 Endpoints", "Active", "2022-02-01", "2027-01-31")]
+        plan = self.plan(rows)
+        self.assertIn("no_new_surface_term", plan["blockers"])
+        self.assertIn("no_core_plus_term", plan["blockers"])
+        self.assertEqual(len(plan["legacy_ignored"]), 1)
+
+    def test_ce_renewal_uses_the_latest_core_plus_term(self):
+        # Like CO-0769: current Core Plus Active, renewal Pending from the next day.
+        rows = [_dealhub("Pentera Core Plus Commercial - 500 End Points", "Active", "2025-10-20", "2026-10-19"),
+                _dealhub("Pentera Core Plus Commercial - 500 End Points", "Pending", "2026-10-20", "2029-02-28")]
+        plan = self.plan(rows, "Credential Exposure")
+        self.assertEqual(plan["engine"], "ce_renewal")
+        self.assertIsNone(plan["surface_term"])
+        ce = plan["ce_term"]
+        self.assertEqual((ce["start"], ce["annual_expiration"], ce["apply_from"]), ("2026-10-20", "2027-10-19", "2026-10-06"))
+
+    def test_terms_that_differ_are_a_blocker(self):
+        rows = [_dealhub("Pentera Surface Prime - 1000 Subdomains", "Active", "2026-10-01", "2029-09-30"),
+                _dealhub("Pentera Core Plus Commercial - 500 End Points", "Active", "2026-10-01", "2027-06-30")]
+        plan = self.plan(rows, onboarding_type="Renewal of Surface + New Credential Exposure Module")
+        self.assertEqual(plan["engine"], "case_4_renew_surface_new_ce")
+        self.assertIn("terms_differ", plan["blockers"])
+

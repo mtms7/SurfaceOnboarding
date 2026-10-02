@@ -2309,3 +2309,39 @@ class RequestOriginTests(unittest.TestCase):
         # A same-origin request reaches routing (an unknown path stays a plain 404).
         self.assertEqual(self._request("POST", "/attended/unknown", lambda port: {"Origin": f"http://127.0.0.1:{port}"}), 404)
 
+
+class RenewalPlanCardTests(unittest.TestCase):
+    ROW = {"Name": "CO-0767", "Account__c": "001000000000DEMO", "Onboarding_Product__c": "Surface & Credential Exposure",
+           "Onboarding_Type__c": "Renewal of Existing Product", "Onboarding_Approval_Status__c": "Approved",
+           "Onboarding_Stage__c": "Request Approved", "Surface_Account_ID__c": None, "Account_UUID__c": None}
+    ROWS = [{"Product_Full_Name__c": "Pentera Surface Prime - 1000 Subdomains", "DealHub_Status__c": "Pending",
+             "DealHub_Subscription_Start_Date__c": "2026-10-27", "DealHub_Subscription_End_Date__c": "2029-10-26"},
+            {"Product_Full_Name__c": "Pentera Core Plus Commercial - 500 End Points", "DealHub_Status__c": "Pending",
+             "DealHub_Subscription_Start_Date__c": "2026-10-27", "DealHub_Subscription_End_Date__c": "2029-10-26"}]
+
+    def test_card_shows_the_plan_and_no_action(self):
+        from datetime import date as _date
+        with patch.object(dashboard, "renewal_subscription_rows", return_value=list(self.ROWS)):
+            card = dashboard._renewal_plan_section(dict(self.ROW), _date(2026, 10, 2))
+        self.assertIn("Renewal plan · Case 6 · renew Surface + CE", card)
+        self.assertIn("Manual in production · plan only", card)
+        self.assertIn("Prime · Weekly", card)
+        self.assertIn("annual cap 2027-10-26 · or term end 2029-10-26", card)
+        self.assertIn("from 2026-10-13", card)
+        self.assertIn("✓ Surface and Core Plus agree", card)
+        self.assertIn("find the tenant by name and primary domain", card)
+        self.assertNotIn("<form", card)
+        self.assertNotIn("<button", card)
+
+    def test_unreadable_dealhub_and_non_renewal_cos(self):
+        with patch.object(dashboard, "renewal_subscription_rows", side_effect=dashboard.ReadUnavailable()):
+            self.assertIn("could not be read", dashboard._renewal_plan_section(dict(self.ROW)))
+        new = dict(self.ROW, Onboarding_Type__c="New Product Onboarding")
+        with patch.object(dashboard, "renewal_subscription_rows", side_effect=AssertionError("no read")):
+            self.assertEqual(dashboard._renewal_plan_section(new), "")
+
+    def test_subscription_read_rejects_a_bad_account_id(self):
+        with patch.object(dashboard, "sf_json", side_effect=AssertionError("no query")):
+            with self.assertRaises(dashboard.ReadUnavailable):
+                dashboard.renewal_subscription_rows("x'; DELETE")
+

@@ -55,6 +55,8 @@ from tools.attended_ce_only_playwright import (
     case3_fill_source,
     case3_scope_summary,
     case3_term_problem,
+    build_renewal_plan,
+    renewal_case,
     SURFACE_ROUTE_PRODUCT,
     SURFACE_ROUTE_TYPE,
     close_automation_browser,
@@ -1692,6 +1694,88 @@ def detail_row(reference: str) -> dict[str, str | None]:
         raise ReadUnavailable() from None
 
 
+@_display_cached
+def renewal_subscription_rows(account_id: str) -> list[dict[str, object]]:
+    """DealHub rows for one account (fixed read-only query; display only, never stored)."""
+    if not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
+        raise ReadUnavailable()
+    response = sf_json(["data", "query", "--query",
+                        "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
+                        "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c WHERE DealHub_Account__c = '"
+                        + account_id + "' LIMIT 100", "--json"])
+    try:
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list):  # type: ignore[index]
+            raise ReadUnavailable()
+        return [{key: record.get(key) for key in ("Product_Full_Name__c", "DealHub_Status__c",
+                                                    "DealHub_Subscription_Start_Date__c", "DealHub_Subscription_End_Date__c")}
+                for record in records if isinstance(record, dict)]
+    except (KeyError, TypeError):
+        raise ReadUnavailable() from None
+
+
+RENEWAL_BLOCKER_TEXT = {
+    "no_new_surface_term": "No new-model Surface term (Go/Prime) is in DealHub yet; only legacy or no Surface rows.",
+    "no_core_plus_term": "No Core Plus term is in DealHub for the Credential Exposure renewal.",
+    "surface_term_ambiguous": "Several different Surface baselines start on the same day.",
+    "core_plus_term_ambiguous": "Several Core Plus rows with different end dates start on the same day.",
+    "terms_differ": "The Surface and Core Plus terms end on different dates (rule 1a: one tenant, one licence term).",
+}
+
+
+def _renewal_plan_section(row: dict[str, str | None], today: date | None = None) -> str:
+    """Read-only renewal plan (Cases 4-6 and single-product renewals): a manual checklist, no action."""
+    case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+    if case is None:
+        return ""
+    head = ("<section class='card' aria-labelledby='renewal-plan-title'><div class='card-head'>"
+            "<h2 id='renewal-plan-title' class='pill'>Renewal plan · " + escape(case[1]) + "</h2>"
+            "<span class='chip chip-neutral'>Manual in production · plan only</span></div>")
+    try:
+        rows = renewal_subscription_rows(row.get("Account__c") or "")
+    except ReadUnavailable:
+        return head + "<p class='note'>The DealHub subscriptions could not be read. No plan is shown.</p></section>"
+    plan = build_renewal_plan(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"), rows, today)
+    if plan is None:
+        return ""
+    has_id = bool((row.get("Surface_Account_ID__c") or "").strip() or (row.get("Account_UUID__c") or "").strip())
+    facts = [("Existing tenant", "Salesforce holds an ID (production tenant) — open it by that ID" if has_id
+              else "No ID in Salesforce — find the tenant by name and primary domain")]
+    surface, ce = plan["surface_term"], plan["ce_term"]
+    if surface:
+        addon = (" + " + str(surface["addon_subdomains"]) + " add-on" if surface["addon_subdomains"] else "")
+        facts += [("New Surface term", f"{surface['products'][0]} · {surface['status']} · {surface['start']} → {surface['end']}"),
+                  ("Tier / interval", f"{str(surface['tier']).title()} · {surface['scanning_interval']}"),
+                  ("Subdomains / domains / assets",
+                   f"{surface['subdomains']} ({surface['baseline_subdomains']} baseline{addon}) / {surface['domains']} / {surface['assets']}"),
+                  ("Surface settings", "Revalidate the Surface profile: 90 h, Recon / brute force / Nuclei ON, discovery / dorking / AI / static IP / auth testing / multi-stack OFF; Notifications / Multiple users / API ON")]
+    if ce:
+        extra = f" + {ce['ce_domains_addon']} from add-on rows (Q7)" if ce["ce_domains_addon"] else ""
+        facts += [("New Core Plus term", f"{ce['products'][0]} · {ce['status']} · {ce['start']} → {ce['end']}"),
+                  ("Leaked Credentials", f"ON · {ce['leaked_credentials_interval']} · {ce['ce_domains_included']} CE email domain{extra}")]
+    term = surface or ce
+    if term:
+        when = "now" if term["applicable_now"] else "from " + term["apply_from"]
+        facts += [("Apply", when + " (up to 14 days before the new term starts)"),
+                  ("Expiration (Q1 open)", f"annual cap {term['annual_expiration']} · or term end {term['end']}"),
+                  ("Start date", "never change (Renew card)")]
+    if "terms_agree" in plan:
+        agree = plan["terms_agree"]
+        facts.append(("Term check", "✓ Surface and Core Plus agree" if agree["annual"] and agree["term_end"]
+                      else "✗ the terms differ — manual review"))
+    if plan["legacy_ignored"]:
+        facts.append(("Legacy rows ignored (Q11)", str(len(plan["legacy_ignored"])) + " older-model product row(s)"))
+    blockers = "".join("<p class='note' style='color:var(--bad)'><b>" + escape(RENEWAL_BLOCKER_TEXT.get(code, code))
+                       + "</b> <code>" + escape(code) + "</code></p>" for code in plan["blockers"])
+    checklist = ["Open the tenant in Back Office › ⋮ › Edit", "Apply the changes above; never change the start date",
+                 "Check the user email domains for the primary user", "Update the Operator Account if the TA changed",
+                 "Save; Salesforce updates stay manual"]
+    return (head + blockers + "<dl>" + "".join("<dt>" + escape(k) + "</dt><dd>" + escape(v) + "</dd>" for k, v in facts)
+            + "</dl><p class='note'>Checklist: " + " · ".join("☐ " + escape(item) for item in checklist) + "</p>"
+            "<p class='login-safety'>Read-only: built from Salesforce and DealHub. Nothing is opened, changed, or "
+            "saved in Leonardo or Salesforce. Rules marked Q1/Q7/Q10/Q11 await owner answers (docs/38).</p></section>")
+
+
 def surface_commercial_readiness(row: dict[str, str | None]) -> dict[str, object] | None:
     """Read one CO's related subscriptions only when its detail page is opened.
 
@@ -2370,7 +2454,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                  + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
                  "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
                  "<button class='ghost' type='submit'>Refresh</button></form></div></div>"
-                 + toast + case4_panel + comment_repair_action + renewal_comment_evaluation_action + renewal_preflight
+                 + toast + case4_panel + comment_repair_action + renewal_comment_evaluation_action
+                 + _renewal_plan_section(row) + renewal_preflight
                  + readiness + manual_action + local_readback + details)
     return _app_shell(reference, main_html, active="onboardings")
 

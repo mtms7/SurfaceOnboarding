@@ -181,6 +181,7 @@ def synthetic_backends() -> Iterator[None]:
             "attended_leonardo_readbacks": lambda: dict(READBACKS), "load_runner_state": lambda: dict(RUNNER_STATE),
             "attended_scan_statuses": _scan_statuses, "salesforce_id_writebacks": lambda: {},
             "attended_validations": _validations,
+            "renewal_subscription_rows": _blocked,
             "load_attended_reminders": lambda: {}, "manual_start_ack_nonce": lambda *_a, **_k: None,
             "evaluate_surface_fill_preflight": _surface_preflight, "evaluate_ce_only_fill_preflight": _ce_preflight,
             "closed_history": _history, "cached_closed_history": _history, "detail_row": _blocked,
