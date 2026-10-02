@@ -1772,9 +1772,29 @@ def record_check_result(reference: str, kind: str, result: str, completed_on: st
     _write_json_atomic(CHECK_STATE_PATH, state)
 
 
+def start_blocker(record: dict[str, str] | None) -> str | None:
+    """Why a new attended start must not happen for a CO, whatever its revision, else None.
+
+    "run_in_progress": a recorded start has no result yet (a runner may still
+    be filling or confirming). "tenant_already_verified": a tenant was
+    created and read back. Review item 1 (2026-10-01): before this, a CO
+    edited in Salesforce during a run could launch a second runner.
+    """
+    if record is None:
+        return None
+    if not record.get("result"):
+        return "run_in_progress"
+    if record["result"] == "readback_verified":
+        return "tenant_already_verified"
+    return None
+
+
 def record_runner_start(reference: str, revision: str, started_on: str, *,
                         route: str | None = None, scope_reviewed_on: str | None = None) -> None:
-    """Record one acknowledged start; a different revision supersedes the prior record.
+    """Record one acknowledged start; a finished, failed run of another revision is superseded.
+
+    Refuses (ValueError with the start_blocker code) while the CO's current
+    record is in progress or verified, regardless of revision.
 
     ``route`` and ``scope_reviewed_on`` are recorded only when given (the
     Surface route's revision-bound scope-review acknowledgement), so a CE-only
@@ -1790,6 +1810,9 @@ def record_runner_start(reference: str, revision: str, started_on: str, *,
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid_runner_state_record") from exc
     state = load_runner_state()
+    blocker = start_blocker(state.get(reference))
+    if blocker is not None:
+        raise ValueError(blocker)
     record = {"source_revision": revision, "started_on": started_on}
     if route is not None:
         record["route"] = route

@@ -58,6 +58,8 @@ from tools.attended_ce_only_playwright import (
     SURFACE_ROUTE_TYPE,
     close_automation_browser,
     load_runner_state,
+    start_blocker,
+    record_runner_result,
     record_runner_start,
     reset_leonardo_profile,
     reset_runner_record,
@@ -103,6 +105,9 @@ _salesforce_login_lock = Lock()
 _salesforce_login_process: subprocess.Popen[str] | None = None
 _comment_update_acks: dict[str, tuple[str, str, float]] = {}
 _comment_update_lock = Lock()
+# One attended start at a time: the gate, the start record, and the launch run
+# under this lock so two quick clicks cannot both pass the gate.
+_start_lock = Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -575,6 +580,9 @@ def evaluate_ce_only_start(acknowledged_revision: str | None, evaluation: Creden
     record = state.get(evaluation.reference)
     if record is not None and record.get("source_revision") == evaluation.source_revision:
         return "revision_already_acknowledged"
+    blocker = start_blocker(record)
+    if blocker is not None:
+        return blocker
     return "start"
 
 
@@ -2392,6 +2400,10 @@ def page_ce_only_fill_preflight(evaluation: CredentialExposureFillPreflight,
             runner_note = ("<p>An attended run for this source revision was started" + started +
                             " and has not reported a result. Do not start another.</p>")
             start_action = ""
+    elif start_blocker(record) is not None:
+        runner_note = ("<p>An earlier run is still in progress or already created a tenant (<code>"
+                       + escape(start_blocker(record) or "") + "</code>). No new run can start.</p>")
+        start_action = ""
     elif record is not None:
         runner_note = ("<p>Previous attended run for a different source revision: <code>" +
                         escape(record.get("result", "no result recorded")) + "</code></p>")
@@ -2418,6 +2430,7 @@ RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "duplicate_ambiguous": ("blocked", "A tenant with a similar name exists, or the search returned more results than could be checked. Nothing was created. Review it in Leonardo Development before retrying."),
     "duplicate_search_schema_unavailable": ("blocked", "The Tenant Management search control could not be found (page-layout/selector issue). No tenant was created."),
     "duplicate_schema_unavailable": ("blocked", "The tenant table could not be classified (unexpected row layout). No tenant was created. Diagnostics were captured; retry after review."),
+    "runner_launch_failed": ("blocked", "The desktop runner could not be launched. Nothing was started in Leonardo."),
     "case3_route_mismatch": ("blocked", "This CO is not a new Surface &amp; Credential Exposure onboarding. Nothing was started."),
     "case3_ce_email_domain_invalid": ("blocked", "Case 3 needs exactly one valid CE email domain in Email Domains. Correct it in Salesforce."),
     "case3_core_plus_missing": ("blocked", "No Core Plus (Credential Exposure) subscription was found on the account. Nothing was started."),
@@ -2723,6 +2736,12 @@ def _entered_license_note(record: dict[str, str] | None) -> str:
             + escape(record["license_start_entered"]) + " → " + escape(record["license_end_entered"]) + "</b></p>")
 
 
+_START_IN_PROGRESS_NOTE = (
+    "<p class='note'><b>A run for an earlier source revision has not reported a result.</b> The CO changed in "
+    "Salesforce while it was running, so no new run can start until it finishes. "
+    "<a href='/attended/ce-only-runner-status?ref={ref}'>View progress</a></p>")
+
+
 def _ce_only_onboard_section(reference: str) -> str:
     """Render the primary Onboard action for one approved CE-only CO.
 
@@ -2768,6 +2787,11 @@ def _ce_only_onboard_section(reference: str) -> str:
         runner_note = ("<p class='note'>An attended run for this source revision was started" + started +
                        " and has not reported a result. Do not start another. "
                        "<a href='/attended/ce-only-runner-status?ref=" + ref + "'>View progress</a></p>")
+    elif start_blocker(record) == "run_in_progress":
+        runner_note = _START_IN_PROGRESS_NOTE.format(ref=ref)
+    elif start_blocker(record) == "tenant_already_verified":
+        runner_note = (_outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
+                                       "readback_verified", record.get("completed_on")) + _entered_license_note(record))
     else:
         if record is not None:
             runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +
@@ -2903,6 +2927,8 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str
         # A verified tenant exists; a later source revision never re-creates it.
         runner_note = (_outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
                                        "readback_verified", record.get("completed_on")) + _entered_license_note(record))
+    elif start_blocker(record) == "run_in_progress":
+        runner_note = _START_IN_PROGRESS_NOTE.format(ref=ref)
     else:
         if record is not None:
             runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +
@@ -2989,6 +3015,16 @@ def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, referenc
                       "<section class='card'>" + body + "</section>", refresh=refresh, active="onboardings")
 
 
+START_BLOCKED_MESSAGES = {
+    "revision_acknowledgement_missing": "The source-revision acknowledgement is missing. No browser was launched.",
+    "preflight_blocked": "The preflight is blocked. No browser was launched.",
+    "source_revision_changed": "The source revision changed since this page was shown. No browser was launched. Review it again.",
+    "scope_changed": "The computed scope changed since it was reviewed. No browser was launched. Review the scope again.",
+    "run_in_progress": "A run for this CO (an earlier source revision) has not reported a result yet. No new run was started.",
+    "tenant_already_verified": "A tenant was already created and verified for this CO. No new run was started.",
+}
+
+
 POST_ROUTES = frozenset({
     "/attended/salesforce-login", "/attended/leonardo-dev-session-check", "/attended/leonardo-dev-session-bootstrap",
     "/attended/leonardo-dev-session-reset", "/attended/leonardo-dev-browser-close",
@@ -3006,6 +3042,27 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args: object) -> None: pass
     def send_page(self, status: HTTPStatus, page: str) -> None:
         data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(data)
+    def _claim_and_launch(self, reference: str, revision: str, launch: Any, **start_fields: str) -> bool:
+        """Record the start first (the claim), then launch; a failed launch is recorded as such."""
+        try:
+            record_runner_start(reference, revision, datetime.now().isoformat(timespec="seconds"), **start_fields)
+        except ValueError as error:
+            message = START_BLOCKED_MESSAGES.get(str(error), "The start could not be recorded. No browser was launched.")
+            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>" + message + "</p>"
+                           "<p><a href='/co/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>")
+            return False
+        except (OSError, RunnerStateUnavailable):
+            self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The start could not be recorded. No browser was launched. Do not retry; inspect the state file.</p>")
+            return False
+        if not launch():
+            try:
+                record_runner_result(reference, revision, "runner_launch_failed", datetime.now().isoformat(timespec="seconds"))
+            except (OSError, ValueError, RunnerStateUnavailable):
+                pass
+            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>The isolated desktop runner is unavailable. No Leonardo action was performed.</p>")
+            return False
+        return True
+
     def send_redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER); self.send_header("Location", location); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.end_headers()
     def do_GET(self) -> None:
@@ -3164,35 +3221,27 @@ class Handler(BaseHTTPRequestHandler):
             except ReadUnavailable:
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Preflight unavailable</title><p>" + escape(reference) + " could not be freshly read. No browser was launched.</p>")
                 return
-            try:
-                state = load_runner_state()
-            except RunnerStateUnavailable:
-                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The local runner state file could not be read. No browser was launched. Do not retry; inspect the state file.</p>")
-                return
-            decision = evaluate_ce_only_start(acknowledged_revision, evaluation, state)
-            if decision == "revision_already_acknowledged":
-                # The run already happened (or is in progress): show its actual
-                # outcome, then return to the CO, instead of a dead-end message.
-                # No browser is launched.
-                self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
-                return
-            if decision != "start":
-                blocked = {
-                    "revision_acknowledgement_missing": "The source-revision acknowledgement is missing. No browser was launched.",
-                    "preflight_blocked": "The CE-only preflight is blocked. No browser was launched.",
-                    "source_revision_changed": "The source revision changed since the preflight page was shown. No browser was launched.",
-                }[decision]
-                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>" + blocked + "</p>"
-                               "<p><a href='/co/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>")
-                return
-            if not start_attended_ce_only_runner(reference, evaluation.source_revision):
-                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>The isolated desktop runner is unavailable. No Leonardo action was performed.</p>")
-                return
-            try:
-                record_runner_start(reference, evaluation.source_revision, datetime.now().isoformat(timespec="seconds"))
-            except (OSError, ValueError, RunnerStateUnavailable):
-                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
-                return
+            with _start_lock:
+                try:
+                    state = load_runner_state()
+                except RunnerStateUnavailable:
+                    self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The local runner state file could not be read. No browser was launched. Do not retry; inspect the state file.</p>")
+                    return
+                decision = evaluate_ce_only_start(acknowledged_revision, evaluation, state)
+                if decision == "revision_already_acknowledged":
+                    # The run already happened (or is in progress): show its actual
+                    # outcome, then return to the CO, instead of a dead-end message.
+                    # No browser is launched.
+                    self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+                    return
+                if decision != "start":
+                    blocked = START_BLOCKED_MESSAGES.get(decision, "The start is blocked. No browser was launched.")
+                    self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>" + blocked + "</p>"
+                                   "<p><a href='/co/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>")
+                    return
+                if not self._claim_and_launch(reference, evaluation.source_revision,
+                                              lambda: start_attended_ce_only_runner(reference, evaluation.source_revision)):
+                    return
             self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
             return
         if path == "/attended/start-surface-runner":
@@ -3217,39 +3266,30 @@ class Handler(BaseHTTPRequestHandler):
             except ReadUnavailable:
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Preflight unavailable</title><p>" + escape(reference) + " could not be freshly read. No browser was launched.</p>")
                 return
-            try:
-                state = load_runner_state()
-            except RunnerStateUnavailable:
-                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The local runner state file could not be read. No browser was launched. Do not retry; inspect the state file.</p>")
-                return
-            record = state.get(reference)
-            if record is not None and record.get("result") == "readback_verified":
-                # A verified tenant exists: show it; a later revision never re-creates it.
-                self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
-                return
-            decision = evaluate_surface_start(acknowledged_revision, scope_digest, evaluation, state)
-            if decision == "revision_already_acknowledged":
-                self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
-                return
-            if decision != "start":
-                blocked = {
-                    "revision_acknowledgement_missing": "The source-revision acknowledgement is missing. No browser was launched.",
-                    "preflight_blocked": "The Surface preflight is blocked. No browser was launched.",
-                    "source_revision_changed": "The source revision changed since the scope was shown. No browser was launched. Review the scope again.",
-                    "scope_changed": "The computed scope changed since it was reviewed. No browser was launched. Review the scope again.",
-                }[decision]
-                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>" + blocked + "</p>" + back)
-                return
-            if not start_attended_surface_runner(reference, evaluation.source_revision, route):
-                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>The isolated desktop runner is unavailable. No Leonardo action was performed.</p>")
-                return
-            now = datetime.now().isoformat(timespec="seconds")
-            try:
-                record_runner_start(reference, evaluation.source_revision, now,
-                                    route=route, scope_reviewed_on=now)
-            except (OSError, ValueError, RunnerStateUnavailable):
-                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The runner started but its start could not be recorded. Do not retry; inspect the state file.</p>")
-                return
+            with _start_lock:
+                try:
+                    state = load_runner_state()
+                except RunnerStateUnavailable:
+                    self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The local runner state file could not be read. No browser was launched. Do not retry; inspect the state file.</p>")
+                    return
+                record = state.get(reference)
+                if record is not None and record.get("result") == "readback_verified":
+                    # A verified tenant exists: show it; a later revision never re-creates it.
+                    self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+                    return
+                decision = evaluate_surface_start(acknowledged_revision, scope_digest, evaluation, state)
+                if decision == "revision_already_acknowledged":
+                    self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+                    return
+                if decision != "start":
+                    blocked = START_BLOCKED_MESSAGES.get(decision, "The start is blocked. No browser was launched.")
+                    self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Start blocked</title><p>" + blocked + "</p>" + back)
+                    return
+                now = datetime.now().isoformat(timespec="seconds")
+                if not self._claim_and_launch(reference, evaluation.source_revision,
+                                              lambda: start_attended_surface_runner(reference, evaluation.source_revision, route),
+                                              route=route, scope_reviewed_on=now):
+                    return
             self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
             return
         if path in ("/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm") \

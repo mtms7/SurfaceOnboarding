@@ -1070,10 +1070,19 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         state = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-21T10:00:00"}}
         self.assertEqual(dashboard.evaluate_ce_only_start("rev1", evaluation, state), "revision_already_acknowledged")
 
-    def test_evaluate_ce_only_start_allows_a_new_revision(self):
+    def test_evaluate_ce_only_start_allows_a_new_revision_after_a_failed_run(self):
         evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev2", 1, ())
-        state = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-21T10:00:00"}}
+        state = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-21T10:00:00",
+                             "result": "duplicate_found", "completed_on": "2026-09-21T10:02:00"}}
         self.assertEqual(dashboard.evaluate_ce_only_start("rev2", evaluation, state), "start")
+
+    def test_evaluate_ce_only_start_blocks_any_revision_while_in_progress_or_verified(self):
+        evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev2", 1, ())
+        in_progress = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-21T10:00:00"}}
+        self.assertEqual(dashboard.evaluate_ce_only_start("rev2", evaluation, in_progress), "run_in_progress")
+        verified = {"CO-0702": {"source_revision": "rev1", "result": "readback_verified",
+                                "completed_on": "2026-09-21T10:05:00"}}
+        self.assertEqual(dashboard.evaluate_ce_only_start("rev2", evaluation, verified), "tenant_already_verified")
 
     def test_ce_only_preflight_page_shows_revision_and_hidden_ack_field(self):
         evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev1", 1, ())
@@ -1091,12 +1100,20 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertNotIn("Start Onboarding", page)
         self.assertIn("has not reported a result", page)
 
-    def test_ce_only_preflight_page_shows_form_for_a_new_revision(self):
+    def test_ce_only_preflight_page_shows_form_for_a_new_revision_after_a_failed_run(self):
         evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev2", 1, ())
-        state = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-21T10:00:00"}}
+        state = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-21T10:00:00",
+                             "result": "duplicate_found", "completed_on": "2026-09-21T10:02:00"}}
         page = page_ce_only_fill_preflight(evaluation, state)
         self.assertIn("Start Onboarding", page)
         self.assertIn("Previous attended run for a different source revision", page)
+
+    def test_ce_only_preflight_page_hides_form_while_an_earlier_run_is_in_progress(self):
+        evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev2", 1, ())
+        state = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-09-21T10:00:00"}}
+        page = page_ce_only_fill_preflight(evaluation, state)
+        self.assertNotIn("Start Onboarding", page)
+        self.assertIn("run_in_progress", page)
 
     def test_ce_only_preflight_page_shows_completed_result_and_hides_form(self):
         evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev1", 1, ())
@@ -2032,4 +2049,88 @@ class ScanStatusSweepTests(unittest.TestCase):
             page = page_detail("CO-0679", row)
         self.assertNotIn("Leonardo scan status", page)
         self.assertIn("Leonardo Development readback", page)
+
+
+class StartGuardTests(unittest.TestCase):
+    """Review item 1 (2026-10-01): one start guard across revisions; claim before launch."""
+
+    IN_PROGRESS = {"CO-0702": {"source_revision": "rev1", "started_on": "2026-10-02T09:00:00"}}
+
+    def test_ce_card_shows_no_start_while_an_earlier_revision_runs(self):
+        evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev2", 1, ())
+        with patch.object(dashboard, "evaluate_ce_only_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value=dict(self.IN_PROGRESS)):
+            section = dashboard._ce_only_onboard_section("CO-0702")
+        self.assertNotIn("Start Onboarding", section)
+        self.assertIn("has not reported a result", section)
+
+    def test_ce_card_shows_the_verified_tenant_for_a_newer_revision(self):
+        evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev2", 1, ())
+        state = {"CO-0702": {"source_revision": "rev1", "result": "readback_verified", "completed_on": "2026-10-01T10:00:00"}}
+        with patch.object(dashboard, "evaluate_ce_only_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value=state):
+            section = dashboard._ce_only_onboard_section("CO-0702")
+        self.assertNotIn("Start Onboarding", section)
+        self.assertIn("Onboarded successfully", section)
+
+    def test_surface_card_shows_no_start_while_an_earlier_revision_runs(self):
+        evaluation = _surface_evaluation()
+        state = {"CO-0801": {"source_revision": "older", "started_on": "2026-10-02T09:00:00",
+                             "route": "case_1_new_surface_only"}}
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value=state), \
+                patch.object(dashboard, "load_attended_reminders", return_value={}):
+            section = dashboard._surface_onboard_section("CO-0801")
+        self.assertNotIn("Start Onboarding", section)
+        self.assertIn("has not reported a result", section)
+
+    def _post_ce_start(self, state, launched=True):
+        class _FakeRequest:
+            def __init__(self):
+                self.path, self.pages, self.redirects = "/attended/start-ce-only-runner", [], []
+            def send_page(self, status, page):
+                self.pages.append((status, page))
+            def send_redirect(self, location):
+                self.redirects.append(location)
+            _claim_and_launch = dashboard.Handler._claim_and_launch
+        request = _FakeRequest()
+        evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev2", 1, ())
+        calls = []
+        form = {"reference": ["CO-0702"], "attended_create_authorized": ["1"], "source_revision": ["rev2"]}
+        with patch.object(dashboard, "post_form", return_value=form), \
+                patch.object(dashboard, "evaluate_ce_only_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value=state), \
+                patch.object(dashboard, "record_runner_start", side_effect=lambda *a, **k: calls.append("record")), \
+                patch.object(dashboard, "record_runner_result", side_effect=lambda *a, **k: calls.append(("result", a[2]))), \
+                patch.object(dashboard, "start_attended_ce_only_runner",
+                             side_effect=lambda *a: calls.append("launch") or launched):
+            dashboard.Handler.do_POST(request)
+        return request, calls
+
+    def test_ce_start_post_refuses_while_an_earlier_revision_runs(self):
+        request, calls = self._post_ce_start(dict(self.IN_PROGRESS))
+        self.assertEqual(calls, [])
+        self.assertEqual(request.pages[0][0], 409)
+        self.assertIn("has not reported a result yet", request.pages[0][1])
+
+    def test_ce_start_records_before_launch_and_records_a_failed_launch(self):
+        request, calls = self._post_ce_start({})
+        self.assertEqual(calls, ["record", "launch"])
+        self.assertEqual(request.redirects, ["/attended/ce-only-runner-status?ref=CO-0702"])
+        request, calls = self._post_ce_start({}, launched=False)
+        self.assertEqual(calls, ["record", "launch", ("result", "runner_launch_failed")])
+        self.assertEqual(request.pages[0][0], 409)
+
+    def test_a_refused_claim_launches_nothing(self):
+        class _FakeRequest:
+            def __init__(self):
+                self.pages = []
+            def send_page(self, status, page):
+                self.pages.append((status, page))
+        request = _FakeRequest()
+        with patch.object(dashboard, "record_runner_start", side_effect=ValueError("run_in_progress")):
+            ok = dashboard.Handler._claim_and_launch(request, "CO-0702", "rev2",
+                                                     lambda: (_ for _ in ()).throw(AssertionError("no launch")))
+        self.assertFalse(ok)
+        self.assertEqual(request.pages[0][0], 409)
 

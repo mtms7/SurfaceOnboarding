@@ -73,13 +73,33 @@ class RunnerStateFileTests(unittest.TestCase):
             self.assertEqual(state["CO-0702"]["started_on"], "2026-09-21T10:00:00")
             self.assertNotIn("result", state["CO-0702"])
 
-    def test_record_start_new_revision_supersedes_prior_record(self):
+    def test_record_start_new_revision_supersedes_a_finished_failed_run(self):
         with patch.object(runner, "RUNNER_STATE_PATH", self._temp_path("state.json")):
             record_runner_start("CO-0702", "rev1", "2026-09-21T10:00:00")
+            record_runner_result("CO-0702", "rev1", "duplicate_search_schema_unavailable", "2026-09-21T10:02:00")
             record_runner_start("CO-0702", "rev2", "2026-09-21T11:00:00")
             state = load_runner_state()
             self.assertEqual(state["CO-0702"]["source_revision"], "rev2")
             self.assertEqual(state["CO-0702"]["started_on"], "2026-09-21T11:00:00")
+
+    def test_record_start_refuses_while_in_progress_or_verified_on_any_revision(self):
+        # Review item 1 (2026-10-01): a CO edited during a run must not start a second runner.
+        with patch.object(runner, "RUNNER_STATE_PATH", self._temp_path("state.json")):
+            record_runner_start("CO-0702", "rev1", "2026-09-21T10:00:00")
+            with self.assertRaisesRegex(ValueError, "run_in_progress"):
+                record_runner_start("CO-0702", "rev2", "2026-09-21T10:30:00")
+            self.assertEqual(load_runner_state()["CO-0702"]["source_revision"], "rev1")  # not overwritten
+            record_runner_result("CO-0702", "rev1", "readback_verified", "2026-09-21T10:05:00")
+            with self.assertRaisesRegex(ValueError, "tenant_already_verified"):
+                record_runner_start("CO-0702", "rev3", "2026-09-21T11:00:00")
+            self.assertEqual(load_runner_state()["CO-0702"]["result"], "readback_verified")
+
+    def test_start_blocker_codes(self):
+        self.assertIsNone(runner.start_blocker(None))
+        self.assertEqual(runner.start_blocker({"source_revision": "r"}), "run_in_progress")
+        self.assertEqual(runner.start_blocker({"source_revision": "r", "result": "readback_verified"}),
+                         "tenant_already_verified")
+        self.assertIsNone(runner.start_blocker({"source_revision": "r", "result": "duplicate_found"}))
 
     def test_record_start_rejects_invalid_reference(self):
         with patch.object(runner, "RUNNER_STATE_PATH", self._temp_path("state.json")):
