@@ -3193,8 +3193,43 @@ POST_ROUTES = frozenset({
 })
 
 
+def request_origin_problem(command: str, host: str | None, origin: str | None, fetch_site: str | None,
+                           port: int) -> str | None:
+    """Why a request must be refused before any handler runs, else None (review item 6, 2026-10-01).
+
+    The Host header must be this dashboard's own loopback address (blocks DNS
+    rebinding reads). A POST must not come from another site: a present
+    Origin must be this dashboard, and without Origin a present
+    Sec-Fetch-Site must be same-origin or none. Browsers always send one of
+    them on a cross-site form post; a local script that sends neither is not
+    a cross-site page. SURFACE_ONBOARDING_ALLOWED_HOSTS adds exact host:port
+    values (for example an SSH-tunnel port), comma-separated.
+    """
+    allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
+    allowed |= {item.strip().lower() for item in os.environ.get("SURFACE_ONBOARDING_ALLOWED_HOSTS", "").split(",") if item.strip()}
+    if (host or "").strip().lower() not in allowed:
+        return "host_not_allowed"
+    if command == "POST":
+        if origin is not None:
+            if origin.strip().lower() not in {"http://" + item for item in allowed}:
+                return "origin_not_allowed"
+        elif fetch_site is not None and fetch_site.strip().lower() not in ("same-origin", "none"):
+            return "cross_site_post"
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args: object) -> None: pass
+    def parse_request(self) -> bool:
+        """Refuse foreign Host / cross-site POST requests before any page or action runs."""
+        if not super().parse_request():
+            return False
+        problem = request_origin_problem(self.command, self.headers.get("Host"), self.headers.get("Origin"),
+                                         self.headers.get("Sec-Fetch-Site"), self.server.server_address[1])
+        if problem is not None:
+            self.send_error(HTTPStatus.FORBIDDEN, "Request refused")
+            return False
+        return True
     def send_page(self, status: HTTPStatus, page: str) -> None:
         data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(data)
     def _claim_and_launch(self, reference: str, revision: str, launch: Any, **start_fields: str) -> bool:

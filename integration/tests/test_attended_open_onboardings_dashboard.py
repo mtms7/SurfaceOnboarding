@@ -2259,3 +2259,53 @@ class CreateUncertainDashboardTests(unittest.TestCase):
         page = dashboard.page_ce_only_runner_status({"CO-0702": dict(self.RECORD)}, "CO-0702")
         self.assertIn("Create uncertain — verify in Leonardo", page)
 
+
+class RequestOriginTests(unittest.TestCase):
+    """Review item 6 (2026-10-01): only this dashboard may read pages or post actions."""
+
+    def test_rules(self):
+        problem = dashboard.request_origin_problem
+        self.assertIsNone(problem("GET", "127.0.0.1:8012", None, None, 8012))
+        self.assertIsNone(problem("GET", "localhost:8012", None, None, 8012))
+        self.assertEqual(problem("GET", "evil.example:8012", None, None, 8012), "host_not_allowed")  # DNS rebinding
+        self.assertEqual(problem("GET", "127.0.0.1:9999", None, None, 8012), "host_not_allowed")
+        self.assertEqual(problem("GET", None, None, None, 8012), "host_not_allowed")
+        self.assertIsNone(problem("POST", "127.0.0.1:8012", "http://127.0.0.1:8012", "same-origin", 8012))
+        self.assertEqual(problem("POST", "127.0.0.1:8012", "https://evil.example", "cross-site", 8012), "origin_not_allowed")
+        self.assertEqual(problem("POST", "127.0.0.1:8012", "null", None, 8012), "origin_not_allowed")
+        self.assertEqual(problem("POST", "127.0.0.1:8012", None, "cross-site", 8012), "cross_site_post")
+        self.assertIsNone(problem("POST", "127.0.0.1:8012", None, None, 8012))  # local script, not a web page
+        with patch.dict(os.environ, {"SURFACE_ONBOARDING_ALLOWED_HOSTS": "127.0.0.1:18012"}):
+            self.assertIsNone(problem("POST", "127.0.0.1:18012", "http://127.0.0.1:18012", None, 8012))
+
+    def _request(self, method, path, headers):
+        import http.client
+        import threading
+        from http.server import ThreadingHTTPServer
+        server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.putrequest(method, path, skip_host=True)
+        for name, value in {"Host": f"127.0.0.1:{port}", **headers(port)}.items():
+            connection.putheader(name, value)
+        connection.putheader("Content-Length", "0")
+        connection.endheaders()
+        return connection.getresponse().status
+
+    def test_the_real_server_refuses_before_any_handler_runs(self):
+        with patch.object(dashboard, "reset_leonardo_profile", side_effect=AssertionError("must not run")), \
+                patch.object(dashboard, "render_dashboard", side_effect=AssertionError("must not run")):
+            self.assertEqual(self._request("GET", "/", lambda port: {"Host": f"rebind.example:{port}"}), 403)
+            self.assertEqual(self._request("POST", "/attended/leonardo-dev-session-reset",
+                                           lambda port: {"Origin": "https://evil.example"}), 403)
+            self.assertEqual(self._request("POST", "/attended/leonardo-dev-session-reset",
+                                           lambda port: {"Sec-Fetch-Site": "cross-site"}), 403)
+        # A same-origin request reaches routing (an unknown path stays a plain 404).
+        self.assertEqual(self._request("POST", "/attended/unknown", lambda port: {"Origin": f"http://127.0.0.1:{port}"}), 404)
+
