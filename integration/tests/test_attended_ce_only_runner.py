@@ -4607,7 +4607,11 @@ class SurfaceValidationTests(unittest.TestCase):
         self.assertEqual(named["Nuclei"]["status"], "ok")
         self.assertEqual(named["Licence type"]["status"], "ok")  # enum spelling differences are normalized
         self.assertEqual(named["Expiration date"]["status"], "ok")
-        self.assertEqual(named["Maximum scan duration (h)"]["status"], "unknown")  # mapping unconfirmed
+        # Not in the search data (operator confirmed 90 h in the Edit form, 2026-10-02): info, not judged.
+        self.assertEqual(named["Maximum scan duration (h)"]["status"], "info")
+        row = _row_from_plan(self.plan)
+        row["campaignsTimeoutInHours"] = 24
+        self.assertEqual(self._by_name(runner.validate_row(row, self.plan))["Maximum scan duration (h)"]["status"], "drift")
 
     def test_a_changed_toggle_and_quantity_are_reported_with_values(self):
         row = _row_from_plan(self.plan)

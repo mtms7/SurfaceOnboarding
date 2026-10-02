@@ -5004,8 +5004,12 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
                 add("People", f"{label} empty", "ok" if _row_value(row, key) in (None, "") else "drift", safe=False)
         if plan.get("advanced_texts", {}).get("Maximum scan Duration (hours)"):
             want, found = int(plan["advanced_texts"]["Maximum scan Duration (hours)"]), _row_value(row, "campaignsTimeoutInHours")
-            # Mapping unconfirmed (CO-0649 shows null although the form showed 90 h): never "ok" by assumption.
-            add("Settings", "Maximum scan duration (h)", "ok" if found == want else "unknown", want, found)
+            if found is None:
+                # Not in the search data: CO-0649's row has campaignsTimeoutInHours = null while the
+                # Edit form shows 90 h (operator-confirmed 2026-10-02), so it is reported, not judged.
+                add("Settings", "Maximum scan duration (h)", "info", None, "not in search data (check the Edit form)")
+            else:
+                add("Settings", "Maximum scan duration (h)", "ok" if found == want else "drift", want, found)
     operators = _row_value(row, "operatorAccounts")
     add("People", "Operator Account", "info", None, "assigned" if operators else "not assigned")
     add("People", "Customer accepted terms of use", "info", None,
