@@ -1,7 +1,7 @@
 # Direct Salesforce-to-Surface Onboarding Integration Plan
 
 **Date:** 2026-09-15
-**Status (2026-10-01, end of day):** CO-0649's first scan **COMPLETED**; Case 3 built locally; scan-status sweep, Salesforce IDs panel (dashboard only, env dev), already-onboarded gate, faster dashboard, and a tested VM staging copy added; Guru rules, gaps, questions, and the renewal mapping are in `docs/38`. The authoritative handoff is **"Handoff — 2026-10-01 end of day"** at the end of §18. **Earlier status (2026-09-30, end of day):** **The first automated Surface-only onboarding succeeded.** CO-0649 was created in Leonardo Development and read back (`readback_verified`, `account/add` 200, ID and UUID captured, "No scan started"). The authoritative handoff and next steps are **"Handoff — 2026-09-30 end of day"** at the end of §18. **Earlier status (2026-09-29, late evening):** CE-only onboarding works end to end (CO-0679, CO-0728, CO-0762 created and read back). The Surface-only route is merged and its CO-0649 dry run passed live; the first real Surface create (CO-0649) was the next action — see "Handoff — 2026-09-29 end of day" at the end of §18. The operator dashboard was redesigned the same evening (Pentera styling, queue tiles, a **History** tab for closed onboardings; commits `626c58a`, `f48094d`) — see "Dashboard redesign" in that handoff. Earlier status: Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
+**Status (2026-10-02):** Surface validation (read-only, against each tenant's own Leonardo row) and the Renewal plan card are built; review items 1–4 and 6 are fixed. The authoritative handoff is **"Handoff — 2026-10-02"** at the end of §18. **Earlier status (2026-10-01, end of day):** CO-0649's first scan **COMPLETED**; Case 3 built locally; scan-status sweep, Salesforce IDs panel (dashboard only, env dev), already-onboarded gate, faster dashboard, and a tested VM staging copy added; Guru rules, gaps, questions, and the renewal mapping are in `docs/38`. The authoritative handoff is **"Handoff — 2026-10-01 end of day"** at the end of §18. **Earlier status (2026-09-30, end of day):** **The first automated Surface-only onboarding succeeded.** CO-0649 was created in Leonardo Development and read back (`readback_verified`, `account/add` 200, ID and UUID captured, "No scan started"). The authoritative handoff and next steps are **"Handoff — 2026-09-30 end of day"** at the end of §18. **Earlier status (2026-09-29, late evening):** CE-only onboarding works end to end (CO-0679, CO-0728, CO-0762 created and read back). The Surface-only route is merged and its CO-0649 dry run passed live; the first real Surface create (CO-0649) was the next action — see "Handoff — 2026-09-29 end of day" at the end of §18. The operator dashboard was redesigned the same evening (Pentera styling, queue tiles, a **History** tab for closed onboardings; commits `626c58a`, `f48094d`) — see "Dashboard redesign" in that handoff. Earlier status: Attended local pilot **working end to end** for new Credential-Exposure-only COs in Leonardo Development. The attended runner created and read back **CO-0679** (Tango) and **CO-0728** (Bravoblox) fully automatically on 2026-09-29; **CO-0702** (manually created 9/25) was verified read-only. **CO-0762** (SIERRA) is ready and awaits the operator's click. Code is at `154846a` (local, not pushed). The authoritative handoff and next steps are the **2026-09-29 handoff** entry at the end of §18. Leonardo Development only; no Salesforce writeback; no production action.
 **Initial execution target:** Leonardo Development only  
 **Production target:** Permanently blocked until a separate, recorded approval
 
@@ -1156,3 +1156,45 @@ Before renewals (Cases 4–6): 19 add a create/edit **mode** to `RouteContract` 
 **Suggested order tomorrow:** after steps 1–3 above, fix review items 1–4 (small, safety) with tests, then 6, then continue with the Renewal plan card.
 
 **Boundaries preserved (2026-10-01):** Leonardo Development only. Live actions were read-only: Salesforce queries (counts, flags, products/dates — no values copied into Git), `--readback-only` and `--scan-status`/`--scan-status-all` reads. **No Leonardo create or edit, no Salesforce write**, no production action. VM changes were operator-run (copy, stage into new inactive folders, tests, a loopback preview later stopped). No credential, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
+
+### Handoff — 2026-10-02 (continue here)
+
+**Authoritative handoff for the next session** (including the "Workato integration implementation" session). It supersedes the "Next steps" of the 2026-10-01 handoff; that handoff's state table, decisions, and `docs/38` remain valid background.
+
+#### Done today (local commits; tests 656 integration OK, 1 skipped; 55 `phase1_validator`; 49 `phase2_leonardo`; Salesforce CLI tripwire 0 real calls; guards pass)
+
+| Commit | Change |
+| --- | --- |
+| `9f47ed7` | **Review item 1** — one start guard across revisions (`start_blocker`: `run_in_progress`, `tenant_already_verified`); the Start handlers record the start before launching, under a lock; a failed launch is `runner_launch_failed`. |
+| `8c858fc` | **Surface validation** (no official API): reads the same tenant search JSON the Tenant Management page loads, matched by captured `id` + `accountUuid`; compares account status, licence, all toggles, intervals, domains, people, scan against the route plan. `--validate` / `--validate-all`; CO-page card, Validate / Validate all buttons, queue drift marker. Names/domains/emails stored only as ok/drift + counts. |
+| `32a04cf` | Validation: Leonardo stores the "None" interval as `NO_SCHEDULE`. |
+| `3872a10` | **Review item 2** — `create_uncertain`: a failure after the licence dates were entered blocks start and reset; "Verify in Leonardo (read-only)" runs `--readback-only`, which promotes a found tenant to `readback_verified` or marks `no_tenant`. |
+| `8c3195d` | **Review items 3 + 4** — readback identity (`readback_tenant_ambiguous`, details IDs must equal the server row, exactly one name+domain row, `readback_id_conflict` never replaces captured IDs); `sf` timeouts become "source unavailable"; `runner_crashed` safety net. |
+| `9c3a5aa` | Validation: max scan duration is not in the search data (operator confirmed 90 h in the Edit form) → reported as info. |
+| `cafbd2a` | **Review item 6** — `parse_request` refuses a foreign `Host` (DNS rebinding) and cross-site POSTs (foreign `Origin`, `null`, or `Sec-Fetch-Site` cross-site) with 403 before any handler runs; `SURFACE_ONBOARDING_ALLOWED_HOSTS` for extra exact host:port values. |
+| `07bb125` | **Renewal plan card** (read-only, no form/button) for Cases 4–6 and single-product renewals; checked against the six real open renewal COs. |
+
+GitHub `origin/main` = `8c3195d` (pushed by the operator); `9c3a5aa`, `cafbd2a`, `07bb125`, and this handoff commit are local.
+
+#### Verified live today (read-only)
+
+- **Schema probe** (CO-0649 Dev tenant): 138 field paths of the tenant search row, types only (no values). Key paths: `accountLicense.{licenseType,startDate,expirationDate,assetsNumber,domainsNumber,subDomainsNumber,…Allowed,phishingEnabled,provisioningEnabled}`, `accountSettings.reconSettings.automatedDiscoveryEnabled`, top-level toggles, `campaignExecutionSettings.domainsMultiAttackStackSettings.enabled`, `primaryUser.isMfaRequired`, `operatorAccounts`, `termsOfUseApproval`, `lastReconExecutionData.timedOutActions`, `pendingValidationAssets`. Not in the row: max scan duration value, the tenant's user list.
+- **Validate all** (before the `NO_SCHEDULE` fix): CO-0649 38/38 ✓; CO-0728 and CO-0762 clean after the fix; CO-0679 real drift (company name, primary domain; its three Advanced toggles now match the plan); CO-0702 (manual creation 9/25) real drift (name, domain, primary-user last name); CO-0740 plan not rebuildable (`ce_subscription_unavailable`), account/scan checks pass.
+- **Renewal plans** for the open renewal COs: CO-0767 and CO-0770 Case 6 (terms agree; CO-0770 Go 500 + Bulk 500 = 1000, CE +100 email domains), CO-0758 Case 4, CO-0761 and CO-0769 CE renewals, CO-0771 blocked (`no_new_surface_term`, `no_core_plus_term`: only legacy rows).
+
+#### Owner input today
+
+- Max scan duration shows **90 h** in the Leonardo Edit form for CO-0649 (it is not in the search data).
+- Next work order agreed: item 6, then the renewal plan (done); renewal rules stay *proposed* until the `docs/38` answers.
+
+#### Next steps (in order)
+
+1. **Operator:** push (`git push origin main`), restart the dashboard (`powershell -ExecutionPolicy Bypass -File tools\start_attended_dashboard.ps1 -Restart`), click **Validate all** on the queue page, and open a renewal CO (e.g. CO-0767) to review the Renewal plan card.
+2. **Owner:** answer `docs/38` §4 — Q1 (annual cap vs term end), Q2 (start date), Q3 (added domains), Q7 (CE email-domain add-ons), Q9 (renewal testing in Dev), Q10 (routing table), Q11 (legacy rows). Then the renewal rules move from *proposed* to decided.
+3. **Assistant:** review item 5 (stale "in progress" recovery: keep Popen handles, stale-record detection, read-only Reconcile); then items 7–12 and 16–17 from the improvement review (2026-10-01 handoff).
+4. **Operator + assistant (needs Q9):** Edit Account probe on a Dev tenant we own (⋮ → Edit, prefilled values, editable controls; one operator manual edit with a diagnostic HAR for the submit endpoint), then the guarded edit mode (`docs/38` §5 contract; review items 19–20).
+5. **Assistant:** stage r21 on the VM with the LF-clean archive (all commits since `a9d230e`); optionally delete the defective `app-r18` with the operator's confirmation.
+6. Carried over: CO-0649 Dev tenant — assign the Operator Account and turn scanning off; CO-0679 tenant name/domain fix; CO-0735 Salesforce correction; README / `LOCAL_IMPLEMENTATION_STATUS.md`; Leonardo-team note on the start-date quirk; Slack status message (connector not authorized).
+
+**Boundaries preserved (2026-10-02):** Leonardo Development only. Live actions were read-only: Salesforce queries, one schema probe, `--validate` / `--validate-all` reads in the automation tab. **No Leonardo create or edit, no Salesforce write**, no production action, no VM change today. No credential, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
+
