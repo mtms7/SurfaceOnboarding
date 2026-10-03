@@ -2651,9 +2651,18 @@ def _url_path(url: str) -> str:
         return url.split("?", 1)[0].split("#", 1)[0]
 
 
+def _url_origin(url: str) -> str:
+    from urllib.parse import urlsplit
+    try:
+        parts = urlsplit(url)
+        return f"{parts.scheme}://{parts.netloc}".lower()
+    except Exception:
+        return ""
+
+
 def _is_tenant_management_url(url: str) -> bool:
-    """True when a live page target is at the Development tenant-management route."""
-    return TENANT_MANAGEMENT_PATH in _url_path(url)
+    """True when a live page target is at the Development tenant-management route (exact origin)."""
+    return _url_origin(url) == DEVELOPMENT_ORIGIN and TENANT_MANAGEMENT_PATH in _url_path(url)
 
 
 def _wait_for_tenant_management(port: int, timeout_seconds: float, stable_polls: int = 5,
@@ -3014,6 +3023,8 @@ def check_leonardo_session() -> str:
             return str(error)
         try:
             classification = _classify_leonardo_session(tab.port, SESSION_CHECK_SECONDS, tab=tab)
+            if classification == "active" and SESSION_API_CHECK_ENABLED:
+                return _api_session_check(playwright, tab)
             return {
                 "active": "leonardo_session_active",
                 "expired": "leonardo_session_expired",
@@ -5194,20 +5205,44 @@ def run_validate(reference: str) -> str:
     and also refreshes the scan observation. A plan that cannot be rebuilt
     (source changed or unavailable) still records the account/scan checks.
     """
-    if not REFERENCE.fullmatch(reference):
-        return "invalid_co_reference"
+    prepared = _validation_inputs(reference)
+    if isinstance(prepared, str):
+        return prepared
+    route, tenant_name, ids, plan, plan_note, entered = prepared
     try:
-        readback = json.loads(READBACK_PATH.read_text(encoding="utf-8")).get(reference)
-    except (OSError, ValueError, AttributeError):
-        readback = None
-    if (not isinstance(readback, dict) or not isinstance(readback.get("surface_account_id"), str)
-            or not isinstance(readback.get("account_uuid"), str)):
-        return "validation_not_onboarded"
-    try:
-        route, tenant_name = _validation_route(reference)
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return "playwright_runtime_unavailable"
+    with sync_playwright() as playwright:
+        try:
+            with _attended_page(playwright) as page:
+                search = _open_search(page)
+                if search is None:
+                    return "duplicate_search_schema_unavailable"
+                searched = _search_tenants(page, search, tenant_name)
+                if searched is None:
+                    return "validation_schema_unavailable"
+                matches = _match_captured_row(searched.rows, ids)
+                if len(matches) != 1:
+                    return "validation_tenant_not_found"
+                return _record_validation(reference, route, matches[0], plan, plan_note, entered)
+        except LoginTimeout:
+            return "development_login_timeout"
+        except RuntimeError as error:
+            return str(error)
+        except Exception:
+            return "attended_ce_runner_unavailable"
+
+
+def _validation_inputs(reference: str) -> "str | tuple[str, str, tuple[str, str], dict[str, Any] | None, str, tuple[str, str] | None]":
+    """(route, tenant name, captured IDs, plan, plan note, entered licence dates), or a result code."""
+    if not REFERENCE.fullmatch(reference):
+        return "invalid_co_reference"
+    ids = _readback_ids(reference)
+    if ids is None:
+        return "validation_not_onboarded"
+    try:
+        route, tenant_name = _validation_route(reference)
     except SurfaceSourceError as error:
         return str(error)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -5230,36 +5265,21 @@ def run_validate(reference: str) -> str:
             plan["license_start"] = None  # the creation day is not recorded for older runs
     except (RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
         plan, plan_note = None, str(error) or "plan_unavailable"
-    with sync_playwright() as playwright:
-        try:
-            with _attended_page(playwright) as page:
-                search = _open_search(page)
-                if search is None:
-                    return "duplicate_search_schema_unavailable"
-                searched = _search_tenants(page, search, tenant_name)
-                if searched is None:
-                    return "validation_schema_unavailable"
-                matches = [row for row in searched.rows
-                           if row.get("id") == readback["surface_account_id"]
-                           and isinstance(row.get("accountUuid"), str)
-                           and row["accountUuid"].casefold() == readback["account_uuid"].casefold()]
-                if len(matches) != 1:
-                    return "validation_tenant_not_found"
-                checks = validate_row(matches[0], plan, entered)
-                try:
-                    now = datetime.now()
-                    write_validation(reference, route, checks, now, plan_note)
-                    write_scan_status(reference, scan_status_from_row(matches[0]), now)
-                except (OSError, ValueError):
-                    return "validation_write_unavailable"
-                drift = sum(1 for check in checks if check["status"] == "drift")
-                return "validation_recorded" if not drift else "validation_drift_found"
-        except LoginTimeout:
-            return "development_login_timeout"
-        except RuntimeError as error:
-            return str(error)
-        except Exception:
-            return "attended_ce_runner_unavailable"
+    return route, tenant_name, ids, plan, plan_note, entered
+
+
+def _record_validation(reference: str, route: str, row: dict[str, Any], plan: dict[str, Any] | None,
+                       plan_note: str, entered: tuple[str, str] | None) -> str:
+    """Compare one matched tenant row with its plan; store the checks and the scan observation."""
+    checks = validate_row(row, plan, entered)
+    try:
+        now = datetime.now()
+        write_validation(reference, route, checks, now, plan_note)
+        write_scan_status(reference, scan_status_from_row(row), now)
+    except (OSError, ValueError):
+        return "validation_write_unavailable"
+    drift = sum(1 for check in checks if check["status"] == "drift")
+    return "validation_recorded" if not drift else "validation_drift_found"
 
 
 def run_validate_all() -> dict[str, str]:
@@ -5273,8 +5293,339 @@ def run_validate_all() -> dict[str, str]:
     for reference in references:
         results[reference] = result = run_validate(reference)
         _record_check(reference, "validation", result)
-        if result in ("leonardo_session_expired", "development_login_timeout", "playwright_runtime_unavailable"):
+        if result in SESSION_STOP_RESULTS:
             break
+    return results
+
+
+# --- Leonardo tenant inventory (2026-10-03) ----------------------------------
+# Read-only. The runner never builds its own API request: it reloads Tenant
+# Management and clicks the table's Next button, and captures the
+# getAllDetailedAccounts responses the page itself requests. Raw rows stay in
+# memory; only the allow-listed snapshot (integration/onboarding/
+# leonardo_inventory.py) is written, outside the repository.
+INVENTORY_API_PATH = "/api/v1/backoffice/getAllDetailedAccounts"
+INVENTORY_RESPONSE_TIMEOUT_MS = 20_000
+INVENTORY_PAGE_DELAY_SECONDS = 1.0
+# The page-level session check also proves the API accepts the session (a tab
+# can show Tenant Management after its API session expired). Off until the
+# read-only probe confirms that a reload of Tenant Management sends the
+# unfiltered table request (assumption A1, 2026-10-03); then a reviewed commit
+# turns it on.
+SESSION_API_CHECK_ENABLED = False
+SESSION_STOP_RESULTS = ("leonardo_session_expired", "development_login_timeout", "playwright_runtime_unavailable")
+
+
+def _is_inventory_response(response: Any) -> bool:
+    """Exactly the table POST on the Development origin; anything else is ignored."""
+    try:
+        return (response.request.method == "POST" and _url_origin(response.url) == DEVELOPMENT_ORIGIN
+                and _url_path(response.url) == INVENTORY_API_PATH)
+    except Exception:
+        return False
+
+
+def _capture_table_page(page: Any, trigger: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Run `trigger` and return (request body, response body) of the table request it causes.
+
+    Raises LeonardoSessionExpired on 401 (or a JSON 403), else RuntimeError
+    with an inventory_* code. Bodies stay in memory; only status and counts
+    are logged.
+    """
+    try:
+        with page.expect_response(_is_inventory_response, timeout=INVENTORY_RESPONSE_TIMEOUT_MS) as info:
+            trigger()
+        response = info.value
+    except Exception as exc:
+        _log().error("inventory", "response", exc)
+        raise RuntimeError("inventory_no_signal") from exc
+    status = response.status
+    try:
+        content_type = (response.headers or {}).get("content-type", "")
+    except Exception:
+        content_type = ""
+    json_reply = "json" in content_type.lower()
+    _log().event("inventory", str(status))
+    if status == 401 or (status == 403 and json_reply):
+        raise LeonardoSessionExpired()
+    if status == 429:
+        raise RuntimeError("inventory_rate_limited")
+    if status >= 500:
+        raise RuntimeError("inventory_server_error")
+    if not 200 <= status < 300 or not json_reply:
+        # A WAF/CloudFront block or a login redirect answers with HTML.
+        raise RuntimeError("inventory_waf_or_redirect")
+    try:
+        request_body = json.loads(response.request.post_data or "")
+        body = response.json()
+    except Exception as exc:
+        raise RuntimeError("inventory_schema_unavailable") from exc
+    if not isinstance(request_body, dict) or not isinstance(body, dict):
+        raise RuntimeError("inventory_schema_unavailable")
+    if not _is_tenant_management_url(page.url):
+        raise RuntimeError("inventory_waf_or_redirect")
+    return request_body, body
+
+
+def _table_query(request_body: dict[str, Any]) -> dict[str, Any]:
+    query = request_body.get("tableServerData")
+    if not isinstance(query, dict):
+        raise RuntimeError("inventory_schema_unavailable")
+    return query
+
+
+def _table_counts(body: dict[str, Any]) -> tuple[int, int]:
+    paged = body.get("pagination_response")
+    rows = paged.get("table_data") if isinstance(paged, dict) else None
+    total = paged.get("total_count") if isinstance(paged, dict) else None
+    if not isinstance(rows, list) or type(total) is not int:
+        raise RuntimeError("inventory_schema_unavailable")
+    return total, len(rows)
+
+
+def _filter_present(filters: Any) -> bool:
+    """True when the table request carries any filter (a search would hide tenants)."""
+    if filters in (None, {}, []):
+        return False
+    if isinstance(filters, dict) and set(filters) <= {"and", "or"}:
+        return any(filters.get(key) for key in filters)
+    return True
+
+
+def _filter_methods(filters: Any) -> list[str]:
+    """Filter method names only (never their values), for the probe report."""
+    methods: list[str] = []
+    if isinstance(filters, dict):
+        for clauses in filters.values():
+            for clause in clauses if isinstance(clauses, list) else []:
+                method = clause.get("method") if isinstance(clause, dict) else None
+                if isinstance(method, str) and re.fullmatch(r"[A-Za-z_]{1,32}", method):
+                    methods.append(method)
+    return methods
+
+
+def _next_page_button(page: Any) -> tuple[Any | None, str]:
+    """The table's single Next-page control, and which locator found it."""
+    candidates = (("role", page.get_by_role("button", name=re.compile(r"^next page$", re.IGNORECASE))),
+                  ("id", page.locator("#pagination-next")),
+                  ("testid", page.locator("[data-testid='pagination-next']")))
+    for kind, locator in candidates:
+        try:
+            if locator.count() == 1:
+                return locator, kind
+        except Exception:
+            continue
+    return None, "none"
+
+
+def _footer_numbers(page: Any) -> list[int]:
+    """Numbers in the table pagination footer (e.g. "1-10 of 26"), nothing else."""
+    try:
+        texts = page.locator("[class*='MuiTablePagination']").all_inner_texts()
+    except Exception:
+        return []
+    return [int(n) for n in re.findall(r"\d{1,6}", " ".join(texts))][:8]
+
+
+def _reload(page: Any) -> Any:
+    return lambda: page.reload(wait_until="domcontentloaded")
+
+
+def _collect_inventory_pages(page: Any) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], int]:
+    """Page 1 from a reload, then Next until every page is captured (fail closed)."""
+    from integration.onboarding import leonardo_inventory as inventory
+
+    pages = [_capture_table_page(page, _reload(page))]
+    query = _table_query(pages[0][0])
+    page_size = query.get("items_per_page")
+    if type(page_size) is not int or page_size < 1 or query.get("offset") != 0:
+        raise RuntimeError("inventory_schema_unavailable")
+    if _filter_present(query.get("filters")):
+        raise RuntimeError("inventory_filtered")
+    total, _rows = _table_counts(pages[0][1])
+    needed = -(-total // page_size)
+    if total > inventory.MAX_TOTAL or needed > inventory.MAX_PAGES:
+        raise RuntimeError("inventory_too_large")
+    while len(pages) < needed:
+        sleep(INVENTORY_PAGE_DELAY_SECONDS)
+        button, _kind = _next_page_button(page)
+        if button is None:
+            raise RuntimeError("inventory_pagination_unavailable")
+        pages.append(_capture_table_page(page, lambda: button.click(timeout=FIELD_TIMEOUT_MS)))
+    return pages, page_size
+
+
+def _api_session_check(playwright: Any, tab: "_AutomationTab") -> str:
+    """The tab is at Tenant Management: prove the API accepts the session too (read-only)."""
+    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{tab.port}")
+    try:
+        context = browser.contexts[0] if browser.contexts else browser.new_context()
+        page = _find_live_page(context, tab)
+        if page is None:
+            return "leonardo_session_unavailable"
+        request_body, body = _capture_table_page(page, _reload(page))
+        _table_query(request_body)
+        _table_counts(body)
+        return "leonardo_session_active"
+    except LeonardoSessionExpired:
+        return "leonardo_session_expired"
+    except RuntimeError as error:
+        return "leonardo_api_" + str(error).removeprefix("inventory_")
+    finally:
+        try:
+            browser.close()
+        except Exception:
+            pass
+
+
+def run_probe_inventory_shape() -> dict[str, Any]:
+    """One read-only look at how the table pages (key names, counts, sort; never values).
+
+    Reloads Tenant Management, records page 1's request shape and counts,
+    clicks Next once if there is a second page, and records page 2's offset.
+    Settles assumption A1 and the 10-vs-1000 page-size question before any
+    export is trusted.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return {"result": "playwright_runtime_unavailable"}
+    report: dict[str, Any] = {}
+    with sync_playwright() as playwright:
+        try:
+            with _attended_page(playwright) as page:
+                request_body, body = _capture_table_page(page, _reload(page))
+                query = _table_query(request_body)
+                total, rows = _table_counts(body)
+                sort = query.get("sort") if isinstance(query.get("sort"), dict) else {}
+                report["page1"] = {
+                    "request_keys": sorted(str(key)[:40] for key in request_body),
+                    "query_keys": sorted(str(key)[:40] for key in query),
+                    "offset": query.get("offset") if type(query.get("offset")) is int else None,
+                    "items_per_page": query.get("items_per_page") if type(query.get("items_per_page")) is int else None,
+                    "sort": {key: sort.get(key) for key in ("direction", "key")
+                             if isinstance(sort.get(key), str) and re.fullmatch(r"[A-Za-z_.]{1,40}", sort[key])},
+                    "filter_present": _filter_present(query.get("filters")),
+                    "filter_methods": _filter_methods(query.get("filters")),
+                    "total_count": total, "rows_on_page": rows,
+                }
+                report["footer_numbers"] = _footer_numbers(page)
+                button, kind = _next_page_button(page)
+                report["next_button"] = kind
+                report["page2"] = None
+                if button is not None and total > rows:
+                    sleep(INVENTORY_PAGE_DELAY_SECONDS)
+                    request2, body2 = _capture_table_page(page, lambda: button.click(timeout=FIELD_TIMEOUT_MS))
+                    query2 = _table_query(request2)
+                    total2, rows2 = _table_counts(body2)
+                    report["page2"] = {
+                        "offset": query2.get("offset") if type(query2.get("offset")) is int else None,
+                        "items_per_page": query2.get("items_per_page") if type(query2.get("items_per_page")) is int else None,
+                        "same_sort": query2.get("sort") == query.get("sort"),
+                        "same_filters": query2.get("filters") == query.get("filters"),
+                        "total_count": total2, "rows_on_page": rows2,
+                    }
+                report["result"] = "inventory_probe_recorded"
+        except LoginTimeout:
+            report["result"] = "development_login_timeout"
+        except RuntimeError as error:
+            report["result"] = str(error)
+        except Exception:
+            report["result"] = "attended_ce_runner_unavailable"
+    return report
+
+
+def run_export_tenants(env_name: str = "dev", *, with_sweeps: bool = False, write_csv: bool = False,
+                       root: Path | None = None) -> dict[str, Any]:
+    """Read-only export of every tenant to the allow-listed local snapshot (stdout: counts only)."""
+    from integration.onboarding import leonardo_inventory as inventory
+
+    try:
+        environment = inventory.require_environment(env_name)
+    except inventory.InventoryError as error:
+        return {"result": error.reason}
+    if environment.origin != DEVELOPMENT_ORIGIN:
+        return {"result": "inventory_environment_not_supported"}
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return {"result": "playwright_runtime_unavailable"}
+    with sync_playwright() as playwright:
+        try:
+            with _attended_page(playwright) as page:
+                assembled = None
+                for attempt in range(2):
+                    pages, page_size = _collect_inventory_pages(page)
+                    try:
+                        assembled = inventory.assemble_pages(pages, page_size=page_size)
+                        break
+                    except inventory.InventoryError as error:
+                        # A scan finishing mid-export can reorder rows (sort by last scan): retry once.
+                        if error.reason != "inventory_inconsistent" or attempt:
+                            return {"result": error.reason}
+                        _log().event("inventory", "retry", detail="inconsistent pages")
+                payload = inventory.snapshot_payload(environment, assembled, datetime.now(timezone.utc))
+                target = inventory.write_snapshot(payload, root or inventory.default_root())
+                if write_csv:
+                    target.with_suffix(".csv").write_text(inventory.to_csv(payload), encoding="utf-8", newline="")
+                sweeps = _sweep_from_inventory(assembled.rows) if with_sweeps else {}
+                drift = payload["schema_drift"]
+                return {"result": "inventory_exported", "environment": environment.name,
+                        "total_count": payload["total_count"], "row_count": payload["row_count"],
+                        "deleted_count": payload["deleted_count"], "pages": payload["pages"],
+                        "schema_drift": {key: len(drift.get(key, [])) for key in ("unknown", "missing", "type_changed")},
+                        "file": target.name, "csv": bool(write_csv), "sweeps": sweeps}
+        except inventory.InventoryError as error:
+            return {"result": error.reason}
+        except LoginTimeout:
+            return {"result": "development_login_timeout"}
+        except RuntimeError as error:
+            return {"result": str(error)}
+        except Exception:
+            return {"result": "attended_ce_runner_unavailable"}
+
+
+def _readback_ids(reference: str) -> tuple[str, str] | None:
+    try:
+        readback = json.loads(READBACK_PATH.read_text(encoding="utf-8")).get(reference)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if (not isinstance(readback, dict) or not isinstance(readback.get("surface_account_id"), str)
+            or not isinstance(readback.get("account_uuid"), str)):
+        return None
+    return readback["surface_account_id"], readback["account_uuid"]
+
+
+def _match_captured_row(rows: Any, ids: tuple[str, str]) -> list[dict[str, Any]]:
+    """Rows whose id AND accountUuid equal the captured readback IDs."""
+    return [row for row in rows if isinstance(row, dict) and row.get("id") == ids[0]
+            and isinstance(row.get("accountUuid"), str) and row["accountUuid"].casefold() == ids[1].casefold()]
+
+
+def _sweep_from_inventory(rows: tuple[dict[str, Any], ...]) -> dict[str, str]:
+    """Validation (and its scan observation) for every onboarded CO from one paged read.
+
+    Same checks and files as --validate-all; only the tenant row comes from
+    the export instead of one live search per CO. The plan is still rebuilt
+    from a fresh, read-only Salesforce read.
+    """
+    try:
+        references = sorted(reference for reference in json.loads(READBACK_PATH.read_text(encoding="utf-8"))
+                            if isinstance(reference, str) and REFERENCE.fullmatch(reference))
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
+    results: dict[str, str] = {}
+    for reference in references:
+        prepared = _validation_inputs(reference)
+        if isinstance(prepared, str):
+            result = prepared
+        else:
+            route, _tenant_name, ids, plan, plan_note, entered = prepared
+            matches = _match_captured_row(rows, ids)
+            result = (_record_validation(reference, route, matches[0], plan, plan_note, entered)
+                      if len(matches) == 1 else "validation_tenant_not_found")
+        results[reference] = result
+        _record_check(reference, "validation", result)
     return results
 
 
@@ -5393,9 +5744,27 @@ def main() -> int:
                         help="Read-only Surface validation of every onboarded CO (no fill, submit, or create).")
     parser.add_argument("--scan-status-all", action="store_true",
                         help="Read-only scan-status read for every onboarded Surface / Case 3 CO (no fill, submit, or create).")
+    parser.add_argument("--probe-inventory-shape", action="store_true",
+                        help="Read-only: reload Tenant Management and report how the tenant table pages (key names and counts only).")
+    parser.add_argument("--export-tenants", action="store_true",
+                        help="Read-only: page through Tenant Management and write the allow-listed tenant snapshot outside the repository.")
+    parser.add_argument("--env", choices=("dev", "prod"), default="dev",
+                        help="With --export-tenants: environment (prod is refused until separately approved).")
+    parser.add_argument("--with-sweeps", action="store_true",
+                        help="With --export-tenants: also validate every onboarded CO from the exported rows.")
+    parser.add_argument("--csv", action="store_true",
+                        help="With --export-tenants: also write a CSV of the allow-listed fields next to the snapshot.")
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
+    if args.probe_inventory_shape:
+        report = run_probe_inventory_shape()
+        print(json.dumps({**report, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.export_tenants:
+        summary = run_export_tenants(args.env, with_sweeps=args.with_sweeps, write_csv=args.csv)
+        print(json.dumps({**summary, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
     if args.duplicate_check:
         if not args.co:
             parser.error("--co is required with --duplicate-check")

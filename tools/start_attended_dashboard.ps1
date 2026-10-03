@@ -10,8 +10,9 @@ and never copies a session, cookie, or credential to the Ubuntu OPA host.
 Use -Restart only when you explicitly want to stop the loopback process that
 currently owns this dashboard port.
 
-Each start prints a one-time unlock code for this dashboard only (not a
-Salesforce or Leonardo password); the dashboard receives only its SHA-256.
+The dashboard login is the operator's Salesforce SSO (no dashboard
+password): only the -AllowedUser address(es) may sign in, and signing in
+also starts the Leonardo Development sign-in and the preflight checks.
 Every Salesforce read is pinned to the -TargetOrg alias and must belong to
 the org Id in -ExpectedOrgId (or the first line of
 %LOCALAPPDATA%\SurfaceOnboarding\salesforce-expected-org-id.txt). The org Id
@@ -25,6 +26,8 @@ param(
     [int]$Port = 8012,
     [string]$TargetOrg = 'surface-onboarding',
     [string]$ExpectedOrgId = '',
+    [string]$AllowedUser = 'milton.stevenson@pentera.io',
+    [string]$PasswordResetUrl = '',
     [string]$PythonPath = 'C:\Users\Milton Stevenson\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
 )
 
@@ -75,25 +78,6 @@ function Test-SalesforceCliSession {
     return (Invoke-SalesforceCli -Arguments @('org', 'display', '--target-org', $TargetOrg, '--json') -Quiet) -eq 0
 }
 
-function New-UnlockCode {
-    # 8 characters from 32 unambiguous symbols; 256 is a multiple of 32, so no bias.
-    $alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'
-    $bytes = New-Object byte[] 8
-    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
-    $chars = foreach ($b in $bytes) { $alphabet[$b % 32] }
-    $code = -join $chars
-    return $code.Substring(0, 4) + '-' + $code.Substring(4, 4)
-}
-
-function Get-UnlockDigest {
-    param([Parameter(Mandatory)] [string]$Code)
-    $normalized = $Code.Trim().ToUpperInvariant().Replace('-', '')
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try { $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normalized)) } finally { $sha.Dispose() }
-    return -join ($hash | ForEach-Object { $_.ToString('x2') })
-}
-
 if ($TargetOrg -notmatch '^[A-Za-z0-9_.-]{1,64}$') {
     throw 'TargetOrg must be a plain Salesforce CLI alias.'
 }
@@ -102,6 +86,14 @@ if (-not $ExpectedOrgId) {
     if (Test-Path -LiteralPath $orgIdFile) {
         $ExpectedOrgId = (Get-Content -LiteralPath $orgIdFile -TotalCount 1).Trim()
     }
+}
+foreach ($user in ($AllowedUser -split ',')) {
+    if ($user.Trim() -notmatch '^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$') {
+        throw 'AllowedUser must be one or more comma-separated email addresses.'
+    }
+}
+if ($PasswordResetUrl -and $PasswordResetUrl -notmatch '^https://') {
+    throw 'PasswordResetUrl must be an https URL.'
 }
 if ($ExpectedOrgId -and $ExpectedOrgId -notmatch '^[A-Za-z0-9]{15}([A-Za-z0-9]{3})?$') {
     throw 'ExpectedOrgId must be a 15- or 18-character Salesforce Id.'
@@ -136,16 +128,12 @@ Remove-Item -LiteralPath $startupLog -Force -ErrorAction SilentlyContinue
 # Quote the script path explicitly because the operator profile path contains
 # a space (for example, "Milton Stevenson").
 $quotedDashboard = '"' + $dashboard + '"'
-$unlockCode = New-UnlockCode
-# The child inherits these; only the digest of the unlock code is passed.
-$env:SURFACE_ONBOARDING_UNLOCK_SHA256 = Get-UnlockDigest -Code $unlockCode
+# The child inherits these non-secret settings.
 $env:SURFACE_SF_TARGET_ORG = $TargetOrg
 $env:SURFACE_SF_EXPECTED_ORG_ID = $ExpectedOrgId
-try {
-    $process = Start-Process -FilePath $PythonPath -ArgumentList $quotedDashboard -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardError $startupLog -PassThru
-} finally {
-    Remove-Item Env:SURFACE_ONBOARDING_UNLOCK_SHA256 -ErrorAction SilentlyContinue
-}
+$env:SURFACE_DASHBOARD_ALLOWED_USERS = $AllowedUser
+$env:SURFACE_PASSWORD_RESET_URL = $PasswordResetUrl
+$process = Start-Process -FilePath $PythonPath -ArgumentList $quotedDashboard -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardError $startupLog -PassThru
 $deadline = (Get-Date).AddSeconds(20)
 do {
     Start-Sleep -Milliseconds 250
@@ -161,16 +149,16 @@ if (-not $listener) {
 }
 
 Write-Host "Dashboard is ready at http://127.0.0.1:$Port/ (listener PID $($listener.OwningProcess))."
-# Liveness: /unlock makes no Salesforce read and needs no unlock, so it answers immediately.
+# Liveness: /login makes no Salesforce read and needs no sign-in, so it answers immediately.
 try {
-    $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 15 -Uri "http://127.0.0.1:$Port/unlock"
+    $null = Invoke-WebRequest -UseBasicParsing -TimeoutSec 15 -Uri "http://127.0.0.1:$Port/login"
 } catch {
     throw 'Dashboard started but did not answer its local health read. Check the desktop firewall and the listener PID above.'
 }
 
 Write-Host ''
-Write-Host "Unlock code (this dashboard only, valid until it restarts): $unlockCode"
-Write-Host "Next: open http://127.0.0.1:$Port/unlock, enter the code, then select Prepare sessions."
+Write-Host "Next: open http://127.0.0.1:$Port/login and select Sign in with Salesforce (SSO and MFA)."
+Write-Host 'Signing in also starts the Leonardo Development sign-in in the automation browser. Connect the RND VPN first.'
 if (-not $NoBrowser) {
-    Start-Process "http://127.0.0.1:$Port/unlock"
+    Start-Process "http://127.0.0.1:$Port/login"
 }

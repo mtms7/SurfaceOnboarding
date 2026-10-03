@@ -12,8 +12,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
-from hashlib import sha256
-import hmac
 import re
 from typing import Mapping
 
@@ -195,24 +193,45 @@ def action_gate(action: str, salesforce: SessionStatus, leonardo: SessionStatus,
     return None
 
 
-# --- Local operator gate (dashboard-only unlock code) -----------------------
+# --- Dashboard login = the operator's Salesforce SSO (2026-10-03) ----------
+# Owner decision: no dashboard password. Signing in runs a fresh
+# `sf org login web` (corporate SSO + MFA); the identity Salesforce reports
+# for that session must be an allowed operator in the pinned org.
 
-UNLOCK_CODE = re.compile(r"^[A-Z2-9]{4}-?[A-Z2-9]{4}$")
-SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
-
-
-def normalize_unlock_code(code: str) -> str:
-    return code.strip().upper().replace("-", "")
+EMAIL = re.compile(r"^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$")
 
 
-def unlock_code_digest(code: str) -> str:
-    return sha256(normalize_unlock_code(code).encode()).hexdigest()
+def allowed_operators(raw: str | None) -> frozenset[str]:
+    """Comma-separated operator emails (SURFACE_DASHBOARD_ALLOWED_USERS); malformed entries are ignored."""
+    return frozenset(item.strip().casefold() for item in (raw or "").split(",") if EMAIL.fullmatch(item.strip()))
 
 
-def unlock_code_matches(code: object, expected_digest: str) -> bool:
-    """Constant-time check of an operator-entered code against the launcher's SHA-256."""
-    if not isinstance(code, str) or not UNLOCK_CODE.fullmatch(code.strip().upper()):
-        return False
-    if not SHA256_HEX.fullmatch(expected_digest):
-        return False
-    return hmac.compare_digest(unlock_code_digest(code), expected_digest)
+def identity_problem(userinfo: object, allowed: frozenset[str], expected_org_id: str | None) -> str | None:
+    """None when Salesforce's userinfo names an allowed operator in the pinned org, else the reason.
+
+    Only email, preferred_username, and organization_id are read; userinfo
+    carries no token. Either the email or the username may match.
+    """
+    if not allowed:
+        return "login_no_allowed_operator"
+    if not isinstance(userinfo, Mapping):
+        return "login_identity_unavailable"
+    org_id = userinfo.get("organization_id")
+    if not expected_org_id or not SALESFORCE_ID.fullmatch(expected_org_id):
+        return "salesforce_org_not_pinned"
+    if not isinstance(org_id, str) or not SALESFORCE_ID.fullmatch(org_id) or org_id[:15] != expected_org_id[:15]:
+        return "salesforce_wrong_org"
+    names = {value.strip().casefold() for value in (userinfo.get("email"), userinfo.get("preferred_username"))
+             if isinstance(value, str)}
+    if not names & allowed:
+        return "login_operator_not_allowed"
+    return None
+
+
+def operator_label(userinfo: Mapping[str, object], allowed: frozenset[str]) -> str:
+    """The allowed address that matched (shown as "Signed in as …")."""
+    for key in ("email", "preferred_username"):
+        value = userinfo.get(key)
+        if isinstance(value, str) and value.strip().casefold() in allowed:
+            return value.strip().casefold()
+    return ""

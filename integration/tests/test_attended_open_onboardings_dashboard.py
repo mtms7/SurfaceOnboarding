@@ -43,15 +43,18 @@ _session_gate_patch = None
 
 
 def setUpModule():
-    # These tests predate the session-readiness gate (2026-10-03) and test what
-    # happens behind it; the gate itself is tested in test_session_readiness.py.
+    # These tests predate the session-readiness gate and the SSO login (2026-10-03)
+    # and test what happens behind them; both are tested in test_session_readiness.py.
     global _session_gate_patch
-    _session_gate_patch = patch.object(dashboard, "action_readiness_problem", return_value=None)
-    _session_gate_patch.start()
+    _session_gate_patch = [patch.object(dashboard, "action_readiness_problem", return_value=None),
+                           patch.object(dashboard, "login_required", return_value=False)]
+    for gate in _session_gate_patch:
+        gate.start()
 
 
 def tearDownModule():
-    _session_gate_patch.stop()
+    for gate in _session_gate_patch:
+        gate.stop()
 
 
 class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
@@ -778,8 +781,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
 
     def test_unavailable_page_offers_attended_salesforce_login_without_sensitive_prompts(self):
         page = page_salesforce_unavailable()
-        self.assertIn("/attended/salesforce-login", page)
-        self.assertIn("Sign in / Prepare sessions", page)  # renamed from "Salesforce connection" (2026-10-03)
+        self.assertIn("/attended/prepare-sessions", page)  # Prepare signs in to Salesforce when needed (2026-10-03)
+        self.assertIn("<h1>Sessions</h1>", page)
         self.assertIn("All queues", page)
         self.assertIn("Complete SSO/MFA", page)
         self.assertNotIn("password", page.lower())
@@ -841,10 +844,11 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
     def test_connection_page_offers_leonardo_session_bootstrap_on_desktop(self):
         with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "desktop"}, clear=False):
             page = page_salesforce_unavailable()
-        self.assertIn("/attended/leonardo-dev-session-check", page)
-        self.assertIn("/attended/leonardo-dev-session-bootstrap", page)
-        self.assertIn("Re-establish Leonardo session (SSO/MFA)", page)
+        # Prepare sessions checks and (re-)establishes the Leonardo session (2026-10-03); Re-check only checks.
+        self.assertIn("/attended/prepare-sessions", page)
+        self.assertIn("/attended/session-recheck", page)
         self.assertIn("/attended/leonardo-dev-session-reset", page)
+        self.assertNotIn("/attended/leonardo-dev-session-bootstrap", page)
 
     def test_vm_connection_page_has_no_leonardo_session_panel(self):
         with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "vm"}, clear=False):

@@ -1,5 +1,6 @@
 """Sign in / Prepare sessions (2026-10-03): readiness rules, the action gate,
-the production lock, the local unlock code, and the pinned Salesforce org.
+the production lock, the Salesforce SSO login, the preflight, and the pinned
+Salesforce org.
 
 Synthetic values only; no Salesforce, Leonardo, or browser call is made.
 """
@@ -19,6 +20,18 @@ import tools.serve_attended_open_onboardings_dashboard as dashboard
 NOW = datetime(2026, 10, 3, 10, 0, 0)
 ORG = "00D000000000001AAA"
 READY = SessionStatus(SessionState.READY, "ok", NOW)
+_login_patch = None
+
+
+def setUpModule():
+    # Unit tests below call handlers directly; the login gate has its own tests (LoginFlowTests).
+    global _login_patch
+    _login_patch = patch.object(dashboard, "login_required", return_value=False)
+    _login_patch.start()
+
+
+def tearDownModule():
+    _login_patch.stop()
 
 
 def _ready(minutes_ago: float) -> SessionStatus:
@@ -102,18 +115,6 @@ class ProductionLockTests(unittest.TestCase):
         self.assertEqual(r.environment_problem(r.BACKOFFICE_PRODUCTION, {}, self.UTC_NOW), "production_sessions_flag_missing")
         self.assertNotEqual(r.ENVIRONMENTS[r.LEONARDO_DEVELOPMENT].profile_dir_name,
                             r.ENVIRONMENTS[r.BACKOFFICE_PRODUCTION].profile_dir_name)
-
-
-class UnlockCodeTests(unittest.TestCase):
-    def test_digest_match(self):
-        digest = r.unlock_code_digest("ABCD-2345")
-        self.assertTrue(r.unlock_code_matches("abcd-2345", digest))
-        self.assertTrue(r.unlock_code_matches(" ABCD2345 ", digest))
-        self.assertFalse(r.unlock_code_matches("ABCD-2346", digest))
-        self.assertFalse(r.unlock_code_matches("ABCD-23456", digest))
-        self.assertFalse(r.unlock_code_matches(None, digest))
-        self.assertFalse(r.unlock_code_matches("ABCD-2345", ""))
-        self.assertFalse(r.unlock_code_matches("ABCD-2345", digest.upper()))
 
 
 def _completed(stdout, returncode=0):
@@ -312,6 +313,14 @@ class PrepareSessionsRouteTests(unittest.TestCase):
 class LeonardoWorkerTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(dashboard.set_session_status, "leonardo", r.NOT_SIGNED_IN)
+        patcher = patch.object(dashboard, "run_preflight", return_value={"leonardo_network": "ok"})
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def test_no_vpn_route_blocks_without_opening_the_browser(self):
+        with patch.object(dashboard, "run_preflight", return_value={"leonardo_network": "unreachable"}),                 patch.object(dashboard, "check_leonardo_session", side_effect=AssertionError("no browser")):
+            dashboard._leonardo_session_work(sign_in=True)
+        status = dashboard.session_statuses(include_runs=False)["leonardo"]
+        self.assertEqual((status.state, status.reason), (SessionState.BLOCKED, "leonardo_unreachable"))
 
     def test_expired_session_waits_for_the_operator_then_is_ready(self):
         with patch.object(dashboard, "check_leonardo_session", return_value="leonardo_session_expired"),                 patch.object(dashboard, "bootstrap_leonardo_session", return_value="leonardo_session_bootstrapped"):
@@ -336,25 +345,77 @@ class ConnectionPageTests(unittest.TestCase):
             page = dashboard.page_salesforce_unavailable(failed=False)
         self.assertIn("Prepare sessions", page)
         self.assertIn("/attended/prepare-sessions", page)
-        self.assertIn("value='backoffice_production' disabled", page)
-        self.assertIn("locked", page)
+        self.assertIn("value='leonardo_development'", page)
+        self.assertNotIn("value='backoffice_production'", page)  # production cannot even be chosen
+        self.assertIn("BackOffice production locked", page)
         self.assertIn("Not signed in", page)
         self.assertNotIn("password", page.lower())
         self.assertNotIn("token", page.lower())
         self.assertNotIn("<script", page.lower())
 
 
-class UnlockGateServerTests(unittest.TestCase):
-    """The real server with an unlock digest configured (as the launcher does)."""
+class IdentityTests(unittest.TestCase):
+    ALLOWED = r.allowed_operators("milton.stevenson@pentera.io, not-an-email")
 
-    CODE = "ABCD-2345"
+    def test_allowed_operators(self):
+        self.assertEqual(self.ALLOWED, frozenset({"milton.stevenson@pentera.io"}))
+        self.assertEqual(r.allowed_operators(None), frozenset())
+
+    def test_identity(self):
+        good = {"email": "Milton.Stevenson@pentera.io", "preferred_username": "x@y.io", "organization_id": ORG}
+        p = r.identity_problem
+        self.assertIsNone(p(good, self.ALLOWED, ORG))
+        self.assertIsNone(p({**good, "email": "x@y.io", "preferred_username": "milton.stevenson@pentera.io"},
+                            self.ALLOWED, ORG))
+        self.assertEqual(r.operator_label(good, self.ALLOWED), "milton.stevenson@pentera.io")
+        self.assertEqual(p({**good, "email": "someone@pentera.io"}, self.ALLOWED, ORG), "login_operator_not_allowed")
+        self.assertEqual(p({**good, "organization_id": "00D000000000002AAA"}, self.ALLOWED, ORG), "salesforce_wrong_org")
+        self.assertEqual(p(good, self.ALLOWED, None), "salesforce_org_not_pinned")
+        self.assertEqual(p(good, frozenset(), ORG), "login_no_allowed_operator")
+        self.assertEqual(p(None, self.ALLOWED, ORG), "login_identity_unavailable")
+        self.assertEqual(p({"email": "milton.stevenson@pentera.io"}, self.ALLOWED, ORG), "salesforce_wrong_org")
+
+
+class _LoginProcess:
+    def __init__(self):
+        self.returncode, self.killed = None, False
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed, self.returncode = True, -9
+
+
+class LoginFlowTests(unittest.TestCase):
+    """The real server with the SSO login gate on; the Salesforce CLI is faked."""
+
+    USERINFO = {"email": "milton.stevenson@pentera.io", "preferred_username": "milton.stevenson@pentera.io",
+                "organization_id": ORG}
 
     def setUp(self):
         import threading
         from http.server import ThreadingHTTPServer
-        env = patch.dict(os.environ, {dashboard.UNLOCK_DIGEST_ENV: r.unlock_code_digest(self.CODE)})
-        env.start(); self.addCleanup(env.stop)
-        dashboard._unlock_failures.clear(); self.addCleanup(dashboard._unlock_failures.clear)
+        for patcher in (patch.object(dashboard, "login_required", return_value=True),
+                        patch.object(dashboard, "local_browser_launch_allowed", return_value=True),
+                        patch.dict(os.environ, {"SURFACE_DASHBOARD_ALLOWED_USERS": "milton.stevenson@pentera.io",
+                                                "SURFACE_SF_EXPECTED_ORG_ID": ORG}),
+                        patch.object(dashboard, "load_runner_state", return_value={})):
+            patcher.start(); self.addCleanup(patcher.stop)
+        self.process = _LoginProcess()
+        self.quiet, self.workers = [], []
+        self.popen = patch.object(dashboard.subprocess, "Popen", side_effect=lambda *a, **k: self.process)
+        for patcher in (self.popen,
+                        patch.object(dashboard, "_sf_quiet", side_effect=lambda *a, **k: self.quiet.append(a) or 0),
+                        patch.object(dashboard, "salesforce_userinfo", side_effect=lambda: dict(self.USERINFO)),
+                        patch.object(dashboard, "start_leonardo_session_worker",
+                                     side_effect=lambda sign_in: self.workers.append(sign_in) or True),
+                        patch.object(dashboard, "close_automation_browser", return_value="automation_browser_closed")):
+            patcher.start(); self.addCleanup(patcher.stop)
+        for cleanup in (dashboard._login_attempt.clear, dashboard._dashboard_sessions.clear):
+            cleanup(); self.addCleanup(cleanup)
+        for system in ("salesforce", "leonardo"):
+            self.addCleanup(dashboard.set_session_status, system, r.NOT_SIGNED_IN)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), dashboard.Handler)
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         thread.start()
@@ -362,38 +423,122 @@ class UnlockGateServerTests(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-    def _request(self, method, path, body="", cookie=None):
+    def _request(self, method, path, cookies=()):
         import http.client
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
         self.addCleanup(connection.close)
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        if cookie:
-            headers["Cookie"] = cookie
-        connection.request(method, path, body=body, headers=headers)
+        if cookies:
+            headers["Cookie"] = "; ".join(cookies)
+        connection.request(method, path, body="", headers=headers)
         response = connection.getresponse()
-        response.read()
-        return response.status, response.getheader("Location"), response.getheader("Set-Cookie")
+        body = response.read().decode("utf-8")
+        set_cookies = [value.split(";")[0] for name, value in response.getheaders() if name.lower() == "set-cookie"]
+        return response.status, response.getheader("Location"), set_cookies, body
 
-    def test_locked_until_the_code_is_entered(self):
-        with patch.object(dashboard, "render_dashboard", side_effect=AssertionError("locked")), \
-                patch.object(dashboard, "start_attended_validation_all", side_effect=AssertionError("locked")):
-            self.assertEqual(self._request("GET", "/")[:2], (303, "/unlock"))
+    def _sign_in(self):
+        status, location, cookies, _ = self._request("POST", "/login/start")
+        self.assertEqual((status, location), (303, "/login"))
+        attempt = cookies[0]
+        self.assertTrue(attempt.startswith(dashboard.ATTEMPT_COOKIE + "="))
+        _status, _, _, body = self._request("GET", "/login", [attempt])
+        self.assertIn("Complete the Salesforce sign-in", body)
+        self.assertIn("http-equiv='refresh'", body)
+        self.process.returncode = 0
+        return attempt, self._request("GET", "/login", [attempt])
+
+    def _session(self, cookies):
+        return next(c for c in cookies if c.startswith(dashboard.SESSION_COOKIE + "="))
+
+    def test_everything_needs_a_signed_in_operator(self):
+        with patch.object(dashboard, "render_dashboard", side_effect=AssertionError("signed out")), \
+                patch.object(dashboard, "start_attended_validation_all", side_effect=AssertionError("signed out")):
+            self.assertEqual(self._request("GET", "/")[:2], (303, "/login"))
+            self.assertEqual(self._request("GET", "/inventory")[:2], (303, "/login"))
             self.assertEqual(self._request("POST", "/attended/validate-all")[0], 403)
-            self.assertEqual(self._request("GET", "/unlock")[0], 200)
-            self.assertEqual(self._request("POST", "/unlock", "code=WXYZ-2345")[0], 403)
-        status, location, cookie = self._request("POST", "/unlock", "code=abcd-2345")
-        self.assertEqual((status, location), (303, "/connection"))
-        self.assertIn("HttpOnly", cookie)
-        self.assertIn("SameSite=Strict", cookie)
-        session = cookie.split(";")[0]
-        with patch.object(dashboard, "load_runner_state", return_value={}):
-            self.assertEqual(self._request("GET", "/connection", cookie=session)[0], 200)
-        self.assertEqual(self._request("GET", "/", cookie=dashboard.UNLOCK_COOKIE + "=forged")[:2], (303, "/unlock"))
+            self.assertEqual(self._request("POST", "/logout")[0], 403)
+            self.assertEqual(self._request("GET", "/", [dashboard.SESSION_COOKIE + "=forged"])[:2], (303, "/login"))
+        status, _, _, body = self._request("GET", "/login")
+        self.assertEqual(status, 200)
+        self.assertIn("Sign in with Salesforce", body)
+        self.assertNotIn("type='password'", body)
+        self.assertNotIn('type="password"', body)
 
-    def test_five_wrong_codes_pause_the_form(self):
-        for _ in range(dashboard.UNLOCK_MAX_FAILURES):
-            self.assertEqual(self._request("POST", "/unlock", "code=WXYZ-2345")[0], 403)
-        self.assertEqual(self._request("POST", "/unlock", "code=" + self.CODE)[0], 403)
+    def test_sso_sign_in_then_leonardo_then_sign_out(self):
+        _attempt, (status, location, cookies, _) = self._sign_in()
+        self.assertEqual((status, location), (303, "/connection"))
+        session = self._session(cookies)
+        # A fresh SSO each time: the alias's previous CLI session was ended before the browser sign-in.
+        self.assertEqual(self.quiet[0][:2], ("org", "logout"))
+        self.assertEqual(self.workers, [True])
+        self.assertEqual(dashboard.session_statuses(include_runs=False)["salesforce"].state, SessionState.READY)
+        status, _, _, body = self._request("GET", "/connection", [session])
+        self.assertEqual(status, 200)
+        self.assertIn("milton.stevenson@pentera.io", body)
+        self.assertIn("Sign out", body)
+        status, location, _, _ = self._request("POST", "/logout", [session])
+        self.assertEqual((status, location), (303, "/login"))
+        self.assertEqual(self.quiet[-1][:2], ("org", "logout"))
+        self.assertEqual(self._request("GET", "/", [session])[:2], (303, "/login"))
+
+    def test_a_different_account_or_org_is_refused_and_its_cli_session_ended(self):
+        cases = (({**self.USERINFO, "email": "x@pentera.io", "preferred_username": "x@pentera.io"},
+                  "login_operator_not_allowed"),
+                 ({**self.USERINFO, "organization_id": "00D000000000002AAA"}, "salesforce_wrong_org"))
+        for userinfo, reason in cases:
+            with self.subTest(reason=reason):
+                self.process = _LoginProcess()
+                with patch.object(dashboard, "salesforce_userinfo", return_value=userinfo):
+                    _attempt, (status, _, cookies, body) = self._sign_in()
+                self.assertEqual(status, 200)
+                self.assertIn(reason, body)
+                self.assertFalse(any(c.startswith(dashboard.SESSION_COOKIE) for c in cookies))
+                self.assertEqual(self.quiet[-1][:2], ("org", "logout"))
+                self.assertEqual(self.workers, [])
+
+    def test_only_the_browser_that_started_the_sign_in_can_finish_it(self):
+        self._request("POST", "/login/start")
+        self.process.returncode = 0
+        status, _, cookies, _ = self._request("GET", "/login")  # no attempt cookie
+        self.assertEqual((status, cookies), (200, []))
+        self.assertEqual(self._request("GET", "/login", [dashboard.ATTEMPT_COOKIE + "=guess"])[2], [])
+        self.assertEqual(self.workers, [])
+
+    def test_a_second_sign_in_is_refused_while_one_is_pending_and_cancel_stops_it(self):
+        _status, _location, cookies, _ = self._request("POST", "/login/start")
+        status, _, _, body = self._request("POST", "/login/start")
+        self.assertEqual(status, 409)
+        self.assertIn("login_in_progress", body)
+        self._request("POST", "/login/cancel")  # another browser: ignored
+        self.assertFalse(self.process.killed)
+        self._request("POST", "/login/cancel", cookies)
+        self.assertTrue(self.process.killed)
+
+    def test_a_cancelled_sso_signs_nobody_in(self):
+        _status, _location, cookies, _ = self._request("POST", "/login/start")
+        self.process.returncode = 1
+        status, _, set_cookies, body = self._request("GET", "/login", cookies)
+        self.assertIn("login_cancelled_or_failed", body)
+        self.assertFalse(any(c.startswith(dashboard.SESSION_COOKIE) for c in set_cookies))
+
+    def test_sign_out_is_refused_during_a_run(self):
+        _attempt, (_s, _l, cookies, _b) = self._sign_in()
+        session = self._session(cookies)
+        running = {"CO-0001": {"source_revision": "r", "started_on": "2026-10-03T10:00:00"}}
+        with patch.object(dashboard, "load_runner_state", return_value=running):
+            status, _, _, _ = self._request("POST", "/logout", [session])
+        self.assertEqual(status, 409)
+        self.assertEqual(self._request("GET", "/connection", [session])[0], 200)
+
+
+class PreflightTests(unittest.TestCase):
+    def test_preflight_reports_presence_and_reachability_only(self):
+        with patch.object(dashboard.socket, "create_connection", side_effect=OSError("no route")), \
+                patch.object(dashboard.shutil, "which", return_value=None):
+            results = dashboard.run_preflight()
+        self.assertEqual(results["leonardo_network"], "unreachable")
+        self.assertEqual(results["salesforce_cli"], "missing")
+        self.assertEqual(dashboard.preflight_snapshot()["results"], results)
 
 
 if __name__ == "__main__":
