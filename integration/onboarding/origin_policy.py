@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 LEONARDO_DEVELOPMENT_ORIGIN = "https://leonardo.dev.app.pentera.io"
+# Named for the production lock only; nothing may use it while that lock holds.
+PRODUCTION_BACKOFFICE_ORIGIN = "https://app.pentera.io"
 
 
 def require_development_origin(origin: str) -> str:

@@ -13,7 +13,7 @@ from html import escape
 from dataclasses import dataclass
 import functools
 from typing import Any
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,13 +24,15 @@ import re
 from secrets import token_urlsafe
 import subprocess
 import sys
-from threading import Lock
+from threading import Lock, Thread
 from time import monotonic
 import webbrowser
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from integration.onboarding import session_readiness as readiness
+from integration.onboarding.session_readiness import SessionState, SessionStatus
 from phase1_validator.onboarding_comment_dates import extract_dealhub_dates
 from phase1_validator.surface_source_readiness import evaluate_new_surface_source
 from phase2_leonardo.case4_comment_validation import (
@@ -220,6 +222,14 @@ def salesforce_cli_command() -> str:
     return "sf.cmd" if os.name == "nt" else "sf"
 
 
+def salesforce_target_org() -> str:
+    """The one Salesforce CLI alias every dashboard read and write is pinned to."""
+    alias = os.environ.get("SURFACE_SF_TARGET_ORG", "surface-onboarding")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", alias):
+        raise RuntimeError("invalid_salesforce_target_org")
+    return alias
+
+
 def local_browser_launch_allowed() -> bool:
     """Only the Windows attended pilot may launch a local operator browser.
 
@@ -244,7 +254,9 @@ def start_attended_salesforce_login() -> bool:
             return True
         try:
             _salesforce_login_process = subprocess.Popen(
-                [salesforce_cli_command(), "org", "login", "web", "--alias", "surface-onboarding", "--set-default"],
+                # The alias only: every read and write pins --target-org to it, so
+                # the operator's global default org is never changed.
+                [salesforce_cli_command(), "org", "login", "web", "--alias", salesforce_target_org()],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -253,6 +265,204 @@ def start_attended_salesforce_login() -> bool:
         except OSError:
             _salesforce_login_process = None
             return False
+
+
+# --- Sign in / Prepare sessions (2026-10-03) ---------------------------------
+# Readiness lives in memory only: a restart means "not signed in". Only state
+# names, reason codes, and check times are kept; never CLI output, cookies,
+# tokens, passwords, or MFA codes.
+_readiness_lock = Lock()
+_readiness: dict[str, SessionStatus] = {"salesforce": readiness.NOT_SIGNED_IN, "leonardo": readiness.NOT_SIGNED_IN}
+_leonardo_worker: Thread | None = None
+SALESFORCE_PROBE_TIMEOUT_SECONDS = 20
+SALESFORCE_ORG_QUERY = "SELECT Id FROM Organization LIMIT 1"
+
+
+def readiness_now() -> datetime:
+    return datetime.now()
+
+
+def session_statuses(*, include_runs: bool = True) -> dict[str, SessionStatus]:
+    """Current statuses; a ready Leonardo session is demoted when a later run reported it expired."""
+    with _readiness_lock:
+        statuses = dict(_readiness)
+    if not include_runs:
+        return statuses
+    try:
+        statuses["leonardo"] = readiness.leonardo_expired_by_runs(statuses["leonardo"], load_runner_state())
+    except RunnerStateUnavailable:
+        pass
+    return statuses
+
+
+def set_session_status(system: str, status: SessionStatus) -> None:
+    with _readiness_lock:
+        _readiness[system] = status
+
+
+def any_run_in_progress() -> bool:
+    """True while any recorded attended run has no result (it may be using the automation browser)."""
+    try:
+        return any(not record.get("result") for record in load_runner_state().values())
+    except RunnerStateUnavailable:
+        return True
+
+
+def probe_salesforce_readiness() -> SessionStatus:
+    """Read-only: the pinned org's Id must equal SURFACE_SF_EXPECTED_ORG_ID."""
+    now = readiness_now()
+    try:
+        done = subprocess.run([salesforce_cli_command(), "data", "query", "--query", SALESFORCE_ORG_QUERY, "--json",
+                               "--target-org", salesforce_target_org()], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=SALESFORCE_PROBE_TIMEOUT_SECONDS, check=False)
+    except subprocess.TimeoutExpired:
+        status = readiness.classify_salesforce_probe(None, None, None, now, timed_out=True)
+    except OSError:
+        status = readiness.classify_salesforce_probe(None, None, None, now, cli_missing=True)
+    else:
+        org_id = None
+        if done.returncode == 0 and done.stdout is not None and len(done.stdout.encode()) <= 64 * 1024:
+            try:
+                records = json.loads(done.stdout).get("result", {}).get("records", [])
+                org_id = records[0].get("Id") if isinstance(records, list) and len(records) == 1 else None
+            except (ValueError, AttributeError, IndexError):
+                org_id = None
+        status = readiness.classify_salesforce_probe(done.returncode, org_id,
+                                                     os.environ.get("SURFACE_SF_EXPECTED_ORG_ID"), now)
+    set_session_status("salesforce", status)
+    return status
+
+
+def refresh_salesforce_after_login() -> None:
+    """When the CLI browser sign-in has exited, check the pinned org once."""
+    with _salesforce_login_lock:
+        process = _salesforce_login_process
+    if session_statuses()["salesforce"].state is SessionState.SIGNING_IN and process is not None \
+            and process.poll() is not None:
+        probe_salesforce_readiness()
+
+
+def _leonardo_session_work(sign_in: bool) -> None:
+    """Background worker: check the automation session; if needed, wait for the operator's SSO/MFA."""
+    status = SessionStatus(SessionState.BLOCKED, "leonardo_check_failed", readiness_now())
+    try:
+        status = readiness.classify_leonardo_result(check_leonardo_session(), readiness_now())
+        if sign_in and status.state is SessionState.EXPIRED:
+            set_session_status("leonardo", SessionStatus(SessionState.SIGNING_IN, "waiting_for_operator", readiness_now()))
+            status = readiness.classify_leonardo_result(bootstrap_leonardo_session(), readiness_now())
+    except Exception:  # fail closed: never leave the page "signing in" after a crash
+        status = SessionStatus(SessionState.BLOCKED, "leonardo_check_failed", readiness_now())
+    finally:
+        set_session_status("leonardo", status)
+
+
+def start_leonardo_session_worker(sign_in: bool) -> bool:
+    """Run one Leonardo check (and sign-in wait) in the background; False if one is already running."""
+    global _leonardo_worker
+    with _readiness_lock:
+        if _leonardo_worker is not None and _leonardo_worker.is_alive():
+            return False
+        _readiness["leonardo"] = SessionStatus(SessionState.SIGNING_IN, "checking", readiness_now())
+        _leonardo_worker = Thread(target=_leonardo_session_work, args=(sign_in,), daemon=True)
+        _leonardo_worker.start()
+        return True
+
+
+def leonardo_worker_running() -> bool:
+    with _readiness_lock:
+        return _leonardo_worker is not None and _leonardo_worker.is_alive()
+
+
+def prepare_sessions_problem(environment: str | None) -> str | None:
+    """Why sessions cannot be prepared now, else None (production stays locked)."""
+    problem = readiness.environment_problem(environment or "", os.environ, datetime.now(timezone.utc))
+    if problem is not None:
+        return problem
+    if not local_browser_launch_allowed():
+        return "desktop_runtime_required"
+    if any_run_in_progress():
+        return "run_in_progress"
+    return None
+
+
+def prepare_sessions() -> None:
+    """Check both sessions; open the sign-in for any that needs the operator."""
+    salesforce = probe_salesforce_readiness()
+    if salesforce.state is SessionState.EXPIRED and start_attended_salesforce_login():
+        set_session_status("salesforce", SessionStatus(SessionState.SIGNING_IN, "waiting_for_operator", readiness_now()))
+    start_leonardo_session_worker(sign_in=True)
+
+
+def action_readiness_problem(action: str) -> str | None:
+    """Gate for every Start / Validate / scan refresh: None means it may launch.
+
+    A stale or unchecked session is re-checked inline once (read-only), but
+    never while a run may be using the automation browser or while the
+    operator is signing in.
+    """
+    statuses = session_statuses()
+    now = readiness_now()
+    if readiness.action_gate(action, statuses["salesforce"], statuses["leonardo"], now) is None:
+        return None
+    if leonardo_worker_running() or statuses["salesforce"].state is SessionState.SIGNING_IN:
+        return "session_signing_in"
+    if any_run_in_progress():
+        return "run_in_progress"
+    ttls = readiness.ACTION_TTLS.get(action, {})
+    if readiness.effective(statuses["salesforce"], now, ttls.get("salesforce", readiness.READ_TTL)).state \
+            is not SessionState.READY:
+        probe_salesforce_readiness()
+    if readiness.effective(statuses["leonardo"], now, ttls.get("leonardo", readiness.READ_TTL)).state \
+            is not SessionState.READY:
+        set_session_status("leonardo", readiness.classify_leonardo_result(check_leonardo_session(), readiness_now()))
+    statuses = session_statuses()
+    return readiness.action_gate(action, statuses["salesforce"], statuses["leonardo"], readiness_now())
+
+
+SESSION_REASON_TEXT = {
+    "not_checked": "Not checked since the dashboard started.",
+    "checking": "Checking…",
+    "waiting_for_operator": "Waiting for you to finish sign-in (SSO/MFA) in the browser.",
+    "check_is_old": "The last check is too old; it is re-checked before the next action.",
+    "salesforce_ready": "Signed in to the pinned Salesforce org.",
+    "salesforce_sign_in_required": "Sign-in required (no valid CLI session for the pinned org alias).",
+    "salesforce_org_not_pinned": "The expected Salesforce org Id is not configured (SURFACE_SF_EXPECTED_ORG_ID). Nothing runs until it is.",
+    "salesforce_wrong_org": "The CLI session belongs to a different Salesforce org than the pinned one.",
+    "salesforce_timeout": "Salesforce did not answer in time. Check the network or VPN, then re-check.",
+    "salesforce_cli_missing": "The Salesforce CLI could not be started on this desktop.",
+    "salesforce_schema": "Salesforce returned an unexpected answer.",
+    "salesforce_read_failed": "A Salesforce read failed; sign in again or re-check.",
+    "leonardo_session_active": "The automation browser is signed in to Leonardo Development.",
+    "leonardo_session_bootstrapped": "Signed in to Leonardo Development in the automation browser.",
+    "leonardo_session_expired": "The Leonardo session has expired. Prepare sessions to sign in again.",
+    "development_login_timeout": "The Leonardo sign-in was not completed in time.",
+    "leonardo_session_unavailable": "No Leonardo Development page was reachable (VPN or network).",
+    "leonardo_check_failed": "The Leonardo check stopped unexpectedly. Re-check, or use the Advanced controls below.",
+}
+GATE_REFUSAL_TEXT = {
+    "session_signing_in": "A sign-in or session check is still running.",
+    "run_in_progress": "An attended run is in progress, so the sessions cannot be re-checked now. Wait for it to finish.",
+    "production_sessions_flag_missing": "BackOffice production is locked (not enabled on this desktop).",
+    "production_approval_missing": "BackOffice production is locked (no owner/SecOps approval reference is configured).",
+    "production_approval_expired": "BackOffice production is locked (the approval reference is expired or invalid).",
+    "production_runner_not_supported": "BackOffice production is locked (the automation runner supports Leonardo Development only).",
+    "unknown_environment": "Unknown environment.",
+    "desktop_runtime_required": "Sign-in can only be prepared on the attended Windows desktop.",
+}
+
+
+def session_gate_page(problem: str, back: str = "/") -> str:
+    """409 page for a refused action: nothing was launched."""
+    system, _, state = problem.partition("_")
+    if system in ("salesforce", "leonardo") and state:
+        status = session_statuses()[system]
+        detail = ("Salesforce" if system == "salesforce" else "Leonardo Development") + ": " + escape(
+            SESSION_REASON_TEXT.get(status.reason, "state " + state.replace("_", " ") + "."))
+    else:
+        detail = escape(GATE_REFUSAL_TEXT.get(problem, "Sessions are not ready."))
+    return ("<!doctype html><title>Sign-in needed</title><p><strong>Sessions are not ready.</strong> " + detail +
+            " Nothing was started.</p><p>Code: <code>" + escape(problem) + "</code></p>"
+            "<p><a href='/connection'>Sign in / Prepare sessions</a> · <a href='" + escape(back) + "'>Return</a></p>")
 
 
 def start_attended_ce_only_runner(reference: str, revision: str) -> bool:
@@ -1115,7 +1325,7 @@ def sf_json(args: list[str]) -> object:
         # Decode CLI output as UTF-8 (the --json contract) rather than the
         # locale code page; cp1252 cannot decode UTF-8 continuation bytes and
         # would otherwise leave done.stdout as None and crash the handler.
-        done = subprocess.run([salesforce_cli_command(), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35, check=False)
+        done = subprocess.run([salesforce_cli_command(), *args, "--target-org", salesforce_target_org()], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35, check=False)
         if done.returncode or done.stdout is None or len(done.stdout.encode()) > 512 * 1024:
             raise ReadUnavailable()
         return json.loads(done.stdout)
@@ -1128,7 +1338,7 @@ def sf_write_json(args: list[str]) -> object:
     try:
         # Same UTF-8 decoding as sf_json so non-ASCII CLI output cannot crash
         # the write path or leave done.stdout as None.
-        done = subprocess.run([salesforce_cli_command(), *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35, check=False)
+        done = subprocess.run([salesforce_cli_command(), *args, "--target-org", salesforce_target_org()], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35, check=False)
         if done.returncode or done.stdout is None or len(done.stdout.encode()) > 512 * 1024:
             raise WriteUnavailable()
         return json.loads(done.stdout)
@@ -2538,9 +2748,83 @@ def page_salesforce_unavailable(failed: bool = True) -> str:
             "While it is open, local processes on this desktop can drive that session, so close the automation browser at the end of the day. "
             "Reset closes the automation browser, then wipes the dedicated automation profile and forces a fresh SSO/MFA. The operator's main Chrome profile is never used.</p></section>"
         )
-    main_html = ("<a class='crumb' href='/'>&larr; All queues</a><div class='page-head'><h1>Salesforce connection</h1></div>"
-                 + salesforce_card + leonardo_card)
-    return _app_shell("Salesforce connection", main_html, active="connection")
+    if vm_mode:
+        main_html = ("<a class='crumb' href='/'>&larr; All queues</a><div class='page-head'><h1>Salesforce connection</h1></div>"
+                     + salesforce_card)
+        return _app_shell("Salesforce connection", main_html, active="connection")
+    refresh_salesforce_after_login()
+    statuses = session_statuses()
+    busy = leonardo_worker_running()
+    waiting = busy or any(s.state is SessionState.SIGNING_IN for s in statuses.values())
+    main_html = ("<a class='crumb' href='/'>&larr; All queues</a><div class='page-head'><h1>Sign in / Prepare sessions</h1></div>"
+                 + _prepare_sessions_card(statuses, waiting, busy)
+                 + "<h2 class='section-title'>Advanced</h2>" + salesforce_card + leonardo_card)
+    return _app_shell("Sign in / Prepare sessions", main_html, active="connection",
+                      refresh="<meta http-equiv='refresh' content='5'>" if waiting else "")
+
+
+SESSION_CHIPS = {
+    SessionState.READY: ("chip-ok", "Ready"), SessionState.STALE: ("chip-neutral", "Re-check due"),
+    SessionState.SIGNING_IN: ("chip-neutral", "Signing in…"), SessionState.NOT_SIGNED_IN: ("chip-warn", "Not signed in"),
+    SessionState.EXPIRED: ("chip-warn", "Sign-in needed"), SessionState.BLOCKED: ("chip-warn", "Blocked"),
+}
+
+
+def _age_text(checked_at: datetime | None, now: datetime) -> str:
+    if checked_at is None:
+        return ""
+    minutes = int(max((now - checked_at).total_seconds(), 0) // 60)
+    return "checked just now" if minutes < 1 else f"checked {minutes} min ago"
+
+
+def _prepare_sessions_card(statuses: dict[str, SessionStatus], waiting: bool, busy: bool = False) -> str:
+    """Environment choice, the two session rows, and the Prepare / Re-check actions."""
+    now = readiness_now()
+    production_problem = readiness.production_unlock_problem(os.environ, datetime.now(timezone.utc))
+    rows = ""
+    for system, label in (("salesforce", "Salesforce (org alias " + escape(salesforce_target_org()) + ")"),
+                          ("leonardo", "Leonardo Development (automation browser)")):
+        status = readiness.effective(statuses[system], now, readiness.READ_TTL)
+        css, text = SESSION_CHIPS[status.state]
+        rows += ("<tr><th>" + label + "</th><td><span class='chip " + css + "'>" + text + "</span></td><td>"
+                 + escape(SESSION_REASON_TEXT.get(status.reason, status.reason.replace("_", " ")))
+                 + " <span class='note'>" + _age_text(status.checked_at, now) + "</span></td></tr>")
+    # Only a running Leonardo check disables the buttons; a Salesforce sign-in the
+    # operator abandoned must not lock the page.
+    disabled = " disabled" if busy else ""
+    return (
+        "<section class='card'><div class='card-head'><h2 class='pill'>Sessions</h2></div>"
+        "<p>One step before validating or onboarding: <strong>Prepare sessions</strong> checks Salesforce and Leonardo and "
+        "opens a sign-in only where one is needed. Complete SSO/MFA only on the real Salesforce and Leonardo pages; "
+        "the dashboard never receives or stores credentials, MFA codes, or cookies.</p>"
+        "<form method='post' action='/attended/prepare-sessions'>"
+        "<fieldset class='env'><legend>Environment</legend>"
+        "<label><input type='radio' name='environment' value='" + readiness.LEONARDO_DEVELOPMENT + "' checked> "
+        "Leonardo Development</label> "
+        "<label class='muted'><input type='radio' name='environment' value='" + readiness.BACKOFFICE_PRODUCTION + "'"
+        + (" disabled" if production_problem else "") + "> BackOffice production"
+        + (" — locked: " + escape(GATE_REFUSAL_TEXT.get(production_problem, production_problem)) if production_problem else "")
+        + "</label></fieldset>"
+        "<table class='sessions'>" + rows + "</table>"
+        "<div class='actions'><button type='submit'" + disabled + ">Prepare sessions</button></div></form>"
+        "<form method='post' action='/attended/session-recheck'><div class='actions'>"
+        "<button class='ghost' type='submit'" + disabled + ">Re-check now</button></div></form>"
+        "<p class='note'>Start needs Leonardo checked in the last 5 minutes and Salesforce in the last 15; Validate and "
+        "scan refresh need both in the last 15. An older check is repeated automatically (read-only) before the action. "
+        + ("This page refreshes every 5 seconds while a sign-in or check runs." if waiting else "") + "</p></section>"
+    )
+
+
+def _session_chip() -> str:
+    """Sidebar chip: the worse of the two sessions, from memory only (no probe, no file read)."""
+    statuses = session_statuses(include_runs=False)
+    now = readiness_now()
+    states = [readiness.effective(statuses[system], now, readiness.READ_TTL).state for system in ("salesforce", "leonardo")]
+    order = [SessionState.BLOCKED, SessionState.EXPIRED, SessionState.NOT_SIGNED_IN, SessionState.SIGNING_IN,
+             SessionState.STALE, SessionState.READY]
+    worst = min(states, key=order.index)
+    css, text = SESSION_CHIPS[worst]
+    return "<a class='session-chip' href='/connection'><span class='chip " + css + "'>Sessions: " + text + "</span></a>"
 
 
 def page_salesforce_login_opened() -> str:
@@ -2881,6 +3165,10 @@ PENTERA_CSS = (
     ".qh-table th,.qh-table td{padding:5px 8px;border-bottom:1px solid var(--line);text-align:right;font-variant-numeric:tabular-nums}"
     ".qh-table th:first-child,.qh-table td:first-child{text-align:left}.qh-table thead th{color:var(--muted);font-weight:600}"
     ".qh-table tfoot td{font-weight:600}.qh-note{margin:8px 0 0;color:var(--muted);font-size:12px}"
+    ".session-chip{display:block;margin:14px 0 0;text-decoration:none}.sessions{border-collapse:collapse;margin:10px 0;width:100%}"
+    ".sessions th,.sessions td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}"
+    "fieldset.env{border:1px solid var(--line);border-radius:6px;margin:10px 0;padding:8px 12px}.env label{margin-right:18px}"
+    ".muted{color:var(--muted)}.section-title{font-size:15px;margin:22px 0 8px}"
 )
 
 
@@ -2894,7 +3182,7 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "") 
         "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body><div class='shell'>"
         "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
         + nav("/", "Onboardings", "onboardings") + nav("/history", "History", "history")
-        + nav("/connection", "Connection", "connection") +
+        + nav("/connection", "Sign in", "connection") + _session_chip() +
         "<div class='side-foot'>Attended · localhost only</div></aside>"
         "<main>" + main_html + "</main></div></body></html>"
     )
@@ -3264,7 +3552,79 @@ START_BLOCKED_MESSAGES = {
 }
 
 
+# Local operator gate (2026-10-03): start_attended_dashboard.ps1 prints a
+# one-time unlock code and passes only its SHA-256 here. The code is entered
+# once on /unlock; the dashboard then sets its own opaque in-memory session
+# cookie (not a Salesforce or Leonardo cookie). Enforced whenever the launcher
+# configured it; it keeps other Windows sessions on this machine, and local
+# scripts without the cookie, from driving the dashboard.
+UNLOCK_DIGEST_ENV = "SURFACE_ONBOARDING_UNLOCK_SHA256"
+UNLOCK_COOKIE = "surface_dashboard_session"
+UNLOCK_SESSION_SECONDS = 12 * 60 * 60
+UNLOCK_MAX_FAILURES, UNLOCK_FAILURE_WINDOW_SECONDS = 5, 60.0
+_unlock_lock = Lock()
+_unlock_sessions: dict[str, float] = {}
+_unlock_failures: list[float] = []
+
+
+def unlock_required() -> bool:
+    return bool(os.environ.get(UNLOCK_DIGEST_ENV))
+
+
+def issue_unlock_session(code: str | None, *, now: float | None = None) -> str | None:
+    """A new dashboard session token for the right code; None (and a counted failure) otherwise."""
+    now = monotonic() if now is None else now
+    with _unlock_lock:
+        _unlock_failures[:] = [t for t in _unlock_failures if now - t < UNLOCK_FAILURE_WINDOW_SECONDS]
+        if len(_unlock_failures) >= UNLOCK_MAX_FAILURES:
+            return None
+        if not readiness.unlock_code_matches(code, os.environ.get(UNLOCK_DIGEST_ENV, "")):
+            _unlock_failures.append(now)
+            return None
+        token = token_urlsafe(32)
+        _unlock_sessions[token] = now + UNLOCK_SESSION_SECONDS
+        return token
+
+
+def unlock_session_valid(cookie_header: str | None, *, now: float | None = None) -> bool:
+    if not unlock_required():
+        return True
+    now = monotonic() if now is None else now
+    for part in (cookie_header or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == UNLOCK_COOKIE and value:
+            with _unlock_lock:
+                expiry = _unlock_sessions.get(value)
+                if expiry is not None and now < expiry:
+                    return True
+    return False
+
+
+def page_unlock(failed: bool = False) -> str:
+    message = ("<p class='note' style='color:#c0392b'><strong>That code was not accepted.</strong> After five wrong codes "
+               "the form pauses for a minute.</p>" if failed else "")
+    main_html = (
+        "<div class='page-head'><h1>Unlock the dashboard</h1></div><section class='card'>"
+        "<p>Enter the unlock code printed by <code>start_attended_dashboard.ps1</code> in your terminal. "
+        "This code only unlocks this local dashboard; it is not a Salesforce or Leonardo sign-in.</p>" + message +
+        "<form method='post' action='/unlock'><label>Unlock code <input name='code' autocomplete='off' "
+        "maxlength='9' required></label> <button type='submit'>Unlock</button></form></section>"
+    )
+    return ("<!doctype html><html lang='en'><head><meta charset='utf-8'><title>Unlock the dashboard</title><style>"
+            + PENTERA_CSS + "</style></head><body><main style='max-width:640px;margin:40px auto'>" + main_html
+            + "</main></body></html>")
+
+
+# Routes that launch the runner: "start" creates a tenant, "read" is read-only.
+SESSION_GATED_ROUTES = {
+    "/attended/start-ce-only-runner": "start", "/attended/start-co0702-ce-only-runner": "start",
+    "/attended/start-surface-runner": "start",
+    "/attended/validate": "read", "/attended/scan-status-refresh": "read", "/attended/verify-uncertain": "read",
+}
+
+
 POST_ROUTES = frozenset({
+    "/attended/prepare-sessions", "/attended/session-recheck",
     "/attended/salesforce-login", "/attended/leonardo-dev-session-check", "/attended/leonardo-dev-session-bootstrap",
     "/attended/leonardo-dev-session-reset", "/attended/leonardo-dev-browser-close",
     "/attended/rerun-comment-evaluation", "/attended/rerun-co0745-renewal-evaluation",
@@ -3341,6 +3701,13 @@ class Handler(BaseHTTPRequestHandler):
     def send_redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.SEE_OTHER); self.send_header("Location", location); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.end_headers()
     def do_GET(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/unlock":
+            if unlock_required() and unlock_session_valid(self.headers.get("Cookie")):
+                self.send_redirect("/"); return
+            self.send_page(HTTPStatus.OK, page_unlock()); return
+        if unlock_required() and not unlock_session_valid(self.headers.get("Cookie")):
+            self.send_redirect("/unlock"); return
         # Display reads may use the short in-memory cache; ?refresh=1 drops it.
         if parse_qs(urlsplit(self.path).query).get("refresh", [""])[0] == "1":
             clear_display_cache()
@@ -3391,15 +3758,56 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
         except ReadUnavailable:
+            set_session_status("salesforce", SessionStatus(SessionState.EXPIRED, "salesforce_read_failed", readiness_now()))
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable())
+
+    def _post_unlock(self) -> None:
+        if not unlock_required():
+            self.send_redirect("/"); return
+        token = issue_unlock_session(exact_form_value(post_form(self), "code"))
+        if token is None:
+            self.send_page(HTTPStatus.FORBIDDEN, page_unlock(failed=True)); return
+        self.send_response(HTTPStatus.SEE_OTHER)
+        self.send_header("Location", "/connection")
+        self.send_header("Set-Cookie", UNLOCK_COOKIE + "=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age="
+                         + str(UNLOCK_SESSION_SECONDS))
+        self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer")
+        self.end_headers()
 
     def do_POST(self) -> None:
         # Any action may change Salesforce or local state; later pages read fresh.
         clear_display_cache()
         path = urlsplit(self.path).path
+        if path == "/unlock":
+            self._post_unlock(); return
+        if unlock_required() and not unlock_session_valid(self.headers.get("Cookie")):
+            # Locked: no form parse, Salesforce read, or launch.
+            self.send_page(HTTPStatus.FORBIDDEN, "<!doctype html><title>Locked</title><p>Unlock the dashboard first: "
+                           "<a href='/unlock'>enter the unlock code</a>. Nothing was started.</p>")
+            return
         if path not in POST_ROUTES:
             # Unknown routes stop here: no form parse, Salesforce read, or launch.
             self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
+            return
+        if path == "/attended/prepare-sessions":
+            environment = exact_form_value(post_form(self), "environment") or readiness.LEONARDO_DEVELOPMENT
+            problem = prepare_sessions_problem(environment)
+            if problem is not None:
+                locked = problem.startswith("production_") or problem == "unknown_environment"
+                self.send_page(HTTPStatus.FORBIDDEN if locked else HTTPStatus.CONFLICT,
+                               session_gate_page(problem, "/connection"))
+                return
+            prepare_sessions()
+            self.send_redirect("/connection")
+            return
+        if path == "/attended/session-recheck":
+            problem = prepare_sessions_problem(readiness.LEONARDO_DEVELOPMENT)
+            if problem is not None:
+                self.send_page(HTTPStatus.CONFLICT, session_gate_page(problem, "/connection"))
+                return
+            probe_salesforce_readiness()
+            start_leonardo_session_worker(sign_in=False)
+            self.send_redirect("/connection")
             return
         if path == "/attended/salesforce-login":
             if start_attended_salesforce_login():
@@ -3415,6 +3823,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_leonardo_session_result("leonardo_session_unavailable"))
                 return
             result = check_leonardo_session()
+            set_session_status("leonardo", readiness.classify_leonardo_result(result, readiness_now()))
             self.send_page(HTTPStatus.OK, page_leonardo_session_result(result))
             return
         if path == "/attended/leonardo-dev-session-bootstrap":
@@ -3422,6 +3831,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_leonardo_session_result("leonardo_session_unavailable"))
                 return
             result = bootstrap_leonardo_session()
+            set_session_status("leonardo", readiness.classify_leonardo_result(result, readiness_now()))
             self.send_page(HTTPStatus.OK, page_leonardo_session_result(result))
             return
         if path == "/attended/leonardo-dev-session-reset":
@@ -3429,6 +3839,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_leonardo_session_result("leonardo_profile_reset_unavailable"))
                 return
             ok = reset_leonardo_profile()
+            if ok:
+                set_session_status("leonardo", SessionStatus(SessionState.EXPIRED, "leonardo_session_expired", readiness_now()))
             self.send_page(HTTPStatus.OK, page_leonardo_session_result("leonardo_profile_reset" if ok else "leonardo_profile_reset_unavailable"))
             return
         if path == "/attended/leonardo-dev-browser-close":
@@ -3439,6 +3851,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/attended/validate-all":
             # Read-only sweep: no CO reference, no Salesforce write.
+            problem = action_readiness_problem("read")
+            if problem is not None:
+                self.send_page(HTTPStatus.CONFLICT, session_gate_page(problem)); return
             if not start_attended_validation_all():
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Validation unavailable</title><p>The read-only validation could not be started on this desktop.</p>")
                 return
@@ -3446,6 +3861,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/attended/scan-status-refresh-all":
             # Read-only sweep: no CO reference, no Salesforce write.
+            problem = action_readiness_problem("read")
+            if problem is not None:
+                self.send_page(HTTPStatus.CONFLICT, session_gate_page(problem)); return
             if not start_attended_scan_status_all():
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Scan status unavailable</title><p>The read-only scan-status sweep could not be started on this desktop.</p>")
                 return
@@ -3456,6 +3874,13 @@ class Handler(BaseHTTPRequestHandler):
         if reference is None or not REFERENCE.fullmatch(reference):
             self.send_page(HTTPStatus.BAD_REQUEST, "<!doctype html><title>Invalid request</title><p>Return to the dashboard and retry the attended step.</p>")
             return
+        gated_action = SESSION_GATED_ROUTES.get(path)
+        if gated_action is not None:
+            # Fresh, verified sessions before any runner launch (2026-10-03).
+            problem = action_readiness_problem(gated_action)
+            if problem is not None:
+                self.send_page(HTTPStatus.CONFLICT, session_gate_page(problem, "/co/" + reference))
+                return
         if path == "/attended/rerun-comment-evaluation":
             if reference != "CO-0741":
                 self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")

@@ -39,6 +39,21 @@ from tools.serve_attended_open_onboardings_dashboard import (
 from tools.attended_ce_only_playwright import ce_only_names, one_email_domain
 
 
+_session_gate_patch = None
+
+
+def setUpModule():
+    # These tests predate the session-readiness gate (2026-10-03) and test what
+    # happens behind it; the gate itself is tested in test_session_readiness.py.
+    global _session_gate_patch
+    _session_gate_patch = patch.object(dashboard, "action_readiness_problem", return_value=None)
+    _session_gate_patch.start()
+
+
+def tearDownModule():
+    _session_gate_patch.stop()
+
+
 class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
     def test_source_ready_detail_offers_only_an_attended_login_preflight(self):
         page = page_detail("CO-0717", {"Onboarding_Approval_Status__c": "Approved"})
@@ -764,7 +779,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
     def test_unavailable_page_offers_attended_salesforce_login_without_sensitive_prompts(self):
         page = page_salesforce_unavailable()
         self.assertIn("/attended/salesforce-login", page)
-        self.assertIn("Salesforce connection", page)
+        self.assertIn("Sign in / Prepare sessions", page)  # renamed from "Salesforce connection" (2026-10-03)
         self.assertIn("All queues", page)
         self.assertIn("Complete SSO/MFA", page)
         self.assertNotIn("password", page.lower())
