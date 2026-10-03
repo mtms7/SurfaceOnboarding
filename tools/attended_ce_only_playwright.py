@@ -2553,9 +2553,10 @@ def _cdp_open_tab(port: int, url: str) -> str | None:
 
     Uses the CDP HTTP endpoint (PUT /json/new, required since Chrome 111), so
     the tab exists before any Playwright attach and is tracked by target id.
-    Only the fixed Leonardo Development URLs (or the anchor tab) are opened.
+    Only the fixed Leonardo Development URLs, the anchor tab, or the local
+    dashboard's sign-in page are opened.
     """
-    if url != ANCHOR_TAB_URL and not url.startswith(DEVELOPMENT_ORIGIN + "/"):
+    if url != ANCHOR_TAB_URL and not url.startswith(DEVELOPMENT_ORIGIN + "/") and _dashboard_port(url) is None:
         return None
     created = _cdp_json(port, "/json/new?" + url, method="PUT")
     if not isinstance(created, dict):
@@ -2564,6 +2565,56 @@ def _cdp_open_tab(port: int, url: str) -> str | None:
     if not isinstance(target_id, str) or not CDP_TARGET_ID.fullmatch(target_id):
         return None
     return target_id
+
+
+# The operator's dashboard opens as the first tab of the automation window
+# (2026-10-03): the dashboard and its Leonardo tabs then share one Chrome
+# window. Only the exact loopback sign-in URL qualifies.
+DASHBOARD_LOGIN_URL = re.compile(r"http://127\.0\.0\.1:([0-9]{4,5})/login")
+
+
+def _dashboard_port(url: str) -> int | None:
+    match = DASHBOARD_LOGIN_URL.fullmatch(url)
+    port = int(match.group(1)) if match else 0
+    return port if 1024 <= port <= 65535 else None
+
+
+def open_dashboard_tab(dashboard_port: int) -> str:
+    """Show the local dashboard in the automation window (reuse or launch it); no Leonardo action.
+
+    An existing dashboard tab for this port is brought to the front instead of
+    opening a second one. Only the persisted desktop profile is used, so the
+    window outlives this process.
+    """
+    url = f"http://127.0.0.1:{dashboard_port}/login"
+    if _dashboard_port(url) is None:
+        return "dashboard_port_invalid"
+    profile_dir, persist = leonardo_profile()
+    if not persist:
+        return "automation_profile_not_persisted"
+    try:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return "leonardo_profile_unavailable"
+    port = _verified_automation_port(profile_dir)
+    if port is None:
+        executable = _chrome_executable()
+        if executable is None:
+            try:
+                from playwright.sync_api import sync_playwright
+            except ModuleNotFoundError:
+                return "playwright_runtime_unavailable"
+            with sync_playwright() as playwright:
+                executable = playwright.chromium.executable_path
+        _chrome_proc, port = _launch_automation_chrome(executable, profile_dir, persist=True)
+        if port is None:
+            return "browser_cdp_unavailable"
+    prefix = f"http://127.0.0.1:{dashboard_port}/"
+    for target in _cdp_page_targets(port):
+        if target["url"].startswith(prefix) and CDP_TARGET_ID.fullmatch(target["id"]):
+            _cdp_request(port, "/json/activate/" + target["id"])
+            return "dashboard_tab_activated"
+    return "dashboard_tab_opened" if _cdp_open_tab(port, url) else "browser_tab_unavailable"
 
 
 def _cdp_close_tab(port: int, target_id: str) -> bool:
@@ -5744,6 +5795,8 @@ def main() -> int:
                         help="Read-only Surface validation of every onboarded CO (no fill, submit, or create).")
     parser.add_argument("--scan-status-all", action="store_true",
                         help="Read-only scan-status read for every onboarded Surface / Case 3 CO (no fill, submit, or create).")
+    parser.add_argument("--open-dashboard", type=int, metavar="PORT",
+                        help="Open (or bring to the front) the local dashboard's sign-in page as a tab of the automation window.")
     parser.add_argument("--probe-inventory-shape", action="store_true",
                         help="Read-only: reload Tenant Management and report how the tenant table pages (key names and counts only).")
     parser.add_argument("--export-tenants", action="store_true",
@@ -5757,6 +5810,9 @@ def main() -> int:
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
+    if args.open_dashboard is not None:
+        print(json.dumps({"result": open_dashboard_tab(args.open_dashboard)}, separators=(",", ":")))
+        return 0
     if args.probe_inventory_shape:
         report = run_probe_inventory_shape()
         print(json.dumps({**report, "salesforce_writeback": "not_performed"}, separators=(",", ":")))

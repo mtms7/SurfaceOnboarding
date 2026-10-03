@@ -410,7 +410,8 @@ class LoginFlowTests(unittest.TestCase):
                         patch.object(dashboard, "salesforce_userinfo", side_effect=lambda: dict(self.USERINFO)),
                         patch.object(dashboard, "start_leonardo_session_worker",
                                      side_effect=lambda sign_in: self.workers.append(sign_in) or True),
-                        patch.object(dashboard, "close_automation_browser", return_value="automation_browser_closed")):
+                        # Sign-out keeps the automation window: it also hosts the dashboard tab.
+                        patch.object(dashboard, "close_automation_browser", side_effect=AssertionError("window stays"))):
             patcher.start(); self.addCleanup(patcher.stop)
         for cleanup in (dashboard._login_attempt.clear, dashboard._dashboard_sessions.clear):
             cleanup(); self.addCleanup(cleanup)
@@ -423,18 +424,33 @@ class LoginFlowTests(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-    def _request(self, method, path, cookies=()):
+    def _request(self, method, path, cookies=(), extra=None):
         import http.client
         connection = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=10)
         self.addCleanup(connection.close)
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        headers = {"Content-Type": "application/x-www-form-urlencoded", **(extra or {})}
         if cookies:
             headers["Cookie"] = "; ".join(cookies)
         connection.request(method, path, body="", headers=headers)
         response = connection.getresponse()
         body = response.read().decode("utf-8")
         set_cookies = [value.split(";")[0] for name, value in response.getheaders() if name.lower() == "set-cookie"]
+        self.last_referrer_policy = response.getheader("Referrer-Policy")
         return response.status, response.getheader("Location"), set_cookies, body
+
+    def test_the_sign_in_button_works_from_a_real_browser(self):
+        # 2026-10-03 live 403: under "no-referrer" Chromium sends "Origin: null" on the page's own
+        # form post, which the cross-site check refuses. Pages now use "same-origin", so the
+        # browser sends the dashboard's own origin, as below.
+        self.assertEqual(self._request("GET", "/login")[0], 200)
+        self.assertEqual(self.last_referrer_policy, "same-origin")
+        origin = f"http://127.0.0.1:{self.server.server_address[1]}"
+        status, location, _, _ = self._request("POST", "/login/start",
+                                               extra={"Origin": origin, "Sec-Fetch-Site": "same-origin"})
+        self.assertEqual((status, location), (303, "/login"))
+        self.assertEqual(self.last_referrer_policy, "same-origin")
+        # The opaque origin stays refused: that is what a sandboxed cross-site frame sends.
+        self.assertEqual(self._request("POST", "/login/start", extra={"Origin": "null"})[0], 403)
 
     def _sign_in(self):
         status, location, cookies, _ = self._request("POST", "/login/start")

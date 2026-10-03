@@ -2801,8 +2801,9 @@ def _sessions_card(statuses: dict[str, SessionStatus], waiting: bool, busy: bool
         "Close automation browser</button></form>"
         "<form method='post' action='/attended/leonardo-dev-session-reset'><button class='ghost' type='submit'>"
         "Reset Leonardo session</button></form></div>"
-        "<p class='note'>Close the automation browser at the end of the day. Reset also wipes its profile and forces a "
-        "fresh Leonardo SSO/MFA.</p></details></section>"
+        "<p class='note'>Close the automation browser at the end of the day; if this dashboard is open in that window, it "
+        "closes too (start it again with the launcher). Reset also wipes its profile and forces a fresh Leonardo "
+        "SSO/MFA.</p></details></section>"
     )
 
 
@@ -3813,7 +3814,11 @@ def finish_dashboard_login(attempt_token: str | None) -> tuple[str, str | None]:
 
 
 def end_dashboard_session(cookie_header: str | None) -> str | None:
-    """Sign out: the dashboard session, the alias's CLI session, and the automation window. Refused mid-run."""
+    """Sign out: the dashboard session and the alias's CLI session. Refused mid-run.
+
+    The automation window stays open: it also hosts the dashboard tab, which
+    now shows the sign-in page. "Close automation browser" ends it.
+    """
     if any_run_in_progress():
         return "run_in_progress"
     token = _cookie(cookie_header, SESSION_COOKIE)
@@ -3823,11 +3828,6 @@ def end_dashboard_session(cookie_header: str | None) -> str | None:
     _sf_quiet("org", "logout", "--target-org", salesforce_target_org(), "--no-prompt")
     set_session_status("salesforce", readiness.NOT_SIGNED_IN)
     set_session_status("leonardo", readiness.NOT_SIGNED_IN)
-    if not leonardo_worker_running():
-        try:
-            close_automation_browser()
-        except Exception:
-            pass
     return None
 
 
@@ -3917,6 +3917,13 @@ POST_ROUTES = frozenset({
 })
 
 
+# "same-origin", not "no-referrer": under no-referrer a browser sends "Origin: null"
+# on this dashboard's own form posts (verified 2026-10-03 in Chromium), which
+# request_origin_problem must refuse, so every button returned 403. same-origin
+# still sends nothing to other sites.
+REFERRER_POLICY = "same-origin"
+
+
 def request_origin_problem(command: str, host: str | None, origin: str | None, fetch_site: str | None,
                            port: int) -> str | None:
     """Why a request must be refused before any handler runs, else None (review item 6, 2026-10-01).
@@ -3955,7 +3962,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
     def send_page(self, status: HTTPStatus, page: str) -> None:
-        data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(data)
+        data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", REFERRER_POLICY); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(data)
     def _claim_and_launch(self, reference: str, revision: str, launch: Any, **start_fields: str) -> bool:
         """Record the start first (the claim), then launch; a failed launch is recorded as such."""
         try:
@@ -3978,12 +3985,12 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def send_redirect(self, location: str) -> None:
-        self.send_response(HTTPStatus.SEE_OTHER); self.send_header("Location", location); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.end_headers()
+        self.send_response(HTTPStatus.SEE_OTHER); self.send_header("Location", location); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", REFERRER_POLICY); self.end_headers()
     def send_redirect_with_cookies(self, location: str, cookies: list[str]) -> None:
         self.send_response(HTTPStatus.SEE_OTHER); self.send_header("Location", location)
         for cookie in cookies:
             self.send_header("Set-Cookie", cookie)
-        self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", "no-referrer"); self.end_headers()
+        self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", REFERRER_POLICY); self.end_headers()
 
     def _get_login(self) -> None:
         cookie_header = self.headers.get("Cookie")

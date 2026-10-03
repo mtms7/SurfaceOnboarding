@@ -271,6 +271,47 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(runner.SESSION_API_CHECK_ENABLED)
 
 
+class DashboardTabTests(unittest.TestCase):
+    """The dashboard opens as a tab of the automation window (2026-10-03); nothing else new may open."""
+
+    def test_only_the_exact_loopback_sign_in_url_qualifies(self):
+        self.assertEqual(runner._dashboard_port("http://127.0.0.1:8012/login"), 8012)
+        for url in ("http://localhost:8012/login", "https://127.0.0.1:8012/login", "http://127.0.0.1:8012/",
+                    "http://127.0.0.1:8012/login?next=x", "http://127.0.0.1:80/login", "http://127.0.0.1:99999/login",
+                    "http://127.0.0.1:8012/attended/validate-all"):
+            with self.subTest(url=url):
+                self.assertIsNone(runner._dashboard_port(url))
+
+    def test_the_tab_opener_accepts_the_sign_in_page_but_no_other_loopback_page(self):
+        with patch.object(runner, "_cdp_json", return_value={"id": "T1"}) as cdp:
+            self.assertEqual(runner._cdp_open_tab(1, "http://127.0.0.1:8012/login"), "T1")
+            self.assertIsNone(runner._cdp_open_tab(1, "http://127.0.0.1:8012/attended/validate-all"))
+        cdp.assert_called_once()
+
+    def _open(self, targets, *, port=1234, persist=True):
+        calls = []
+        with patch.object(runner, "leonardo_profile", return_value=(Path(tempfile.mkdtemp()), persist)), \
+                patch.object(runner, "_verified_automation_port", return_value=port), \
+                patch.object(runner, "_launch_automation_chrome", side_effect=lambda *a, **k: calls.append("launch") or (None, 4321)), \
+                patch.object(runner, "_chrome_executable", return_value="chrome.exe"), \
+                patch.object(runner, "_cdp_page_targets", return_value=targets), \
+                patch.object(runner, "_cdp_request", side_effect=lambda p, path, **k: calls.append(path) or b"{}"), \
+                patch.object(runner, "_cdp_open_tab", side_effect=lambda p, url: calls.append(url) or "T9"):
+            return runner.open_dashboard_tab(8012), calls
+
+    def test_an_existing_dashboard_tab_is_brought_to_the_front(self):
+        result, calls = self._open([{"id": "ABC", "url": "http://127.0.0.1:8012/connection"}])
+        self.assertEqual((result, calls), ("dashboard_tab_activated", ["/json/activate/ABC"]))
+
+    def test_a_new_tab_opens_in_the_running_window_or_a_launched_one(self):
+        self.assertEqual(self._open([{"id": "X", "url": "about:blank"}]),
+                         ("dashboard_tab_opened", ["http://127.0.0.1:8012/login"]))
+        self.assertEqual(self._open([], port=None), ("dashboard_tab_opened", ["launch", "http://127.0.0.1:8012/login"]))
+
+    def test_a_temporary_profile_is_refused(self):
+        self.assertEqual(self._open([], persist=False)[0], "automation_profile_not_persisted")
+
+
 class InventoryPageTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())

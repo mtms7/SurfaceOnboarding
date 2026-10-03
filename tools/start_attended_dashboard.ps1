@@ -157,8 +157,27 @@ try {
 }
 
 Write-Host ''
-Write-Host "Next: open http://127.0.0.1:$Port/login and select Sign in with Salesforce (SSO and MFA)."
-Write-Host 'Signing in also starts the Leonardo Development sign-in in the automation browser. Connect the RND VPN first.'
 if (-not $NoBrowser) {
-    Start-Process "http://127.0.0.1:$Port/login"
+    # The dashboard opens as a tab of the automation Chrome (its own profile, not the
+    # work profile), so the Leonardo tabs the runs drive open in the same window.
+    $runner = Join-Path $PSScriptRoot 'attended_ce_only_playwright.py'
+    $opened = $null
+    # A Python warning on stderr must not trip this script's strict error policy.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $opened = (& $PythonPath $runner --open-dashboard $Port 2>$null | Select-Object -Last 1 | ConvertFrom-Json).result
+    } catch {
+        $opened = $null
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($opened -in @('dashboard_tab_opened', 'dashboard_tab_activated')) {
+        Write-Host 'The dashboard is open in the automation Chrome window; Leonardo tabs open next to it.'
+    } else {
+        Write-Warning "The automation window could not be opened ($opened). Opening the dashboard in the default browser instead."
+        Start-Process "http://127.0.0.1:$Port/login"
+    }
 }
+Write-Host "Next: select Sign in with Salesforce (OneLogin SSO and MFA) at http://127.0.0.1:$Port/login."
+Write-Host 'Signing in also starts the Leonardo Development sign-in in the automation window. Connect the RND VPN first.'
