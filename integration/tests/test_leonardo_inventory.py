@@ -237,6 +237,17 @@ class AssemblePagesTests(unittest.TestCase):
         self.assertEqual(assembled.query["filter"], "present")
 
 
+class QuotaFieldDriftTests(unittest.TestCase):
+    def test_quota_objects_are_known_and_their_children_not_reported(self):
+        # Live 2026-10-04: both quota fields are objects with max/used counts and a renewal time.
+        quota = {"maxScanQuota": 10, "numOfExecutedScans": 2, "nextQuotaRenewalTime": 1790000000000,
+                 "scanQuotaPeriodEnum": "MONTHLY"}
+        license_ = dict(tenant_row(1)["accountLicense"], scanQuotaEnforcement=quota,
+                        authWebAttackQuotaEnforcement={"maxAttackedWebsites": 5, "quotaPeriodEnum": "MONTHLY"})
+        drift = schema_drift([tenant_row(1, accountLicense=license_), tenant_row(2)])
+        self.assertEqual(drift, {"unknown": [], "missing": [], "type_changed": []})
+
+
 class DuplicatePrecheckTests(unittest.TestCase):
     """Owner decision 2026-10-04 (options A + B): the live check's rules plus alternate domains."""
 

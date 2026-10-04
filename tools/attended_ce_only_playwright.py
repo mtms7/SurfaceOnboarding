@@ -205,7 +205,9 @@ FORM_CLOSE_POLL_SECONDS = 0.5
 # Server-side tenant search (getAllDetailedAccounts per edit, HAR-verified):
 # wait for the response that carries this lookup instead of a fixed sleep.
 TENANT_SEARCH_API = "getAllDetailedAccounts"
-SEARCH_RESPONSE_TIMEOUT_MS = 10_000
+SEARCH_RESPONSE_TIMEOUT_MS = 15_000
+# Rows per invisible search; more matches than this is ambiguous (fail closed).
+API_SEARCH_PAGE_SIZE = 100
 ACCOUNT_ADD_API = "/backoffice/account/add"
 # Selects that can reset dependent controls are set before the toggles.
 EARLY_SELECTS = ("Account Type", "Type", "Scanning interval")
@@ -4446,34 +4448,52 @@ def _fill_select(page: Any, label: str, option: str) -> str | None:
 
 
 def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult | None":
-    """Run one server-side tenant search and wait for its own response.
+    """One invisible, server-side tenant search (owner decision 2026-10-04, Development).
 
-    The tenant search is server-side (a getAllDetailedAccounts POST per edit,
-    HAR-verified 2026-09-29), so a fixed sleep can read the previous lookup's
-    table and false-clear. The box is cleared first so re-searching the same
-    text still issues a request, and only a response whose request carries
-    this lookup counts. Returns the parsed rows, or None (the caller fails
-    closed) when no such response arrives in time or its schema is unexpected.
+    Nothing is typed in the UI. The page is reloaded and the app's own table
+    request is sent with only its body changed: offset 0, API_SEARCH_PAGE_SIZE
+    rows, and a search filter for ``lookup``. The app's own headers (its
+    session token) go out unchanged and are never read here, so no token is
+    handled. ``search`` is unused (kept for callers). Returns the parsed rows,
+    or None (the caller fails closed) when the rewrite did not happen, no
+    reply arrives in time, or the reply's schema is unexpected. A server that
+    ignored the filter answers with more matches than rows, which every
+    caller treats as ambiguous.
     """
-    needle = lookup.casefold()
+    rewritten: list[bool] = []
 
-    def matches(response: Any) -> bool:
+    def rewrite(route: Any) -> None:
         try:
-            if TENANT_SEARCH_API not in response.url:
-                return False
-            body = response.request.post_data or ""
-            return needle in body.casefold()
+            if route.request.method != "POST":
+                route.continue_()
+                return
+            body = json.loads(route.request.post_data or "")
+            body["tableServerData"].update(offset=0, items_per_page=API_SEARCH_PAGE_SIZE,
+                                           filters={"and": [{"method": "search", "value": lookup}]})
+            route.continue_(post_data=json.dumps(body))
+            rewritten.append(True)
         except Exception:
-            return False
+            route.continue_()  # unchanged: the missing rewrite fails the search closed
 
     try:
-        search.fill("", timeout=FIELD_TIMEOUT_MS)
-        with page.expect_response(matches, timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
-            search.fill(lookup, timeout=FIELD_TIMEOUT_MS)
-            search.press("Enter")
+        page.route(INVENTORY_ROUTE_PATTERN, rewrite)
+    except Exception as exc:
+        _log().error("tenant_search", "route", exc)
+        return None
+    try:
+        with page.expect_response(_is_inventory_response, timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
+            page.reload(wait_until="domcontentloaded")
         status = info.value.status
     except Exception as exc:
         _log().error("tenant_search", "response", exc)
+        return None
+    finally:
+        try:
+            page.unroute(INVENTORY_ROUTE_PATTERN, rewrite)
+        except Exception:
+            pass
+    if not rewritten:
+        _log().event("tenant_search", "not_rewritten")
         return None
     if status in (401, 403):
         # The tab can still show Tenant Management while its API token has
@@ -5410,6 +5430,7 @@ def run_validate_all() -> dict[str, str]:
 # memory; only the allow-listed snapshot (integration/onboarding/
 # leonardo_inventory.py) is written, outside the repository.
 INVENTORY_API_PATH = "/api/v1/backoffice/getAllDetailedAccounts"
+INVENTORY_ROUTE_PATTERN = re.compile(re.escape(DEVELOPMENT_ORIGIN + INVENTORY_API_PATH) + r"(?:\?.*)?$")
 INVENTORY_RESPONSE_TIMEOUT_MS = 20_000
 INVENTORY_PAGE_DELAY_SECONDS = 1.0
 # The page-level session check also proves the API accepts the session (a tab
@@ -5536,6 +5557,29 @@ def _footer_numbers(page: Any) -> list[int]:
     return [int(n) for n in re.findall(r"\d{1,6}", " ".join(t for t in texts if isinstance(t, str)))][:8]
 
 
+ROWS_PER_PAGE_SELECTOR = "#pagination-rows, [data-testid='pagination-rows']"
+
+
+def _largest_page_size_trigger(page: Any) -> Any:
+    """A trigger choosing the largest numeric "rows per page" option, or None when absent/already largest."""
+    try:
+        control = page.locator(ROWS_PER_PAGE_SELECTOR).first
+        if control.count() == 0:
+            return None
+    except Exception:
+        return None
+
+    def choose() -> None:
+        control.click(timeout=FIELD_TIMEOUT_MS)
+        options = page.get_by_role("option")
+        sizes = [(int(text.strip()), index) for index, text in enumerate(options.all_inner_texts())
+                 if re.fullmatch(r"\d{1,4}", text.strip())]
+        if not sizes:
+            raise RuntimeError("inventory_pagination_unavailable")
+        options.nth(max(sizes)[1]).click(timeout=FIELD_TIMEOUT_MS)
+    return choose
+
+
 def _reload(page: Any) -> Any:
     return lambda: page.reload(wait_until="domcontentloaded")
 
@@ -5545,6 +5589,11 @@ def _collect_inventory_pages(page: Any) -> tuple[list[tuple[dict[str, Any], dict
     from integration.onboarding import leonardo_inventory as inventory
 
     pages = [_capture_table_page(page, _reload(page))]
+    larger = _largest_page_size_trigger(page)
+    if larger is not None:
+        # Page 1 again at the table's largest "rows per page" (10/25/50/100 live):
+        # about 6 pages instead of 60 for 593 tenants.
+        pages = [_capture_table_page(page, larger)]
     query = _table_query(pages[0][0])
     page_size = query.get("items_per_page")
     if type(page_size) is not int or page_size < 1 or query.get("offset") != 0:

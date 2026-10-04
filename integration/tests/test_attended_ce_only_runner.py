@@ -1382,6 +1382,35 @@ class _RPPage:
     def on(self, event: str, handler) -> None:
         self.handlers.setdefault(event, []).append(handler)
 
+    # Invisible search (2026-10-04): the runner reloads and rewrites only the body of
+    # the app's own table request; the fake applies the rewritten search value.
+    route_handler = None
+    rewritten_bodies: list
+
+    def route(self, pattern, handler) -> None:
+        self.route_handler = handler
+
+    def unroute(self, pattern, handler=None) -> None:
+        self.route_handler = None
+
+    def reload(self, **kwargs) -> None:
+        if self.route_handler is None:
+            return
+        page = self
+        page.rewritten_bodies = getattr(page, "rewritten_bodies", [])
+        original = json.dumps({"tableServerData": {"offset": 0, "items_per_page": 10, "filters": {},
+                                                   "sort": {"direction": "DESC", "key": "lastReconScan"}}})
+
+        class _Route:
+            request = types.SimpleNamespace(method="POST", post_data=original)
+
+            def continue_(self, post_data=None):
+                if post_data is not None:
+                    body = json.loads(post_data)
+                    page.rewritten_bodies.append(body)
+                    page.filled["Search"] = body["tableServerData"]["filters"]["and"][0]["value"]
+        self.route_handler(_Route())
+
     def search_payload(self, text: str) -> dict:
         # The live getAllDetailedAccounts shape: rows under
         # pagination_response.table_data, filtered server-side by the text.
@@ -1848,21 +1877,47 @@ class RunEndToEndTests(unittest.TestCase):
         self.assertFalse(page.confirmed)
 
     def test_stale_search_response_fails_closed_before_add_account(self):
-        # The server-side search response must carry this lookup; a response
-        # for another query (the previous lookup) never counts as clear.
+        # The server-side search must be this lookup's (2026-10-04: the invisible
+        # search rewrites the app's own request). When the rewrite does not
+        # happen, the unfiltered reply never counts as clear.
+        tracker: dict = {}
+        page = self._install_fake_playwright(self._base(), tracker)
+
+        def reload_without_rewrite(**kwargs):
+            if page.route_handler is None:
+                return
+
+            class _UnreadableRoute:
+                request = types.SimpleNamespace(method="POST", post_data="not json")
+
+                def continue_(self, post_data=None):
+                    assert post_data is None  # sent unchanged
+
+            page.route_handler(_UnreadableRoute())
+
+        with patch.object(page, "reload", reload_without_rewrite):
+            result = self._run_scenario(page, tracker)
+        self.assertEqual(result, "duplicate_schema_unavailable")
+        self.assertFalse(page.confirmed)
+
+    def test_the_duplicate_search_is_invisible_and_rewrites_only_the_body(self):
         tracker: dict = {}
         page = self._install_fake_playwright(self._base(), tracker)
         original_fill = _RPControl.fill
 
-        def sticky_search(control, value, **kwargs):
+        def no_typing_in_search(control, value, **kwargs):
             if control.label == "Search" and value:
-                return original_fill(control, "previous lookup", **kwargs)
+                raise AssertionError("typed into the Search box")
             return original_fill(control, value, **kwargs)
 
-        with patch.object(_RPControl, "fill", sticky_search):
-            result = self._run_scenario(page, tracker)
-        self.assertEqual(result, "duplicate_schema_unavailable")
-        self.assertFalse(page.confirmed)
+        with patch.object(_RPControl, "fill", no_typing_in_search):
+            self.assertEqual(self._run_scenario(page, tracker), "readback_verified")
+        lookups = [body["tableServerData"]["filters"]["and"][0]["value"] for body in page.rewritten_bodies]
+        self.assertEqual(lookups[:2], [TENANT, MAIN_DOMAIN])
+        for body in page.rewritten_bodies:
+            self.assertEqual((body["tableServerData"]["offset"], body["tableServerData"]["items_per_page"]),
+                             (0, runner.API_SEARCH_PAGE_SIZE))
+            self.assertEqual(body["tableServerData"]["sort"], {"direction": "DESC", "key": "lastReconScan"})
 
     def test_disabled_confirm_fails_closed_without_click(self):
         tracker: dict = {}

@@ -152,9 +152,10 @@ _EXPECTED_SPEC: dict[str, str] = {
     "accountLicense.scanningFrequency": "str|int|NoneType", "accountLicense.allowedModules": _LIST,
     "accountLicense.leakedCredentialsScannedDomainsNumber": "int|NoneType",
     **{f"accountLicense.{name}": _FLAG for name in _LICENSE_FLAGS.values()},
-    # Seen live 2026-10-04; known, not stored, and optional (never reported missing).
-    "accountLicense.scanQuotaEnforcement": "bool|str|int|NoneType",
-    "accountLicense.authWebAttackQuotaEnforcement": "bool|str|int|NoneType",
+    # Seen live 2026-10-04: quota objects (max/used counts, renewal time); known, not
+    # stored, optional (never reported missing), children not modelled.
+    "accountLicense.scanQuotaEnforcement": "dict|NoneType",
+    "accountLicense.authWebAttackQuotaEnforcement": "dict|NoneType",
     "primaryUser.id": "str|NoneType", "primaryUser.firstName": "str|NoneType", "primaryUser.lastName": "str|NoneType",
     "primaryUser.email": "str|NoneType", "primaryUser.isMfaRequired": _FLAG, "primaryUser.jobTitle": "str|NoneType",
     "primaryUser.phoneNumber": "str|NoneType",
@@ -165,6 +166,7 @@ EXPECTED_PATHS: dict[str, frozenset[str]] = {
 OPTIONAL_PATHS = frozenset({"accountLicense.scanQuotaEnforcement", "accountLicense.authWebAttackQuotaEnforcement"})
 # Objects whose further children are not modelled; only their listed children are compared.
 OPEN_PATHS = frozenset({
+    "accountLicense.scanQuotaEnforcement", "accountLicense.authWebAttackQuotaEnforcement",
     "emailSettings", "termsOfUseApproval", "accountSettings", "accountSettings.reconSettings",
     "lastReconExecutionData", "leakedCredentialsSettings", "leakedCredentialsSettings.spyCloudSettings",
     "campaignExecutionSettings", "campaignExecutionSettings.domainsMultiAttackStackSettings",

@@ -178,6 +178,53 @@ class CollectTests(unittest.TestCase):
         assembled = inventory.assemble_pages(pages, page_size=size)
         self.assertEqual(assembled.total_count, 5)
 
+    def test_the_largest_rows_per_page_is_chosen_before_paging(self):
+        # Live 2026-10-04: options 10/25/50/100; 593 tenants become 6 pages instead of 60.
+        small = _responses(5, 1)[0]                       # the reload's page 1 at 10 rows
+        large = _responses(5, 4)                          # pages at the chosen size
+
+        class _Options:
+            def __init__(self, page):
+                self.page = page
+
+            def all_inner_texts(self):
+                return ["10", "25", "50", "100"]
+
+            def nth(self, index):
+                page = self.page
+
+                class _Option:
+                    def click(self, timeout=None):
+                        page.chosen = ["10", "25", "50", "100"][index]
+                        page.pending = page.responses[0]
+                return _Option()
+
+        class _Control:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            def count(self):
+                return 1
+
+            def click(self, timeout=None):
+                pass
+
+        class _RowsPage(_FakePage):
+            def locator(self, selector):
+                return _Control() if selector == runner.ROWS_PER_PAGE_SELECTOR else super().locator(selector)
+
+            def get_by_role(self, role, name=None):
+                return _Options(self) if role == "option" else super().get_by_role(role, name)
+
+            def reload(self, wait_until=None):
+                self.index, self.pending = 0, small
+
+        page = _RowsPage(large)
+        pages, size = runner._collect_inventory_pages(page)
+        self.assertEqual((page.chosen, size, len(pages)), ("100", 4, 2))
+
     def test_a_filtered_first_page_is_refused(self):
         request, body = capture(2, 2)[0]
         request["tableServerData"]["filters"] = {"and": [{"method": "search", "value": "x"}]}
