@@ -140,12 +140,13 @@ class SalesforcePinTests(unittest.TestCase):
         dashboard._salesforce_login_process = None
         process = Mock(); process.poll.return_value = None
         with patch.object(dashboard, "local_browser_launch_allowed", return_value=True), \
+                patch.object(dashboard, "salesforce_login_port_busy", return_value=False), \
                 patch.object(dashboard.subprocess, "Popen", return_value=process) as popen:
             self.assertTrue(dashboard.start_attended_salesforce_login())
         dashboard._salesforce_login_process = None
         args = popen.call_args[0][0]
         self.assertNotIn("--set-default", args)
-        self.assertEqual(args[-2:], ["--alias", "surface-onboarding"])
+        self.assertEqual(args[-4:], ["--alias", "surface-onboarding", "--browser", "chrome"])
 
     def _probe(self, stdout, expected=ORG, returncode=0, side_effect=None):
         environ = {"SURFACE_SF_EXPECTED_ORG_ID": expected} if expected else {}
@@ -377,6 +378,8 @@ class IdentityTests(unittest.TestCase):
 
 
 class _LoginProcess:
+    pid = 4242
+
     def __init__(self):
         self.returncode, self.killed = None, False
 
@@ -404,8 +407,13 @@ class LoginFlowTests(unittest.TestCase):
             patcher.start(); self.addCleanup(patcher.stop)
         self.process = _LoginProcess()
         self.quiet, self.workers = [], []
-        self.popen = patch.object(dashboard.subprocess, "Popen", side_effect=lambda *a, **k: self.process)
+        self.launched = []
+        self.popen = patch.object(dashboard.subprocess, "Popen",
+                                  side_effect=lambda args, **k: self.launched.append(args) or self.process)
+        self.port_busy = patch.object(dashboard, "salesforce_login_port_busy", return_value=False)
+        self.port_busy.start(); self.addCleanup(self.port_busy.stop)
         for patcher in (self.popen,
+                        patch.object(dashboard, "kill_process_tree", side_effect=lambda process: process.kill()),
                         patch.object(dashboard, "_sf_quiet", side_effect=lambda *a, **k: self.quiet.append(a) or 0),
                         patch.object(dashboard, "salesforce_userinfo", side_effect=lambda: dict(self.USERINFO)),
                         patch.object(dashboard, "start_leonardo_session_worker",
@@ -530,6 +538,18 @@ class LoginFlowTests(unittest.TestCase):
         self._request("POST", "/login/cancel", cookies)
         self.assertTrue(self.process.killed)
 
+    def test_the_sign_in_opens_in_chrome_not_the_default_browser(self):
+        self._request("POST", "/login/start")
+        self.assertEqual(self.launched[-1][-2:], ["--browser", "chrome"])
+
+    def test_a_busy_callback_port_is_reported_and_the_current_session_is_kept(self):
+        # 2026-10-03: an orphaned CLI held port 1717, so each retry failed and had already logged out.
+        with patch.object(dashboard, "salesforce_login_port_busy", return_value=True):
+            status, _, cookies, body = self._request("POST", "/login/start")
+        self.assertEqual(status, 409)
+        self.assertIn("salesforce_login_port_busy", body)
+        self.assertEqual((self.quiet, self.launched, cookies), ([], [], []))
+
     def test_a_cancelled_sso_signs_nobody_in(self):
         _status, _location, cookies, _ = self._request("POST", "/login/start")
         self.process.returncode = 1
@@ -545,6 +565,22 @@ class LoginFlowTests(unittest.TestCase):
             status, _, _, _ = self._request("POST", "/logout", [session])
         self.assertEqual(status, 409)
         self.assertEqual(self._request("GET", "/connection", [session])[0], 200)
+
+
+class ProcessTreeTests(unittest.TestCase):
+    def test_cancel_stops_the_whole_cli_tree_on_windows(self):
+        process = _LoginProcess()
+        with patch.object(dashboard.os, "name", "nt"), \
+                patch.object(dashboard.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            dashboard.kill_process_tree(process)
+        self.assertEqual(run.call_args[0][0], ["taskkill", "/PID", "4242", "/T", "/F"])
+        self.assertTrue(process.killed)
+
+    def test_the_browser_setting_only_accepts_known_browsers(self):
+        with patch.dict(os.environ, {"SURFACE_SF_LOGIN_BROWSER": "edge"}):
+            self.assertEqual(dashboard.salesforce_login_browser(), "edge")
+        with patch.dict(os.environ, {"SURFACE_SF_LOGIN_BROWSER": "evil; rm"}):
+            self.assertEqual(dashboard.salesforce_login_browser(), "chrome")
 
 
 class PreflightTests(unittest.TestCase):

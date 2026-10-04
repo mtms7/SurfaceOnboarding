@@ -236,6 +236,42 @@ def salesforce_target_org() -> str:
     return alias
 
 
+# The CLI's browser sign-in opens Chrome (where the operator's OneLogin session
+# lives), not the system default browser, and waits for its OAuth callback on
+# this loopback port (2026-10-03: the default browser was Edge, unseen, and an
+# orphaned CLI kept the port, so every retry failed with PortInUseError).
+SALESFORCE_OAUTH_PORT = 1717
+SALESFORCE_LOGIN_BROWSERS = frozenset({"chrome", "edge", "firefox"})
+
+
+def salesforce_login_browser() -> str:
+    browser = os.environ.get("SURFACE_SF_LOGIN_BROWSER", "chrome").casefold()
+    return browser if browser in SALESFORCE_LOGIN_BROWSERS else "chrome"
+
+
+def salesforce_login_port_busy() -> bool:
+    """True while another CLI sign-in still holds the OAuth callback port (nothing is sent)."""
+    try:
+        with socket.create_connection(("localhost", SALESFORCE_OAUTH_PORT), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def kill_process_tree(process: Any) -> None:
+    """Stop a CLI sign-in and its children: killing only sf.cmd leaves node holding the port."""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15, check=False)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def local_browser_launch_allowed() -> bool:
     """Only the Windows attended pilot may launch a local operator browser.
 
@@ -258,11 +294,14 @@ def start_attended_salesforce_login() -> bool:
     with _salesforce_login_lock:
         if _salesforce_login_process is not None and _salesforce_login_process.poll() is None:
             return True
+        if salesforce_login_port_busy():
+            return False
         try:
             _salesforce_login_process = subprocess.Popen(
                 # The alias only: every read and write pins --target-org to it, so
                 # the operator's global default org is never changed.
-                [salesforce_cli_command(), "org", "login", "web", "--alias", salesforce_target_org()],
+                [salesforce_cli_command(), "org", "login", "web", "--alias", salesforce_target_org(),
+                 "--browser", salesforce_login_browser()],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -3680,6 +3719,9 @@ LOGIN_REASON_TEXT = {
     "login_cancelled_or_failed": "The Salesforce sign-in was cancelled or did not finish. Nothing was changed.",
     "login_timeout": "The Salesforce sign-in was not completed within 10 minutes.",
     "login_in_progress": "A sign-in is already in progress on this desktop. Finish it, or cancel it first.",
+    "salesforce_login_port_busy": "An earlier Salesforce sign-in is still waiting on this desktop (port 1717). Finish or "
+                                  "close it, or wait a few minutes until it times out, then try again. Your current "
+                                  "session was not changed.",
     "login_identity_unavailable": "Salesforce did not report who signed in. You were not signed in.",
     "login_no_allowed_operator": "No operator is configured for this dashboard (start it with start_attended_dashboard.ps1).",
     "login_operator_not_allowed": "That Salesforce account is not an operator of this dashboard. Its CLI session was ended.",
@@ -3735,12 +3777,16 @@ def start_dashboard_login() -> tuple[str | None, str | None]:
         if process is not None and process.poll() is None:
             if monotonic() - _login_attempt["started"] < LOGIN_ATTEMPT_SECONDS:
                 return None, "login_in_progress"
-            process.kill()
+            kill_process_tree(process)
         _login_attempt.clear()
+        if salesforce_login_port_busy():
+            # Checked before the logout: a refused start leaves the current session untouched.
+            return None, "salesforce_login_port_busy"
         # A fresh SSO + MFA every time: the previous CLI session for the alias is ended first.
         _sf_quiet("org", "logout", "--target-org", salesforce_target_org(), "--no-prompt")
         try:
-            process = subprocess.Popen([salesforce_cli_command(), "org", "login", "web", "--alias", salesforce_target_org()],
+            process = subprocess.Popen([salesforce_cli_command(), "org", "login", "web", "--alias", salesforce_target_org(),
+                                        "--browser", salesforce_login_browser()],
                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError:
             return None, "login_cancelled_or_failed"
@@ -3755,7 +3801,7 @@ def cancel_dashboard_login(attempt_token: str | None) -> None:
         if attempt_token and _login_attempt.get("token") and hmac.compare_digest(attempt_token, _login_attempt["token"]):
             process = _login_attempt.get("process")
             if process is not None and process.poll() is None:
-                process.kill()
+                kill_process_tree(process)
             _login_attempt.clear()
 
 
@@ -3786,7 +3832,7 @@ def finish_dashboard_login(attempt_token: str | None) -> tuple[str, str | None]:
         if returncode is None:
             if monotonic() - _login_attempt["started"] < LOGIN_ATTEMPT_SECONDS:
                 return "pending", None
-            process.kill()
+            kill_process_tree(process)
             _login_attempt.clear()
             set_session_status("salesforce", SessionStatus(SessionState.EXPIRED, "salesforce_sign_in_required", readiness_now()))
             return "failed", "login_timeout"
@@ -3868,8 +3914,8 @@ def page_login(state: str = "", reason: str | None = None) -> str:
     pending = state == "pending"
     banner = ""
     if pending:
-        banner = ("<div class='banner'><strong>Complete the Salesforce sign-in</strong> (SSO and MFA) in the browser "
-                  "window that opened. This page checks every 3 seconds.</div>"
+        banner = ("<div class='banner'><strong>Complete the Salesforce sign-in</strong> (OneLogin: email, password, MFA) "
+                  "in the new Chrome tab that opened. This page checks every 3 seconds.</div>"
                   "<form method='post' action='/login/cancel'><button class='ghost' type='submit'>Cancel sign-in"
                   "</button></form>")
     elif reason:

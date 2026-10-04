@@ -809,6 +809,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         process = unittest.mock.Mock()
         process.poll.return_value = None
         with patch("tools.serve_attended_open_onboardings_dashboard.local_browser_launch_allowed", return_value=True), patch(
+            "tools.serve_attended_open_onboardings_dashboard.salesforce_login_port_busy", return_value=False), patch(
             "tools.serve_attended_open_onboardings_dashboard.subprocess.Popen", return_value=process
         ) as launcher:
             self.assertTrue(start_attended_salesforce_login())
