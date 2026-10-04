@@ -3437,6 +3437,9 @@ def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
         ("Licensed subdomains", licensed),
         ("Assets", str(scope["assets"])),
         ("License dates (planned)", f"{scope['license_start']} → {scope['license_end']}"),
+        ("Onboarding day", (f"Leonardo Development: now. Production: from {scope['production_onboarding_day']} "
+                            f"(2 days before the {scope['subscription_start']} subscription start), or earlier on a "
+                            "CSM request") if scope.get("production_onboarding_day") else "—"),
         ("Large scope (&gt;60)", "yes — review carefully" if scope["large_scope"] else "no"),
         ("Core Plus on account", "yes — CE to be enabled later" if scope.get("core_plus_present") else "no"),
     ]

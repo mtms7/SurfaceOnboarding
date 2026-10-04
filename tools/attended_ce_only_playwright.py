@@ -633,6 +633,26 @@ CORE_PLUS_ADDON_MARKERS = ("bulk", "additional")
 # subscription starts within this many days of the run day. Other statuses
 # (Expired, later-starting Pending, ...) are ignored.
 SURFACE_PENDING_START_WINDOW_DAYS = 14
+# Owner decision 2026-10-04: an Approved CO (Onboarding_Approval_Status__c =
+# "Approved", the team's review) counts a Pending baseline whatever its start
+# date (CO-0757 started Nov 3, 30 days out). Not Approved keeps the window.
+APPROVED_STATUS = "Approved"
+# Owner decision 2026-10-04 on timing: in production a tenant is onboarded 2 days
+# before the subscription starts, unless the CSM asks for immediate onboarding
+# (force option). Leonardo Development onboards immediately, for manual checks.
+ONBOARD_DAYS_BEFORE_START = 2
+
+
+def earliest_onboarding_day(subscription_start: date) -> date:
+    return subscription_start - timedelta(days=ONBOARD_DAYS_BEFORE_START)
+
+
+def onboarding_allowed_now(subscription_start: date, run_day: date, *, environment: str = "dev",
+                           csm_immediate: bool = False) -> bool:
+    """Development: always. Production: from 2 days before the start, or earlier on a CSM request."""
+    if environment == "dev" or csm_immediate:
+        return True
+    return run_day >= earliest_onboarding_day(subscription_start)
 SURFACE_LICENSE_ASSETS = "10000"
 SURFACE_MAX_SCAN_DURATION_LABEL = "Maximum scan Duration (hours)"
 SURFACE_MAX_SCAN_DURATION_HOURS = "90"
@@ -677,12 +697,14 @@ def _row_status(row: dict[str, Any]) -> str:
     return " ".join(status.split()).casefold() if isinstance(status, str) else ""
 
 
-def _surface_row_counts(status: str, start: date | None, run_day: date) -> bool:
-    """Owner rule: Active counts; Pending counts when it starts within the window."""
+def _surface_row_counts(status: str, start: date | None, run_day: date, approved: bool = False) -> bool:
+    """Owner rule: Active counts; Pending counts when it starts within the window, or at all once Approved."""
     if status == "active":
         return True
     if status == "pending":
-        return start is not None and start <= run_day + timedelta(days=SURFACE_PENDING_START_WINDOW_DAYS)
+        if start is None:
+            return False
+        return approved or start <= run_day + timedelta(days=SURFACE_PENDING_START_WINDOW_DAYS)
     return False
 
 
@@ -702,7 +724,8 @@ class SurfaceEntitlement:
         return self.baseline_subdomains + self.addon_subdomains
 
 
-def select_surface_entitlement(rows: list[Any], run_day: date | None = None) -> SurfaceEntitlement:
+def select_surface_entitlement(rows: list[Any], run_day: date | None = None, *,
+                               approved: bool = False) -> SurfaceEntitlement:
     """Select exactly one counted Surface baseline plus its subdomain add-ons.
 
     A Surface row counts when Active, or Pending with a start no later than
@@ -745,7 +768,7 @@ def select_surface_entitlement(rows: list[Any], run_day: date | None = None) -> 
             raise SurfaceSourceError("surface_product_unrecognized")
         if not status:
             raise SurfaceSourceError("surface_subscription_invalid")
-        if not _surface_row_counts(status, start, day):
+        if not _surface_row_counts(status, start, day, approved):
             continue
         if classified.kind == "baseline":
             if start is None or end is None or end <= start:
@@ -879,7 +902,8 @@ def surface_fill_source(reference: str, run_day: date | None = None) -> SurfaceF
     try:
         rows = _sf_records(
             "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
-            "Main_Domain__c, Alternate_Domains__c, Onboarding_Product__c, Onboarding_Type__c, Surface_Account_ID__c "
+            "Main_Domain__c, Alternate_Domains__c, Onboarding_Product__c, Onboarding_Type__c, Surface_Account_ID__c, "
+            "Onboarding_Approval_Status__c "
             "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
             raise ValueError()
@@ -921,7 +945,8 @@ def _surface_source_from_row(reference: str, row: dict[str, Any],
         "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
         "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
         "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
-    entitlement = select_surface_entitlement(subscription_rows, run_day)
+    entitlement = select_surface_entitlement(subscription_rows, run_day,
+                                             approved=row.get("Onboarding_Approval_Status__c") == APPROVED_STATUS)
     if 1 + len(roots) > entitlement.licensed_subdomains:
         raise SurfaceSourceError("surface_domains_exceed_license")
     return SurfaceFillSource(
@@ -971,7 +996,7 @@ def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillS
         rows = _sf_records(
             "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
             "Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Onboarding_Product__c, Onboarding_Type__c, "
-            "Surface_Account_ID__c, Account_UUID__c "
+            "Surface_Account_ID__c, Account_UUID__c, Onboarding_Approval_Status__c "
             "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
             raise ValueError()
@@ -1287,6 +1312,9 @@ def surface_scope_summary(source: SurfaceFillSource, run_day: date | None = None
         "license_end": end.isoformat(),
         "large_scope": manual_review_reason(counts) is not None,
         "core_plus_present": entitlement.core_plus_present,
+        # Timing rule (owner decision 2026-10-04); Development onboards immediately.
+        "subscription_start": entitlement.subscription_start.isoformat(),
+        "production_onboarding_day": earliest_onboarding_day(entitlement.subscription_start).isoformat(),
     }
 
 

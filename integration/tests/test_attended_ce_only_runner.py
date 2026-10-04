@@ -3834,8 +3834,51 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
             "addon_subdomains": 250, "licensed_subdomains": 750, "product_domains": None, "assets": 10000,
             "license_start": "2026-09-29", "license_end": "2027-08-31", "large_scope": True,
             "core_plus_present": True,
+            "subscription_start": "2026-09-01", "production_onboarding_day": "2026-08-30",
         })
         self.assertNotIn(SURFACE_MAIN, json.dumps(summary))
+
+
+class ApprovedPendingBaselineTests(unittest.TestCase):
+    """Owner decisions 2026-10-04 (CO-0757: Pending Surface Go baseline starting 30 days out)."""
+
+    ROWS = [{"Product_Full_Name__c": "Pentera Surface Go - 500 Subdomains", "DealHub_Status__c": "Pending",
+             "DealHub_Subscription_Start_Date__c": "2026-11-03", "DealHub_Subscription_End_Date__c": "2029-11-02"}]
+    DAY = date(2026, 10, 4)
+
+    def test_approved_counts_a_pending_baseline_whatever_its_start(self):
+        entitlement = runner.select_surface_entitlement(self.ROWS, self.DAY, approved=True)
+        self.assertEqual((entitlement.tier, entitlement.subscription_start), ("go", date(2026, 11, 3)))
+
+    def test_not_approved_keeps_the_fourteen_day_window(self):
+        with self.assertRaisesRegex(runner.SurfaceSourceError, "surface_baseline_unavailable"):
+            runner.select_surface_entitlement(self.ROWS, self.DAY)
+        soon = [dict(self.ROWS[0], DealHub_Subscription_Start_Date__c="2026-10-18")]
+        self.assertEqual(runner.select_surface_entitlement(soon, self.DAY).tier, "go")
+
+    def test_approval_never_revives_expired_rows_or_hides_ambiguity(self):
+        expired = [dict(self.ROWS[0], DealHub_Status__c="Expired")]
+        with self.assertRaisesRegex(runner.SurfaceSourceError, "surface_baseline_unavailable"):
+            runner.select_surface_entitlement(expired, self.DAY, approved=True)
+        two = self.ROWS + [dict(self.ROWS[0], DealHub_Subscription_Start_Date__c="2027-11-03",
+                                DealHub_Subscription_End_Date__c="2030-11-02")]
+        with self.assertRaisesRegex(runner.SurfaceSourceError, "surface_baseline_ambiguous"):
+            runner.select_surface_entitlement(two, self.DAY, approved=True)
+
+    def test_the_readers_ask_salesforce_for_the_approval_status(self):
+        import inspect
+        for reader in (runner.surface_fill_source, runner.case3_fill_source):
+            self.assertIn("Onboarding_Approval_Status__c", inspect.getsource(reader))
+        self.assertIn('approved=row.get("Onboarding_Approval_Status__c") == APPROVED_STATUS',
+                      inspect.getsource(runner._surface_source_from_row))
+
+    def test_onboarding_timing(self):
+        start = date(2026, 11, 3)
+        self.assertEqual(runner.earliest_onboarding_day(start), date(2026, 11, 1))
+        self.assertTrue(runner.onboarding_allowed_now(start, self.DAY))  # Leonardo Development: now
+        self.assertFalse(runner.onboarding_allowed_now(start, self.DAY, environment="prod"))
+        self.assertTrue(runner.onboarding_allowed_now(start, self.DAY, environment="prod", csm_immediate=True))
+        self.assertTrue(runner.onboarding_allowed_now(start, date(2026, 11, 1), environment="prod"))
 
 
 class SurfaceApiReadbackTests(unittest.TestCase):
