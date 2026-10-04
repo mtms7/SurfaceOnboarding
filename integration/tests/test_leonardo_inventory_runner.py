@@ -155,6 +155,9 @@ class CaptureTests(unittest.TestCase):
     def test_tenant_management_needs_the_development_origin(self):
         self.assertTrue(runner._is_tenant_management_url(runner.TENANT_MANAGEMENT + "?tab=1"))
         self.assertFalse(runner._is_tenant_management_url("https://evil.example/backoffice/tenantManagement"))
+        # Leonardo's own spelling after a fresh SSO sign-in (2026-10-03).
+        self.assertTrue(runner._is_tenant_management_url(runner.DEVELOPMENT_ORIGIN + "/backOffice/tenantManagement"))
+        self.assertFalse(runner._is_tenant_management_url("https://evil.example/backOffice/tenantManagement"))
 
 
 class CollectTests(unittest.TestCase):

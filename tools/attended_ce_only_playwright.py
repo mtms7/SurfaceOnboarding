@@ -2712,8 +2712,14 @@ def _url_origin(url: str) -> str:
 
 
 def _is_tenant_management_url(url: str) -> bool:
-    """True when a live page target is at the Development tenant-management route (exact origin)."""
-    return _url_origin(url) == DEVELOPMENT_ORIGIN and TENANT_MANAGEMENT_PATH in _url_path(url)
+    """True when a live page target is at the Development tenant-management route (exact origin).
+
+    The path is compared without case: after a fresh SSO sign-in Leonardo
+    lands on its own spelling, /backOffice/tenantManagement (2026-10-03),
+    while the runner opens /backoffice/tenantManagement.
+    """
+    return (_url_origin(url) == DEVELOPMENT_ORIGIN
+            and TENANT_MANAGEMENT_PATH.casefold() in _url_path(url).casefold())
 
 
 def _wait_for_tenant_management(port: int, timeout_seconds: float, stable_polls: int = 5,
