@@ -12,7 +12,7 @@ from typing import Any
 
 from integration.onboarding.leonardo_inventory import (
     ENVIRONMENTS, EXPECTED_PATHS, MAX_TOTAL, SCHEMA_VERSION, VALIDATION_TOGGLE_PATHS, InventoryError,
-    assemble_pages, default_root, load_latest, match_readbacks, minimize_row, prune, require_environment,
+    assemble_pages, default_root, duplicate_precheck, load_latest, match_readbacks, minimize_row, prune, require_environment,
     schema_drift, snapshot_payload, to_csv, write_snapshot,
 )
 
@@ -89,7 +89,10 @@ def walk(value: Any):
 class MinimizeRowTests(unittest.TestCase):
     def test_allow_list_drops_personal_data_domain_lists_and_settings(self):
         tenant = minimize_row(tenant_row(1))
-        for kind, item in walk(tenant):
+        # Owner decision 2026-10-04 (option B): alternate (company) domains are kept, normalised,
+        # for the duplicate pre-check; nothing else from the domain lists is.
+        self.assertEqual(tenant["alternate_domains"], ["alt.example.com"])
+        for kind, item in walk({key: value for key, value in tenant.items() if key != "alternate_domains"}):
             text = str(item)
             for forbidden in ("@", "firstName", "lastName", "phone", "spyCloud", "Pat", "Sample", "secret-path",
                               "FAKE-NOT-A-KEY", "alt.example.com", "a.example.com", "jobTitle", "Analyst"):
@@ -232,6 +235,40 @@ class AssemblePagesTests(unittest.TestCase):
         rows = [tenant_row(0)]
         assembled = assemble_pages([page(0, rows, 1, filters={"accountName": "Example"})], page_size=2)
         self.assertEqual(assembled.query["filter"], "present")
+
+
+class DuplicatePrecheckTests(unittest.TestCase):
+    """Owner decision 2026-10-04 (options A + B): the live check's rules plus alternate domains."""
+
+    def payload(self, *rows):
+        return snapshot_payload(DEV, assemble_pages([page(0, list(rows), len(rows), size=len(rows))],
+                                                    page_size=len(rows)), NOW)
+
+    def test_rules(self):
+        payload = self.payload(tenant_row(1), tenant_row(2, isDeleted=True, accountName="Other Tenant",
+                                                         alternateDomains=["Co.Example.ORG."]))
+        by_name = duplicate_precheck(payload, "  example   TENANT 1 ", ["unrelated.example.net"])
+        self.assertEqual([(m["id"], m["reasons"]) for m in by_name["matches"]], [("TENANTID00000001", ["tenant_name"])])
+        by_domain = duplicate_precheck(payload, "New Co", ["TENANT1.example.com."])
+        self.assertEqual(by_domain["matches"][0]["reasons"], ["primary_domain"])
+        by_alternate = duplicate_precheck(payload, "New Co", ["new.example.net", "co.example.org"])
+        self.assertEqual([(m["id"], m["reasons"], m["is_deleted"]) for m in by_alternate["matches"]],
+                         [("TENANTID00000002", ["alternate_domain"], True)])
+        clear = duplicate_precheck(payload, "New Co", ["new.example.net"])
+        self.assertEqual((clear["result"], clear["tenants_checked"], clear["alternate_domains_available"]),
+                         ("inventory_no_match", 2, True))
+        self.assertEqual(duplicate_precheck(payload, "", [None, "not a domain", 5])["result"], "inventory_no_match")
+
+    def test_a_legacy_snapshot_says_alternate_domains_are_not_available(self):
+        payload = self.payload(tenant_row(1))
+        for tenant in payload["tenants"]:
+            del tenant["alternate_domains"]
+        self.assertFalse(duplicate_precheck(payload, "x", ["y.example"])["alternate_domains_available"])
+
+    def test_alternate_domains_are_normalised_and_only_valid_domains_kept(self):
+        tenant = minimize_row(tenant_row(1, alternateDomains=["B.example.com.", "b.example.com", "bad domain", 7, ""]))
+        self.assertEqual(tenant["alternate_domains"], ["b.example.com"])
+        self.assertIsNone(minimize_row(tenant_row(1, alternateDomains=None))["alternate_domains"])
 
 
 class SchemaDriftTests(unittest.TestCase):

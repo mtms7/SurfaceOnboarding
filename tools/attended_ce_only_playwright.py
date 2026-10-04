@@ -4621,6 +4621,11 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
     except ValueError as error:
         return _finish(reference, acknowledged_revision, str(error))
     log.event("license_dates", "ok", detail=f"start={license_start.isoformat()} end={license_end.isoformat()}")
+    # Duplicate pre-check against the latest DEV tenant inventory, before any browser
+    # work (owner decision 2026-10-04). It can only stop a run; the live check below
+    # still decides every run it lets through.
+    if _inventory_precheck(contract, source, log)["result"] == "inventory_match":
+        return _finish(reference, acknowledged_revision, "duplicate_inventory_match")
     tenant_name, main_domain = source.tenant_name, contract.primary_domain(source)
     with sync_playwright() as playwright:
         try:
@@ -5714,6 +5719,56 @@ def _sweep_from_inventory(rows: tuple[dict[str, Any], ...]) -> dict[str, str]:
     return results
 
 
+# Any age: an old snapshot's match still stops a run; a fresh export (a live read) clears it.
+INVENTORY_PRECHECK_MAX_AGE = timedelta(days=3650)
+
+
+def inventory_root() -> Path:
+    """Where the tenant inventory lives (tests point this at an empty folder)."""
+    from integration.onboarding import leonardo_inventory as inventory
+
+    return inventory.default_root()
+
+
+def _co_domains(contract: RouteContract, source: Any) -> tuple[str, ...]:
+    """Every domain the CO brings: its primary domain plus the route's extra lookups."""
+    extras = contract.extra_lookups(source) if contract.extra_lookups else ()
+    return (contract.primary_domain(source), *(domain for _name, _lookup, domain in extras))
+
+
+def _inventory_precheck(contract: RouteContract, source: Any, log: "RunLog | None" = None) -> dict[str, Any]:
+    """The duplicate pre-check for one loaded CO source; no usable inventory is "inventory_unavailable"."""
+    from integration.onboarding import leonardo_inventory as inventory
+
+    log = log or _log()
+    try:
+        payload = inventory.load_latest(inventory_root(), "dev", max_age=INVENTORY_PRECHECK_MAX_AGE,
+                                        now=datetime.now(timezone.utc))
+    except inventory.InventoryError as error:
+        log.event("inventory_precheck", "inventory_unavailable", detail=error.reason)
+        return {"result": "inventory_unavailable", "reason": error.reason, "matches": []}
+    result = inventory.duplicate_precheck(payload, source.tenant_name, _co_domains(contract, source))
+    result["captured_at"] = payload.get("captured_at")
+    result["environment_label"] = payload.get("environment_label")
+    log.event("inventory_precheck", result["result"],
+              detail=f"tenants={result['tenants_checked']} matches={len(result['matches'])}")
+    return result
+
+
+def run_inventory_precheck(reference: str, route: str = CE_ENGINE) -> dict[str, Any]:
+    """Read-only: one Salesforce source read and the local inventory; no Leonardo or browser."""
+    if not REFERENCE.fullmatch(reference):
+        return {"result": "invalid_co_reference", "matches": []}
+    contract = ROUTES.get(route)
+    if contract is None:
+        return {"result": "route_unsupported", "matches": []}
+    try:
+        source = contract.load_source(reference)
+    except RuntimeError as error:
+        return {"result": str(error), "matches": []}
+    return _inventory_precheck(contract, source)
+
+
 def _combine_duplicate(ui: str, api: str) -> str:
     """Combine the table and server-row classifications (worst outcome wins)."""
     for outcome in ("duplicate_schema_unavailable", "duplicate_found", "duplicate_ambiguous"):
@@ -5829,6 +5884,8 @@ def main() -> int:
                         help="Read-only Surface validation of every onboarded CO (no fill, submit, or create).")
     parser.add_argument("--scan-status-all", action="store_true",
                         help="Read-only scan-status read for every onboarded Surface / Case 3 CO (no fill, submit, or create).")
+    parser.add_argument("--duplicate-precheck", action="store_true",
+                        help="With --co (and --route): read-only duplicate pre-check against the latest DEV tenant inventory (no Leonardo, no browser).")
     parser.add_argument("--open-dashboard", type=int, metavar="PORT",
                         help="Open (or bring to the front) the local dashboard's sign-in page as a tab of the automation window.")
     parser.add_argument("--probe-inventory-shape", action="store_true",
@@ -5844,6 +5901,18 @@ def main() -> int:
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
+    if args.duplicate_precheck:
+        if not args.co:
+            parser.error("--co is required with --duplicate-precheck")
+        report = run_inventory_precheck(args.co, args.route)
+        # Tenant ids and match reasons only; names stay in the local inventory.
+        print(json.dumps({"result": report["result"], "tenants_checked": report.get("tenants_checked"),
+                          "captured_at": report.get("captured_at"),
+                          "alternate_domains_available": report.get("alternate_domains_available"),
+                          "matches": [{"id": m["id"], "reasons": m["reasons"], "is_deleted": m["is_deleted"]}
+                                      for m in report["matches"]],
+                          "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
     if args.open_dashboard is not None:
         print(json.dumps({"result": open_dashboard_tab(args.open_dashboard)}, separators=(",", ":")))
         return 0

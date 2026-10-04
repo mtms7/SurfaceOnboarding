@@ -12,7 +12,7 @@ import contextlib
 import types
 import unittest
 import unittest.mock
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -3215,6 +3215,9 @@ _ORIGINAL_RUNTIME_PATHS = {name: getattr(runner, name)
                            for name in ("DIAGNOSTICS_PATH", "READBACK_PATH", "RUNNER_STATE_PATH")}
 
 
+_ORIGINAL_INVENTORY_ROOT = runner.inventory_root
+
+
 def setUpModule():
     # Never write the real integration/ run log, check-state, diagnostics,
     # readback, or runner-state files from tests.
@@ -3225,9 +3228,12 @@ def setUpModule():
     runner.DIAGNOSTICS_PATH = _RUN_LOG_DIR / "diagnostics.json"
     runner.READBACK_PATH = _RUN_LOG_DIR / "readbacks.json"
     runner.RUNNER_STATE_PATH = _RUN_LOG_DIR / "runner_state.json"
+    # Never read the operator's real tenant inventory: the pre-check sees no snapshot.
+    runner.inventory_root = lambda: _RUN_LOG_DIR / "inventory"
 
 
 def tearDownModule():
+    runner.inventory_root = _ORIGINAL_INVENTORY_ROOT
     runner.RUN_LOG_PATH = _ORIGINAL_RUN_LOG_PATH
     runner.CHECK_STATE_PATH = _ORIGINAL_CHECK_STATE_PATH
     for name, value in _ORIGINAL_RUNTIME_PATHS.items():
@@ -3382,6 +3388,8 @@ CE_GOLDEN_PLAN = {
 CE_GOLDEN_EVENTS = [
     ["source_read", "start", "", ""], ["source_read", "ok", "", ""],
     ["license_dates", "ok", "", "start=2026-09-29 end=2027-09-27"],
+    # 2026-10-04: the DEV inventory pre-check runs before any browser work (no snapshot here).
+    ["inventory_precheck", "inventory_unavailable", "", "inventory_snapshot_missing"],
     ["tenant_search", "200", "", "rows=0 total=0"], ["duplicate_check", "duplicate_clear", "tenant_name", ""],
     ["tenant_search", "200", "", "rows=0 total=0"], ["duplicate_check", "duplicate_clear", "primary_domain", ""],
     ["add_account_open", "clicked", "", ""],
@@ -3415,6 +3423,52 @@ def _events(log_path: Path) -> list[list[str]]:
     events = json.loads(log_path.read_text(encoding="utf-8"))["runs"][-1]["events"]
     return [[e["step"], e["outcome"], e.get("field", ""), e.get("detail", "")]
             for e in events if not e["step"].startswith("browser_")]
+
+
+class InventoryPrecheckRunTests(unittest.TestCase):
+    """2026-10-04: a match in the DEV tenant inventory stops Start before any browser work."""
+
+    def _write_inventory(self, **row):
+        from integration.onboarding import leonardo_inventory as inventory
+        from integration.tests.test_leonardo_inventory import page as inventory_page, tenant_row
+
+        root = runner.inventory_root()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        assembled = inventory.assemble_pages([inventory_page(0, [tenant_row(1, **row)], 1, size=1)], page_size=1)
+        inventory.write_snapshot(inventory.snapshot_payload(inventory.ENVIRONMENTS["dev"], assembled,
+                                                            datetime.now(timezone.utc)), root)
+
+    def _run(self):
+        case = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(case.doCleanups)
+        source = case._source()
+        with patch.object(runner, "ce_fill_source", return_value=source),                 patch.object(runner, "RUNNER_STATE_PATH", case._temp_path("state.json")),                 patch.object(runner, "_attach_attended_browser", side_effect=AssertionError("no browser")),                 patch.object(runner, "_run_day", return_value=date(2026, 9, 29)):
+            return runner.run("CO-0702", REVISION, review_wait_seconds=1), source
+
+    def test_a_name_match_stops_before_the_browser(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        self._write_inventory(accountName=source.tenant_name.upper())
+        result, _ = self._run()
+        self.assertEqual(result, "duplicate_inventory_match")
+        events = _events(runner.RUN_LOG_PATH)
+        self.assertIn(["inventory_precheck", "inventory_match", "", "tenants=1 matches=1"], events)
+
+    def test_an_alternate_domain_match_stops_before_the_browser(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        self._write_inventory(alternateDomains=[source.email_domain])
+        self.assertEqual(self._run()[0], "duplicate_inventory_match")
+
+    def test_co_domains_include_the_route_extras(self):
+        contract = runner.RouteContract(engine="x", load_source=None, license_dates=None, build_fill=None,
+                                        primary_domain=lambda source: "main.example",
+                                        redactions=None, allow_scan_started=False,
+                                        extra_lookups=lambda source: (("alternate_1", "alt.example", "alt.example"),))
+        self.assertEqual(runner._co_domains(contract, object()), ("main.example", "alt.example"))
+
+    def test_the_cli_check_rejects_bad_input_without_reading_anything(self):
+        with patch.object(runner, "_sf_records", side_effect=AssertionError("no read")):
+            self.assertEqual(runner.run_inventory_precheck("CO-X")["result"], "invalid_co_reference")
+            self.assertEqual(runner.run_inventory_precheck("CO-0702", "nope")["result"], "route_unsupported")
 
 
 class CeGoldenTests(unittest.TestCase):

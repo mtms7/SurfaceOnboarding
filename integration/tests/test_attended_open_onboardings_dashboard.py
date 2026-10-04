@@ -995,7 +995,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertNotIn("/attended/ce-only-duplicate-check", page)
         self.assertNotIn("Verify existing tenant", page)
         self.assertNotIn("Check for duplicates", page)
-        self.assertIn("Checks Leonardo for an existing tenant", page)
+        self.assertIn("Checks the DEV tenant inventory, then Leonardo itself, for an existing tenant", page)
+        self.assertIn("/attended/duplicate-precheck", page)
         self.assertIn("chip-info'>Ready<", page)
         # Creation is enabled for CE-only, so the "not enabled" note is gone.
         self.assertNotIn("Why Leonardo creation is not enabled yet", page)

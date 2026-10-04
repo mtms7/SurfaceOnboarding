@@ -228,8 +228,9 @@ class ExportTests(unittest.TestCase):
         self.assertEqual((summary["total_count"], summary["row_count"], summary["pages"]), (5, 5, 3))
         self.assertNotIn("Example Tenant", json.dumps(summary))
         written = (self.root / "dev" / summary["file"]).read_text(encoding="utf-8")
-        for secret in ("pat.sample@example.com", "+1 555 0100", "FAKE-NOT-A-KEY", "/secret-path", "alt.example.com"):
+        for secret in ("pat.sample@example.com", "+1 555 0100", "FAKE-NOT-A-KEY", "/secret-path", "a.example.com"):
             self.assertNotIn(secret, written)
+        self.assertIn('"alt.example.com"', written)  # alternate domains are kept (option B)
         self.assertTrue((self.root / "dev" / summary["file"]).with_suffix(".csv").is_file())
         loaded = inventory.load_latest(self.root, "dev", max_age=timedelta(hours=1), now=datetime.now(timezone.utc))
         self.assertEqual(loaded["row_count"], 5)
@@ -368,6 +369,54 @@ class DashboardTabTests(unittest.TestCase):
 
     def test_a_temporary_profile_is_refused(self):
         self.assertEqual(self._open([], persist=False)[0], "automation_profile_not_persisted")
+
+
+class DuplicatePrecheckPageTests(unittest.TestCase):
+    """The CO page's read-only "Duplicate pre-check (DEV inventory)" (2026-10-04)."""
+
+    def _post(self, route, report):
+        class _FakeRequest:
+            path = "/attended/duplicate-precheck"
+            def __init__(self):
+                self.pages = []
+            def send_page(self, status, page):
+                self.pages.append((int(status), page))
+        request = _FakeRequest()
+        calls = []
+        with patch.object(dashboard, "post_form", return_value={"reference": ["CO-0801"]}), \
+                patch.object(dashboard, "detail_row", return_value={"Name": "CO-0801"}), \
+                patch.object(dashboard, "route_for", return_value=route), \
+                patch.object(dashboard, "run_inventory_precheck",
+                             side_effect=lambda ref, r: calls.append((ref, r)) or report):
+            dashboard.Handler.do_POST(request)
+        return request.pages[0], calls
+
+    def test_a_match_is_shown_with_its_reasons(self):
+        report = {"result": "inventory_match", "tenants_checked": 593, "captured_at": "2026-10-04T18:23:10Z",
+                  "environment_label": "DEV (Leonardo Development)",
+                  "matches": [{"id": "T1", "account_name": "Example Tenant", "is_deleted": False,
+                               "reasons": ["tenant_name", "alternate_domain"]}]}
+        (status, page), calls = self._post("case_1_new_surface_only", report)
+        self.assertEqual((status, calls), (200, [("CO-0801", "case_1_new_surface_only")]))
+        self.assertIn("Possible duplicate", page)
+        self.assertIn("Example Tenant", page)
+        self.assertIn("a CO domain is this tenant&#x27;s alternate domain", page)
+        self.assertIn("DEV (Leonardo Development)", page)
+
+    def test_no_match_is_never_presented_as_a_clearance(self):
+        report = {"result": "inventory_no_match", "tenants_checked": 593, "matches": [],
+                  "alternate_domains_available": False}
+        (status, page), _ = self._post("case_2_new_ce_only", report)
+        self.assertIn("This is not a clearance", page)
+        self.assertIn("refresh it to include them", page)
+
+    def test_unsupported_routes_are_refused_without_a_check(self):
+        (status, _page), calls = self._post(None, {})
+        self.assertEqual((status, calls), (409, []))
+
+    def test_an_inventory_match_counts_as_a_duplicate_everywhere(self):
+        self.assertIn("duplicate_inventory_match", dashboard.DUPLICATE_RESULTS)
+        self.assertEqual(dashboard.RUNNER_RESULT_MESSAGES["duplicate_inventory_match"][0], "blocked")
 
 
 class InventoryPageTests(unittest.TestCase):

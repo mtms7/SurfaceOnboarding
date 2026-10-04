@@ -75,6 +75,7 @@ from tools.attended_ce_only_playwright import (
     record_runner_start,
     reset_leonardo_profile,
     reset_runner_record,
+    run_inventory_precheck,
     surface_fill_source,
     surface_scope_summary,
 )
@@ -2333,7 +2334,7 @@ def classify_queue_row(row: dict[str, str | None], record: dict[str, str] | None
     if create_uncertain(record):
         return "review", "<b>Check Leonardo</b><span class='sub'>Create uncertain · verify read-only</span>", "you"
     if record is not None and result is not None and result not in _TENANT_RESULTS:
-        if result in ("duplicate_found", "duplicate_ambiguous"):
+        if result in DUPLICATE_RESULTS:
             return "review", "<b>Review existing tenant</b><span class='sub'>Duplicate check stopped the run</span>", "you"
         if result == "salesforce_id_already_present":
             return "review", "<b>Review existing tenant</b><span class='sub'>Already has an ID in Salesforce</span>", "you"
@@ -2378,7 +2379,7 @@ def _run_chip(record: dict[str, str] | None) -> str:
         return "<span class='chip chip-ok'>Onboarded</span>"
     if create_uncertain(record):
         return "<span class='chip chip-warn'>Create uncertain</span>"
-    if result in ("duplicate_found", "duplicate_ambiguous"):
+    if result in DUPLICATE_RESULTS:
         return "<span class='chip chip-bad'>Duplicate</span>"
     return "<span class='chip chip-bad'>Onboarding failed</span>"
 
@@ -2904,8 +2905,9 @@ def _ce_only_start_form(evaluation: CredentialExposureFillPreflight) -> str:
             "<button type='submit'>Start Onboarding</button>"
             "<label><input type='checkbox' name='attended_create_authorized' value='1' required> "
             "I authorize one Leonardo Development run for this source revision</label></form>"
-            "<p class='note'>Checks Leonardo for an existing tenant (name and primary domain) first. "
-            "If one exists, nothing is created and this CO is marked as a duplicate.</p>")
+            "<p class='note'>Checks the DEV tenant inventory, then Leonardo itself, for an existing tenant (name, "
+            "primary domain, alternate domains) first. If one exists, nothing is created and this CO is marked as a "
+            "duplicate.</p>" + duplicate_precheck_form(evaluation.reference))
 
 
 def page_ce_only_fill_preflight(evaluation: CredentialExposureFillPreflight,
@@ -2952,7 +2954,10 @@ def page_ce_only_fill_preflight(evaluation: CredentialExposureFillPreflight,
     )
 
 
+# Run results that mean "a tenant like this may already exist" (live check or inventory pre-check).
+DUPLICATE_RESULTS = frozenset({"duplicate_found", "duplicate_ambiguous", "duplicate_inventory_match"})
 RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
+    "duplicate_inventory_match": ("blocked", "The latest DEV tenant inventory already has a tenant with this tenant name, primary domain, or one of its alternate domains. No browser was opened and nothing was created. Review that tenant; if it was removed, refresh the inventory and try again."),
     "readback_verified": ("success", "Tenant created and read back. Surface Account ID, Account UUID, and Account Scanning state were captured locally."),
     "duplicate_found": ("blocked", "A tenant with this tenant name or primary domain already exists in Leonardo Development. Nothing was created. Review the existing tenant; this CO should not be onboarded again."),
     "duplicate_ambiguous": ("blocked", "A tenant with a similar name exists, or the search returned more results than could be checked. Nothing was created. Review it in Leonardo Development before retrying."),
@@ -3059,6 +3064,7 @@ OUTCOME_STYLES: dict[str, tuple[str, str, str]] = {
 RUNNER_HEADLINES = {
     "duplicate_found": "Already exists — duplicate",
     "duplicate_ambiguous": "Possible duplicate — review",
+    "duplicate_inventory_match": "Already in the tenant inventory — duplicate",
     "leonardo_session_expired": "Leonardo session expired",
 }
 
@@ -3247,7 +3253,7 @@ def _onboarding_chip(reference: str) -> str:
         return "<span class='chip chip-ok'>Onboarded</span>"
     if create_uncertain(record):
         return "<span class='chip chip-warn'>Create uncertain</span>"
-    if result in ("duplicate_found", "duplicate_ambiguous"):
+    if result in DUPLICATE_RESULTS:
         return "<span class='chip chip-bad'>Duplicate</span>"
     return "<span class='chip chip-bad'>Onboarding failed</span>"
 
@@ -3332,7 +3338,7 @@ def _ce_only_onboard_section(reference: str) -> str:
         status_chip = "<span class='chip chip-bad'>Blocked</span>"
     elif same_revision and record.get("result") == "readback_verified":
         status_chip = "<span class='chip chip-ok'>Onboarded</span>"
-    elif same_revision and record.get("result") in ("duplicate_found", "duplicate_ambiguous"):
+    elif same_revision and record.get("result") in DUPLICATE_RESULTS:
         status_chip = "<span class='chip chip-bad'>Duplicate</span>"
     elif same_revision and record.get("result"):
         status_chip = "<span class='chip chip-bad'>Failed</span>"
@@ -3409,8 +3415,9 @@ def _surface_start_form(evaluation: SurfaceScopePreflight) -> str:
             "I authorize one Leonardo Development run for this source revision</label>"
             "<label><input type='checkbox' name='scope_reviewed' value='1' required> "
             "I reviewed the scope for this source revision</label></form>"
-            "<p class='note'>Checks Leonardo for an existing tenant (name and primary domain) first. "
-            "If one exists, nothing is created and this CO is marked as a duplicate.</p>")
+            "<p class='note'>Checks the DEV tenant inventory, then Leonardo itself, for an existing tenant (name, "
+            "primary domain, alternate domains) first. If one exists, nothing is created and this CO is marked as a "
+            "duplicate.</p>" + duplicate_precheck_form(evaluation.reference))
 
 
 def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
@@ -3471,7 +3478,7 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str
         status_chip = "<span class='chip chip-ok'>Onboarded</span>"
     elif not evaluation.eligible_for_fill_review:
         status_chip = "<span class='chip chip-bad'>Blocked</span>"
-    elif same_revision and record.get("result") in ("duplicate_found", "duplicate_ambiguous"):
+    elif same_revision and record.get("result") in DUPLICATE_RESULTS:
         status_chip = "<span class='chip chip-bad'>Duplicate</span>"
     elif same_revision and record.get("result"):
         status_chip = "<span class='chip chip-bad'>Failed</span>"
@@ -3631,6 +3638,47 @@ def _inventory_duration(value: object) -> str:
         return "—"
     minutes = value // 60000
     return f"{minutes // 60} h {minutes % 60:02d} m"
+
+
+PRECHECK_REASON_TEXT = {"tenant_name": "same tenant name", "primary_domain": "same primary domain",
+                        "alternate_domain": "a CO domain is this tenant's alternate domain"}
+
+
+def duplicate_precheck_form(reference: str) -> str:
+    return ("<form method='post' action='/attended/duplicate-precheck'><input type='hidden' name='reference' value='"
+            + escape(reference) + "'><button class='ghost' type='submit'>Duplicate pre-check (DEV inventory)</button></form>")
+
+
+def page_duplicate_precheck(reference: str, report: dict[str, object]) -> str:
+    """Result of the read-only pre-check; a "no match" is never a clearance."""
+    ref = escape(reference)
+    result = str(report.get("result"))
+    label = escape(str(report.get("environment_label") or inventory.ENVIRONMENTS["dev"].label))
+    if result == "inventory_match":
+        rows = "".join(
+            "<tr><td>" + escape(str(m.get("account_name") or "")) + "</td><td><code>" + escape(str(m.get("id") or ""))
+            + "</code></td><td>" + escape(", ".join(PRECHECK_REASON_TEXT.get(r, r) for r in m.get("reasons") or ()))
+            + ("" if not m.get("is_deleted") else " <span class='chip chip-warn'>deleted</span>") + "</td></tr>"
+            for m in report.get("matches") or () if isinstance(m, dict))
+        body = ("<div class='banner banner-warn'><strong>Possible duplicate.</strong> Start will stop before opening a "
+                "browser while the inventory shows this match.</div><div class='qh-table inv'><table><thead><tr>"
+                "<th>Tenant</th><th>ID</th><th>Why</th></tr></thead><tbody>" + rows + "</tbody></table></div>")
+    elif result == "inventory_no_match":
+        body = ("<div class='banner'><strong>No match</strong> among " + escape(str(report.get("tenants_checked")))
+                + " tenants. This is not a clearance: Start still runs the live duplicate check in Leonardo.</div>"
+                + ("" if report.get("alternate_domains_available") else
+                   "<p class='note'>This inventory predates alternate domains; refresh it to include them.</p>"))
+    elif result == "inventory_unavailable":
+        body = ("<div class='banner banner-warn'>No usable tenant inventory (<code>" + escape(str(report.get("reason")))
+                + "</code>). Refresh it on the Tenants page. Start still runs the live duplicate check.</div>")
+    else:
+        body = "<div class='banner banner-warn'>The CO source could not be read (<code>" + escape(result) + "</code>).</div>"
+    main_html = ("<a class='crumb' href='/co/" + ref + "'>&larr; " + ref + "</a><div class='page-head'><h1>Duplicate "
+                 "pre-check</h1><span class='chip chip-info'>" + label + "</span></div><section class='card'>" + body
+                 + "<p class='note'>Inventory captured " + escape(str(report.get("captured_at") or "—")) + ". Rules: same "
+                 "tenant name or primary domain (as the live check), plus the CO's domains against each tenant's "
+                 "alternate domains.</p></section>")
+    return _app_shell(reference + " duplicate pre-check", main_html, active="onboardings")
 
 
 def render_inventory(query: str = "", notice: str = "") -> str:
@@ -3955,6 +4003,7 @@ SESSION_GATED_ROUTES = {
 
 POST_ROUTES = frozenset({
     "/attended/prepare-sessions", "/attended/session-recheck", "/attended/inventory-refresh",
+    "/attended/duplicate-precheck",
     "/attended/salesforce-login", "/attended/leonardo-dev-session-check", "/attended/leonardo-dev-session-bootstrap",
     "/attended/leonardo-dev-session-reset", "/attended/leonardo-dev-browser-close",
     "/attended/rerun-comment-evaluation", "/attended/rerun-co0745-renewal-evaluation",
@@ -4418,6 +4467,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Verify unavailable</title><p>The read-only check could not be started on this desktop.</p>")
                 return
             self.send_redirect("/co/" + reference)
+            return
+        if path == "/attended/duplicate-precheck":
+            # Read-only: one Salesforce source read and the local DEV inventory; no Leonardo, no browser.
+            try:
+                route = route_for(detail_row(reference))
+            except ReadUnavailable:
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
+            if route not in (CE_ENGINE, *SURFACE_ROUTES):
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not supported</title><p>The duplicate pre-check "
+                               "covers new CE, Surface, and Case 3 onboardings only.</p><p><a href='/co/" + escape(reference)
+                               + "'>Return</a></p>"); return
+            self.send_page(HTTPStatus.OK, page_duplicate_precheck(reference, run_inventory_precheck(reference, route)))
             return
         if path == "/attended/validate":
             if reference not in attended_leonardo_readbacks():

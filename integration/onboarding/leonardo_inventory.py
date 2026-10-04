@@ -223,6 +223,58 @@ def _terms_accepted(value: Any) -> bool | None:
     return None
 
 
+_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
+MAX_ALTERNATE_DOMAINS = 500
+
+
+def canonical_domain(value: Any) -> str | None:
+    """Lower-case, no trailing dot, a plain domain name; anything else is None."""
+    if type(value) is not str:
+        return None
+    domain = value.strip().casefold().rstrip(".")
+    return domain if len(domain) <= 253 and _DOMAIN.fullmatch(domain) else None
+
+
+def _domain_list(value: Any) -> list[str] | None:
+    if type(value) is not list:
+        return None
+    domains = sorted({domain for domain in map(canonical_domain, value) if domain})
+    return domains[:MAX_ALTERNATE_DOMAINS]
+
+
+def _name_key(value: Any) -> str:
+    """The live check's name rule: case-insensitive, whitespace collapsed."""
+    return " ".join(value.casefold().split()) if type(value) is str else ""
+
+
+def duplicate_precheck(payload: Mapping[str, Any], tenant_name: str, co_domains: Any) -> dict[str, Any]:
+    """Would this CO duplicate a tenant already in the inventory? (informational; it can only block)
+
+    A tenant matches on (A) the live check's rules: the same tenant name or
+    the same primary domain as any of the CO's domains; or (B) one of the
+    CO's domains is one of that tenant's alternate domains. A "no match" is
+    never a clearance: the live duplicate check still runs at Start.
+    """
+    name = _name_key(tenant_name)
+    wanted = {domain for domain in map(canonical_domain, co_domains or ()) if domain}
+    tenants = [tenant for tenant in payload.get("tenants") or () if isinstance(tenant, dict)]
+    matches = []
+    for tenant in tenants:
+        reasons = []
+        if name and _name_key(tenant.get("account_name")) == name:
+            reasons.append("tenant_name")
+        if canonical_domain(tenant.get("account_domain")) in wanted:
+            reasons.append("primary_domain")
+        if wanted & set(tenant.get("alternate_domains") or ()):
+            reasons.append("alternate_domain")
+        if reasons:
+            matches.append({"id": tenant.get("id"), "account_name": tenant.get("account_name"),
+                            "is_deleted": tenant.get("is_deleted") is True, "reasons": reasons})
+    return {"result": "inventory_match" if matches else "inventory_no_match", "matches": matches,
+            "tenants_checked": len(tenants),
+            "alternate_domains_available": any("alternate_domains" in tenant for tenant in tenants)}
+
+
 def minimize_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Allow-list projection of one tenant row; no personal data, domain lists, or settings blobs."""
     get = row.get
@@ -276,6 +328,9 @@ def minimize_row(row: Mapping[str, Any]) -> dict[str, Any]:
             "pending_validation_assets_count": _count(get("pendingValidationAssets")),
         },
         "counts": {name: len(get(key)) if type(get(key)) is list else None for name, key in _COUNTED_LISTS.items()},
+        # Owner decision 2026-10-04 (option B): company alternate domains are kept for the
+        # duplicate pre-check. Still no user names, emails, phones, or other domain lists.
+        "alternate_domains": _domain_list(get("alternateDomains")),
         "operator_assigned": bool(operators) if type(operators) is list else None,
         "terms_accepted": _terms_accepted(get("termsOfUseApproval")),
         "primary_user": {
@@ -542,11 +597,13 @@ CSV_COLUMNS: tuple[tuple[str, str], ...] = (
     ("license_assets_number", "license.assets_number"), ("license_domains_number", "license.domains_number"),
     ("license_subdomains_number", "license.subdomains_number"), ("scanning_interval", "scanning_interval"),
     ("last_recon_scan_utc", "scan.last_recon_scan_utc"), ("scan_duration_ms", "scan.duration_ms"),
-    ("scan_status", "scan.status"),
+    ("scan_status", "scan.status"), ("alternate_domains", "alternate_domains"),
 )
 
 
 def _csv_cell(value: Any) -> str:
+    if isinstance(value, list):
+        value = " ".join(str(item) for item in value)
     if isinstance(value, (dict, list)):
         return ""
     text = "" if value is None else ("true" if value is True else "false" if value is False else str(value))
