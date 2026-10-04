@@ -292,8 +292,8 @@ class SnapshotTests(unittest.TestCase):
     def test_write_and_load_roundtrip(self):
         with tempfile.TemporaryDirectory() as directory:
             path = write_snapshot(self.payload(), Path(directory))
-            self.assertEqual(path.name, "inventory-20261003T120000Z.json")
-            self.assertEqual(sorted(entry.name for entry in path.parent.iterdir()), [path.name, "latest.json"])
+            self.assertEqual(path.name, "leonardo-dev-inventory-20261003T120000Z.json")  # DEV in every name
+            self.assertEqual(sorted(entry.name for entry in path.parent.iterdir()), sorted([path.name, "latest.json"]))
             loaded = load_latest(Path(directory), "dev", max_age=timedelta(hours=1), now=NOW + timedelta(minutes=5))
             self.assertEqual(loaded["age_seconds"], 300)
             self.assertEqual(loaded["rows_sha256"], self.payload()["rows_sha256"])
@@ -306,10 +306,25 @@ class SnapshotTests(unittest.TestCase):
             folder = root / "dev"
             (folder / "notes.json").write_text("{}", encoding="utf-8")
             (folder / "inventory-latest.json").write_text("{}", encoding="utf-8")
-            self.assertEqual(prune(folder, 2), ["inventory-20261003T140000Z.json"])
+            # A legacy (unprefixed) first export is older, so it goes first; each CSV goes with its snapshot.
+            (folder / "inventory-20261003T110000Z.json").write_text("{}", encoding="utf-8")
+            (folder / "inventory-20261003T110000Z.csv").write_text("x", encoding="utf-8")
+            (folder / "leonardo-dev-inventory-20261003T140000Z.csv").write_text("x", encoding="utf-8")
+            self.assertEqual(prune(folder, 2), ["leonardo-dev-inventory-20261003T140000Z.json",
+                                                "inventory-20261003T110000Z.json"])
             self.assertEqual(sorted(entry.name for entry in folder.iterdir()), [
-                "inventory-20261003T150000Z.json", "inventory-20261003T160000Z.json", "inventory-latest.json",
-                "latest.json", "notes.json"])
+                "inventory-latest.json", "latest.json", "leonardo-dev-inventory-20261003T150000Z.json",
+                "leonardo-dev-inventory-20261003T160000Z.json", "notes.json"])
+
+    def test_the_first_unprefixed_dev_snapshot_still_loads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_snapshot(self.payload(), Path(directory))
+            legacy = path.with_name("inventory-20261003T120000Z.json")
+            path.rename(legacy)
+            latest = path.parent / "latest.json"
+            latest.write_text(latest.read_text(encoding="utf-8").replace(path.name, legacy.name), encoding="utf-8")
+            loaded = load_latest(Path(directory), "dev", max_age=timedelta(hours=1), now=NOW)
+            self.assertEqual(loaded["environment_label"], "DEV (Leonardo Development)")
 
     def written(self, directory: str) -> Path:
         return write_snapshot(self.payload(), Path(directory))
@@ -371,11 +386,12 @@ class ViewTests(unittest.TestCase):
                 tenant_row(4, accountName="\tTabbed Example")]
         payload = snapshot_payload(DEV, assemble_pages([page(0, rows, 5, size=5)], page_size=5), NOW)
         parsed = list(csv.reader(io.StringIO(to_csv(payload))))
-        self.assertEqual(parsed[0][:3], ["id", "account_uuid", "account_name"])
-        names = [line[2] for line in parsed[1:]]
+        self.assertEqual(parsed[0][:4], ["environment", "id", "account_uuid", "account_name"])
+        self.assertEqual({line[0] for line in parsed[1:]}, {"DEV (Leonardo Development)"})
+        names = [line[3] for line in parsed[1:]]
         self.assertEqual(names, ["'=HYPERLINK(\"http://example.com\")", "'+cmd", "'-2+3", "'@SUM(A1)",
                                  "'\tTabbed Example"])
-        self.assertEqual(parsed[1][5], "true")
+        self.assertEqual(parsed[1][6], "true")
 
     def test_match_readbacks_match_conflict_and_orphan(self):
         payload = snapshot_payload(DEV, assemble_pages(capture(4, 2), page_size=2), NOW)

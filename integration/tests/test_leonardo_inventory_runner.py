@@ -223,6 +223,8 @@ class ExportTests(unittest.TestCase):
     def test_export_writes_the_minimized_snapshot_and_prints_counts_only(self):
         summary = self._export(_FakePage(_responses(5, 2)), write_csv=True)
         self.assertEqual(summary["result"], "inventory_exported")
+        self.assertEqual(summary["environment_label"], "DEV (Leonardo Development)")
+        self.assertTrue(summary["file"].startswith("leonardo-dev-inventory-"))
         self.assertEqual((summary["total_count"], summary["row_count"], summary["pages"]), (5, 5, 3))
         self.assertNotIn("Example Tenant", json.dumps(summary))
         written = (self.root / "dev" / summary["file"]).read_text(encoding="utf-8")
@@ -271,6 +273,26 @@ class ExportTests(unittest.TestCase):
         summary = self._export(_FakePage([_Response(request, body, status=401)]))
         self.assertEqual(summary["result"], "leonardo_session_expired")
         self.assertFalse((self.root / "dev").exists())
+
+
+class SalesforcePinningTests(unittest.TestCase):
+    """2026-10-04: no default org is set any more, so every runner read must name the alias."""
+
+    def test_every_runner_salesforce_call_names_the_org(self):
+        source = inspect.getsource(runner)
+        calls = [line for line in source.splitlines() if "[sf_command()" in line]
+        self.assertGreaterEqual(len(calls), 2)
+        for function in (runner.source_for_fill, runner._sf_records):
+            self.assertIn('"--target-org", sf_target_org()', inspect.getsource(function))
+
+    def test_reads_use_the_pinned_alias(self):
+        completed = runner.subprocess.CompletedProcess([], 0, json.dumps({"status": 0, "result": {"records": []}}), "")
+        with patch.object(runner.subprocess, "run", return_value=completed) as run:
+            runner._sf_records("SELECT Id FROM Organization LIMIT 1")
+        self.assertEqual(run.call_args[0][0][-2:], ["--target-org", "surface-onboarding"])
+        with patch.dict(runner.os.environ, {"SURFACE_SF_TARGET_ORG": "bad alias;x"}),                 patch.object(runner.subprocess, "run", side_effect=AssertionError("never runs")):
+            with self.assertRaises(ValueError):
+                runner._sf_records("SELECT Id FROM Organization LIMIT 1")
 
 
 class SweepTests(unittest.TestCase):
@@ -371,6 +393,7 @@ class InventoryPageTests(unittest.TestCase):
             page = dashboard.render_inventory()
             filtered = dashboard.render_inventory("tenant 2")
         self.assertIn("Example Tenant 1", page)
+        self.assertIn("DEV (Leonardo Development)", page)  # the environment is always named
         self.assertIn("href='/co/CO-0649'", page)
         self.assertIn("no CO", page)
         self.assertIn("stale", page)

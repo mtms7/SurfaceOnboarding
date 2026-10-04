@@ -322,6 +322,18 @@ def sf_command() -> str:
     return os.environ.get("SURFACE_SF_CLI", "sf.cmd" if os.name == "nt" else "sf")
 
 
+def sf_target_org() -> str:
+    """The Salesforce CLI alias every runner read is pinned to (the dashboard's alias).
+
+    Since 2026-10-03 the dashboard no longer sets a global default org, so an
+    unpinned read finds no org (every validation sweep failed that way).
+    """
+    alias = os.environ.get("SURFACE_SF_TARGET_ORG", "surface-onboarding")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", alias):
+        raise RuntimeError("invalid_salesforce_target_org")
+    return alias
+
+
 def source_for_fill(reference: str) -> tuple[str, str, str, str, str]:
     """Fresh, fixed-field source read; retain values only in this process.
 
@@ -338,7 +350,8 @@ def source_for_fill(reference: str) -> tuple[str, str, str, str, str]:
         # Decode CLI output as UTF-8 (the --json contract) rather than the
         # locale code page; cp1252 cannot decode UTF-8 continuation bytes and
         # would otherwise leave completed.stdout as None and fail the read.
-        completed = subprocess.run([sf_command(), "data", "query", "--query", query, "--json"],
+        completed = subprocess.run([sf_command(), "data", "query", "--query", query, "--json",
+                                    "--target-org", sf_target_org()],
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
                                    timeout=45, check=False)
@@ -370,12 +383,14 @@ def _sf_records(query: str) -> list[Any]:
     """
     try:
         completed = subprocess.run(
-            [sf_command(), "data", "query", "--query", query, "--json"],
+            [sf_command(), "data", "query", "--query", query, "--json", "--target-org", sf_target_org()],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
             text=True, encoding="utf-8", errors="replace", timeout=45, check=False,
         )
     except subprocess.SubprocessError as exc:
         raise ValueError("salesforce_cli_timeout") from exc
+    except RuntimeError as exc:  # an invalid alias setting: a normal "source unavailable"
+        raise ValueError("invalid_salesforce_target_org") from exc
     if completed.stdout is None:
         raise ValueError()
     payload = json.loads(completed.stdout)
@@ -5639,6 +5654,7 @@ def run_export_tenants(env_name: str = "dev", *, with_sweeps: bool = False, writ
                 sweeps = _sweep_from_inventory(assembled.rows) if with_sweeps else {}
                 drift = payload["schema_drift"]
                 return {"result": "inventory_exported", "environment": environment.name,
+                        "environment_label": environment.label,
                         "total_count": payload["total_count"], "row_count": payload["row_count"],
                         "deleted_count": payload["deleted_count"], "pages": payload["pages"],
                         "uuid_missing_count": payload["uuid_missing_count"],

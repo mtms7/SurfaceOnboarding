@@ -25,7 +25,8 @@ SCHEMA_VERSION = 1
 MAX_TOTAL = 5000
 MAX_PAGES = 200
 ACQUISITION = "ui_pagination_intercept"
-SNAPSHOT_FILE = re.compile(r"inventory-\d{8}T\d{6}Z\.json")
+# <prefix>-inventory-<UTC stamp>.json; the unprefixed form is the first (2026-10-04) DEV export.
+SNAPSHOT_FILE = re.compile(r"(?:(leonardo-dev|backoffice-prod)-)?inventory-(\d{8}T\d{6}Z)\.json")
 LATEST_FILE = "latest.json"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 _SAFE_KEY = re.compile(r"[A-Za-z_]\w{0,63}")
@@ -49,13 +50,27 @@ class InventoryEnvironment:
     origin: str
     endpoint_path: str = "/api/v1/backoffice/getAllDetailedAccounts"
     approved: bool = False
+    # Shown in every file name, snapshot, CSV row, and page so DEV and PROD never mix.
+    label: str = ""
+    file_prefix: str = ""
 
 
 ENVIRONMENTS: dict[str, InventoryEnvironment] = {
-    "dev": InventoryEnvironment("dev", "https://leonardo.dev.app.pentera.io", approved=True),
+    "dev": InventoryEnvironment("dev", "https://leonardo.dev.app.pentera.io", approved=True,
+                                label="DEV (Leonardo Development)", file_prefix="leonardo-dev"),
     # Production BackOffice reads need a separate explicit approval.
-    "prod": InventoryEnvironment("prod", "https://app.pentera.io", approved=False),
+    "prod": InventoryEnvironment("prod", "https://app.pentera.io", approved=False,
+                                 label="PROD (BackOffice production)", file_prefix="backoffice-prod"),
 }
+
+
+def snapshot_name(environment: InventoryEnvironment, captured_at: datetime) -> str:
+    return f"{environment.file_prefix}-inventory-{captured_at.strftime('%Y%m%dT%H%M%SZ')}.json"
+
+
+def _name_matches(name: str, environment: InventoryEnvironment, captured_at: datetime) -> bool:
+    legacy = environment.name == "dev" and name == f"inventory-{captured_at.strftime('%Y%m%dT%H%M%SZ')}.json"
+    return name == snapshot_name(environment, captured_at) or legacy
 
 
 def require_environment(name: str) -> InventoryEnvironment:
@@ -107,7 +122,7 @@ _LIST = "list|NoneType"
 _EXPECTED_SPEC: dict[str, str] = {
     "id": "str", "_modified": "int|str", "_created": "int|str", "isDeleted": "bool", "accountName": "str",
     "accountUuid": "str|NoneType", "accountDomain": "str|NoneType", "userEmailDomains": _LIST,
-    "accountCountryCode": "str|NoneType", "emailSettings": "dict|NoneType", "accountLicense": "dict",
+    "accountCountryCode": "str|NoneType", "emailSettings": "dict|NoneType", "accountLicense": "dict|NoneType",
     "enabled": "bool", "termsOfUseApproval": "bool|dict|int|str|NoneType", "accountSettings": "dict|NoneType",
     "accountSettings.reconSettings": "dict|NoneType", "accountSettings.reconSettings.automatedDiscoveryEnabled": _FLAG,
     "primaryUserId": "str|NoneType", "accountType": "str|NoneType", "scanningInterval": "str|int|NoneType",
@@ -137,12 +152,17 @@ _EXPECTED_SPEC: dict[str, str] = {
     "accountLicense.scanningFrequency": "str|int|NoneType", "accountLicense.allowedModules": _LIST,
     "accountLicense.leakedCredentialsScannedDomainsNumber": "int|NoneType",
     **{f"accountLicense.{name}": _FLAG for name in _LICENSE_FLAGS.values()},
+    # Seen live 2026-10-04; known, not stored, and optional (never reported missing).
+    "accountLicense.scanQuotaEnforcement": "bool|str|int|NoneType",
+    "accountLicense.authWebAttackQuotaEnforcement": "bool|str|int|NoneType",
     "primaryUser.id": "str|NoneType", "primaryUser.firstName": "str|NoneType", "primaryUser.lastName": "str|NoneType",
     "primaryUser.email": "str|NoneType", "primaryUser.isMfaRequired": _FLAG, "primaryUser.jobTitle": "str|NoneType",
     "primaryUser.phoneNumber": "str|NoneType",
 }
 EXPECTED_PATHS: dict[str, frozenset[str]] = {
     path: frozenset(types.split("|")) for path, types in _EXPECTED_SPEC.items()}
+# Newer fields not every tenant row carries yet: known when present, never "missing".
+OPTIONAL_PATHS = frozenset({"accountLicense.scanQuotaEnforcement", "accountLicense.authWebAttackQuotaEnforcement"})
 # Objects whose further children are not modelled; only their listed children are compared.
 OPEN_PATHS = frozenset({
     "emailSettings", "termsOfUseApproval", "accountSettings", "accountSettings.reconSettings",
@@ -372,7 +392,7 @@ def schema_drift(rows: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
         if not isinstance(row, dict) or any(key not in row for key in REQUIRED_PATHS):
             raise InventoryError("inventory_schema_unavailable")
         _walk(row, "", False, expected_paths, observed)
-    missing = [path for path in expected_paths if path not in observed
+    missing = [path for path in expected_paths if path not in observed and path not in OPTIONAL_PATHS
                and ("." not in path or "dict" in observed.get(path.rsplit(".", 1)[0], ()))]
     return {
         "unknown": sorted(path for path in observed if path not in expected_paths),
@@ -396,7 +416,8 @@ def snapshot_payload(env: InventoryEnvironment, assembled: AssembledInventory, c
         raise ValueError("captured_at_requires_timezone")
     tenants = sorted((minimize_row(row) for row in assembled.rows), key=lambda tenant: tenant["id"])
     return {
-        "schema_version": SCHEMA_VERSION, "environment": env.name, "origin": env.origin,
+        "schema_version": SCHEMA_VERSION, "environment": env.name, "environment_label": env.label,
+        "origin": env.origin,
         "endpoint_path": env.endpoint_path, "acquisition": ACQUISITION,
         "captured_at": captured_at.astimezone(timezone.utc).strftime(_STAMP), "query": dict(assembled.query),
         "total_count": assembled.total_count, "row_count": len(tenants), "deleted_count": assembled.deleted_count,
@@ -437,10 +458,14 @@ def prune(directory: Path, keep: int) -> list[str]:
     """Delete snapshot files beyond the newest ``keep``; any other file is left alone."""
     if type(keep) is not int or keep < 1:
         raise ValueError("keep_must_be_positive")
-    names = sorted((entry.name for entry in Path(directory).iterdir()
-                    if entry.is_file() and SNAPSHOT_FILE.fullmatch(entry.name)), reverse=True)
+    matches = [(SNAPSHOT_FILE.fullmatch(entry.name), entry.name) for entry in Path(directory).iterdir()
+               if entry.is_file()]
+    # Newest first by capture stamp (prefixed and legacy names sort differently by name).
+    names = [name for match, name in sorted(((m, n) for m, n in matches if m), key=lambda item: item[0].group(2),
+                                            reverse=True)]
     for name in names[keep:]:
         (Path(directory) / name).unlink(missing_ok=True)
+        (Path(directory) / name).with_suffix(".csv").unlink(missing_ok=True)  # its CSV goes with it
     return names[keep:]
 
 
@@ -451,7 +476,7 @@ def write_snapshot(payload: Mapping[str, Any], root: Path, *, keep: int = 10) ->
     captured_at = _parse_stamp(payload.get("captured_at"))
     directory = env_dir(root, environment.name)
     directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"inventory-{captured_at.strftime('%Y%m%dT%H%M%SZ')}.json"
+    target = directory / snapshot_name(environment, captured_at)
     _write_json_atomic(target, payload)
     _write_json_atomic(directory / LATEST_FILE, {
         "file": target.name, "rows_sha256": payload["rows_sha256"], "captured_at": payload["captured_at"],
@@ -497,7 +522,7 @@ def load_latest(root: Path, env_name: str, *, max_age: timedelta, now: datetime)
     digest = _rows_sha256(tenants)
     if (type(tenants) is not list or payload.get("rows_sha256") != digest or latest.get("rows_sha256") != digest
             or latest.get("captured_at") != payload.get("captured_at") or payload.get("row_count") != len(tenants)
-            or name != f"inventory-{captured_at.strftime('%Y%m%dT%H%M%SZ')}.json"):
+            or not _name_matches(name, environment, captured_at)):
         raise InventoryError("inventory_snapshot_tampered")
     age = now - captured_at
     if age < -_FUTURE_SKEW:
@@ -510,7 +535,7 @@ def load_latest(root: Path, env_name: str, *, max_age: timedelta, now: datetime)
 # ----- local views ------------------------------------------------------------
 
 CSV_COLUMNS: tuple[tuple[str, str], ...] = (
-    ("id", "id"), ("account_uuid", "account_uuid"), ("account_name", "account_name"),
+    ("environment", "environment_label"), ("id", "id"), ("account_uuid", "account_uuid"), ("account_name", "account_name"),
     ("account_domain", "account_domain"), ("account_type", "account_type"), ("enabled", "enabled"),
     ("is_deleted", "is_deleted"), ("created", "created"), ("license_type", "license.type"),
     ("license_start_date", "license.start_date"), ("license_expiration_date", "license.expiration_date"),
@@ -533,9 +558,12 @@ def to_csv(payload: Mapping[str, Any]) -> str:
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
     writer.writerow([header for header, _ in CSV_COLUMNS])
+    environment = ENVIRONMENTS.get(payload.get("environment"))
+    label = payload.get("environment_label") or (environment.label if environment else "")
     for tenant in payload.get("tenants") or ():
         if isinstance(tenant, dict):
-            writer.writerow([_csv_cell(_path(tenant, path)) for _, path in CSV_COLUMNS])
+            row = {**tenant, "environment_label": label}
+            writer.writerow([_csv_cell(_path(row, path)) for _, path in CSV_COLUMNS])
     return buffer.getvalue()
 
 

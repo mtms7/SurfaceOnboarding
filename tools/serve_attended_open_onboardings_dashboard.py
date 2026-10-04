@@ -3638,7 +3638,8 @@ def render_inventory(query: str = "", notice: str = "") -> str:
     now = datetime.now(timezone.utc)
     refresh_form = ("<form method='post' action='/attended/inventory-refresh'><button type='submit'>Refresh inventory"
                     "</button></form>")
-    head = ("<div class='page-head'><h1>Tenant inventory</h1>" + refresh_form + "</div>")
+    head = ("<div class='page-head'><h1>Tenant inventory</h1><span class='chip chip-info'>"
+            + escape(inventory.ENVIRONMENTS["dev"].label) + "</span>" + refresh_form + "</div>")
     note = ("<p class='note'>Read-only copy of Leonardo Development's tenant list, with personal data removed (no user "
             "names, emails, phones, or domain lists). It is informational: Start always re-checks Leonardo live for "
             "duplicates. Refresh also re-validates every onboarded CO from the same read.</p>")
@@ -3661,7 +3662,9 @@ def render_inventory(query: str = "", notice: str = "") -> str:
     stale = age > INVENTORY_STALE_AFTER
     drift = payload.get("schema_drift") or {}
     drift_count = sum(len(drift.get(key, [])) for key in ("unknown", "missing", "type_changed"))
-    summary = ("<div class='banner" + (" banner-warn" if stale else "") + "'>Captured " + escape(str(payload.get("captured_at")))
+    summary = ("<div class='banner" + (" banner-warn" if stale else "") + "'><strong>"
+               + escape(str(payload.get("environment_label") or inventory.ENVIRONMENTS["dev"].label))
+               + "</strong> · Captured " + escape(str(payload.get("captured_at")))
                + " (" + str(int(age.total_seconds() // 3600)) + " h ago" + ("; stale, refresh before relying on it" if stale else "")
                + ") · " + str(payload.get("row_count")) + " tenants (" + str(payload.get("deleted_count")) + " deleted, "
                + str(payload.get("uuid_missing_count", 0)) + " without UUID) · "
@@ -3692,7 +3695,7 @@ def render_inventory(query: str = "", notice: str = "") -> str:
     search = ("<form method='get' action='/inventory' class='actions'><input name='q' value='" + escape(query[:80])
               + "' placeholder='Filter by tenant name'> <button class='ghost' type='submit'>Filter</button></form>")
     table = ("<section class='card'>" + search + "<p class='note'>" + str(shown) + " shown. Last scan times are UTC. "
-             "Snapshot file: " + escape(str(payload.get("environment"))) + " folder under %LOCALAPPDATA%\\SurfaceOnboarding"
+             "Snapshot file: " + escape(str(payload.get("environment"))) + " folder (leonardo-dev-inventory-*) under %LOCALAPPDATA%\\SurfaceOnboarding"
              "\\leonardo-inventory (CSV beside it).</p><div class='qh-table inv'><table><thead><tr><th>Tenant</th><th>CO</th>"
              "<th>ID</th><th>Licence</th><th>Start → End</th><th>Last scan (UTC)</th><th>Duration</th><th>Status</th>"
              "<th>Account</th></tr></thead><tbody>" + rows_html + "</tbody></table></div></section>")
