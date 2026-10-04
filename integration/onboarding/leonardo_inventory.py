@@ -106,7 +106,7 @@ _FLAG = "bool|NoneType"
 _LIST = "list|NoneType"
 _EXPECTED_SPEC: dict[str, str] = {
     "id": "str", "_modified": "int|str", "_created": "int|str", "isDeleted": "bool", "accountName": "str",
-    "accountUuid": "str", "accountDomain": "str|NoneType", "userEmailDomains": _LIST,
+    "accountUuid": "str|NoneType", "accountDomain": "str|NoneType", "userEmailDomains": _LIST,
     "accountCountryCode": "str|NoneType", "emailSettings": "dict|NoneType", "accountLicense": "dict",
     "enabled": "bool", "termsOfUseApproval": "bool|dict|int|str|NoneType", "accountSettings": "dict|NoneType",
     "accountSettings.reconSettings": "dict|NoneType", "accountSettings.reconSettings.automatedDiscoveryEnabled": _FLAG,
@@ -275,6 +275,9 @@ class AssembledInventory:
     duplicates_dropped: int
     deleted_count: int
     query: dict[str, Any]
+    # Tenants Leonardo returns with accountUuid null (2 in Development, live 2026-10-03):
+    # kept and counted, never matchable to a CO (matching needs id AND UUID).
+    uuid_missing_count: int = 0
 
 
 def _page_parts(request: Any, response: Any) -> tuple[dict[str, Any], int, list[Any]]:
@@ -318,15 +321,20 @@ def assemble_pages(pages: list[tuple[dict[str, Any], dict[str, Any]]], *, page_s
     for _, _, table in parts:
         for row in table:
             if not isinstance(row, dict) or not all(type(row.get(key)) is str and row[key]
-                                                    for key in ("id", "accountUuid", "accountName")):
+                                                    for key in ("id", "accountName")):
                 raise InventoryError("inventory_schema_unavailable")
-            row_id, row_uuid = row["id"], row["accountUuid"].casefold()
-            if uuid_by_id.get(row_id, row_uuid) != row_uuid or id_by_uuid.get(row_uuid, row_id) != row_id:
+            uuid = row.get("accountUuid", "")
+            if uuid is not None and (type(uuid) is not str or not uuid):
+                raise InventoryError("inventory_schema_unavailable")  # only an explicit null is tolerated
+            row_id, row_uuid = row["id"], uuid.casefold() if uuid else ""
+            if uuid_by_id.get(row_id, row_uuid) != row_uuid or (row_uuid and id_by_uuid.get(row_uuid, row_id) != row_id):
                 raise InventoryError("inventory_id_conflict")
             if row_id in uuid_by_id:
                 duplicates += 1
                 continue
-            uuid_by_id[row_id], id_by_uuid[row_uuid] = row_uuid, row_id
+            uuid_by_id[row_id] = row_uuid
+            if row_uuid:
+                id_by_uuid[row_uuid] = row_id
             rows.append(row)
     if len(rows) != total_count:
         raise InventoryError("inventory_inconsistent")
@@ -335,7 +343,8 @@ def assemble_pages(pages: list[tuple[dict[str, Any], dict[str, Any]]], *, page_s
              "sort": {"direction": _typed(sort.get("direction"), str), "key": _typed(sort.get("key"), str)},
              "filter": "present" if first.get("filters") else "none"}
     return AssembledInventory(tuple(rows), total_count, len(pages), duplicates,
-                              sum(1 for row in rows if row.get("isDeleted") is True), query)
+                              sum(1 for row in rows if row.get("isDeleted") is True), query,
+                              sum(1 for row in rows if row.get("accountUuid") is None))
 
 
 # ----- schema drift -----------------------------------------------------------
@@ -392,6 +401,7 @@ def snapshot_payload(env: InventoryEnvironment, assembled: AssembledInventory, c
         "captured_at": captured_at.astimezone(timezone.utc).strftime(_STAMP), "query": dict(assembled.query),
         "total_count": assembled.total_count, "row_count": len(tenants), "deleted_count": assembled.deleted_count,
         "pages": assembled.pages, "duplicates_dropped": assembled.duplicates_dropped,
+        "uuid_missing_count": assembled.uuid_missing_count,
         "schema_drift": schema_drift(assembled.rows), "tenants": tenants, "rows_sha256": _rows_sha256(tenants),
     }
 
@@ -536,9 +546,12 @@ def match_readbacks(payload: Mapping[str, Any], readbacks: Mapping[str, Mapping[
     account_uuid both match; a match on either one alone is a "conflict".
     """
     tenants = [tenant for tenant in payload.get("tenants") or () if isinstance(tenant, dict)
-               and type(tenant.get("id")) is str and type(tenant.get("account_uuid")) is str]
-    by_id = {tenant["id"]: tenant["account_uuid"].casefold() for tenant in tenants}
-    by_uuid = {tenant["account_uuid"].casefold(): tenant["id"] for tenant in tenants}
+               and type(tenant.get("id")) is str]
+    # A tenant without a UUID keeps an empty one here: it can never match, but a CO
+    # whose captured id points at it is a conflict, and it still counts as an orphan.
+    by_id = {tenant["id"]: (tenant["account_uuid"] or "").casefold() if type(tenant.get("account_uuid")) is str else ""
+             for tenant in tenants}
+    by_uuid = {uuid: tenant_id for tenant_id, uuid in by_id.items() if uuid}
     by_reference: dict[str, str | None] = {}
     matched: set[str] = set()
     for reference, readback in readbacks.items():
@@ -548,7 +561,7 @@ def match_readbacks(payload: Mapping[str, Any], readbacks: Mapping[str, Mapping[
             by_reference[reference] = None
             continue
         account_uuid = account_uuid.casefold()
-        if by_id.get(account_id) == account_uuid:
+        if account_uuid and by_id.get(account_id) == account_uuid:
             by_reference[reference] = account_id
             matched.add(account_id)
         elif account_id in by_id or account_uuid in by_uuid:

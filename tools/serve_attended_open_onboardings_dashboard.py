@@ -3663,7 +3663,8 @@ def render_inventory(query: str = "", notice: str = "") -> str:
     drift_count = sum(len(drift.get(key, [])) for key in ("unknown", "missing", "type_changed"))
     summary = ("<div class='banner" + (" banner-warn" if stale else "") + "'>Captured " + escape(str(payload.get("captured_at")))
                + " (" + str(int(age.total_seconds() // 3600)) + " h ago" + ("; stale, refresh before relying on it" if stale else "")
-               + ") · " + str(payload.get("row_count")) + " tenants (" + str(payload.get("deleted_count")) + " deleted) · "
+               + ") · " + str(payload.get("row_count")) + " tenants (" + str(payload.get("deleted_count")) + " deleted, "
+               + str(payload.get("uuid_missing_count", 0)) + " without UUID) · "
                + str(drift_count) + " schema change(s)"
                + (" · <strong>ID conflict for " + escape(", ".join(conflicts)) + "</strong>: re-check live" if conflicts else "")
                + "</div>")
@@ -3682,7 +3683,8 @@ def render_inventory(query: str = "", notice: str = "") -> str:
         state = "deleted" if tenant.get("is_deleted") else ("enabled" if tenant.get("enabled") else "disabled")
         rows_html += (
             "<tr><td>" + escape(name) + "</td><td>" + co_cell + "</td><td><code>" + escape(str(tenant.get("id") or ""))
-            + "</code></td><td>" + escape(str(licence.get("type") or "—")) + "</td><td>"
+            + "</code>" + ("" if tenant.get("account_uuid") else " <span class='chip chip-warn'>no UUID</span>")
+            + "</td><td>" + escape(str(licence.get("type") or "—")) + "</td><td>"
             + _inventory_date(licence.get("start_date")) + " → " + _inventory_date(licence.get("expiration_date"))
             + "</td><td>" + escape(str(scan.get("last_recon_scan_utc") or "—")[:16].replace("T", " ")) + "</td><td>"
             + _inventory_duration(scan.get("duration_ms")) + "</td><td>" + escape(str(scan.get("status") or "—"))

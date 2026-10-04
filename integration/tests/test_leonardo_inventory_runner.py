@@ -152,6 +152,17 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(runner._filter_present({"weird": 1}))
         self.assertEqual(runner._filter_methods({"and": [{"method": "search", "value": "secret"}]}), ["search"])
 
+    def test_footer_numbers_skip_elements_without_text(self):
+        # Live 2026-10-03: one pagination element reported None and the join crashed the probe.
+        class _Footer:
+            def all_inner_texts(self):
+                return ["Rows per page: 10", None, "1-10 of 593"]
+
+        class _Page:
+            def locator(self, selector):
+                return _Footer()
+        self.assertEqual(runner._footer_numbers(_Page()), [10, 1, 10, 593])
+
     def test_tenant_management_needs_the_development_origin(self):
         self.assertTrue(runner._is_tenant_management_url(runner.TENANT_MANAGEMENT + "?tab=1"))
         self.assertFalse(runner._is_tenant_management_url("https://evil.example/backoffice/tenantManagement"))
@@ -232,6 +243,28 @@ class ExportTests(unittest.TestCase):
         bad[1].__dict__["_body"]["pagination_response"]["total_count"] = 6
         self.assertEqual(self._export(_FakePage(bad + bad))["result"], "inventory_inconsistent")
         self.assertFalse((self.root / "dev").exists())
+
+    def test_an_unreadable_reply_body_is_retried_once(self):
+        # Live 2026-10-03: the page-1 body was once unreadable right after a reload.
+        request, body = capture(2, 2)[0]
+        broken = _Response(request, "not json")
+        # Broken on both attempts: fails closed, nothing written.
+        summary = self._export(_FakePage([broken] + _responses(5, 2)[1:]))
+        self.assertEqual(summary["result"], "inventory_body_unavailable")
+        self.assertFalse((self.root / "dev").exists())
+        # Broken only on the first reload: the retry exports.
+        good = _responses(5, 2)
+        page = _FakePage([broken] + good[1:])
+        calls = {"n": 0}
+        original = page.reload
+
+        def reload(wait_until=None):
+            calls["n"] += 1
+            page.responses[0] = broken if calls["n"] == 1 else good[0]
+            original(wait_until)
+        page.reload = reload
+        summary = self._export(page)
+        self.assertEqual((summary["result"], calls["n"]), ("inventory_exported", 2))
 
     def test_session_expiry_writes_nothing(self):
         request, body = capture(2, 2)[0]

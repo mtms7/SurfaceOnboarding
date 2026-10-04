@@ -5416,7 +5416,10 @@ def _capture_table_page(page: Any, trigger: Any) -> tuple[dict[str, Any], dict[s
         request_body = json.loads(response.request.post_data or "")
         body = response.json()
     except Exception as exc:
-        raise RuntimeError("inventory_schema_unavailable") from exc
+        # Live 2026-10-03: the reply body was once unreadable right after a reload
+        # (intermittent); the export retries the whole sweep once on this code.
+        _log().event("inventory", "body_unavailable", detail=type(exc).__name__)
+        raise RuntimeError("inventory_body_unavailable") from exc
     if not isinstance(request_body, dict) or not isinstance(body, dict):
         raise RuntimeError("inventory_schema_unavailable")
     if not _is_tenant_management_url(page.url):
@@ -5481,7 +5484,8 @@ def _footer_numbers(page: Any) -> list[int]:
         texts = page.locator("[class*='MuiTablePagination']").all_inner_texts()
     except Exception:
         return []
-    return [int(n) for n in re.findall(r"\d{1,6}", " ".join(texts))][:8]
+    # Some pagination elements report no text (None, live 2026-10-03).
+    return [int(n) for n in re.findall(r"\d{1,6}", " ".join(t for t in texts if isinstance(t, str)))][:8]
 
 
 def _reload(page: Any) -> Any:
@@ -5612,10 +5616,17 @@ def run_export_tenants(env_name: str = "dev", *, with_sweeps: bool = False, writ
             with _attended_page(playwright) as page:
                 assembled = None
                 for attempt in range(2):
-                    pages, page_size = _collect_inventory_pages(page)
                     try:
+                        pages, page_size = _collect_inventory_pages(page)
                         assembled = inventory.assemble_pages(pages, page_size=page_size)
                         break
+                    except LeonardoSessionExpired:
+                        raise
+                    except RuntimeError as error:
+                        # An unreadable reply body (intermittent) is retried once, from page 1.
+                        if str(error) != "inventory_body_unavailable" or attempt:
+                            raise
+                        _log().event("inventory", "retry", detail="body unavailable")
                     except inventory.InventoryError as error:
                         # A scan finishing mid-export can reorder rows (sort by last scan): retry once.
                         if error.reason != "inventory_inconsistent" or attempt:
@@ -5630,6 +5641,7 @@ def run_export_tenants(env_name: str = "dev", *, with_sweeps: bool = False, writ
                 return {"result": "inventory_exported", "environment": environment.name,
                         "total_count": payload["total_count"], "row_count": payload["row_count"],
                         "deleted_count": payload["deleted_count"], "pages": payload["pages"],
+                        "uuid_missing_count": payload["uuid_missing_count"],
                         "schema_drift": {key: len(drift.get(key, [])) for key in ("unknown", "missing", "type_changed")},
                         "file": target.name, "csv": bool(write_csv), "sweeps": sweeps}
         except inventory.InventoryError as error:

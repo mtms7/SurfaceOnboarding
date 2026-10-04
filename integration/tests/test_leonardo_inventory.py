@@ -192,6 +192,37 @@ class AssemblePagesTests(unittest.TestCase):
         self.assertReason("inventory_schema_unavailable", pages)
         self.assertReason("inventory_schema_unavailable", [])
 
+    def test_a_null_uuid_is_kept_and_counted_but_nothing_else_is_relaxed(self):
+        # Live 2026-10-03: two active Development tenants come back with accountUuid null.
+        pages = capture(3, 2)
+        pages[0][1]["pagination_response"]["table_data"][1]["accountUuid"] = None
+        assembled = assemble_pages(pages, page_size=2)
+        self.assertEqual((assembled.total_count, assembled.uuid_missing_count), (3, 1))
+        payload = snapshot_payload(DEV, assembled, NOW)
+        self.assertEqual(payload["uuid_missing_count"], 1)
+        self.assertEqual(payload["schema_drift"]["type_changed"], [])
+        self.assertEqual(sum(1 for tenant in payload["tenants"] if tenant["account_uuid"] is None), 1)
+        for bad in ("", 7, ["x"]):
+            pages = capture(3, 2)
+            pages[0][1]["pagination_response"]["table_data"][1]["accountUuid"] = bad
+            with self.subTest(uuid=bad):
+                self.assertReason("inventory_schema_unavailable", pages)
+        pages = capture(3, 2)
+        pages[0][1]["pagination_response"]["table_data"][1]["accountName"] = None
+        self.assertReason("inventory_schema_unavailable", pages)
+
+    def test_a_tenant_without_uuid_never_matches_a_co(self):
+        pages = capture(3, 2)
+        no_uuid = pages[0][1]["pagination_response"]["table_data"][1]
+        no_uuid["accountUuid"] = None
+        payload = snapshot_payload(DEV, assemble_pages(pages, page_size=2), NOW)
+        readbacks = {"CO-0001": {"surface_account_id": no_uuid["id"], "account_uuid": "a" * 32},
+                     "CO-0002": {"surface_account_id": no_uuid["id"], "account_uuid": ""}}
+        matched = match_readbacks(payload, readbacks)
+        self.assertEqual(matched["by_reference"]["CO-0001"], "conflict")
+        self.assertNotEqual(matched["by_reference"]["CO-0002"], no_uuid["id"])
+        self.assertIn(no_uuid["id"], matched["orphans"])
+
     def test_too_large_and_empty(self):
         self.assertReason("inventory_too_large", [page(0, [], MAX_TOTAL + 1)])
         self.assertReason("inventory_too_large", [page(0, [], 1)] * 201)
