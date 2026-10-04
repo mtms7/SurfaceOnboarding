@@ -904,6 +904,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("role='status'", page)
         self.assertIn("Re-run evaluation unavailable", page)
         self.assertNotIn("<button type='submit'>Re-run evaluation</button>", page)
+        # The eligible re-run is a ghost button now (renewal: no primary action); no form at all here.
+        self.assertNotIn("action='/attended/rerun-comment-evaluation'", page)
 
     def test_co0745_detail_offers_a_read_only_renewal_term_evaluation(self):
         page = page_detail("CO-0745", {
@@ -1472,6 +1474,52 @@ class SurfaceRouteDashboardTests(unittest.TestCase):
         self.assertNotIn("Why Leonardo creation is not enabled yet", page)
         self.assertNotIn("Start manual onboarding", page)
         self.assertNotIn("Credential Exposure onboarding", page)
+
+    def test_ready_surface_detail_has_one_primary_action_after_its_confirmations(self):
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=_surface_evaluation(core_plus=True)), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
+            page = page_detail("CO-0801", SURFACE_ROW)
+        self.assertEqual(page.count("<button type='submit'>"), 1)
+        start = page.index("<button type='submit'>Start Onboarding</button>")
+        self.assertLess(page.index("name='scope_reviewed' value='1' required"), start)
+        self.assertLess(page.index("name='attended_create_authorized' value='1' required"), start)
+        self.assertLess(page.index("<dt>Tier</dt>"), start)  # the scope to review comes first
+        self.assertNotIn("Source ready to onboard", page)  # folded into the card's first line
+        self.assertIn("Salesforce approval is validated.", page)
+        self.assertIn("<button class='ghost' type='submit'>Duplicate pre-check (DEV inventory)</button>", page)
+
+    def test_manual_route_primary_moves_from_session_check_to_manual_start(self):
+        row = {"Onboarding_Approval_Status__c": "Approved", "LastModifiedDate": "2026-09-12T17:00:00Z"}
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
+                patch.object(dashboard, "manual_start_ack_nonce", return_value=None):
+            before = page_detail("CO-0717", row)
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
+                patch.object(dashboard, "manual_start_ack_nonce", return_value="n" * 32):
+            after = page_detail("CO-0717", row)
+        self.assertIn("<button type='submit'>Check Leonardo Development session</button>", before)
+        self.assertEqual(before.count("<button type='submit'>"), 1)
+        self.assertIn("<button class='ghost' type='submit'>Check Leonardo Development session</button>", after)
+        self.assertIn("<button type='submit'>Start manual onboarding</button>", after)
+        self.assertEqual(after.count("<button type='submit'>"), 1)
+
+    def test_onboarded_detail_folds_scope_and_ids_and_lists_follow_ups(self):
+        state = {"CO-0801": {"source_revision": "rev1", "route": "case_1_new_surface_only",
+                             "result": "readback_verified", "completed_on": "2026-09-29T10:00:00"}}
+        ids = {"surface_account_id": "a" * 24, "account_uuid": "b" * 32, "leonardo_state": "Account Scanning",
+               "observed_on": "2026-09-29", "source": "Leonardo Development Details readback"}
+        with patch.object(dashboard, "evaluate_surface_fill_preflight", return_value=_surface_evaluation()), \
+                patch.object(dashboard, "load_runner_state", return_value=state), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={"CO-0801": ids}), \
+                patch.object(dashboard, "attended_validations", return_value={}), \
+                patch.object(dashboard, "attended_scan_statuses", return_value={}):
+            page = page_detail("CO-0801", SURFACE_ROW)
+        self.assertNotIn("<button type='submit'>", page)  # nothing to start; follow-ups and reads are ghost
+        self.assertIn("<details class='fold'><summary>Planned scope · Prime · Weekly", page)
+        self.assertIn("<details class='more source-ready' aria-labelledby='salesforce-ids-title'>", page)
+        self.assertEqual(page.count(dashboard.REMINDER_NOTE), 1)
+        self.assertIn("<div class='health'>", page)
+        self.assertIn("Leonardo Development readback", page)
 
     def test_entered_licence_dates_show_after_a_create(self):
         record = {"source_revision": _surface_evaluation().source_revision, "result": "readback_verified",
@@ -2353,6 +2401,24 @@ class RenewalPlanCardTests(unittest.TestCase):
         self.assertIn("find the tenant by name and primary domain", card)
         self.assertNotIn("<form", card)
         self.assertNotIn("<button", card)
+
+    def test_renewal_detail_has_no_primary_action(self):
+        # Owner decision 2026-10-04: the renewal plan leads; sign-in and manual actions are folded ghost buttons.
+        with patch.object(dashboard, "renewal_subscription_rows", return_value=list(self.ROWS)), \
+                patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
+                patch.object(dashboard, "manual_start_ack_nonce", return_value=None), \
+                patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce")):
+            page = page_detail("CO-0767", dict(self.ROW))
+        self.assertNotIn("<button type='submit'>", page)
+        self.assertIn(dashboard.RENEWAL_MANUAL_NOTE, page)
+        self.assertLess(page.index("Renewal plan · Case 6"), page.index(dashboard.RENEWAL_MANUAL_NOTE))
+        folded = page.index("<details class='more'><summary><h2 class='sum-h'>Sign-in and manual onboarding")
+        self.assertLess(folded, page.index("action='/attended/production-renewal-preflight'"))
+        self.assertLess(folded, page.index("action='/attended/leonardo-session-check'"))
+        self.assertIn("<button class='ghost' type='submit'>Open production sign-in</button>", page)
+        self.assertIn("<button class='ghost' type='submit'>Check Leonardo Development session</button>", page)
+        self.assertIn("disabled aria-disabled='true' title='Run the attended session check first'>Start manual onboarding", page)
 
     def test_unreadable_dealhub_and_non_renewal_cos(self):
         with patch.object(dashboard, "renewal_subscription_rows", side_effect=dashboard.ReadUnavailable()):

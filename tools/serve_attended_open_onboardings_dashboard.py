@@ -626,13 +626,14 @@ def _validation_section(reference: str, notice: str = "", now: datetime | None =
     result = attended_validations().get(reference)
     now = now or datetime.now()
     button = ("<form method='post' action='/attended/validate'><input type='hidden' name='reference' value='"
-              + escape(reference) + "'><button type='submit' class='ghost'>Validate in Surface</button></form>")
+              + escape(reference) + "'><button type='submit' class='ghost sm'>Validate in Surface</button></form>")
     started = ("<p class='note'>A read-only validation was started in the automation browser. "
                "Reload this page in about 30 seconds.</p>" if notice == "validation-started" else "")
     if result is None:
-        return ("<section class='login-preflight' aria-labelledby='validation-title'><div><h2 id='validation-title'>Surface validation</h2>"
+        return ("<section class='stat' aria-labelledby='validation-title'><div class='stat-head'>"
+                "<h2 id='validation-title'>Surface validation</h2></div>"
                 "<p>Not validated yet. Validate reads the tenant from Leonardo Development (read-only) and compares "
-                "it with the onboarding plan.</p>" + started + "</div>" + button + "</section>")
+                "it with the onboarding plan.</p>" + started + button + "</section>")
     checks = result["checks"]  # type: ignore[assignment]
     drift = [c for c in checks if c["status"] == "drift"]  # type: ignore[union-attr]
     unknown = [c for c in checks if c["status"] == "unknown"]  # type: ignore[union-attr]
@@ -663,12 +664,14 @@ def _validation_section(reference: str, notice: str = "", now: datetime | None =
         plan_note = ("<p class='note'>The onboarding plan could not be rebuilt from Salesforce (<code>"
                      + escape(str(result["plan_note"])) + "</code>); only account, people, and scan checks ran.</p>")
     observed = result["observed_at"].strftime("%Y-%m-%d %H:%M")  # type: ignore[union-attr]
-    return ("<section class='readiness " + cls + "' aria-labelledby='validation-title'><div class='readiness-heading'>"
-            f"<span class='readiness-icon' aria-hidden='true'>{icon}</span><div>"
-            f"<h2 id='validation-title'>Surface validation · {escape(title)}</h2>"
+    return ("<section class='stat " + cls + "' aria-labelledby='validation-title'><div class='stat-head'>"
+            f"<span class='readiness-icon' aria-hidden='true'>{icon}</span>"
+            f"<h2 id='validation-title'>Surface validation · {escape(title)}</h2></div>"
             f"<p>Observed {escape(observed)}" + (" · <b>stale, validate again</b>" if stale else "") + ". "
             "Compared with the onboarding plan; names, domains, and emails are checked but not stored.</p>"
-            + plan_note + started + "</div></div><dl>" + rows + "</dl>" + button + "</section>")
+            + plan_note + started + button
+            + "<details class='fold'" + (" open" if drift else "") + "><summary>" + str(len(checks)) + " checks</summary>"
+            "<dl>" + rows + "</dl></details></section>")
 
 
 def start_attended_scan_status(reference: str) -> bool:
@@ -736,13 +739,14 @@ def _scan_status_section(reference: str, notice: str = "", now: datetime | None 
     observation = attended_scan_statuses().get(reference)
     now = now or datetime.now()
     refresh = ("<form method='post' action='/attended/scan-status-refresh'><input type='hidden' name='reference' value='"
-               + escape(reference) + "'><button type='submit' class='ghost'>Refresh scan status</button></form>")
+               + escape(reference) + "'><button type='submit' class='ghost sm'>Refresh scan status</button></form>")
     started = ("<p class='note'>A read-only scan-status read was started in the automation browser. "
                "Reload this page in about 30 seconds.</p>" if notice == "started" else "")
     if observation is None:
-        return ("<section class='login-preflight' aria-labelledby='scan-status-title'><div><h2 id='scan-status-title'>Leonardo scan status</h2>"
-                "<p>Not read yet. Refresh reads the tenant's scan fields from Leonardo Development (read-only).</p>" + started + "</div>"
-                + refresh + "</section>")
+        return ("<section class='stat' aria-labelledby='scan-status-title'><div class='stat-head'>"
+                "<h2 id='scan-status-title'>Leonardo scan status</h2></div>"
+                "<p>Not read yet. Refresh reads the tenant's scan fields from Leonardo Development (read-only).</p>"
+                + started + refresh + "</section>")
     cls, title, message = SCAN_STATES[str(observation["state"])]
     stale = now > observation["expires_at"]  # type: ignore[operator]
     icon_style = "" if cls else " style='background:#9aa1ad'"
@@ -750,14 +754,14 @@ def _scan_status_section(reference: str, notice: str = "", now: datetime | None 
     duration = observation["duration_ms"]
     rows = (f"<dt>Last recon scan</dt><dd>{escape(str(observation['last_recon_scan'] or 'None'))}</dd>"
             f"<dt>Leonardo status</dt><dd><code>{escape(str(observation['status_enum'] or 'None'))}</code></dd>"
-            f"<dt>Last scan duration</dt><dd>{escape(f'{duration / 3_600_000:.1f} h' if isinstance(duration, int) else 'None')}</dd>"
+            f"<dt>Duration</dt><dd>{escape(f'{duration / 3_600_000:.1f} h' if isinstance(duration, int) else 'None')}</dd>"
             f"<dt>Observed</dt><dd>{escape(observation['observed_at'].strftime('%Y-%m-%d %H:%M'))}"  # type: ignore[union-attr]
             + (" · <b>stale, refresh</b>" if stale else "") + "</dd>")
-    return ("<section class='readiness" + (" " + cls if cls else "") + "' aria-labelledby='scan-status-title'><div class='readiness-heading'>"
-            f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span><div>"
-            f"<h2 id='scan-status-title'>Leonardo scan status · {escape(title)}</h2><p>{escape(message)}</p>"
-            "<p class='login-safety'>Local observation from Leonardo Development; Salesforce is not changed.</p>" + started
-            + "</div></div><dl>" + rows + "</dl>" + refresh + "</section>")
+    return ("<section class='stat" + (" " + cls if cls else "") + "' aria-labelledby='scan-status-title'><div class='stat-head'>"
+            f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span>"
+            f"<h2 id='scan-status-title'>Leonardo scan status · {escape(title)}</h2></div><p>{escape(message)}</p>"
+            "<dl>" + rows + "</dl>" + started + refresh
+            + "<p class='meta-line'>Local observation from Leonardo Development; Salesforce is not changed.</p></section>")
 
 
 def route_for(row: dict[str, str | None]) -> str | None:
@@ -1223,16 +1227,23 @@ def page_id_writeback_confirmation(evaluation: IdWritebackEvaluation, nonce: str
 
 
 def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, row: dict[str, str | None],
-                            reference: str = "") -> str:
+                            reference: str = "", extra: str = "") -> str:
+    """Folded Salesforce IDs panel (``extra``: the local readback block); a warning opens it."""
     plan = salesforce_id_writeback_plan(route, readback, row)
     status = plan["status"]
-    head = "<section class='readiness{cls}' aria-labelledby='salesforce-ids-title'><div class='readiness-heading'>"
+
+    def folded(cls: str, icon: str, icon_style: str, title: str, body: str) -> str:
+        return ("<details class='more" + (" " + cls if cls else "") + "'"
+                + (" open" if cls in ("source-warn", "source-blocked") else "") + " aria-labelledby='salesforce-ids-title'>"
+                f"<summary><span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span>"
+                f"<h2 id='salesforce-ids-title' class='sum-h'>Salesforce IDs · {escape(title)}</h2></summary>"
+                "<div class='body'>" + body + extra + "</div></details>")
     if status == "mapping_not_decided":
         if readback is None:
             return ""
-        return (head.format(cls="") + "<span class='readiness-icon' aria-hidden='true' style='background:#9aa1ad'>–</span><div>"
-                "<h2 id='salesforce-ids-title'>Salesforce IDs · Mapping not decided</h2>"
-                "<p>No owner-approved Salesforce field mapping exists for this route. Nothing is proposed for Salesforce.</p></div></div></section>")
+        return folded("", "–", " style='background:#9aa1ad'", "Mapping not decided",
+                      "<p class='note'>No owner-approved Salesforce field mapping exists for this route. "
+                      "Nothing is proposed for Salesforce.</p>")
     cls, icon, title, message = SALESFORCE_ID_STATUS[status]
     icon_style = "" if cls else " style='background:#9aa1ad'"
     rows = f"<dt>Environment</dt><dd><span class='chip chip-info'>{escape(ID_ENVIRONMENT_LABEL)}</span> Leonardo Development</dd>"
@@ -1257,10 +1268,9 @@ def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, 
     if ID_WRITEBACK_ENABLED and status == "ready_to_write" and (last is None or last.get("result") != "write_uncertain"):
         action = ("<form method='post' action='/attended/salesforce-id-writeback-review'><input type='hidden' name='reference' value='"
                   + escape(reference) + "'><button type='submit' class='ghost'>Review write to Salesforce</button></form>")
-    return (head.format(cls=" " + cls if cls else "") + f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span><div>"
-            f"<h2 id='salesforce-ids-title'>Salesforce IDs · {escape(title)}</h2><p>{escape(message)}</p>"
-            "<p class='login-safety'>" + escape(note) + "</p></div></div>"
-            "<dl>" + rows + "</dl>" + action + "</section>")
+    return folded(cls, icon, icon_style, title,
+                  f"<p class='note'>{escape(message)}</p><p class='login-safety'>" + escape(note) + "</p>"
+                  "<dl>" + rows + "</dl>" + action)
 
 
 def attended_leonardo_readbacks() -> dict[str, dict[str, str]]:
@@ -2529,17 +2539,48 @@ def ce_only_eligible(row: dict[str, str | None]) -> bool:
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", domain))
 
 
+RENEWAL_MANUAL_NOTE = ("Renewals are applied manually in BackOffice until the renewal rules (docs/38) are decided.")
+
+
+def _domain_count(raw: str | None) -> str:
+    items = [item for item in re.split(r"[,;\s]+", (raw or "").strip()) if item]
+    return str(len(items)) if items else "—"
+
+
+def _detail_summary(row: dict[str, str | None]) -> str:
+    """One line of key CO facts under the header (the full record is folded below)."""
+    product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
+    items = (
+        ("Product", _PRODUCT_SHORT.get(product or "", product or "—") + " · "
+         + _TYPE_SHORT.get(onboarding_type or "", onboarding_type or "—")),
+        ("Salesforce", (row.get("Onboarding_Approval_Status__c") or "Approval not populated") + " · "
+         + (row.get("Onboarding_Stage__c") or "Stage not populated")),
+        ("Main domain", row.get("Main_Domain__c") or "Not populated"),
+        ("Alternate domains", _domain_count(row.get("Alternate_Domains__c"))),
+        ("Email domains", _domain_count(row.get("Email_Domains__c"))),
+    )
+    return "<div class='summary'>" + "".join(
+        "<span>" + escape(label) + "<b>" + escape(value) + "</b></span>" for label, value in items) + "</div>"
+
+
 def page_detail(reference: str, row: dict[str, str | None], notification: str = "", commercial_readiness: dict[str, object] | None = None) -> str:
+    """CO detail: header + summary, one next-step card, tenant health, then folded records.
+
+    Renewal COs (owner decision 2026-10-04) have no primary action: the renewal
+    plan leads, and the production sign-in and Leonardo Development manual
+    actions are folded away as ghost buttons.
+    """
     rows = "".join(f"<dt>{escape(label)}</dt><dd>{escape(row.get(field) or 'Not populated')}</dd>" for label, field in DETAIL_DISPLAY_FIELDS)
     comment_validation = extract_dealhub_dates(row.get("Onboarding_Comments__c"))
+    is_renewal = "renewal" in (row.get("Onboarding_Type__c") or "").casefold()
     case4_panel = ""
     renewal_preflight = ""
-    if "renewal" in (row.get("Onboarding_Type__c") or "").casefold():
+    if is_renewal:
         renewal_preflight = (
             "<section class='login-preflight' aria-labelledby='renewal-preflight-title'><div><h2 id='renewal-preflight-title'>Production renewal account validation</h2>"
             "<p>Step 1: open the production BackOffice login and complete SSO/MFA manually. This preflight stops before any tenant search, edit, or save action.</p>"
             "<p class='login-safety'>The subsequent read-only account-existence lookup requires an approved desktop Playwright runtime and a reviewed production page schema. No credentials, cookies, MFA codes, or browser state are read or retained.</p></div>"
-            "<form method='post' action='/attended/production-renewal-preflight'><input type='hidden' name='reference' value='" + escape(reference) + "'><button type='submit'>Open production sign-in</button></form></section>"
+            "<form method='post' action='/attended/production-renewal-preflight'><input type='hidden' name='reference' value='" + escape(reference) + "'><button class='ghost' type='submit'>Open production sign-in</button></form></section>"
         )
     is_case4 = row.get("Onboarding_Product__c") == CASE4_PRODUCT and row.get("Onboarding_Type__c") == CASE4_TYPE
     if is_case4:
@@ -2565,7 +2606,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
             "<section class='login-preflight' aria-labelledby='comment-repair-title'><div><h2 id='comment-repair-title'>Re-run DealHub comment evaluation</h2>"
             "<p>Read CO-0741 and the selected active Surface Go 500-subdomain subscription. A successful result shows a separate, revision-bound Salesforce update confirmation.</p>"
             "<p class='login-safety'>This reads Salesforce only. It cannot overwrite a non-empty comment or make a Leonardo change.</p></div>"
-            "<form method='post' action='/attended/rerun-comment-evaluation'><input type='hidden' name='reference' value='CO-0741'><button type='submit'>Re-run evaluation</button></form></section>"
+            "<form method='post' action='/attended/rerun-comment-evaluation'><input type='hidden' name='reference' value='CO-0741'><button class='ghost' type='submit'>Re-run evaluation</button></form></section>"
             )
         else:
             comment_repair_action = ("<section class='manual-action'><div><h2>Re-run DealHub comment evaluation</h2>"
@@ -2577,7 +2618,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
             row.get("Onboarding_Comments__c") in (None, "")
             and row.get("Onboarding_Stage__c") == "New"
             and row.get("Onboarding_Approval_Status__c") == "Pending"
-            and "renewal" in (row.get("Onboarding_Type__c") or "").casefold()
+            and is_renewal
             and "surface" in (row.get("Onboarding_Product__c") or "").casefold()
         )
         if co0745_eligible:
@@ -2586,7 +2627,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                 "<h2 id='co0745-evaluation-title'>Validate DealHub renewal term</h2>"
                 "<p>Read CO-0745 and require one active Surface baseline subscription. A successful result only displays a proposed Onboarding Comments date range.</p>"
                 "<p class='login-safety'>This is read-only. Production existing-account validation and a separate final approval remain required before any Salesforce update.</p></div>"
-                "<form method='post' action='/attended/rerun-co0745-renewal-evaluation'><input type='hidden' name='reference' value='CO-0745'><button type='submit'>Run read-only evaluation</button></form></section>"
+                "<form method='post' action='/attended/rerun-co0745-renewal-evaluation'><input type='hidden' name='reference' value='CO-0745'><button class='ghost' type='submit'>Run read-only evaluation</button></form></section>"
             )
         else:
             renewal_comment_evaluation_action = (
@@ -2603,7 +2644,6 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
             if comment_validation["ready_for_cse_review"]
             else "The onboarding-comment subscription period needs separate review before execution."
         )
-        is_renewal = "renewal" in (row.get("Onboarding_Type__c") or "").casefold()
         ce_automated = not is_case4 and ce_only_eligible(row) and not is_renewal
         # Surface-only (Case 1): exact Product "Surface" + Type "New Product
         # Onboarding" only; every other CO keeps its existing behaviour.
@@ -2622,6 +2662,9 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
             "<p>Salesforce approval is validated. " + comment_summary + "</p></div></div>"
             + not_enabled + "</section>"
         )
+        # The automated cards carry this sentence themselves (no separate readiness card).
+        lede = ("Salesforce approval is validated. " + (comment_summary if comment_validation["ready_for_cse_review"]
+                                                         else "<b>" + comment_summary + "</b>"))
         if is_case4:
             manual_action = (
                 "<section class='manual-action' aria-labelledby='case4-route-title'><div><h2 id='case4-route-title'>Case 4 Leonardo workflow</h2>"
@@ -2633,17 +2676,22 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                 and reference not in attended_leonardo_readbacks():
             manual_action = _SALESFORCE_ID_PRESENT_SECTION
         elif ce_automated:
-            manual_action = _ce_only_onboard_section(reference)
+            readiness = ""
+            manual_action = _ce_only_onboard_section(reference, lede=lede)
         elif surface_automated:
-            manual_action = _surface_onboard_section(reference, route_for(row) or SURFACE_ENGINE)
+            readiness = ""
+            manual_action = _surface_onboard_section(reference, route_for(row) or SURFACE_ENGINE, lede=lede)
         else:
+            nonce = manual_start_ack_nonce(reference, row)
+            # One primary action: the session check until it is recorded, then the manual start.
+            # A renewal has no primary action at all.
+            check_class = " class='ghost'" if is_renewal or nonce is not None else ""
             session_check = (
                 "<section class='login-preflight' aria-labelledby='login-preflight-title'><div><h2 id='login-preflight-title'>Leonardo Development session check</h2>"
                 "<p>Open the exact Development tenant-management route. Your browser will show tenant management when the current session is active or redirect to SSO/MFA when it is not.</p>"
                 "<p class='login-safety'>This dashboard cannot inspect VPN state, credentials, cookies, or browser state. The resulting browser page is the attended authentication signal; it does not clear any authority, duplicate, mapping, or execution gate.</p></div>"
-                "<form method='post' action='/attended/leonardo-session-check'><input type='hidden' name='reference' value='" + escape(reference) + "'><button type='submit'>Check Leonardo Development session</button></form></section>"
+                "<form method='post' action='/attended/leonardo-session-check'><input type='hidden' name='reference' value='" + escape(reference) + "'><button" + check_class + " type='submit'>Check Leonardo Development session</button></form></section>"
             )
-            nonce = manual_start_ack_nonce(reference, row)
             if nonce is None:
                 manual_action = (
                     "<section class='manual-action' aria-labelledby='manual-action-title'><div><h2 id='manual-action-title'>Manual Leonardo onboarding</h2>"
@@ -2657,7 +2705,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                     "<p>A fresh session check is recorded for this source revision. Attest that your Leonardo Development admin session remains active to open tenant management and begin the attended workflow.</p></div>"
                     "<form method='post' action='/attended/start-manual-onboarding'><input type='hidden' name='reference' value='" + escape(reference) + "'><input type='hidden' name='nonce' value='" + escape(nonce) + "'>"
                     "<label><input type='checkbox' name='admin_session_active' value='1' required> I attest that my Leonardo Development admin session is active.</label>"
-                    "<button type='submit'>Start manual onboarding</button></form>"
+                    "<button" + (" class='ghost'" if is_renewal else "") + " type='submit'>Start manual onboarding</button></form>"
                     "<p class='manual-blocker'>This opens tenant management only. It does not fill, submit, create, or authorize a tenant.</p></section>"
                 )
             manual_action = session_check + manual_action
@@ -2691,18 +2739,21 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         )
         manual_action = ""
     readback = attended_leonardo_readbacks().get(reference)
-    local_readback = ""
+    readback_html = ""
     if readback is not None:
-        local_readback = ("<section class='readiness' aria-labelledby='leonardo-readback-title'><h2 id='leonardo-readback-title'>Leonardo Development readback</h2>"
-                          "<p>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
-                          f"<dt>Environment</dt><dd><span class='chip chip-info'>{escape(ID_ENVIRONMENT_LABEL)}</span> Leonardo Development</dd>"
-                          f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
-                          f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></section>")
-    local_readback = _salesforce_ids_section(route_for(row), readback, row, reference) + local_readback
-    if readback is not None and route_for(row) != CE_ENGINE:
-        local_readback = _scan_status_section(reference, notification) + local_readback
+        readback_html = ("<div class='sub-block' aria-labelledby='leonardo-readback-title'>"
+                         "<h3 id='leonardo-readback-title' class='sub-h'>Leonardo Development readback</h3>"
+                         "<p class='note'>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
+                         f"<dt>Environment</dt><dd><span class='chip chip-info'>{escape(ID_ENVIRONMENT_LABEL)}</span> Leonardo Development</dd>"
+                         f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
+                         f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></div>")
+    ids_html = _salesforce_ids_section(route_for(row), readback, row, reference, readback_html)
+    health = ""
     if readback is not None:
-        local_readback = _validation_section(reference, notification) + local_readback
+        tiles = _validation_section(reference, notification)
+        if route_for(row) != CE_ENGINE:
+            tiles += _scan_status_section(reference, notification)
+        health = "<div class='health'>" + tiles + "</div>"
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
     if notification.startswith("id-write:") and notification[9:] in ID_WRITEBACK_RESULTS:
@@ -2711,15 +2762,27 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     if notification in notifications:
         title, message = notifications[notification]
         toast = "<section class='toast' role='status' aria-live='polite'><strong>" + escape(title) + "</strong><span>" + escape(message) + "</span></section>"
-    details = "<section class='card'><div class='card-head'><span class='pill'>Salesforce record</span></div><dl>" + rows + "</dl></section>"
+    if is_renewal:
+        # Owner decision 2026-10-04: no primary action on a renewal CO.
+        folded = renewal_preflight + comment_repair_action + renewal_comment_evaluation_action + manual_action
+        next_step = (case4_panel + _renewal_plan_section(row)
+                     + "<p class='lede renewal-note'>" + escape(RENEWAL_MANUAL_NOTE) + "</p>" + readiness
+                     + ("<details class='more'><summary><h2 class='sum-h'>Sign-in and manual onboarding</h2>"
+                        "<span class='note'>Production sign-in · Leonardo Development session check</span></summary>"
+                        "<div class='body'>" + folded + "</div></details>" if folded else ""))
+    else:
+        next_step = (case4_panel + comment_repair_action + renewal_comment_evaluation_action
+                     + renewal_preflight + readiness + manual_action)
+    record = ("<details class='more'><summary><h2 class='sum-h'>Salesforce record</h2><span class='note'>"
+              + str(len(DETAIL_DISPLAY_FIELDS)) + " fields</span></summary><div class='body'><dl>" + rows + "</dl></div></details>")
+    account = row.get("Account_Name__c")
     main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>"
-                 "<div class='page-head'><h1>" + escape(reference) + "</h1>" + _onboarding_chip(reference)
+                 "<div class='page-head'><h1>" + escape(reference) + "</h1>"
+                 + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + _route_chip(row)
                  + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
                  "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
                  "<button class='ghost' type='submit'>Refresh</button></form></div></div>"
-                 + toast + case4_panel + comment_repair_action + renewal_comment_evaluation_action
-                 + _renewal_plan_section(row) + renewal_preflight
-                 + readiness + manual_action + local_readback + details)
+                 + _detail_summary(row) + toast + next_step + health + ids_html + record)
     return _app_shell(reference, main_html, active="onboardings")
 
 
@@ -2902,12 +2965,10 @@ def _ce_only_start_form(evaluation: CredentialExposureFillPreflight) -> str:
     return ("<form class='start-form' method='post' action='/attended/start-ce-only-runner'>"
             "<input type='hidden' name='reference' value='" + escape(evaluation.reference) + "'>"
             "<input type='hidden' name='source_revision' value='" + escape(evaluation.source_revision) + "'>"
-            "<button type='submit'>Start Onboarding</button>"
-            "<label><input type='checkbox' name='attended_create_authorized' value='1' required> "
-            "I authorize one Leonardo Development run for this source revision</label></form>"
-            "<p class='note'>Checks the DEV tenant inventory, then Leonardo itself, for an existing tenant (name, "
-            "primary domain, alternate domains) first. If one exists, nothing is created and this CO is marked as a "
-            "duplicate.</p>" + duplicate_precheck_form(evaluation.reference))
+            "<div class='confirm'><label><input type='checkbox' name='attended_create_authorized' value='1' required> "
+            "I authorize one Leonardo Development run for this source revision</label></div>"
+            "<button type='submit'>Start Onboarding</button></form>" + _START_DUPLICATE_NOTE
+            + _duplicate_precheck_row(evaluation.reference))
 
 
 def page_ce_only_fill_preflight(evaluation: CredentialExposureFillPreflight,
@@ -3210,6 +3271,48 @@ PENTERA_CSS = (
     ".operator{margin:14px 0 0;font-size:12px;color:#c9d1e0;word-break:break-all}.operator form{margin-top:6px}"
     ".banner-warn{background:var(--warn-bg)}.inv{overflow-x:auto}.inv th,.inv td{text-align:left!important;white-space:nowrap}"
     ".inv td:first-child{white-space:normal;min-width:160px}"
+    # CO detail page (2026-10-04): summary strip, one next-step card, follow-ups,
+    # tenant-health tiles, and folded secondary panels. Existing tokens only.
+    ".page-head .acct{color:var(--muted);font-size:15px;font-weight:600}"
+    ".summary{display:flex;flex-wrap:wrap;gap:8px 32px;margin:-8px 0 18px;color:var(--muted);font-size:12.5px}"
+    ".summary b{display:block;color:var(--text);font-size:14px;font-weight:600;overflow-wrap:anywhere}"
+    ".lede{margin:0 0 12px;color:var(--heading)}"
+    ".sub-h{margin:16px 0 4px;font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}"
+    "dl.compact{grid-template-columns:minmax(120px,170px) minmax(0,1fr) minmax(120px,170px) minmax(0,1fr);column-gap:12px}"
+    "dl.compact dt,dl.compact dd{padding:7px 4px}"
+    ".start-form{display:grid;justify-items:start;gap:10px;margin:14px 0 8px}"
+    ".confirm{display:grid;gap:8px;justify-self:stretch;padding:12px 14px;background:var(--canvas);border-radius:8px}"
+    ".confirm label{display:flex;gap:8px;align-items:flex-start;color:var(--text);font-size:13.5px}.confirm input{margin-top:3px}"
+    ".start-row{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:10px 0 0}.start-row form{margin:0}"
+    ".meta-line{margin:10px 0 0;color:var(--muted);font-size:12px}"
+    ".blockers{list-style:none;margin:0 0 12px;padding:0;display:grid;gap:6px}"
+    ".blockers li{background:#fff3f2;border-radius:6px;padding:8px 12px}"
+    ".outcome.compact{padding:10px 14px;margin:0 0 12px}.outcome.compact .outcome-icon{width:26px;height:26px;font-size:14px}"
+    ".outcome form{margin:6px 0}"
+    ".todo{list-style:none;margin:0;padding:0}"
+    ".todo li{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}"
+    ".todo li:last-child{border-bottom:0}.todo .what{flex:1}.todo form{margin:0}.todo li.done{color:var(--muted)}"
+    "button.sm{padding:4px 12px;font-size:12.5px}"
+    ".health{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:0 0 16px}"
+    ".stat{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;"
+    "box-shadow:0 1px 2px #1018280a;min-width:0}"
+    ".stat-head{display:flex;align-items:center;gap:8px}.stat-head h2{margin:0;font-size:14px;color:var(--heading)}"
+    ".stat p{margin:4px 0 10px;color:var(--muted);font-size:12.5px}.stat form{margin:0}"
+    ".stat dl{grid-template-columns:110px minmax(0,1fr);margin:0 0 10px;font-size:12.5px}.stat dt,.stat dd{padding:5px 2px}"
+    ".fold{margin:10px 0 0}.fold>summary{cursor:pointer;color:var(--primary-dark);font-weight:600;font-size:13px}"
+    ".fold[open]>summary{margin-bottom:6px}"
+    "details.more{background:var(--card);border:1px solid var(--line);border-radius:10px;margin:0 0 10px;"
+    "box-shadow:0 1px 2px #1018280a}"
+    "details.more>summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:10px;padding:12px 20px}"
+    "details.more>summary::-webkit-details-marker{display:none}"
+    "details.more>summary::before{content:'\\25B8';color:var(--muted);font-size:12px}"
+    "details.more[open]>summary::before{content:'\\25BE'}"
+    "details.more>summary .note{margin-left:auto}.sum-h{margin:0;font-size:15px;color:var(--heading)}"
+    "details.more>.body{padding:0 20px 14px}"
+    "details.more .readiness-icon{flex:0 0 20px;height:20px;font-size:11px}"
+    "details.more .login-preflight,details.more .manual-action{box-shadow:none;margin:10px 0 0;padding:12px 14px}"
+    "@media(max-width:760px){dl.compact,.stat dl{display:block}.health{grid-template-columns:1fr}.summary{margin-top:0}"
+    ".todo li{flex-wrap:wrap}}"
 )
 
 
@@ -3259,7 +3362,7 @@ def _onboarding_chip(reference: str) -> str:
 
 
 def _outcome_banner(kind: str, message: str, result: str, completed: str | None = None,
-                    headline: str | None = None) -> str:
+                    headline: str | None = None, compact: bool = False) -> str:
     """Render one attended-run outcome with a green check or red cross icon.
 
     ``kind`` comes from RUNNER_RESULT_MESSAGES: success is green with a check,
@@ -3273,7 +3376,8 @@ def _outcome_banner(kind: str, message: str, result: str, completed: str | None 
     headline = headline or RUNNER_HEADLINES.get(result) or default_headline
     when = " · " + escape(completed) if completed else ""
     return (
-        "<div class='outcome outcome-" + modifier + "' role='status' aria-label='" + escape(headline) + "'>"
+        "<div class='outcome outcome-" + modifier + (" compact" if compact else "") + "' role='status' aria-label='"
+        + escape(headline) + "'>"
         "<span class='outcome-icon' aria-hidden='true'>" + icon + "</span>"
         "<div><strong>" + escape(headline) + "</strong><p>" + message + "</p>"
         "<span class='meta'>Result <code>" + escape(result) + "</code>" + when + "</span></div></div>"
@@ -3300,24 +3404,54 @@ def _uncertain_banner(ref: str, record: dict[str, str]) -> str:
             + escape(record.get("result", "")) + "</code>). A tenant may exist. Start and reset stay blocked until a "
             "read-only check settles it: a found tenant is recorded as onboarded; no tenant re-arms the run.</p>"
             "<form method='post' action='/attended/verify-uncertain'><input type='hidden' name='reference' value='" + ref + "'>"
-            "<button type='submit' class='ghost'>Verify in Leonardo (read-only)</button></form>"
+            "<button type='submit'>Verify in Leonardo (read-only)</button></form>"
             "<span class='meta'>Result <code>" + escape(record.get("result", "")) + "</code>"
             + (" · " + escape(record["completed_on"]) if record.get("completed_on") else "") + "</span></div></div>")
 
 
 _START_IN_PROGRESS_NOTE = (
     "<p class='note'><b>A run for an earlier source revision has not reported a result.</b> The CO changed in "
-    "Salesforce while it was running, so no new run can start until it finishes. "
-    "<a href='/attended/ce-only-runner-status?ref={ref}'>View progress</a></p>")
+    "Salesforce while it was running, so no new run can start until it finishes.</p>")
 
 
-def _ce_only_onboard_section(reference: str) -> str:
+def _progress_button(ref: str) -> str:
+    """The one action while a run is open: the read-only status page (GET; ``ref`` is already escaped)."""
+    return ("<form method='get' action='/attended/ce-only-runner-status'><input type='hidden' name='ref' value='"
+            + ref + "'><button type='submit'>View progress</button></form>")
+
+
+def _running_note(ref: str, record: dict[str, str]) -> str:
+    started = " at " + escape(record["started_on"]) if record.get("started_on") else ""
+    return ("<p class='note'>An attended run for this source revision was started" + started +
+            " and has not reported a result. Do not start another.</p>" + _progress_button(ref))
+
+
+def _reset_form(ref: str, record: dict[str, str]) -> str:
+    """Re-arm a failed run; folded away for a duplicate, where the next step is a manual review."""
+    form = ("<form class='reset-form' method='post' action='/attended/reset-ce-only-runner'>"
+            "<input type='hidden' name='reference' value='" + ref + "'>"
+            "<label><input type='checkbox' name='reset_authorized' value='1' required> "
+            "Re-arm this failed run (nothing was created)</label>"
+            "<button type='submit' class='ghost'>Reset runner record</button></form>")
+    if record.get("result") in DUPLICATE_RESULTS:
+        return "<details class='fold'><summary>Re-arm this run</summary>" + form + "</details>"
+    return form
+
+
+def _onboard_card(title: str, status_chip: str, body: str) -> str:
+    return ("<section class='card onboard' aria-labelledby='onboard-title'>"
+            "<div class='card-head'><h2 id='onboard-title' class='pill'>" + title + "</h2>" + status_chip + "</div>"
+            + body + "</section>")
+
+
+def _ce_only_onboard_section(reference: str, lede: str = "") -> str:
     """Render the primary Onboard action for one approved CE-only CO.
 
     This inlines the fill preflight and the one-time, revision-bound start form so the
     operator can trigger the attended automation directly from the CO detail page.
     The runner opens an isolated browser, checks for duplicates, fills the Add Account form,
     and auto-confirms after a clear duplicate check. It never updates Salesforce.
+    ``lede`` is trusted static HTML (the source-readiness sentence from page_detail).
     """
     ref = escape(reference)
     try:
@@ -3350,17 +3484,16 @@ def _ce_only_onboard_section(reference: str) -> str:
     start_action = ""
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
-        runner_note = _outcome_banner(kind, message, record["result"], record.get("completed_on")) + _entered_license_note(record)
+        runner_note = (_outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
+                       + _entered_license_note(record))
     elif same_revision:
-        started = " at " + escape(record["started_on"]) if record.get("started_on") else ""
-        runner_note = ("<p class='note'>An attended run for this source revision was started" + started +
-                       " and has not reported a result. Do not start another. "
-                       "<a href='/attended/ce-only-runner-status?ref=" + ref + "'>View progress</a></p>")
+        runner_note = _running_note(ref, record)
     elif start_blocker(record) == "run_in_progress":
-        runner_note = _START_IN_PROGRESS_NOTE.format(ref=ref)
+        runner_note = _START_IN_PROGRESS_NOTE + _progress_button(ref)
     elif start_blocker(record) == "tenant_already_verified":
         runner_note = (_outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
-                                       "readback_verified", record.get("completed_on")) + _entered_license_note(record))
+                                       "readback_verified", record.get("completed_on"), compact=True)
+                       + _entered_license_note(record))
     else:
         if record is not None:
             runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +
@@ -3368,29 +3501,19 @@ def _ce_only_onboard_section(reference: str) -> str:
         start_action = _ce_only_start_form(evaluation)
     blockers = ""
     if evaluation.blockers:
-        blockers = ("<p class='note'>Blocked: " +
-                    ", ".join(escape(item.replace("_", " ")) for item in evaluation.blockers) + "</p>")
+        blockers = ("<ul class='blockers'>" + "".join(
+            "<li><b>Blocked:</b> " + escape(item.replace("_", " ")) + "</li>" for item in evaluation.blockers) + "</ul>")
     reset_action = ""
     if create_uncertain(record):
         runner_note = _uncertain_banner(ref, record)
         start_action = ""
     elif record is not None and record.get("result") and record["result"] != "readback_verified":
-        reset_action = (
-            "<form class='reset-form' method='post' action='/attended/reset-ce-only-runner'>"
-            "<input type='hidden' name='reference' value='" + ref + "'>"
-            "<label><input type='checkbox' name='reset_authorized' value='1' required> "
-            "Re-arm this failed run (nothing was created)</label>"
-            "<button type='submit' class='ghost'>Reset runner record</button></form>"
-        )
-    return (
-        "<section class='card onboard' aria-labelledby='onboard-title'>"
-        "<div class='card-head'><h2 id='onboard-title' class='pill'>Credential Exposure onboarding</h2>" + status_chip + "</div>"
-        + runner_note +
-        "<div class='facts'><span>Email domains <b>" + str(evaluation.email_domain_count) + "</b></span>"
-        "<span>Source revision <b>" + escape(evaluation.source_revision) + "</b></span></div>"
-        + blockers + start_action + reset_action +
-        "</section>"
-    )
+        reset_action = _reset_form(ref, record)
+    return _onboard_card(
+        "Credential Exposure onboarding", status_chip,
+        ("<p class='lede'>" + lede + "</p>" if lede else "") + runner_note + blockers + start_action + reset_action
+        + "<p class='meta-line'>Email domains <b>" + str(evaluation.email_domain_count) + "</b> · Source revision <code>"
+        + escape(evaluation.source_revision) + "</code></p>")
 
 
 SCAN_REMINDER_TEXT = ("Scan now / scanning interval are ON for this Leonardo Development tenant — "
@@ -3410,14 +3533,12 @@ def _surface_start_form(evaluation: SurfaceScopePreflight) -> str:
             "<input type='hidden' name='route' value='" + escape(evaluation.route) + "'>"
             "<input type='hidden' name='source_revision' value='" + escape(evaluation.source_revision) + "'>"
             "<input type='hidden' name='scope_digest' value='" + escape(evaluation.scope_digest) + "'>"
-            "<button type='submit'>Start Onboarding</button>"
+            "<div class='confirm'><label><input type='checkbox' name='scope_reviewed' value='1' required> "
+            "I reviewed the scope for this source revision</label>"
             "<label><input type='checkbox' name='attended_create_authorized' value='1' required> "
-            "I authorize one Leonardo Development run for this source revision</label>"
-            "<label><input type='checkbox' name='scope_reviewed' value='1' required> "
-            "I reviewed the scope for this source revision</label></form>"
-            "<p class='note'>Checks the DEV tenant inventory, then Leonardo itself, for an existing tenant (name, "
-            "primary domain, alternate domains) first. If one exists, nothing is created and this CO is marked as a "
-            "duplicate.</p>" + duplicate_precheck_form(evaluation.reference))
+            "I authorize one Leonardo Development run for this source revision</label></div>"
+            "<button type='submit'>Start Onboarding</button></form>" + _START_DUPLICATE_NOTE
+            + _duplicate_precheck_row(evaluation.reference))
 
 
 def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
@@ -3437,9 +3558,9 @@ def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
         ("Licensed subdomains", licensed),
         ("Assets", str(scope["assets"])),
         ("License dates (planned)", f"{scope['license_start']} → {scope['license_end']}"),
-        ("Onboarding day", (f"Leonardo Development: now. Production: from {scope['production_onboarding_day']} "
-                            f"(2 days before the {scope['subscription_start']} subscription start), or earlier on a "
-                            "CSM request") if scope.get("production_onboarding_day") else "—"),
+        ("Onboarding day", (f"DEV: now · production: from {scope['production_onboarding_day']} (2 days before the "
+                            f"{scope['subscription_start']} subscription start, or earlier on a CSM request)")
+         if scope.get("production_onboarding_day") else "—"),
         ("Large scope (&gt;60)", "yes — review carefully" if scope["large_scope"] else "no"),
         ("Core Plus on account", "yes — CE to be enabled later" if scope.get("core_plus_present") else "no"),
     ]
@@ -3448,25 +3569,34 @@ def _surface_scope_facts(evaluation: SurfaceScopePreflight) -> str:
     if scope.get("leaked_credentials_domains") is not None:
         rows.append(("Leaked Credentials", f"ON · {scope['leaked_credentials_interval']} · "
                                            f"{scope['leaked_credentials_domains']} CE email domain"))
-    return ("<dl class='scope'>" + "".join(
+    return ("<dl class='scope compact'>" + "".join(
         "<dt>" + label + "</dt><dd>" + escape(value) + "</dd>" for label, value in rows) + "</dl>")
 
 
+REMINDER_NOTE = "Records a local acknowledgement only; nothing is changed in Leonardo or Salesforce."
+
+
 def _reminder(text: str, action: str, reference: str, button: str) -> str:
-    return ("<div class='outcome outcome-info' role='status'><span class='outcome-icon' aria-hidden='true'>!</span>"
-            "<div><strong>" + escape(text) + "</strong>"
+    """One open follow-up as a list item (the shared REMINDER_NOTE is shown once per list)."""
+    return ("<li><span class='chip chip-warn'>To do</span><span class='what'>" + escape(text) + "</span>"
             "<form method='post' action='" + action + "'><input type='hidden' name='reference' value='"
-            + escape(reference) + "'><button type='submit' class='ghost'>" + escape(button) + "</button></form>"
-            "<span class='meta'>Records a local acknowledgement only; nothing is changed in Leonardo or Salesforce.</span>"
-            "</div></div>")
+            + escape(reference) + "'><button type='submit' class='ghost sm'>" + escape(button) + "</button></form></li>")
 
 
-def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str:
+def _scope_summary_line(evaluation: SurfaceScopePreflight) -> str:
+    scope = evaluation.scope or {}
+    return escape(f"{str(scope.get('tier', '')).title()} · {scope.get('scanning_interval', '')} · "
+                  f"{scope.get('licensed_subdomains', '')} licensed subdomains · "
+                  f"{scope.get('license_start', '')} → {scope.get('license_end', '')}")
+
+
+def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE, lede: str = "") -> str:
     """Render the Surface-only (Case 1) Onboard card: scope review + one Start action.
 
     Mirrors the CE-only card (chip, outcome banner, reset for failed runs) and
     adds the counts-only scope summary, the required revision-bound scope
-    review, and the local Scan-now / Credential Exposure reminders.
+    review, and the local Scan-now / Credential Exposure reminders (a
+    Follow-ups list after the card). ``lede`` is trusted static HTML.
     """
     ref = escape(reference)
     evaluation = evaluate_surface_fill_preflight(reference, route)
@@ -3493,18 +3623,17 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str
     start_action = ""
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
-        runner_note = _outcome_banner(kind, message, record["result"], record.get("completed_on")) + _entered_license_note(record)
+        runner_note = (_outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
+                       + _entered_license_note(record))
     elif same_revision:
-        started = " at " + escape(record["started_on"]) if record.get("started_on") else ""
-        runner_note = ("<p class='note'>An attended run for this source revision was started" + started +
-                       " and has not reported a result. Do not start another. "
-                       "<a href='/attended/ce-only-runner-status?ref=" + ref + "'>View progress</a></p>")
+        runner_note = _running_note(ref, record)
     elif record is not None and record.get("result") == "readback_verified":
         # A verified tenant exists; a later source revision never re-creates it.
         runner_note = (_outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
-                                       "readback_verified", record.get("completed_on")) + _entered_license_note(record))
+                                       "readback_verified", record.get("completed_on"), compact=True)
+                       + _entered_license_note(record))
     elif start_blocker(record) == "run_in_progress":
-        runner_note = _START_IN_PROGRESS_NOTE.format(ref=ref)
+        runner_note = _START_IN_PROGRESS_NOTE + _progress_button(ref)
     else:
         if record is not None:
             runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +
@@ -3512,10 +3641,10 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str
         start_action = _surface_start_form(evaluation)
     blockers = ""
     if evaluation.blockers:
-        blockers = "".join(
-            "<p class='note'>Blocked: <code>" + escape(code) + "</code> "
-            + RUNNER_RESULT_MESSAGES.get(code, ("blocked", ""))[1] + "</p>" for code in evaluation.blockers)
-        blockers += "".join("<p class='note'><b>" + escape(detail) + "</b></p>" for detail in evaluation.blocker_details)
+        blockers = ("<ul class='blockers'>" + "".join(
+            "<li><b>Blocked:</b> " + RUNNER_RESULT_MESSAGES.get(code, ("blocked", ""))[1]
+            + " <code>" + escape(code) + "</code></li>" for code in evaluation.blockers)
+            + "".join("<li><b>" + escape(detail) + "</b></li>" for detail in evaluation.blocker_details) + "</ul>")
     try:
         reminders = load_attended_reminders().get(reference, {})
         reminder_error = ""
@@ -3536,31 +3665,31 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE) -> str
     for kind, label in (("scan_settings_off", "Scan settings marked off"), ("ce_enabled", "Credential Exposure marked enabled"),
                         ("operator_assigned", "Operator Account marked assigned")):
         if reminders.get(REMINDER_FIELDS[kind]):
-            reminder_html += "<p class='note'>" + label + " on " + escape(reminders[REMINDER_FIELDS[kind]]) + ".</p>"
+            reminder_html += ("<li class='done'><span class='chip chip-ok'>Done</span><span class='what'>" + label
+                              + " on " + escape(reminders[REMINDER_FIELDS[kind]]) + ".</span></li>")
+    followups = ""
+    if reminder_html or reminder_error:
+        followups = ("<section class='card' aria-labelledby='followups-title'><div class='card-head'>"
+                     "<h2 id='followups-title' class='pill'>Follow-ups</h2><span class='note'>" + REMINDER_NOTE + "</span></div>"
+                     + reminder_error + ("<ul class='todo'>" + reminder_html + "</ul>" if reminder_html else "") + "</section>")
     reset_action = ""
     if create_uncertain(record):
         runner_note = _uncertain_banner(ref, record)
         start_action = ""
     elif record is not None and record.get("result") and record["result"] != "readback_verified":
-        reset_action = (
-            "<form class='reset-form' method='post' action='/attended/reset-ce-only-runner'>"
-            "<input type='hidden' name='reference' value='" + ref + "'>"
-            "<label><input type='checkbox' name='reset_authorized' value='1' required> "
-            "Re-arm this failed run (nothing was created)</label>"
-            "<button type='submit' class='ghost'>Reset runner record</button></form>"
-        )
+        reset_action = _reset_form(ref, record)
+    scope_html = _surface_scope_facts(evaluation)
+    if scope_html and start_action:
+        scope_html = "<h3 class='sub-h'>Scope to review</h3>" + scope_html
+    elif scope_html:
+        scope_html = ("<details class='fold'><summary>Planned scope · " + _scope_summary_line(evaluation)
+                      + "</summary>" + scope_html + "</details>")
     revision = evaluation.source_revision or "unavailable"
-    return (
-        "<section class='card onboard' aria-labelledby='onboard-title'>"
-        "<div class='card-head'><h2 id='onboard-title' class='pill'>"
-        + ("Surface + Credential Exposure onboarding" if route == CASE3_ENGINE else "Surface onboarding")
-        + "</h2>" + status_chip + "</div>"
-        + runner_note + reminder_html + reminder_error +
-        "<div class='facts'><span>Route <b>" + escape(route) + "</b></span>"
-        "<span>Source revision <b>" + escape(revision) + "</b></span></div>"
-        + _surface_scope_facts(evaluation) + blockers + start_action + reset_action +
-        "</section>"
-    )
+    return _onboard_card(
+        "Surface + Credential Exposure onboarding" if route == CASE3_ENGINE else "Surface onboarding", status_chip,
+        ("<p class='lede'>" + lede + "</p>" if lede else "") + runner_note + blockers + scope_html + start_action
+        + reset_action + "<p class='meta-line'>Route <code>" + escape(route) + "</code> · Source revision <code>"
+        + escape(revision) + "</code></p>") + followups
 
 
 def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, reference: str) -> str:
@@ -3650,6 +3779,17 @@ PRECHECK_REASON_TEXT = {"tenant_name": "same tenant name", "primary_domain": "sa
 def duplicate_precheck_form(reference: str) -> str:
     return ("<form method='post' action='/attended/duplicate-precheck'><input type='hidden' name='reference' value='"
             + escape(reference) + "'><button class='ghost' type='submit'>Duplicate pre-check (DEV inventory)</button></form>")
+
+
+_START_DUPLICATE_NOTE = (
+    "<p class='note'>Checks the DEV tenant inventory, then Leonardo itself, for an existing tenant (name, primary "
+    "domain, alternate domains) first. If one exists, nothing is created and this CO is marked as a duplicate.</p>")
+
+
+def _duplicate_precheck_row(reference: str) -> str:
+    """The optional read-only pre-check, secondary to Start (a separate form; forms cannot nest)."""
+    return ("<div class='start-row'>" + duplicate_precheck_form(reference)
+            + "<span class='note'>Optional and read-only; Start runs the live duplicate check anyway.</span></div>")
 
 
 def page_duplicate_precheck(reference: str, report: dict[str, object]) -> str:
