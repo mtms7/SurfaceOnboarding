@@ -77,7 +77,7 @@ superseded by the owner.
 | Authenticated Testing | Disabled | Owner-attested Case 3 decision. |
 | AI | Disabled | Owner-attested Case 3 decision. |
 | Web Agent | Leave untouched. Do not set, enable, or disable it. | Owner instruction 2026-09-12; excluded until the instruction is explicitly updated. |
-| SpyCloud | Leave untouched. Do not set, enable, or disable it. | Owner instruction 2026-09-12; excluded until the instruction is explicitly updated. |
+| SpyCloud | ~~Leave untouched.~~ **Superseded 2026-10-05: OFF on LC tenants** (see the supersession note after this table). | Owner instruction 2026-09-12, superseded by the owner decision 2026-10-05. |
 | Web dictionary brute force | Enabled | Owner-attested Case 3 decision. |
 | Multiple users | Enabled | Owner-attested Case 3 decision. |
 | Notifications | Enabled | Owner-attested Case 3 decision. |
@@ -87,6 +87,13 @@ superseded by the owner.
 | Number of assets | 10,000 | Owner instruction 2026-09-12: default for every new Surface account; do not derive it from Core endpoint quantity. |
 | Number of domains | 3 | Owner-attested Case 3 combined-account decision; do not substitute the CE-only one-domain rule. |
 | Number of subdomains | 500 plus the sum of any explicitly approved Surface subdomain add-ons. | Stop if add-on entitlement is missing or ambiguous. |
+
+**Supersession note, 2026-10-05 (SpyCloud).** The owner decided that SpyCloud must be OFF on Credential
+Exposure (LC) tenants, which supersedes the 2026-09-12 "leave untouched" instruction above. Leonardo's Add
+Account form hard-codes it ON, so it is turned OFF afterwards through the tenant's Edit form (only the
+`spyCloudEnabled` checkbox), as a separately approved Leonardo Development write with read-after-write
+verification (`--spycloud-off --co CO-XXXX --confirm-write`; a dry run without the flag). The Web Agent
+instruction is unchanged.
 
 The historical/guide candidate for a user created by the operator does not
 override the project's newer exact-primary-user source binding. The exact

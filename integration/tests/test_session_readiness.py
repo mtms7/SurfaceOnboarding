@@ -479,6 +479,8 @@ class LoginFlowTests(unittest.TestCase):
                 patch.object(dashboard, "start_attended_validation_all", side_effect=AssertionError("signed out")):
             self.assertEqual(self._request("GET", "/")[:2], (303, "/login"))
             self.assertEqual(self._request("GET", "/inventory")[:2], (303, "/login"))
+            self.assertEqual(self._request("GET", "/tenants")[:2], (303, "/login"))
+            self.assertEqual(self._request("POST", "/attended/production-duplicate-check")[0], 403)
             self.assertEqual(self._request("POST", "/attended/validate-all")[0], 403)
             self.assertEqual(self._request("POST", "/logout")[0], 403)
             self.assertEqual(self._request("GET", "/", [dashboard.SESSION_COOKIE + "=forged"])[:2], (303, "/login"))

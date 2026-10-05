@@ -4460,7 +4460,7 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
     ignored the filter answers with more matches than rows, which every
     caller treats as ambiguous.
     """
-    rewritten: list[bool] = []
+    rewritten: list[Any] = []
 
     def rewrite(route: Any) -> None:
         try:
@@ -4470,8 +4470,8 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
             body = json.loads(route.request.post_data or "")
             body["tableServerData"].update(offset=0, items_per_page=API_SEARCH_PAGE_SIZE,
                                            filters={"and": [{"method": "search", "value": lookup}]})
+            rewritten.append(route.request)
             route.continue_(post_data=json.dumps(body))
-            rewritten.append(True)
         except Exception:
             route.continue_()  # unchanged: the missing rewrite fails the search closed
 
@@ -4481,7 +4481,10 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
         _log().error("tenant_search", "route", exc)
         return None
     try:
-        with page.expect_response(_is_inventory_response, timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
+        # Only the reply to the rewritten request counts: an app refresh already in flight (e.g. after an
+        # Edit save) also matches the path but carries the unfiltered table.
+        with page.expect_response(lambda r: _is_inventory_response(r) and any(r.request is q for q in rewritten),
+                                  timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
             page.reload(wait_until="domcontentloaded")
         status = info.value.status
     except Exception as exc:
@@ -4845,6 +4848,9 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                     return _finish(reference, acknowledged_revision, "readback_id_conflict")
                 except (OSError, ValueError):
                     return _finish(reference, acknowledged_revision, "readback_write_unavailable")
+                # SpyCloud OFF on LC routes (off by default, see SPYCLOUD_AFTER_CREATE_ENABLED); it
+                # records its own warning and never changes this create result.
+                _spycloud_after_create(page, reference, contract.engine, tenant_name, surface_account_id, account_uuid)
                 return _finish(reference, acknowledged_revision, "readback_verified")
         except LoginTimeout:
             return _finish(reference, acknowledged_revision, "development_login_timeout")
@@ -4978,6 +4984,128 @@ def scan_status_from_row(row: dict[str, Any]) -> dict[str, Any]:
     return observation
 
 
+# --- Scan executions (Details > "Duration Per Scan", probe 2026-10-04) ------------
+# Read-only. The runner drives Leonardo's own UI (select the tenant row, open the
+# row menu, Details, "Duration Per Scan") and passively captures the app's OWN
+# POST /api/v1/backoffice/account/{id}/campaign/executions reply. It never builds
+# that request. Only the stable Details item is clicked; the hazard items
+# (Grid_Access, _Scan_Now, _Stop_Scan, _Delete) are never touched.
+SCAN_EXEC_ROW_MENU_SELECTOR = ".rowMenuActionsContainer .list-trigger"
+SCAN_EXEC_DETAILS_SELECTOR = '[data-am="Button-Grid_Details"]'
+SCAN_EXEC_DURATION_TEXT = "Duration Per Scan"
+SCAN_EXEC_PATH = re.compile(r"/api/v1/backoffice/account/([A-Za-z0-9_-]{1,64})/campaign/executions")
+SCAN_EXEC_TIMEOUT_MS = 20_000
+SCAN_EXEC_MAX_ROWS = 200
+SCAN_EXEC_DONE = frozenset({"DONE"})
+SCAN_EXEC_RUNNING = frozenset({"PENDING"})
+
+
+def _exec_time(value: Any) -> datetime | None:
+    """Strict start/end parser (ISO text or epoch milliseconds) to an aware UTC datetime, else None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        if isinstance(value, str) and value.strip():
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        return None
+    return None
+
+
+def _exec_enum(value: Any) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(SCAN_STATUS_ENUM_PATTERN, value) else None
+
+
+def parse_scan_executions(body: Any) -> dict[str, Any] | None:
+    """Parse the executions reply to {"executions": [...], "execution_state": ...}, or None (fail closed).
+
+    Accepted envelopes: the table-server shape {"pagination_response": {"table_data": [...]}} (as
+    getAllDetailedAccounts), {"table_data": [...]}, or a bare list; anything else is None (envelope
+    still unverified live). Only campaign_type, execution_type, status, start, end and duration_ms
+    are kept per execution. execution_state: "no_executions", "running" (any PENDING; the earliest
+    start is "running_since"), "done" (at least one execution, all DONE), else "unrecognized".
+    """
+    rows = body
+    if isinstance(body, dict):
+        paged = body.get("pagination_response")
+        rows = paged.get("table_data") if isinstance(paged, dict) else body.get("table_data")
+    if not isinstance(rows, list) or len(rows) > SCAN_EXEC_MAX_ROWS or not all(isinstance(r, dict) for r in rows):
+        return None
+    executions: list[dict[str, Any]] = []
+    for row in rows:
+        start, end = _exec_time(row.get("startDate")), _exec_time(row.get("endDate"))
+        duration = int((end - start).total_seconds() * 1000) if start and end and end >= start else None
+        executions.append({
+            "campaign_type": _exec_enum(row.get("campaignTypeEnum")),
+            "execution_type": _exec_enum(row.get("campaignExecutionTypeEnum")),
+            "status": _exec_enum(row.get("status")),
+            "start": start.isoformat(timespec="seconds") if start else None,
+            "end": end.isoformat(timespec="seconds") if end else None,
+            "duration_ms": duration})
+    statuses = [e["status"] for e in executions]
+    result: dict[str, Any] = {"executions": executions}
+    if not executions:
+        result["execution_state"] = "no_executions"
+    elif any(s not in SCAN_EXEC_DONE | SCAN_EXEC_RUNNING for s in statuses):
+        result["execution_state"] = "unrecognized"
+    elif any(s in SCAN_EXEC_RUNNING for s in statuses):
+        starts = sorted(e["start"] for e in executions if e["status"] in SCAN_EXEC_RUNNING and e["start"])
+        result["execution_state"] = "running"
+        result["running_since"] = starts[0] if starts else None
+    else:
+        result["execution_state"] = "done"
+    return result
+
+
+def _is_scan_exec_response(response: Any) -> bool:
+    """Exactly the app's executions POST on the Development origin (any tenant id; the caller compares it)."""
+    try:
+        return (response.request.method == "POST" and _url_origin(response.url) == DEVELOPMENT_ORIGIN
+                and SCAN_EXEC_PATH.fullmatch(_url_path(response.url)) is not None)
+    except Exception:
+        return False
+
+
+def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[str, Any]:
+    """Open the tenant's Details > Duration Per Scan and return the parsed executions reply.
+
+    Raises LeonardoSessionExpired (401/403) or RuntimeError with scan_status_executions_unavailable /
+    scan_status_executions_id_mismatch. Nothing is saved; the details view is closed with Escape.
+    """
+    try:
+        page.locator("tr, [role='row']").filter(has_text=tenant_name).first.click(timeout=FIELD_TIMEOUT_MS)
+        page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
+        page.locator(SCAN_EXEC_DETAILS_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
+        with page.expect_response(_is_scan_exec_response, timeout=SCAN_EXEC_TIMEOUT_MS) as info:
+            page.get_by_text(SCAN_EXEC_DURATION_TEXT, exact=True).first.click(timeout=FIELD_TIMEOUT_MS)
+        response = info.value
+    except Exception as exc:
+        _log().error("scan_executions", "response", exc)
+        raise RuntimeError("scan_status_executions_unavailable") from exc
+    finally:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+    match = SCAN_EXEC_PATH.fullmatch(_url_path(response.url))
+    if match is None or match.group(1) != expected_id:
+        raise RuntimeError("scan_status_executions_id_mismatch")
+    if response.status in (401, 403):
+        raise LeonardoSessionExpired()
+    if not 200 <= response.status < 300:
+        raise RuntimeError("scan_status_executions_unavailable")
+    try:
+        parsed = parse_scan_executions(response.json())
+    except Exception:
+        parsed = None
+    if parsed is None:
+        raise RuntimeError("scan_status_executions_unavailable")
+    return parsed
+
+
 def write_scan_status(reference: str, observation: dict[str, Any], observed_at: datetime) -> None:
     """Store one CO's latest observation with observed_at/expires_at (replaces its previous one)."""
     if not REFERENCE.fullmatch(reference):
@@ -5059,11 +5187,19 @@ def run_scan_status(reference: str, surface_only: bool = False) -> str:
                 if len(matches) != 1:
                     return "scan_status_tenant_not_found"
                 observation = scan_status_from_row(matches[0])
+                # The row-based status is always kept; the executions add to it, or leave a reason code.
+                outcome = "scan_status_recorded"
+                try:
+                    observation.update(read_scan_executions(page, tenant_name, readback["surface_account_id"]))
+                except LeonardoSessionExpired:
+                    raise
+                except RuntimeError as error:
+                    outcome = str(error)
                 try:
                     write_scan_status(reference, observation, datetime.now())
                 except (OSError, ValueError):
                     return "scan_status_write_unavailable"
-                return "scan_status_recorded"
+                return outcome
         except LoginTimeout:
             return "development_login_timeout"
         except RuntimeError as error:
@@ -5185,11 +5321,11 @@ def _epoch_dates(value: Any) -> set[str]:
 
 
 def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
-                 entered: tuple[str, str] | None = None) -> list[dict[str, Any]]:
+                 entered: tuple[str, str] | None = None, route: str | None = None) -> list[dict[str, Any]]:
     """Compare one tenant search row with the route's fill plan (read-only, pure).
 
     Each check is {"check", "group", "status"} with status ok / drift /
-    unknown / info, plus "expected"/"found" for booleans, enums, numbers and
+    unknown / info / warn, plus "expected"/"found" for booleans, enums, numbers and
     dates only. Without a plan (source unavailable) only the account status,
     scan, and people checks run.
     """
@@ -5270,6 +5406,16 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
                 add("Settings", "Maximum scan duration (h)", "info", None, "not in search data (check the Edit form)")
             else:
                 add("Settings", "Maximum scan duration (h)", "ok" if found == want else "drift", want, found)
+    if route in SPYCLOUD_ROUTES:
+        # Informational only (owner decision 2026-10-05): SpyCloud must be OFF on LC tenants; never a drift.
+        from integration.onboarding.leonardo_inventory import spycloud_enabled
+        spy = spycloud_enabled(row)
+        if spy is True:
+            add("Settings", "SpyCloud is ON (owner: must be OFF)", "warn")
+        elif spy is False:
+            add("Settings", "SpyCloud is OFF", "ok", False, False)
+        else:
+            add("Settings", "SpyCloud state not readable", "unknown")
     operators = _row_value(row, "operatorAccounts")
     add("People", "Operator Account", "info", None, "assigned" if operators else "not assigned")
     add("People", "Customer accepted terms of use", "info", None,
@@ -5396,7 +5542,7 @@ def _validation_inputs(reference: str) -> "str | tuple[str, str, tuple[str, str]
 def _record_validation(reference: str, route: str, row: dict[str, Any], plan: dict[str, Any] | None,
                        plan_note: str, entered: tuple[str, str] | None) -> str:
     """Compare one matched tenant row with its plan; store the checks and the scan observation."""
-    checks = validate_row(row, plan, entered)
+    checks = validate_row(row, plan, entered, route)
     try:
         now = datetime.now()
         write_validation(reference, route, checks, now, plan_note)
@@ -5421,6 +5567,303 @@ def run_validate_all() -> dict[str, str]:
         if result in SESSION_STOP_RESULTS:
             break
     return results
+
+
+# --- SpyCloud OFF on Credential Exposure tenants (owner decision 2026-10-05) ---------
+# Leonardo's Add Account hard-codes leakedCredentialsSettings.spyCloudSettings.enabled = true, but the
+# owner requires SpyCloud OFF on LC tenants (routes CE-only and Case 3; this supersedes docs/33 "leave
+# untouched"). The tenant's Edit form (row menu > Edit > both "Advanced options" sections) carries the
+# checkbox input[name="spyCloudEnabled"]; Confirm posts /api/v1/backoffice/account/{id}/edit.
+# This is a Leonardo WRITE: it needs an explicit confirm_write (CLI: --spycloud-off --co CO-XXXX
+# --confirm-write), Development only. Without it the run is a dry run (open Edit, report, Cancel).
+# The runner touches only that one checkbox, then Confirm, and passively observes the app's own
+# reply; it never builds the request. Hazard row actions (Access, Scan now, Stop scan, Delete) are
+# never clicked.
+SPYCLOUD_EDIT_SELECTOR = '[data-am="Button-Grid_Edit"]'
+SPYCLOUD_CHECKBOX_NAME = "spyCloudEnabled"
+SPYCLOUD_CHECKBOX_SELECTOR = f'input[type=checkbox][name="{SPYCLOUD_CHECKBOX_NAME}"]'
+SPYCLOUD_ADVANCED_TEXT = "Advanced options"
+SPYCLOUD_EDIT_PATH = re.compile(r"/api/v1/backoffice/account/([A-Za-z0-9_-]{1,64})/edit")
+SPYCLOUD_EDIT_TIMEOUT_MS = 30_000
+SPYCLOUD_ROUTES = frozenset({CE_ENGINE, CASE3_ENGINE})  # Credential Exposure routes; the Surface-only route never
+SPYCLOUD_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_spycloud.json"
+SPYCLOUD_OK_OUTCOMES = frozenset({"spycloud_off_verified", "spycloud_already_off"})
+# The only row-menu items this runner may click (Details: scan status; Edit: SpyCloud). Everything else
+# in that menu (_Access, _Scan_Now, _Stop_Scan, _Delete) is a hazard.
+ROW_ACTIONS_ALLOWED = frozenset({SCAN_EXEC_DETAILS_SELECTOR, SPYCLOUD_EDIT_SELECTOR})
+# After-create hook (CE and Case 3, after readback_verified). OFF until the operator's first live
+# standalone SpyCloud save (--spycloud-off --confirm-write) has been verified; flip this in a reviewed
+# commit afterwards. While False, no create path changes behaviour. When True, a SpyCloud failure never
+# undoes or alters the create result: it is recorded as a warning (run log, state file, dashboard).
+SPYCLOUD_AFTER_CREATE_ENABLED = False
+
+
+def _is_spycloud_edit_response(response: Any) -> bool:
+    """Exactly the app's own edit POST on the Development origin (any tenant id; the caller compares it)."""
+    try:
+        return (response.request.method == "POST" and _url_origin(response.url) == DEVELOPMENT_ORIGIN
+                and SPYCLOUD_EDIT_PATH.fullmatch(_url_path(response.url)) is not None)
+    except Exception:
+        return False
+
+
+def _open_row_action(page: Any, tenant_name: str, item_selector: str) -> None:
+    """Select the tenant row, open its row menu, click one allow-listed item (never a hazard item)."""
+    if item_selector not in ROW_ACTIONS_ALLOWED:
+        raise ValueError("row_action_not_allowed")
+    page.locator("tr, [role='row']").filter(has_text=tenant_name).first.click(timeout=FIELD_TIMEOUT_MS)
+    page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
+    page.locator(item_selector).first.click(timeout=FIELD_TIMEOUT_MS)
+
+
+def _spycloud_cancel(page: Any) -> bool:
+    """Close the Edit form without saving: its own Cancel when unique, else Escape. False = not confirmed closed."""
+    try:
+        cancel = page.get_by_role("button", name="Cancel", exact=True)
+        if cancel.count() == 1:
+            cancel.first.click(timeout=FIELD_TIMEOUT_MS)
+            return True
+    except Exception as exc:
+        _log().error("spycloud", "cancel", exc)
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    return False
+
+
+def _spycloud_row(page: Any, tenant_name: str, expected_id: str, expected_uuid: str | None) -> tuple[str, bool | None]:
+    """Search the tenant and return (result, spycloud_enabled): result "ok" or a reason code.
+
+    The search must return exactly the one expected row (id, and accountUuid when given), so the
+    row the runner clicks next is that tenant and no other (a name that is a substring of another
+    tenant's is ambiguous: fail closed).
+    """
+    from integration.onboarding import leonardo_inventory as inventory
+
+    searched = _search_tenants(page, None, tenant_name)
+    if searched is None:
+        return "spycloud_readback_unavailable", None
+    matches = [row for row in searched.rows if isinstance(row, dict) and row.get("id") == expected_id
+               and (expected_uuid is None or (isinstance(row.get("accountUuid"), str)
+                                              and row["accountUuid"].casefold() == expected_uuid.casefold()))]
+    if len(matches) != 1:
+        return "spycloud_tenant_not_found", None
+    if len(searched.rows) != 1 or searched.total_count != 1:
+        return "spycloud_row_ambiguous", None
+    return "ok", inventory.spycloud_enabled(matches[0])
+
+
+def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_uuid: str | None = None,
+                     confirm_write: bool = False) -> str:
+    """Turn SpyCloud OFF on one Leonardo Development tenant, or (without confirm_write) report it.
+
+    Outcomes: spycloud_off_verified (saved and the re-read row says false), spycloud_already_off (no save),
+    spycloud_dry_run_on (no confirm_write: Edit opened, checkbox still ON, cancelled). Anything else is a
+    reason code: spycloud_environment_not_supported, spycloud_readback_unavailable,
+    spycloud_tenant_not_found, spycloud_row_ambiguous, spycloud_edit_unavailable,
+    spycloud_advanced_options_unavailable, spycloud_checkbox_missing, spycloud_checkbox_ambiguous,
+    spycloud_checkbox_unreadable, spycloud_uncheck_failed, spycloud_confirm_unavailable,
+    spycloud_save_no_signal, spycloud_save_id_mismatch, spycloud_save_failed, spycloud_readback_still_on,
+    spycloud_readback_missing, spycloud_saved_unverified (2xx save, re-read failed twice), spycloud_cancel_unavailable. A 401/403 raises LeonardoSessionExpired.
+    The form is cancelled (or Escape pressed) wherever nothing was saved.
+    """
+    if _url_origin(page.url) != DEVELOPMENT_ORIGIN or not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, expected_id or ""):
+        return "spycloud_environment_not_supported"
+    found, _before = _spycloud_row(page, tenant_name, expected_id, expected_uuid)
+    if found != "ok":
+        return found
+    try:
+        _open_row_action(page, tenant_name, SPYCLOUD_EDIT_SELECTOR)
+    except Exception as exc:
+        _log().error("spycloud", "edit_open", exc)
+        _spycloud_cancel(page)
+        return "spycloud_edit_unavailable"
+
+    def stop(reason: str) -> str:
+        """Nothing was saved: close the form and report the reason (a form that stays open is reported)."""
+        closed = _spycloud_cancel(page)
+        if closed or reason not in ("spycloud_already_off", "spycloud_dry_run_on"):
+            return reason
+        return "spycloud_cancel_unavailable"
+
+    try:
+        expanders = page.get_by_text(SPYCLOUD_ADVANCED_TEXT, exact=True)
+        expander_count = expanders.count()
+        for index in range(expander_count):
+            expanders.nth(index).click(timeout=FIELD_TIMEOUT_MS)
+        checkbox = page.locator(SPYCLOUD_CHECKBOX_SELECTOR)
+        found_count = checkbox.count()
+    except Exception as exc:
+        _log().error("spycloud", "advanced_options", exc)
+        return stop("spycloud_advanced_options_unavailable")
+    if found_count == 0:
+        return stop("spycloud_advanced_options_unavailable" if expander_count == 0 else "spycloud_checkbox_missing")
+    if found_count > 1:
+        return stop("spycloud_checkbox_ambiguous")
+    try:
+        checked = checkbox.first.is_checked()
+    except Exception as exc:
+        _log().error("spycloud", "checkbox_read", exc)
+        return stop("spycloud_checkbox_unreadable")
+    if checked is False:
+        return stop("spycloud_already_off")
+    if not confirm_write:
+        return stop("spycloud_dry_run_on")
+    # Approved write: uncheck this one checkbox (re-read), then Confirm.
+    if not _set_checkbox(page, SPYCLOUD_CHECKBOX_NAME, False):
+        return stop("spycloud_uncheck_failed")
+    confirm = page.get_by_role("button", name="Confirm", exact=True)
+    try:
+        if confirm.count() != 1:
+            return stop("spycloud_confirm_unavailable")
+    except Exception as exc:
+        _log().error("spycloud", "confirm_locate", exc)
+        return stop("spycloud_confirm_unavailable")
+    try:
+        with page.expect_response(_is_spycloud_edit_response, timeout=SPYCLOUD_EDIT_TIMEOUT_MS) as info:
+            confirm.first.click(timeout=FIELD_TIMEOUT_MS)
+        response = info.value
+    except Exception as exc:
+        # Uncertain: the click may or may not have saved. Never re-click; a dry run shows the state.
+        _log().error("spycloud", "save_response", exc)
+        _spycloud_cancel(page)
+        return "spycloud_save_no_signal"
+    match = SPYCLOUD_EDIT_PATH.fullmatch(_url_path(response.url))
+    if match is None or match.group(1) != expected_id:
+        _log().event("spycloud", "wrong_tenant_edit_observed")
+        _spycloud_cancel(page)
+        return "spycloud_save_id_mismatch"
+    if response.status in (401, 403):
+        _log().event("spycloud", str(response.status), detail="leonardo session expired")
+        raise LeonardoSessionExpired()
+    if not 200 <= response.status < 300:
+        _log().event("spycloud", "save_status", detail=str(response.status))
+        _spycloud_cancel(page)
+        return "spycloud_save_failed"
+    # Read-after-write: the tenant row itself must now say false. The save returned 2xx, so a failed
+    # re-read is "saved, unverified" (one retry), never a reason code that reads as "nothing written".
+    found, after = _spycloud_row(page, tenant_name, expected_id, expected_uuid)
+    if found != "ok":
+        found, after = _spycloud_row(page, tenant_name, expected_id, expected_uuid)
+    if found != "ok":
+        _log().event("spycloud", "saved_readback", detail=found)
+        return "spycloud_saved_unverified"
+    if after is False:
+        return "spycloud_off_verified"
+    return "spycloud_readback_still_on" if after is True else "spycloud_readback_missing"
+
+
+def write_spycloud_state(reference: str, outcome: str, mode: str, observed_at: datetime) -> None:
+    """Store one CO's latest SpyCloud outcome (replaces the previous; atomic). mode: standalone, dry_run, after_create."""
+    if not REFERENCE.fullmatch(reference) or mode not in ("standalone", "dry_run", "after_create"):
+        raise ValueError("invalid_spycloud_record")
+    if not re.fullmatch(r"[a-z_]{1,64}", outcome or ""):
+        raise ValueError("invalid_spycloud_record")
+    try:
+        state = json.loads(SPYCLOUD_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            state = {}
+    except (OSError, json.JSONDecodeError):
+        state = {}
+    state[reference] = {"outcome": outcome, "mode": mode, "observed_at": observed_at.isoformat(timespec="seconds"),
+                        "warning": outcome not in SPYCLOUD_OK_OUTCOMES}
+    _write_json_atomic(SPYCLOUD_STATE_PATH, state)
+
+
+def _record_spycloud(reference: str, outcome: str, mode: str) -> None:
+    """Best-effort state record plus a run-log warning when SpyCloud is not verified OFF."""
+    _log().event("spycloud", outcome, detail=mode)
+    if outcome not in SPYCLOUD_OK_OUTCOMES:
+        _log().event("spycloud_warning", "not_verified_off", detail="SpyCloud still ON or unknown: run SpyCloud off")
+    try:
+        write_spycloud_state(reference, outcome, mode, datetime.now())
+    except (OSError, ValueError):
+        _log().event("spycloud", "state_write_unavailable")
+
+
+def _spycloud_after_create(page: Any, reference: str, engine: str, tenant_name: str, account_id: str,
+                           account_uuid: str) -> None:
+    """After readback_verified on an LC route: SpyCloud OFF. Never raises; never alters the create result."""
+    if not SPYCLOUD_AFTER_CREATE_ENABLED or engine not in SPYCLOUD_ROUTES:
+        return
+    try:
+        outcome = set_spycloud_off(page, tenant_name, account_id, expected_uuid=account_uuid, confirm_write=True)
+    except LeonardoSessionExpired:
+        outcome = "leonardo_session_expired"
+    except Exception as exc:  # noqa: BLE001 - the create already succeeded; report, never undo
+        _log().error("spycloud", "after_create", exc)
+        outcome = "spycloud_hook_error"
+    _record_spycloud(reference, outcome, "after_create")
+
+
+# Outcomes reached only after Confirm was clicked: the save may have happened but is not verified.
+SPYCLOUD_AFTER_CONFIRM_RESULTS = frozenset({
+    "spycloud_save_no_signal", "spycloud_save_id_mismatch", "spycloud_save_failed",
+    "spycloud_readback_still_on", "spycloud_readback_missing", "spycloud_saved_unverified",
+    "leonardo_session_expired"})
+
+
+def spycloud_write_label(result: str, confirm_write: bool) -> str:
+    """What the CLI may claim about the Leonardo write; never "attempted" for a run that stopped before Confirm."""
+    if result == "spycloud_off_verified":
+        return "verified"
+    if confirm_write and result in SPYCLOUD_AFTER_CONFIRM_RESULTS:
+        return "attempted_unverified"
+    return "not_performed"
+
+
+def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: str = "dev") -> str:
+    """Standalone SpyCloud OFF for one onboarded CE / Case 3 CO in Leonardo Development.
+
+    Needs the CO's local readback (its id and accountUuid). Without ``confirm_write`` it is a dry run
+    (Edit opened, checkbox state reported, Cancel). Any environment other than dev is refused before
+    anything else. Salesforce is never written.
+    """
+    global _ACTIVE_RUN_LOG
+    if env_name != "dev":
+        return "spycloud_environment_not_supported"
+    if not REFERENCE.fullmatch(reference):
+        return "invalid_co_reference"
+    ids = _readback_ids(reference)
+    if ids is None:
+        return "spycloud_not_onboarded"
+    try:
+        route, tenant_name = _validation_route(reference)
+    except SurfaceSourceError as error:
+        return str(error)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
+        return "spycloud_source_unavailable"
+    if route not in SPYCLOUD_ROUTES:
+        return "spycloud_route_not_applicable"
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    _ACTIVE_RUN_LOG = RunLog(reference, "spycloud_off" if confirm_write else "spycloud_dry_run", route=route)
+    log = _ACTIVE_RUN_LOG
+    result = "attended_ce_runner_unavailable"
+    try:
+        with sync_playwright() as playwright:
+            try:
+                with _attended_page(playwright) as page:
+                    log.attach(page)
+                    result = set_spycloud_off(page, tenant_name, ids[0], expected_uuid=ids[1],
+                                              confirm_write=confirm_write)
+            except LoginTimeout:
+                result = "development_login_timeout"
+            except RuntimeError as error:
+                result = str(error)
+            except Exception as exc:  # noqa: BLE001
+                log.error("runner", "unexpected", exc)
+                result = "attended_ce_runner_unavailable"
+        if result not in SESSION_STOP_RESULTS:
+            _record_spycloud(reference, result, "standalone" if confirm_write else "dry_run")
+        return result
+    finally:
+        log.event("finish", result)
+        log.write(result)
+        _ACTIVE_RUN_LOG = None
 
 
 # --- Leonardo tenant inventory (2026-10-03) ----------------------------------
@@ -5813,20 +6256,45 @@ def _co_domains(contract: RouteContract, source: Any) -> tuple[str, ...]:
     return (contract.primary_domain(source), *(domain for _name, _lookup, domain in extras))
 
 
-def _inventory_precheck(contract: RouteContract, source: Any, log: "RunLog | None" = None) -> dict[str, Any]:
-    """The duplicate pre-check for one loaded CO source; no usable inventory is "inventory_unavailable"."""
+# Owner decision 2026-10-05: Dev keeps the Leonardo Development inventory as its duplicate validation; the
+# duplicate validation for PRODUCTION is the production clone (Redash, collected hourly). The gate below is what a
+# production onboarding will call at the place `run()` calls `_inventory_precheck`; production onboarding is not
+# enabled yet, so today it is only reported (pre-check page and CLI) and never changes a Dev result.
+def _production_gate(contract: RouteContract, source: Any, log: "RunLog") -> dict[str, Any]:
+    """The production duplicate gate for one loaded CO source (see ``production_duplicate_gate``)."""
+    from integration.onboarding import leonardo_inventory as inventory
+
+    gate = inventory.production_duplicate_gate(inventory_root(), source.tenant_name, _co_domains(contract, source),
+                                               now=datetime.now(timezone.utc))
+    log.event("production_gate", gate["result"],
+              detail=f"blocks={gate['blocks']} tenants={gate.get('tenants_checked', 0)} matches={len(gate['matches'])}")
+    return gate
+
+
+def _inventory_precheck(contract: RouteContract, source: Any, log: "RunLog | None" = None, *,
+                        include_clone: bool = False) -> dict[str, Any]:
+    """The duplicate pre-check for one loaded CO source; no usable inventory is "inventory_unavailable".
+
+    ``result`` and ``matches`` come from the DEV inventory only (they decide Start). With ``include_clone``
+    (the pre-check page and CLI, never a Start run) ``production_clone`` adds the production gate's answer;
+    it never changes ``result``.
+    """
     from integration.onboarding import leonardo_inventory as inventory
 
     log = log or _log()
+    clone = _production_gate(contract, source, log) if include_clone else None
     try:
         payload = inventory.load_latest(inventory_root(), "dev", max_age=INVENTORY_PRECHECK_MAX_AGE,
                                         now=datetime.now(timezone.utc))
     except inventory.InventoryError as error:
         log.event("inventory_precheck", "inventory_unavailable", detail=error.reason)
-        return {"result": "inventory_unavailable", "reason": error.reason, "matches": []}
+        unavailable = {"result": "inventory_unavailable", "reason": error.reason, "matches": []}
+        return {**unavailable, "production_clone": clone} if include_clone else unavailable
     result = inventory.duplicate_precheck(payload, source.tenant_name, _co_domains(contract, source))
     result["captured_at"] = payload.get("captured_at")
     result["environment_label"] = payload.get("environment_label")
+    if include_clone:
+        result["production_clone"] = clone
     log.event("inventory_precheck", result["result"],
               detail=f"tenants={result['tenants_checked']} matches={len(result['matches'])}")
     return result
@@ -5843,7 +6311,26 @@ def run_inventory_precheck(reference: str, route: str = CE_ENGINE) -> dict[str, 
         source = contract.load_source(reference)
     except RuntimeError as error:
         return {"result": str(error), "matches": []}
-    return _inventory_precheck(contract, source)
+    return _inventory_precheck(contract, source, include_clone=True)
+
+
+def run_production_duplicate_check(reference: str, route: str = CE_ENGINE) -> dict[str, Any]:
+    """Read-only: one Salesforce source read and the production-clone snapshot; no DEV inventory, Leonardo, or browser.
+
+    Returns ``{"result": ..., "production_clone": <gate>}``; a CO that cannot be read has no ``production_clone``.
+    Informational for Dev runs: it never feeds the Start gate.
+    """
+    if not REFERENCE.fullmatch(reference):
+        return {"result": "invalid_co_reference", "matches": []}
+    contract = ROUTES.get(route)
+    if contract is None:
+        return {"result": "route_unsupported", "matches": []}
+    try:
+        source = contract.load_source(reference)
+    except RuntimeError as error:
+        return {"result": str(error), "matches": []}
+    gate = _production_gate(contract, source, _log())
+    return {"result": gate["result"], "production_clone": gate}
 
 
 def _combine_duplicate(ui: str, api: str) -> str:
@@ -5963,6 +6450,12 @@ def main() -> int:
                         help="Read-only scan-status read for every onboarded Surface / Case 3 CO (no fill, submit, or create).")
     parser.add_argument("--duplicate-precheck", action="store_true",
                         help="With --co (and --route): read-only duplicate pre-check against the latest DEV tenant inventory (no Leonardo, no browser).")
+    parser.add_argument("--production-duplicate-check", action="store_true",
+                        help="With --co (and --route): read-only duplicate check against the production clone (Redash snapshot; no Leonardo, no browser).")
+    parser.add_argument("--spycloud-off", action="store_true",
+                        help="With --co: open the tenant's Edit form in Leonardo Development and report the SpyCloud checkbox (dry run: Cancel, nothing saved). Add --confirm-write to turn it OFF.")
+    parser.add_argument("--confirm-write", action="store_true",
+                        help="With --spycloud-off: explicitly approve the Leonardo Development save that turns SpyCloud OFF (Edit > Confirm). Without it nothing is saved.")
     parser.add_argument("--open-dashboard", type=int, metavar="PORT",
                         help="Open (or bring to the front) the local dashboard's sign-in page as a tab of the automation window.")
     parser.add_argument("--probe-inventory-shape", action="store_true",
@@ -5970,7 +6463,7 @@ def main() -> int:
     parser.add_argument("--export-tenants", action="store_true",
                         help="Read-only: page through Tenant Management and write the allow-listed tenant snapshot outside the repository.")
     parser.add_argument("--env", choices=("dev", "prod"), default="dev",
-                        help="With --export-tenants: environment (prod is refused until separately approved).")
+                        help="With --export-tenants or --spycloud-off: environment (prod is refused until separately approved).")
     parser.add_argument("--with-sweeps", action="store_true",
                         help="With --export-tenants: also validate every onboarded CO from the exported rows.")
     parser.add_argument("--csv", action="store_true",
@@ -5978,6 +6471,15 @@ def main() -> int:
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
+    if args.confirm_write and not args.spycloud_off:
+        parser.error("--confirm-write is only valid with --spycloud-off")
+    if args.spycloud_off:
+        if not args.co:
+            parser.error("--co is required with --spycloud-off")
+        result = run_spycloud_off(args.co, confirm_write=args.confirm_write, env_name=args.env)
+        print(json.dumps({"result": result, "leonardo_write": spycloud_write_label(result, args.confirm_write),
+                          "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
     if args.duplicate_precheck:
         if not args.co:
             parser.error("--co is required with --duplicate-precheck")
@@ -5988,6 +6490,18 @@ def main() -> int:
                           "alternate_domains_available": report.get("alternate_domains_available"),
                           "matches": [{"id": m["id"], "reasons": m["reasons"], "is_deleted": m["is_deleted"]}
                                       for m in report["matches"]],
+                          "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
+    if args.production_duplicate_check:
+        if not args.co:
+            parser.error("--co is required with --production-duplicate-check")
+        report = run_production_duplicate_check(args.co, args.route)
+        gate = report.get("production_clone") or {}
+        # Reason codes, ids, and counts only; names stay in the local snapshot.
+        print(json.dumps({"result": report["result"], "blocks": gate.get("blocks", True), "reason": gate.get("reason"),
+                          "tenants_checked": gate.get("tenants_checked"), "captured_at": gate.get("captured_at"),
+                          "matches": [{"id": m["id"], "reasons": m["reasons"], "is_deleted": m["is_deleted"]}
+                                      for m in gate.get("matches") or ()],
                           "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0
     if args.open_dashboard is not None:

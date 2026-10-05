@@ -56,6 +56,7 @@ integration/attended_scan_reminders.json
 # Locally built release archives and checksums
 release/
 integration/attended_scan_status.json
+integration/attended_spycloud.json
 integration/attended_salesforce_id_writebacks.json
 integration/attended_salesforce_id_writebacks.tmp
 integration/attended_surface_validation.json

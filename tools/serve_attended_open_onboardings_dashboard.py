@@ -31,7 +31,7 @@ import sys
 from threading import Lock, Thread
 from time import monotonic
 import webbrowser
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -48,6 +48,8 @@ from tools.attended_ce_only_playwright import (
     SCAN_STATUS_COMPLETED,
     SCAN_STATUS_FAILED,
     SCAN_STATUS_PATH,
+    SPYCLOUD_OK_OUTCOMES,
+    SPYCLOUD_STATE_PATH,
     VALIDATION_PATH,
     RunnerStateUnavailable,
     bootstrap_leonardo_session,
@@ -76,6 +78,7 @@ from tools.attended_ce_only_playwright import (
     reset_leonardo_profile,
     reset_runner_record,
     run_inventory_precheck,
+    run_production_duplicate_check,
     surface_fill_source,
     surface_scope_summary,
 )
@@ -581,7 +584,7 @@ def start_attended_validation_all() -> bool:
     return _start_runner_mode("--validate-all")
 
 
-VALIDATION_STATUSES = frozenset({"ok", "drift", "unknown", "info"})
+VALIDATION_STATUSES = frozenset({"ok", "drift", "unknown", "info", "warn"})
 VALIDATION_GROUPS = ("Account", "Licence", "Settings", "Domains", "People", "Scan")
 
 
@@ -637,11 +640,13 @@ def _validation_section(reference: str, notice: str = "", now: datetime | None =
     checks = result["checks"]  # type: ignore[assignment]
     drift = [c for c in checks if c["status"] == "drift"]  # type: ignore[union-attr]
     unknown = [c for c in checks if c["status"] == "unknown"]  # type: ignore[union-attr]
+    warned = [c for c in checks if c["status"] == "warn"]  # type: ignore[union-attr]
     stale = now > result["expires_at"]  # type: ignore[operator]
-    cls, icon = ("source-blocked", "!") if drift else (("source-warn", "!") if unknown else ("source-ready", "✓"))
+    cls, icon = (("source-blocked", "!") if drift else (("source-warn", "!") if unknown or warned else ("source-ready", "✓")))
     title = (f"{len(drift)} difference(s) found" if drift
-             else (f"Verified, {len(unknown)} check(s) unconfirmed" if unknown else "Everything matches"))
-    marks = {"ok": "✓", "drift": "✗", "unknown": "?", "info": "·"}
+             else (f"Verified, {len(unknown)} check(s) unconfirmed" if unknown
+                   else (f"Verified, {len(warned)} warning(s)" if warned else "Everything matches")))
+    marks = {"ok": "✓", "drift": "✗", "unknown": "?", "info": "·", "warn": "!"}
     rows = ""
     for group in VALIDATION_GROUPS:
         items = [c for c in checks if c["group"] == group]  # type: ignore[union-attr]
@@ -656,7 +661,8 @@ def _validation_section(reference: str, notice: str = "", now: datetime | None =
                 else:
                     detail = (" · expected " + escape(_validation_value(item.get("expected")))
                               + ", found " + escape(_validation_value(item.get("found"))))
-            style = " style='color:var(--bad);font-weight:600'" if item["status"] == "drift" else ""
+            style = (" style='color:var(--bad);font-weight:600'" if item["status"] == "drift"
+                     else " style='color:#8a6d1a;font-weight:600'" if item["status"] == "warn" else "")
             lines.append(f"<span{style}>{marks[item['status']]} {escape(item['check'])}{detail}</span>")
         rows += f"<dt>{escape(group)}</dt><dd>{'<br>'.join(lines)}</dd>"
     plan_note = ""
@@ -670,8 +676,76 @@ def _validation_section(reference: str, notice: str = "", now: datetime | None =
             f"<p>Observed {escape(observed)}" + (" · <b>stale, validate again</b>" if stale else "") + ". "
             "Compared with the onboarding plan; names, domains, and emails are checked but not stored.</p>"
             + plan_note + started + button
-            + "<details class='fold'" + (" open" if drift else "") + "><summary>" + str(len(checks)) + " checks</summary>"
+            + "<details class='fold'" + (" open" if drift or warned else "") + "><summary>" + str(len(checks)) + " checks</summary>"
             "<dl>" + rows + "</dl></details></section>")
+
+
+def start_attended_spycloud_check(reference: str) -> bool:
+    """Launch the read-only SpyCloud dry run (opens Edit, reports the checkbox, Cancel). Never passes --confirm-write:
+    the save that turns SpyCloud OFF is a Leonardo write and stays a CLI step."""
+    return REFERENCE.fullmatch(reference) is not None and _start_runner_mode("--co", reference, "--spycloud-off")
+
+
+SPYCLOUD_MESSAGES = {
+    "spycloud_off_verified": "SpyCloud is OFF (saved and read back).",
+    "spycloud_already_off": "SpyCloud is already OFF; nothing was saved.",
+    "spycloud_dry_run_on": "SpyCloud is still ON (dry run; nothing was saved).",
+    "spycloud_readback_still_on": "A save was made but Leonardo still shows SpyCloud ON.",
+    "spycloud_save_id_mismatch": "Leonardo's edit reply named a different tenant. Check the tenants in Leonardo Development.",
+}
+
+
+def attended_spycloud_states() -> dict[str, dict[str, object]]:
+    """Load the per-CO SpyCloud outcomes; absence means none. Malformed entries are dropped."""
+    try:
+        raw = json.loads(SPYCLOUD_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    states: dict[str, dict[str, object]] = {}
+    for reference, value in raw.items():
+        try:
+            if not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict):
+                continue
+            outcome = value.get("outcome")
+            if not isinstance(outcome, str) or not re.fullmatch(r"[a-z_]{1,64}", outcome):
+                continue
+            if value.get("mode") not in ("standalone", "dry_run", "after_create"):
+                continue
+            states[reference] = {"outcome": outcome, "mode": value["mode"],
+                                 "observed_at": datetime.fromisoformat(value["observed_at"]),
+                                 "ok": outcome in SPYCLOUD_OK_OUTCOMES}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return states
+
+
+def _spycloud_section(reference: str, notice: str = "") -> str:
+    """SpyCloud card for an onboarded CE / Case 3 CO (owner: SpyCloud must be OFF on LC tenants)."""
+    state = attended_spycloud_states().get(reference)
+    check = ("<form method='post' action='/attended/spycloud-check'><input type='hidden' name='reference' value='"
+             + escape(reference) + "'><button type='submit' class='ghost sm'>Check SpyCloud (read-only)</button></form>")
+    started = ("<p class='note'>A read-only SpyCloud check was started in the automation browser (it opens Edit and "
+               "cancels). Reload this page in about 30 seconds.</p>" if notice == "spycloud-started" else "")
+    how = ("<p class='meta-line'>Turning it OFF is a Leonardo Development write and needs the operator's approval: run "
+           "<code>--co " + escape(reference) + " --spycloud-off --confirm-write</code>.</p>")
+    if state is None:
+        return ("<section class='stat' aria-labelledby='spycloud-title'><div class='stat-head'>"
+                "<h2 id='spycloud-title'>SpyCloud</h2></div><p>Not checked yet. The owner requires SpyCloud OFF on "
+                "Credential Exposure tenants; Leonardo creates them with it ON.</p>" + started + check + how + "</section>")
+    ok = bool(state["ok"])
+    outcome = str(state["outcome"])
+    message = SPYCLOUD_MESSAGES.get(outcome, "SpyCloud was not verified OFF. Reason: " + outcome + ".")
+    observed = state["observed_at"].strftime("%Y-%m-%d %H:%M")  # type: ignore[union-attr]
+    headline = "SpyCloud is OFF" if ok else "SpyCloud still ON — run SpyCloud off"
+    cls, icon = ("source-ready", "✓") if ok else ("source-warn", "!")
+    return ("<section class='stat " + cls + "' aria-labelledby='spycloud-title'><div class='stat-head'>"
+            f"<span class='readiness-icon' aria-hidden='true'>{icon}</span>"
+            f"<h2 id='spycloud-title'>{escape(headline)}</h2></div><p>{escape(message)}</p>"
+            f"<dl><dt>Result</dt><dd><code>{escape(outcome)}</code></dd><dt>Observed</dt><dd>{escape(observed)} "
+            f"({escape(str(state['mode']).replace('_', ' '))})</dd></dl>" + started + check + ("" if ok else how)
+            + "<p class='meta-line'>Local record from Leonardo Development; Salesforce is not changed.</p></section>")
 
 
 def start_attended_scan_status(reference: str) -> bool:
@@ -693,6 +767,75 @@ SCAN_STATES = {
     "scan_failed": ("source-blocked", "Scan failed", "Review the tenant in Leonardo Development."),
     "unrecognized": ("source-blocked", "Unrecognized scan status", "Leonardo returned a value this dashboard does not recognize. Check the tenant in Leonardo Development."),
 }
+
+
+SCAN_EXEC_STATES = ("done", "running", "no_executions", "unrecognized")
+_SCAN_ENUM = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,39}")
+
+
+def _scan_executions_from_entry(value: dict[str, object]) -> dict[str, object]:
+    """Validated per-execution fields of one stored entry; anything malformed is dropped (the row status stays)."""
+    state, raw = value.get("execution_state"), value.get("executions")
+    if state not in SCAN_EXEC_STATES or not isinstance(raw, list) or len(raw) > 200:
+        return {}
+    executions: list[dict[str, object]] = []
+    try:
+        for item in raw:
+            entry: dict[str, object] = {}
+            for key in ("campaign_type", "execution_type", "status"):
+                text = item.get(key)
+                if text is not None and not (isinstance(text, str) and _SCAN_ENUM.fullmatch(text)):
+                    return {}
+                entry[key] = text
+            for key in ("start", "end"):
+                text = item.get(key)
+                entry[key] = datetime.fromisoformat(text) if text is not None else None
+            duration = item.get("duration_ms")
+            if duration is not None and (not isinstance(duration, int) or isinstance(duration, bool) or duration < 0):
+                return {}
+            entry["duration_ms"] = duration
+            executions.append(entry)
+        since = value.get("running_since")
+        since = datetime.fromisoformat(since) if since is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return {}
+    return {"executions": executions, "execution_state": state, "running_since": since}
+
+
+def _clock(moment: datetime | None) -> str:
+    """Local wall-clock text for a stored (UTC) time."""
+    if moment is None:
+        return "unknown"
+    return (moment.astimezone() if moment.tzinfo else moment).strftime("%Y-%m-%d %H:%M")
+
+
+def _hms(milliseconds: int) -> str:
+    seconds = milliseconds // 1000
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+def _scan_executions_html(observation: dict[str, object]) -> str:
+    """Headline and per-execution list from the Details > Duration Per Scan read (empty if not read)."""
+    state = observation.get("execution_state")
+    if state is None:
+        return ""
+    executions: list[dict[str, object]] = observation["executions"]  # type: ignore[assignment]
+    if state == "running":
+        headline = f"Running since {_clock(observation.get('running_since'))}"  # type: ignore[arg-type]
+    elif state == "done":
+        finished = [e for e in executions if e["end"] is not None and e["duration_ms"] is not None]
+        last = max(finished, key=lambda e: e["end"], default=None)  # type: ignore[arg-type,return-value]
+        headline = ("Done · " + _hms(last["duration_ms"]) + " (last finished execution)") if last else "Done"  # type: ignore[arg-type]
+    elif state == "no_executions":
+        headline = "No scan executions yet"
+    else:
+        headline = "Unrecognized execution status"
+    items = "".join(
+        f"<li><code>{escape(str(e['campaign_type'] or 'unknown'))}</code> · {escape(str(e['status'] or 'unknown'))}"
+        f" · started {escape(_clock(e['start']))}"  # type: ignore[arg-type]
+        f" · {escape(_hms(e['duration_ms']) if isinstance(e['duration_ms'], int) else 'no duration')}</li>"
+        for e in executions)
+    return (f"<p><b>{escape(headline)}</b></p>" + (f"<ul class='meta-line'>{items}</ul>" if items else ""))
 
 
 def attended_scan_statuses() -> dict[str, dict[str, object]]:
@@ -728,7 +871,8 @@ def attended_scan_statuses() -> dict[str, dict[str, object]]:
                 state = ("scan_completed" if status_enum in SCAN_STATUS_COMPLETED
                          else "scan_failed" if status_enum in SCAN_STATUS_FAILED else "scan_started")
             statuses[reference] = {"state": state, "status_enum": status_enum, "last_recon_scan": last,
-                                   "duration_ms": duration, "observed_at": observed, "expires_at": expires}
+                                   "duration_ms": duration, "observed_at": observed, "expires_at": expires,
+                                   **_scan_executions_from_entry(value)}
         except (KeyError, TypeError, ValueError):
             continue
     return statuses
@@ -760,7 +904,7 @@ def _scan_status_section(reference: str, notice: str = "", now: datetime | None 
     return ("<section class='stat" + (" " + cls if cls else "") + "' aria-labelledby='scan-status-title'><div class='stat-head'>"
             f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span>"
             f"<h2 id='scan-status-title'>Leonardo scan status · {escape(title)}</h2></div><p>{escape(message)}</p>"
-            "<dl>" + rows + "</dl>" + started + refresh
+            + _scan_executions_html(observation) + "<dl>" + rows + "</dl>" + started + refresh
             + "<p class='meta-line'>Local observation from Leonardo Development; Salesforce is not changed.</p></section>")
 
 
@@ -2279,7 +2423,7 @@ def history_card(history: ClosedHistory | None, read_at: str, failed: bool = Fal
 
 
 def history_tile(history: ClosedHistory | None, failed: bool = False) -> str:
-    """The main-dashboard tile that summarizes the closed queue and opens the History tab."""
+    """The filter-bar chip that summarizes the closed queue and opens the History tab."""
     kpis = history.kpis if history is not None else None
     if kpis is not None:
         delta = kpis.completed_30d - kpis.completed_prev_30d
@@ -2290,8 +2434,8 @@ def history_tile(history: ClosedHistory | None, failed: bool = False) -> str:
     else:
         number, label = "—", "Closed history"
         sub = "Unavailable · open to retry" if failed else "Monthly trend"
-    return (f"<a class='tile hist' href='/history'><b>{number}</b><span>{escape(label)} "
-            f"<i aria-hidden='true'>&rarr;</i></span><small>{escape(sub)}</small></a>")
+    return (f"<a class='fchip hist' href='/history'><b>{number}</b> {escape(label)} "
+            f"<small>{escape(sub)}</small> <i aria-hidden='true'>&rarr;</i></a>")
 
 
 def page_history(history: ClosedHistory | None, failed: bool = False) -> str:
@@ -2412,109 +2556,199 @@ def _age_days(submitted: str | None, today: date) -> str:
         return "—"
 
 
+QUEUE_SORTS = frozenset({"start", "co", "queue", "age"})
+_QUEUE_RANK = {"ready": 0, "review": 1, "validation": 2, "scanning": 3}
+_QUEUE_CHIP = {"ready": "chip-ok", "review": "chip-bad", "validation": "chip-warn", "scanning": "chip-info"}
+_NOT_YET_ONBOARDED = frozenset({"ready", "review", "validation"})
+
+
+@_display_cached
+def queue_start_dates(references: tuple[str, ...]) -> dict[str, str]:
+    """Subscription start date (ISO) per CO, read-only, from the DealHub range in its comments.
+
+    One batched query; only the validated date is kept (never the comment).
+    A CO without exactly one valid range simply has no entry.
+    """
+    dates: dict[str, str] = {}
+    for reference, summary in subscription_summaries(references).items():
+        try:
+            dates[reference] = date.fromisoformat(summary["Subscription_Start"]).isoformat()
+        except ValueError:
+            continue
+    return dates
+
+
+def _start_cell(start: str | None, key: str, today: date) -> str:
+    if not start:
+        return "<span class='muted'>—</span>"
+    parsed = date.fromisoformat(start)
+    days = (parsed - today).days
+    label = f"{parsed:%b} {parsed.day}" + ("" if parsed.year == today.year else f", {parsed.year}")
+    if days < 0:
+        when = (f"<span class='chip chip-bad'>overdue {-days}d</span>" if key in _NOT_YET_ONBOARDED
+                else f"<span class='sub'>{-days}d ago</span>")
+    else:
+        when = "<span class='sub'>today</span>" if days == 0 else f"<span class='sub'>in {days}d</span>"
+    return f"<b>{label}</b>{when}"
+
+
 def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
                runner_state: dict[str, dict[str, str]] | None = None, runner_state_unavailable: bool = False,
                history: ClosedHistory | None = None, history_failed: bool = False,
-               read_at: str | None = None, today: date | None = None, scan_started: bool = False) -> str:
-    """Render the open-onboardings dashboard: queue tiles, a closed-history tile
-    that opens the History tab, and one aligned table per queue."""
+               read_at: str | None = None, today: date | None = None, scan_started: bool = False,
+               start_dates: dict[str, str] | None = None, start_dates_unavailable: bool = False,
+               sort: str = "", direction: str = "") -> str:
+    """Render the open-onboardings dashboard: one filter bar (queues, history) and one sortable table.
+
+    Default order is the soonest subscription start first (blank dates last),
+    then Ready, Manual review, Needs validation, Follow-up. Without ``start_dates``
+    (not given, or ``start_dates_unavailable`` after a failed read) the page orders by submission date.
+    """
     today = today or date.today()
     read_at = read_at or datetime.now().strftime("%H:%M")
     state = runner_state or {}
+    starts = start_dates or {}
     allowed = {key for key, _label, _helper in QUEUE_DEFINITIONS}
     selected = selected_queue if selected_queue in allowed else ""
+    sort = sort if sort in QUEUE_SORTS else "start"
+    if direction not in ("asc", "desc"):
+        direction = "desc" if sort == "age" else "asc"
+    descending = direction == "desc"
     classified = []
     for row in rows:
         record = state.get(row.get("Name") or "")
         key, step, owner = classify_queue_row(row, record)
         classified.append((row, record, key, step, owner))
-    by_queue: dict[str, list[tuple]] = {key: [] for key, _label, _helper in QUEUE_DEFINITIONS}
-    for item in classified:
-        by_queue[item[2]].append(item)
-    for items in by_queue.values():
-        items.sort(key=lambda item: (item[4] != "you", item[0].get("Submission_Date__c") or "9999", item[0].get("Name") or ""))
+    counts = {key: sum(1 for item in classified if item[2] == key) for key in allowed}
     need_you = sum(1 for item in classified if item[4] == "you")
-    duplicates = sum(1 for item in by_queue["review"] if item[1] and (item[1].get("result") or "").startswith("duplicate"))
-    automated = sum(1 for item in by_queue["ready"] if item[4] == "you" and route_for(item[0]))
-    running = sum(1 for item in by_queue["ready"] if item[4] == "runner")
-    scanning = sum(1 for item in by_queue["scanning"] if item[4] == "leonardo")
-    tile_subs = {
-        "review": f"{duplicates} duplicate" if duplicates else "Runs and data gaps",
+    duplicates = sum(1 for item in classified if item[2] == "review" and item[1]
+                     and (item[1].get("result") or "").startswith("duplicate"))
+    automated = sum(1 for item in classified if item[2] == "ready" and item[4] == "you" and route_for(item[0]))
+    running = sum(1 for item in classified if item[2] == "ready" and item[4] == "runner")
+    waiting = sum(1 for item in classified if item[2] == "scanning" and item[4] == "leonardo")
+    hints = {
+        "review": f"{duplicates} duplicate" if duplicates else "Failed runs and data gaps",
         "ready": f"{automated} automated" + (f" · {running} running" if running else ""),
         "validation": "DealHub term check",
-        "scanning": f"{scanning} waiting on Leonardo" if scanning else "Salesforce, scan, user",
+        "scanning": f"{waiting} waiting on Leonardo" if waiting else "Salesforce, scan, user",
     }
+    visible = [item for item in classified if not selected or item[2] == selected]
 
-    def tile(href: str, key: str, number: int, label: str, sub: str) -> str:
-        current = " aria-current='page'" if key == selected else ""
-        state_class = " zero" if number == 0 else (" alert" if key == "review" else "")
-        return (f"<a class='tile{state_class}' href='{href}'{current}><b>{number}</b><span>{escape(label)}</span>"
-                f"<small>{escape(sub)}</small></a>")
+    def start_of(item: tuple) -> str:
+        name = item[0].get("Name") or ""
+        return starts.get(name, "") if start_dates is not None else (item[0].get("Submission_Date__c") or "")[:10]
 
-    tiles = ("<nav class='tiles' aria-label='Queues and history'>"
-             + tile("/", "", len(rows), "All open", f"{need_you} need you")
-             + "".join(tile(f"/?queue={key}", key, len(by_queue[key]), label, tile_subs[key])
-                       for key, label, _helper in QUEUE_DEFINITIONS)
-             + history_tile(history, failed=history_failed) + "</nav>")
+    def sort_value(item: tuple) -> str:
+        if sort == "co":
+            return item[0].get("Name") or ""
+        if sort == "queue":
+            return str(_QUEUE_RANK.get(item[2], 9))
+        if sort == "age":  # days since submission, so the oldest sorts "highest" (default: descending)
+            try:
+                return f"{(today - date.fromisoformat((item[0].get('Submission_Date__c') or '')[:10])).days + 100000:06d}"
+            except ValueError:
+                return ""
+        return start_of(item)
+
+    base = sorted(visible, key=lambda item: (_QUEUE_RANK.get(item[2], 9), item[0].get("Name") or ""))
+    filled = sorted((item for item in base if sort_value(item)), key=sort_value, reverse=descending)
+    ordered = filled + [item for item in base if not sort_value(item)]  # blanks always last
+
+    def link(queue: str | None = None, **changes: str) -> str:
+        params = {"queue": selected if queue is None else queue, "sort": sort if sort != "start" else "",
+                  "dir": direction if direction != ("desc" if sort == "age" else "asc") else "", **changes}
+        query = urlencode({name: value for name, value in params.items() if value})
+        return "/?" + query if query else "/"
+
+    def chip(href: str, label: str, number: int, current: bool, extra: str = "") -> str:
+        on = " on" if current else ""
+        aria = " aria-current='page'" if current else ""
+        return f"<a class='fchip{on}{extra}' href='{escape(href)}'{aria}>{escape(label)} <b>{number}</b></a>"
+
+    chips = chip(link(""), "All open", len(rows), not selected)
+    for key, label, _helper in QUEUE_DEFINITIONS:
+        number = counts[key]
+        extra = " ok" if key == "ready" and number else (" bad" if key == "review" and number else "")
+        chips += chip(link(key), label, number, key == selected, extra)
+    notes = [f"{need_you} need you"] + [hints[key] for key in ("ready", "review") if counts[key]]
+    bar = (f"<nav class='fbar' aria-label='Queues and history'><span class='fgroup'>{chips}</span>"
+           f"<span class='note'>{escape(' · '.join(notes))}</span>{history_tile(history, failed=history_failed)}</nav>")
     banner = ""
     if runner_state_unavailable:
         banner = _outcome_banner("info", "The local attended-run record could not be read, so run results are not shown. "
                                  "Open the CO page before acting.", "runner_state_unavailable",
                                  headline="Local run results unavailable")
-    head_row = ("<thead><tr><th scope='col'>Onboarding</th><th scope='col' class='opt'>Product</th>"
-                "<th scope='col'>Automation</th><th scope='col' class='opt'>Salesforce</th><th scope='col'>Next step</th>"
-                "<th scope='col' class='num'><abbr title='Days since submission'>Age</abbr></th></tr></thead>")
-    cards = ""
-    for key, label, helper in QUEUE_DEFINITIONS:
-        if selected and key != selected:
-            continue
-        items = by_queue[key]
-        if not items and not selected:
-            continue
-        if items:
-            body = ""
-            for row, record, _key, step, _owner in items:
-                reference = escape(row.get("Name") or "")
-                product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
-                leonardo = row.get("Local_Leonardo_State")
-                run = _run_chip(record)
-                drift = row.get("Local_Validation_Drift")
-                automation = (_route_chip(row) + (f"<span class='run'>{run}</span>" if run else "")
-                              + (f"<span class='sub'>Leonardo: {escape(leonardo)}</span>" if leonardo else "")
-                              + (f"<span class='sub' style='color:var(--bad)'>⚠ {escape(drift)} setting(s) differ</span>"
-                                 if drift not in (None, "0") else ""))
-                body += (
-                    f"<tr><td><a class='co' href='/co/{reference}'>{reference}"
-                    f"<span class='sub'>{escape(row.get('Account__r.Name') or 'Account unavailable')}</span></a></td>"
-                    f"<td class='opt'>{escape(_PRODUCT_SHORT.get(product or '', product or '—'))}"
-                    f"<span class='sub'>{escape(_TYPE_SHORT.get(onboarding_type or '', onboarding_type or '—'))}</span></td>"
-                    f"<td>{automation}</td>"
-                    f"<td class='opt'>{escape(row.get('Onboarding_Stage__c') or '—')}"
-                    f"<span class='sub'>{escape(row.get('Onboarding_Approval_Status__c') or '—')}</span></td>"
-                    f"<td>{step}</td><td class='num'>{_age_days(row.get('Submission_Date__c'), today)}</td></tr>")
-            inner = f"<table class='q'>{head_row}<tbody>{body}</tbody></table>"
-        else:
-            inner = f"<p class='empty'>Nothing in {escape(label)} right now. <a href='/'>Show all open ({len(rows)})</a></p>"
-        cards += (f"<section class='card queue-card' id='queue-{key}' aria-labelledby='queue-{key}-h'><div class='card-head'>"
-                  f"<h2 class='pill' id='queue-{key}-h'>{escape(label)}<b class='n'>{len(items)}</b></h2>"
-                  f"<span class='note'>{escape(helper)}</span></div>{inner}</section>")
-    if not rows:
-        cards = ("<section class='card'><div class='card-head'><h2 class='pill'>Open onboardings</h2></div>"
-                 f"<p class='empty'>No open onboardings. The Salesforce Open_Onboardings view returned 0 records at "
-                 f"{escape(read_at)}.</p></section>")
-    hidden = (f"<input type='hidden' name='queue' value='{escape(selected)}'>" if selected else "") + "<input type='hidden' name='refresh' value='1'>"
-    title = next((label for key, label, _helper in QUEUE_DEFINITIONS if key == selected), "Open onboardings")
-    head = (f"<div class='page-head'><h1>{escape(title)}</h1><div class='head-meta'><span>Read from Salesforce at "
-            f"{escape(read_at)}</span><form method='get' action='/'>{hidden}<button class='ghost' type='submit'>Refresh"
-            "</button></form><form method='post' action='/attended/scan-status-refresh-all'>"
+    if start_dates_unavailable and rows:
+        banner += ("<p class='note'>Subscription start dates could not be read from Salesforce, so the list is ordered "
+                   "by submission date.</p>")
+
+    def header(key: str, label: str, css: str = "") -> str:
+        active = key == sort
+        target = link(sort=key, dir=("asc" if descending else "desc") if active else "")
+        order = "descending" if descending else "ascending"
+        aria = f" aria-sort='{order}'" if active else ""
+        cls = f" class='{css}'" if css else ""
+        return f"<th scope='col'{cls}{aria}><a class='sort' href='{escape(target)}'>{escape(label)}</a></th>"
+
+    head_row = ("<thead><tr>" + header("start", "Start", "c-start") + header("co", "Onboarding", "stick")
+                + "<th scope='col'>Account</th>" + header("queue", "Queue")
+                + "<th scope='col' class='c-prod'>Product</th><th scope='col' class='c-sf'>Salesforce</th>"
+                "<th scope='col' class='c-auto'>Automation</th><th scope='col'>Next step</th>"
+                + header("age", "Age", "num") + "<th scope='col' class='c-act'><span class='sr'>Action</span></th></tr></thead>")
+    labels = {key: label for key, label, _helper in QUEUE_DEFINITIONS}
+    body = ""
+    for row, record, key, step, owner in ordered:
+        reference = escape(row.get("Name") or "")
+        product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
+        leonardo = row.get("Local_Leonardo_State")
+        run = _run_chip(record)
+        drift = row.get("Local_Validation_Drift")
+        automation = (_route_chip(row) + (f"<span class='run'>{run}</span>" if run else "")
+                      + (f"<span class='sub'>Leonardo: {escape(leonardo)}</span>" if leonardo else "")
+                      + (f"<span class='sub' style='color:var(--bad)'>⚠ {escape(drift)} setting(s) differ</span>"
+                         if drift not in (None, "0") else ""))
+        ready_row = key == "ready" and owner == "you"
+        action = (f"<a class='btn sm' href='/co/{reference}'>Review &amp; start</a>" if ready_row
+                  else f"<a href='/co/{reference}'>Open</a>")
+        row_class = " class='is-ready'" if ready_row else ""
+        body += (
+            f"<tr{row_class}>"
+            f"<td class='c-start'>{_start_cell(starts.get(row.get('Name') or '') or None, key, today)}</td>"
+            f"<td class='stick'><a class='co' href='/co/{reference}'>{reference}</a></td>"
+            f"<td>{escape(row.get('Account__r.Name') or 'Account unavailable')}</td>"
+            f"<td><span class='chip {_QUEUE_CHIP[key]}'>{escape(labels[key])}</span></td>"
+            f"<td class='c-prod'>{escape(_PRODUCT_SHORT.get(product or '', product or '—'))}"
+            f"<span class='sub'>{escape(_TYPE_SHORT.get(onboarding_type or '', onboarding_type or '—'))}</span></td>"
+            f"<td class='c-sf'>{escape(row.get('Onboarding_Stage__c') or '—')}"
+            f"<span class='sub'>{escape(row.get('Onboarding_Approval_Status__c') or '—')}</span></td>"
+            f"<td class='c-auto'>{automation}</td><td>{step}</td>"
+            f"<td class='num'>{_age_days(row.get('Submission_Date__c'), today)}</td><td class='c-act'>{action}</td></tr>")
+    if ordered:
+        table = f"<div class='tbl-wrap'><table class='dense'>{head_row}<tbody>{body}</tbody></table></div>"
+    elif rows:
+        helper_label = labels.get(selected, "this view")
+        table = f"<p class='empty'>Nothing in {escape(helper_label)} right now. <a href='/'>Show all open ({len(rows)})</a></p>"
+    else:
+        table = (f"<p class='empty'>No open onboardings. The Salesforce Open_Onboardings view returned 0 records at "
+                 f"{escape(read_at)}.</p>")
+    hidden = ((f"<input type='hidden' name='queue' value='{escape(selected)}'>" if selected else "")
+              + (f"<input type='hidden' name='sort' value='{escape(sort)}'>" if sort != "start" else "")
+              + "<input type='hidden' name='refresh' value='1'>")
+    title = labels.get(selected, "Open onboardings")
+    head = (f"<div class='page-head'><h1>{escape(title)}</h1><span class='note'>Read from Salesforce at "
+            f"{escape(read_at)}</span><div class='head-meta'><form method='get' action='/'>{hidden}"
+            "<button class='ghost' type='submit'>Refresh</button></form>"
+            "<details class='menu'><summary>More</summary><div class='menu-pop'>"
+            "<form method='post' action='/attended/scan-status-refresh-all'>"
             "<button class='ghost' type='submit' title='Read-only: reads each onboarded Surface tenant&#39;s scan status'>"
             "Refresh scan statuses</button></form><form method='post' action='/attended/validate-all'>"
             "<button class='ghost' type='submit' title='Read-only: compares each onboarded tenant with its plan'>"
-            "Validate all</button></form></div></div>")
+            "Validate all</button></form></div></details></div></div>")
     if scan_started:
         banner = ("<p class='note'>A read-only scan-status sweep of every onboarded Surface tenant was started in the "
                   "automation browser. Reload in about a minute.</p>") + banner
-    return _app_shell("Onboardings", head + tiles + banner + cards, active="onboardings")
+    return _app_shell("Onboardings", head + bar + banner + f"<section class='card tbl-card'>{table}</section>",
+                      active="onboardings", wide=True)
 
 
 def ce_only_eligible(row: dict[str, str | None]) -> bool:
@@ -2753,6 +2987,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         tiles = _validation_section(reference, notification)
         if route_for(row) != CE_ENGINE:
             tiles += _scan_status_section(reference, notification)
+        if route_for(row) in (CE_ENGINE, CASE3_ENGINE):
+            tiles += _spycloud_section(reference, notification)
         health = "<div class='health'>" + tiles + "</div>"
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
@@ -2786,7 +3022,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     return _app_shell(reference, main_html, active="onboardings")
 
 
-def render_dashboard(selected_queue: str = "", scan_started: bool = False) -> str:
+def render_dashboard(selected_queue: str = "", scan_started: bool = False, sort: str = "", direction: str = "") -> str:
     """Read the open queue (live), the local run records, and the cached
     closed-onboardings history for the history tile, then render the dashboard.
 
@@ -2810,10 +3046,18 @@ def render_dashboard(selected_queue: str = "", scan_started: bool = False) -> st
             history_failed = True
     else:
         history = cached_closed_history()
+    start_dates: dict[str, str] | None = None
+    start_dates_unavailable = False
+    if rows:
+        try:
+            start_dates = queue_start_dates(tuple(row["Name"] or "" for row in rows))
+        except ReadUnavailable:
+            start_dates_unavailable = True
     return page_queue(rows, selected_queue, runner_state=runner_state,
                       runner_state_unavailable=runner_state_unavailable,
                       history=history, history_failed=history_failed, read_at=display_read_at(),
-                      scan_started=scan_started)
+                      scan_started=scan_started, start_dates=start_dates,
+                      start_dates_unavailable=start_dates_unavailable, sort=sort, direction=direction)
 
 
 def page_salesforce_unavailable(failed: bool = True) -> str:
@@ -3271,6 +3515,59 @@ PENTERA_CSS = (
     ".operator{margin:14px 0 0;font-size:12px;color:#c9d1e0;word-break:break-all}.operator form{margin-top:6px}"
     ".banner-warn{background:var(--warn-bg)}.inv{overflow-x:auto}.inv th,.inv td{text-align:left!important;white-space:nowrap}"
     ".inv td:first-child{white-space:normal;min-width:160px}"
+    # Wide pages (2026-10-05): full-width main, filter bar, scrolling table with sticky header and first column.
+    "main.wide{max-width:none}.inv-card{padding:14px 16px}"
+    ".filterbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:0 0 12px}"
+    ".filterbar input[name=q]{width:220px;padding:6px 10px;border:1px solid var(--line);border-radius:6px;font:inherit}"
+    ".fgroup{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}"
+    ".fchip{padding:5px 11px;font-size:12.5px;font-weight:600;color:var(--heading);background:#fff;"
+    "border-right:1px solid var(--line)}.fchip:last-child{border-right:0}"
+    ".fchip:hover{background:#f3f7fe;text-decoration:none}.fchip.on{background:var(--info-bg);color:var(--info)}"
+    ".filterbar .count{margin-left:auto;color:var(--muted);font-size:12.5px}.filterbar .count b{color:var(--text)}"
+    ".inv-card .inv{max-height:70vh;min-height:320px;overflow:auto}"
+    ".inv-card table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px}"
+    ".inv-card th{position:sticky;top:0;z-index:2;background:#fff;color:var(--muted);font-size:12px;font-weight:600;"
+    "padding:7px 10px;border-bottom:1px solid var(--line)}"
+    ".inv-card td{padding:6px 10px;border-bottom:1px solid var(--line);vertical-align:top}"
+    ".inv-card .stick{position:sticky;left:0;z-index:1;background:#fff;border-right:1px solid var(--line);font-weight:600}"
+    ".inv-card th.stick{z-index:3}.inv-card tbody tr:hover td{background:#f8fafc}"
+    ".inv-card abbr{text-decoration:none;cursor:help}.inv-card td.stick{max-width:300px}"
+    ".inv-card td.dom{max-width:230px;overflow:hidden;text-overflow:ellipsis}.inv-card td .sub code{font-size:11px}"
+    ".sortlink{color:inherit;font-weight:600}.sortlink:hover{color:var(--primary-dark);text-decoration:none}"
+    # Open onboardings (2026-10-05): one filter bar and one dense, sortable table.
+    ".page-head>.note{margin-top:4px}.tbl-card{padding:0;overflow:hidden}.tbl-card .empty{padding:18px 20px}"
+    ".fbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:0 0 14px}"
+    ".fbar .fchip b{font-weight:700;color:var(--text)}.fchip.ok b{color:var(--ok)}.fchip.bad b{color:var(--bad)}"
+    ".fchip.ok{background:var(--ok-bg)}.fchip.on{background:var(--info-bg)}"
+    ".fbar>.fchip{border:1px solid var(--line);border-radius:8px;margin-left:auto}"
+    ".fbar>.fchip small{color:var(--muted);font-weight:400}"
+    ".tbl-wrap{max-height:calc(100vh - 210px);overflow:auto}"
+    ".dense{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}"
+    ".dense th{position:sticky;top:0;z-index:2;background:#f9fafb;color:var(--muted);font-size:12px;font-weight:600;"
+    "padding:8px 10px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}"
+    ".dense td{padding:8px 10px;vertical-align:top;border-bottom:1px solid var(--line)}"
+    ".dense th a.sort{color:inherit;font-weight:600}.dense th a.sort:hover{color:var(--primary-dark);text-decoration:none}"
+    ".dense th a.sort::after{content:' \\2195';opacity:.3}"
+    ".dense th[aria-sort=ascending] a.sort::after{content:' \\2191';opacity:1;color:var(--primary)}"
+    ".dense th[aria-sort=descending] a.sort::after{content:' \\2193';opacity:1;color:var(--primary)}"
+    ".dense .stick{position:sticky;left:0;z-index:1;background:var(--card);border-right:1px solid var(--line)}"
+    ".dense th.stick{z-index:3;background:#f9fafb}.dense .num{text-align:right;white-space:nowrap}"
+    ".dense .co{display:block;font-weight:700}.dense .run{display:block;margin-top:4px}"
+    ".dense .c-start{white-space:nowrap}.dense .c-start b{display:block}.dense .c-act{white-space:nowrap;text-align:right}"
+    ".dense tbody tr:hover td{background:#f8fafc}"
+    ".dense tr.is-ready td{background:#f6fdf0}.dense tr.is-ready td:first-child{box-shadow:inset 3px 0 0 var(--ok)}"
+    ".dense tbody tr.is-ready:hover td{background:#eef9e4}"
+    ".btn{display:inline-block;background:var(--primary);color:#fff;border-radius:6px;padding:4px 12px;font-weight:600}"
+    ".btn:hover{background:var(--primary-dark);color:#fff;text-decoration:none}"
+    ".sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}"
+    "details.menu{position:relative}details.menu>summary{cursor:pointer;list-style:none;padding:8px 14px;"
+    "border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--heading);font-weight:600}"
+    "details.menu>summary::-webkit-details-marker{display:none}"
+    ".menu-pop{position:absolute;right:0;top:calc(100% + 4px);z-index:5;display:grid;gap:6px;padding:10px;"
+    "background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 20px #0000001f;width:max-content}"
+    ".menu-pop form{margin:0}"
+    "@media(max-width:1300px){.dense .c-prod,.dense .c-sf{display:none}}"
+    "@media(max-width:1100px){.dense .c-auto{display:none}}"
     # CO detail page (2026-10-04): summary strip, one next-step card, follow-ups,
     # tenant-health tiles, and folded secondary panels. Existing tokens only.
     ".page-head .acct{color:var(--muted);font-size:15px;font-weight:600}"
@@ -3316,7 +3613,7 @@ PENTERA_CSS = (
 )
 
 
-def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "") -> str:
+def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", wide: bool = False) -> str:
     """Wrap a page in the Pentera-styled shell (navy sidebar + light canvas)."""
     def nav(href: str, label: str, key: str) -> str:
         return "<a href='" + href + "'" + (" class='active'" if key == active else "") + ">" + label + "</a>"
@@ -3326,10 +3623,10 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "") 
         "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body><div class='shell'>"
         "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
         + nav("/", "Onboardings", "onboardings") + nav("/history", "History", "history")
-        + nav("/inventory", "Tenants", "inventory")
+        + nav("/tenants", "Tenants", "tenants") + nav("/inventory", "DevOps", "inventory")
         + nav("/connection", "Sessions", "connection") + _session_chip() + _operator_block() +
         "<div class='side-foot'>Attended · localhost only</div></aside>"
-        "<main>" + main_html + "</main></div></body></html>"
+        "<main" + (" class='wide'" if wide else "") + ">" + main_html + "</main></div></body></html>"
     )
 
 
@@ -3792,6 +4089,45 @@ def _duplicate_precheck_row(reference: str) -> str:
             + "<span class='note'>Optional and read-only; Start runs the live duplicate check anyway.</span></div>")
 
 
+def _created_date(value: object) -> str:
+    """A tenant's created date as YYYY-MM-DD (UTC): epoch milliseconds (Dev) or an ISO string (Redash); else "—"."""
+    try:
+        if type(value) is int:
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).date().isoformat()
+        if isinstance(value, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}([T ].*)?", value):
+            return value[:10]
+    except (OverflowError, OSError, ValueError):
+        pass
+    return "—"
+
+
+def _clone_precheck_section(clone: object) -> str:
+    """The production duplicate check: whether the CO already has a tenant in production (Redash clone)."""
+    if not isinstance(clone, dict):
+        return ""
+    title = "<h2 class='section-title'>Production duplicate check</h2>"
+    result = clone.get("result")
+    if result == "duplicate_production_clone_match":
+        rows = "".join(
+            "<tr><td>" + escape(str(m.get("account_name") or "")) + "</td><td><code>" + escape(str(m.get("id") or ""))
+            + "</code></td><td>" + escape(_created_date(m.get("created"))) + "</td><td>"
+            + escape(", ".join(PRECHECK_REASON_TEXT.get(r, r) for r in m.get("reasons") or ()))
+            + ("" if not m.get("is_deleted") else " <span class='chip chip-warn'>deleted</span>") + "</td></tr>"
+            for m in clone.get("matches") or () if isinstance(m, dict))
+        return (title + "<div class='banner banner-warn'><strong>This CO already has a tenant in production.</strong> "
+                "A production onboarding of it would be blocked as a duplicate.</div><div class='qh-table inv'><table>"
+                "<thead><tr><th>Tenant</th><th>ID</th><th>Created</th><th>Why</th>"
+                "</tr></thead><tbody>" + rows + "</tbody></table></div>"
+                "<p class='note'>Production clone data as of " + escape(str(clone.get("captured_at") or "—")) + ".</p>")
+    if result == "production_clone_no_match":
+        return (title + "<p class='note'>No match among " + escape(str(clone.get("tenants_checked"))) + " production "
+                "tenants (data as of " + escape(str(clone.get("captured_at") or "—")) + "). This is not a clearance: "
+                "the clone can be up to a day behind, and a production onboarding still runs its own live check.</p>")
+    return (title + "<div class='banner banner-warn'><strong>No answer:</strong> the production clone is not usable "
+            "(<code>" + escape(str(clone.get("reason") or result))
+            + "</code>). A production onboarding would be blocked until it is (fail closed).</div>")
+
+
 def page_duplicate_precheck(reference: str, report: dict[str, object]) -> str:
     """Result of the read-only pre-check; a "no match" is never a clearance."""
     ref = escape(reference)
@@ -3813,36 +4149,122 @@ def page_duplicate_precheck(reference: str, report: dict[str, object]) -> str:
                    "<p class='note'>This inventory predates alternate domains; refresh it to include them.</p>"))
     elif result == "inventory_unavailable":
         body = ("<div class='banner banner-warn'>No usable tenant inventory (<code>" + escape(str(report.get("reason")))
-                + "</code>). Refresh it on the Tenants page. Start still runs the live duplicate check.</div>")
+                + "</code>). Refresh it on the DevOps tab. Start still runs the live duplicate check.</div>")
     else:
         body = "<div class='banner banner-warn'>The CO source could not be read (<code>" + escape(result) + "</code>).</div>"
     main_html = ("<a class='crumb' href='/co/" + ref + "'>&larr; " + ref + "</a><div class='page-head'><h1>Duplicate "
                  "pre-check</h1><span class='chip chip-info'>" + label + "</span></div><section class='card'>" + body
+                 + _clone_precheck_section(report.get("production_clone"))
                  + "<p class='note'>Inventory captured " + escape(str(report.get("captured_at") or "—")) + ". Rules: same "
                  "tenant name or primary domain (as the live check), plus the CO's domains against each tenant's "
                  "alternate domains.</p></section>")
     return _app_shell(reference + " duplicate pre-check", main_html, active="onboardings")
 
 
-def render_inventory(query: str = "", notice: str = "") -> str:
-    """Server-rendered tenant table (the CSP blocks scripts); ?q= filters by tenant name."""
+PRODUCTION_CHECK_ROUTES = ((CE_ENGINE, "New CE (credential exposure)"), (SURFACE_ENGINE, "New Surface"),
+                           (CASE3_ENGINE, "Case 3 (Surface and CE)"))
+
+
+def production_check_form(reference: str = "", route_value: str = CE_ENGINE) -> str:
+    """Read-only duplicate check of one CO against the production clone (Redash); never writes anywhere."""
+    options = "".join("<option value='" + value + "'" + (" selected" if value == route_value else "") + ">"
+                      + escape(label) + "</option>" for value, label in PRODUCTION_CHECK_ROUTES)
+    return ("<section class='card'><h2 class='section-title'>Check a CO for duplicates in production</h2>"
+            "<form method='post' action='/attended/production-duplicate-check' class='filterbar'>"
+            "<input name='reference' value='" + escape(reference[:20]) + "' placeholder='CO-0801' pattern='CO-[0-9]{4,10}' "
+            "required aria-label='CO reference'><select name='route' aria-label='Route'>" + options + "</select>"
+            "<button type='submit'>Check production clone</button></form>"
+            "<div class='banner banner-warn'>The production clone is a copy that can be up to about a day behind "
+            "production. A \"no match\" is not a clearance: a production onboarding must still pass the live check. "
+            "If the clone is missing or stale the check fails closed.</div></section>")
+
+
+def production_check_result(reference: str, report: dict[str, object]) -> str:
+    """The production gate's answer for one CO, or why the CO could not be checked."""
+    gate = report.get("production_clone")
+    ref = escape(reference)
+    if not isinstance(gate, dict):
+        return ("<section class='card'><div class='banner banner-warn'><strong>" + ref + " could not be checked</strong> "
+                "(<code>" + escape(str(report.get("result"))) + "</code>). Nothing was started or written.</div></section>")
+    return "<section class='card'><h2 class='section-title'>" + ref + "</h2>" + _clone_precheck_section(gate) + "</section>"
+
+
+INVENTORY_SCAN_FILTERS = (("", "All"), ("COMPLETED", "Completed"), ("RUNNING", "Running"),
+                          ("INCOMPLETE", "Incomplete"), ("NONE", "No status"))
+INVENTORY_CO_FILTERS = (("", "Any CO"), ("linked", "With CO"), ("none", "No CO"))
+INVENTORY_SORTS = frozenset({"name", "co", "licence", "end", "domain", "scan", "status"})
+_SCAN_CHIP = {"COMPLETED": "chip-ok", "RUNNING": "chip-warn", "INCOMPLETE": "chip-bad"}
+
+
+def _inventory_sort_date(value: object) -> str:
+    if type(value) is int:
+        try:
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            return ""
+    return value[:10] if isinstance(value, str) else ""
+
+
+def _inventory_sort_value(tenant: dict, key: str, co_ref: str | None) -> str:
+    licence, scan = tenant.get("license") or {}, tenant.get("scan") or {}
+    if key == "co":
+        return co_ref or ""
+    if key == "licence":
+        return str(licence.get("type") or "").casefold()
+    if key == "end":
+        return _inventory_sort_date(licence.get("expiration_date"))
+    if key == "domain":
+        return str(tenant.get("account_domain") or "").casefold()
+    if key == "scan":
+        return str(scan.get("last_recon_scan_utc") or "")
+    if key == "status":
+        return str(scan.get("status") or "")
+    return str(tenant.get("account_name") or "").casefold()
+
+
+INVENTORY_ENVIRONMENTS = ("dev", "prod-clone")
+PROD_CLONE_MISSING_TEXT = ("No production-clone inventory has been collected yet. The collector "
+                           "(tools/redash_inventory_collector.py --collect) writes it; it needs no sign-in.")
+
+
+def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direction: str = "",
+                     scan: str = "", co: str = "", env: str = "dev", top: str = "") -> str:
+    """Server-rendered tenant table (the CSP blocks scripts); sort and filters are query parameters.
+
+    One environment per tab: "dev" is the DevOps tab (/inventory), "prod-clone" the Tenants tab (/tenants).
+    ``top`` is extra HTML shown above the table (the production duplicate-check form and result).
+    """
     now = datetime.now(timezone.utc)
-    refresh_form = ("<form method='post' action='/attended/inventory-refresh'><button type='submit'>Refresh inventory"
-                    "</button></form>")
-    head = ("<div class='page-head'><h1>Tenant inventory</h1><span class='chip chip-info'>"
-            + escape(inventory.ENVIRONMENTS["dev"].label) + "</span>" + refresh_form + "</div>")
-    note = ("<p class='note'>Read-only copy of Leonardo Development's tenant list, with personal data removed (no user "
-            "names, emails, phones, or domain lists). It is informational: Start always re-checks Leonardo live for "
-            "duplicates. Refresh also re-validates every onboarded CO from the same read.</p>")
+    env = env if env in INVENTORY_ENVIRONMENTS else "dev"
+    clone = env == "prod-clone"
+    environment = inventory.ENVIRONMENTS[env]
+    refresh_form = "" if clone else ("<form method='post' action='/attended/inventory-refresh'><button type='submit'>"
+                                     "Refresh inventory</button></form>")
+    base = "/tenants" if clone else "/inventory"
+    active = "tenants" if clone else "inventory"
+    title = "Tenants — Production (Redash clone)" if clone else "DevOps — Leonardo Development tenants"
+    head = ("<div class='page-head'><h1>" + escape(title) + "</h1><span class='chip chip-info'>"
+            + escape(environment.label) + "</span>" + refresh_form + "</div>")
+    if clone:
+        note = ("<p class='note'>Read-only copy of the <b>production</b> tenant list through Redash (saved query 251 on the "
+                "cloned database), with personal data removed. It refreshes on a schedule and needs no sign-in. It is "
+                "informational: a match can block a duplicate, a missing match never clears one, and Start always "
+                "re-checks Leonardo live. Dashboard CO links are not shown for production tenants.</p>")
+    else:
+        note = ("<p class='note'>Read-only copy of Leonardo Development's tenant list, with personal data removed (no user "
+                "names, emails, phones, or domain lists). It is informational: Start always re-checks Leonardo live for "
+                "duplicates. Refresh also re-validates every onboarded CO from the same read.</p>")
     started = ("<div class='banner'><strong>Export started.</strong> It runs read-only in the automation browser; reload "
-               "this page in a minute.</div>" if notice == "started" else "")
+               "this page in a minute.</div>" if notice == "started" and not clone else "")
     try:
-        payload = inventory.load_latest(inventory_root(), "dev", max_age=INVENTORY_DISPLAY_MAX_AGE, now=now)
+        payload = inventory.load_latest(inventory_root(), env, max_age=INVENTORY_DISPLAY_MAX_AGE, now=now)
     except inventory.InventoryError as error:
-        body = "<section class='card'><p>" + escape(INVENTORY_ERROR_TEXT.get(error.reason, error.reason)) + "</p></section>"
-        return _app_shell("Tenant inventory", head + started + body + note, active="inventory")
+        text = (PROD_CLONE_MISSING_TEXT if clone and error.reason == "inventory_snapshot_missing"
+                else INVENTORY_ERROR_TEXT.get(error.reason, error.reason))
+        body = "<section class='card'><p>" + escape(text) + "</p></section>"
+        return _app_shell(title, head + top + started + body + note, active=active)
     try:
-        readbacks = attended_leonardo_readbacks()
+        readbacks = {} if clone else attended_leonardo_readbacks()
     except ReadUnavailable:
         readbacks = {}
     matched = inventory.match_readbacks(payload, readbacks)
@@ -3851,46 +4273,112 @@ def render_inventory(query: str = "", notice: str = "") -> str:
     conflicts = sorted(ref for ref, tenant_id in matched["by_reference"].items() if tenant_id == "conflict")
     age = timedelta(seconds=int(payload.get("age_seconds", 0)))
     stale = age > INVENTORY_STALE_AFTER
-    drift = payload.get("schema_drift") or {}
-    drift_count = sum(len(drift.get(key, [])) for key in ("unknown", "missing", "type_changed"))
+    drift = payload.get("schema_drift") if isinstance(payload.get("schema_drift"), dict) else {}
+    drift_count = sum(len(drift.get(key) or []) for key in ("unknown", "missing", "type_changed"))
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    newest = source.get("data_latest_modified")
     summary = ("<div class='banner" + (" banner-warn" if stale else "") + "'><strong>"
-               + escape(str(payload.get("environment_label") or inventory.ENVIRONMENTS["dev"].label))
-               + "</strong> · Captured " + escape(str(payload.get("captured_at")))
-               + " (" + str(int(age.total_seconds() // 3600)) + " h ago" + ("; stale, refresh before relying on it" if stale else "")
-               + ") · " + str(payload.get("row_count")) + " tenants (" + str(payload.get("deleted_count")) + " deleted, "
-               + str(payload.get("uuid_missing_count", 0)) + " without UUID) · "
+               + escape(str(payload.get("environment_label") or environment.label))
+               + "</strong> · " + ("Data as of " if clone else "Captured ") + escape(str(payload.get("captured_at")))
+               + (" · newest change in the source " + escape(str(newest)) if clone and newest else "")
+               + " (" + str(int(age.total_seconds() // 3600)) + " h ago" + ("; stale, " + ("check that the collector is running" if clone else "refresh before relying on it") if stale else "")
+               + ") · " + escape(str(payload.get("row_count"))) + " tenants (" + escape(str(payload.get("deleted_count")))
+               + " deleted, " + escape(str(payload.get("uuid_missing_count", 0))) + " without UUID) · "
                + str(drift_count) + " schema change(s)"
                + (" · <strong>ID conflict for " + escape(", ".join(conflicts)) + "</strong>: re-check live" if conflicts else "")
                + "</div>")
     needle = " ".join(query.split()).casefold()[:80]
-    rows_html = ""
-    shown = 0
-    for tenant in sorted(payload.get("tenants") or [], key=lambda t: str(t.get("account_name") or "").casefold()):
+    sort = sort if sort in INVENTORY_SORTS else "name"
+    descending = direction == "desc"
+    scan = scan if scan in {value for value, _ in INVENTORY_SCAN_FILTERS} else ""
+    co = co if co in {value for value, _ in INVENTORY_CO_FILTERS} else ""
+    selected = []
+    for tenant in payload.get("tenants") or []:
         name = str(tenant.get("account_name") or "")
+        ref = co_by_tenant.get(tenant.get("id"))
+        status = (tenant.get("scan") or {}).get("status")
         if needle and needle not in name.casefold():
             continue
-        shown += 1
+        if scan and (status or "NONE").upper() != scan:
+            continue
+        if (co == "linked" and not ref) or (co == "none" and ref):
+            continue
+        selected.append((tenant, ref, _inventory_sort_value(tenant, sort, ref)))
+    name_key = lambda item: str(item[0].get("account_name") or "").casefold()  # noqa: E731
+    filled = sorted((item for item in selected if item[2]), key=lambda item: (item[2], name_key(item)), reverse=descending)
+    empty = sorted((item for item in selected if not item[2]), key=name_key)  # blanks always last
+    rows_html = ""
+    for tenant, ref, _value in filled + empty:
         licence = tenant.get("license") or {}
-        scan = tenant.get("scan") or {}
-        ref = co_by_tenant.get(tenant.get("id"))
+        tenant_scan = tenant.get("scan") or {}
+        status = tenant_scan.get("status")
         co_cell = ("<a href='/co/" + escape(ref) + "'>" + escape(ref) + "</a>") if ref else "<span class='muted'>no CO</span>"
         state = "deleted" if tenant.get("is_deleted") else ("enabled" if tenant.get("enabled") else "disabled")
+        alt = tenant.get("alternate_domains")
+        domain = escape(str(tenant.get("account_domain") or "—"))
+        if alt:
+            domain += "<span class='sub'>+" + str(len(alt)) + " alternate</span>"
+        quota = [licence.get(key) for key in ("assets_number", "domains_number", "subdomains_number")]
+        quota_cell = " / ".join("—" if value is None else str(value) for value in quota) if any(
+            value is not None for value in quota) else "—"
+        scanned = str(tenant_scan.get("last_recon_scan_utc") or "")[:16].replace("T", " ")
+        scan_cell = (escape(scanned) + "<span class='sub'>" + _inventory_duration(tenant_scan.get("duration_ms")) + "</span>"
+                     if scanned else "<span class='muted'>never</span>")
+        status_cell = ("<span class='chip " + _SCAN_CHIP.get(status.upper(), "chip-neutral") + "'>" + escape(status.title()) + "</span>"
+                       if status else "<span class='muted'>—</span>")
+        interval = str(tenant.get("scanning_interval") or "—").replace("_", " ").casefold()
+        spy = tenant.get("spycloud_enabled")  # owner: must be OFF on LC tenants; boolean only
+        spy_cell = {True: "<span class='chip chip-warn'>ON</span>", False: "<span class='chip chip-ok'>OFF</span>"}.get(
+            spy, "<span class='muted'>—</span>")
         rows_html += (
-            "<tr><td>" + escape(name) + "</td><td>" + co_cell + "</td><td><code>" + escape(str(tenant.get("id") or ""))
-            + "</code>" + ("" if tenant.get("account_uuid") else " <span class='chip chip-warn'>no UUID</span>")
-            + "</td><td>" + escape(str(licence.get("type") or "—")) + "</td><td>"
+            "<tr><td class='stick'>" + escape(str(tenant.get("account_name") or "")) + "<span class='sub'><code>"
+            + escape(str(tenant.get("id") or "")) + "</code>"
+            + ("" if tenant.get("account_uuid") else " <span class='chip chip-warn'>no UUID</span>")
+            + "</span></td><td>" + co_cell
+            + "</td><td>" + escape(str(licence.get("type") or "—")) + "<span class='sub'>"
             + _inventory_date(licence.get("start_date")) + " → " + _inventory_date(licence.get("expiration_date"))
-            + "</td><td>" + escape(str(scan.get("last_recon_scan_utc") or "—")[:16].replace("T", " ")) + "</td><td>"
-            + _inventory_duration(scan.get("duration_ms")) + "</td><td>" + escape(str(scan.get("status") or "—"))
-            + "</td><td>" + state + "</td></tr>")
-    search = ("<form method='get' action='/inventory' class='actions'><input name='q' value='" + escape(query[:80])
-              + "' placeholder='Filter by tenant name'> <button class='ghost' type='submit'>Filter</button></form>")
-    table = ("<section class='card'>" + search + "<p class='note'>" + str(shown) + " shown. Last scan times are UTC. "
-             "Snapshot file: " + escape(str(payload.get("environment"))) + " folder (leonardo-dev-inventory-*) under %LOCALAPPDATA%\\SurfaceOnboarding"
-             "\\leonardo-inventory (CSV beside it).</p><div class='qh-table inv'><table><thead><tr><th>Tenant</th><th>CO</th>"
-             "<th>ID</th><th>Licence</th><th>Start → End</th><th>Last scan (UTC)</th><th>Duration</th><th>Status</th>"
-             "<th>Account</th></tr></thead><tbody>" + rows_html + "</tbody></table></div></section>")
-    return _app_shell("Tenant inventory", head + started + summary + table + note, active="inventory")
+            + "</span></td><td class='dom' title='" + escape(str(tenant.get("account_domain") or ""), quote=True) + "'>"
+            + domain + "</td><td class='num'>" + escape(quota_cell) + "</td><td>" + scan_cell
+            + "</td><td>" + status_cell + "</td><td>" + escape(interval) + "</td><td>" + spy_cell + "</td><td>" + state + "</td></tr>")
+
+    def link(**changes: str) -> str:
+        params = {"q": query[:80], "sort": sort, "dir": "desc" if descending else "asc", "scan": scan, "co": co,
+                  **changes}
+        return base + "?" + urlencode({key: value for key, value in params.items() if value})
+
+    def header(key: str, label: str, numeric: bool = False) -> str:
+        active = key == sort
+        arrow = (" ▼" if descending else " ▲") if active else ""
+        target = link(sort=key, dir="desc" if active and not descending else "asc")
+        aria = (" aria-sort='" + ("descending" if descending else "ascending") + "'") if active else ""
+        return ("<th scope='col'" + (" class='num'" if numeric else "") + aria + "><a class='sortlink' href='"
+                + escape(target) + "'>" + escape(label) + arrow + "</a></th>")
+
+    def chips(options: tuple, current: str, param: str) -> str:
+        return "".join("<a class='fchip" + (" on" if value == current else "") + "' href='" + escape(link(**{param: value}))
+                       + "'" + (" aria-current='true'" if value == current else "") + ">" + escape(label) + "</a>"
+                       for value, label in options)
+
+    hidden = "".join("<input type='hidden' name='" + key + "' value='" + escape(value) + "'>"
+                     for key, value in (("sort", sort if sort != "name" else ""), ("dir", direction if direction == "desc" else ""),
+                                        ("scan", scan), ("co", co)) if value)
+    search = ("<form method='get' action='" + base + "' class='filterbar'><input name='q' value='" + escape(query[:80])
+              + "' placeholder='Search tenant name' aria-label='Search tenant name'>" + hidden
+              + "<button class='ghost' type='submit'>Search</button><span class='fgroup' aria-label='Scan status'>"
+              + chips(INVENTORY_SCAN_FILTERS, scan, "scan") + "</span><span class='fgroup' aria-label='Onboarding'>"
+              + chips(INVENTORY_CO_FILTERS, co, "co") + "</span><span class='count'><b>" + str(len(selected))
+              + "</b> of " + str(len(payload.get("tenants") or [])) + " tenants</span></form>")
+    table = ("<section class='card inv-card'>" + search
+             + "<div class='inv'><table><thead><tr>" + header("name", "Tenant · ID").replace("<th ", "<th class='stick' ", 1)
+             + header("co", "CO") + header("licence", "Licence · start → end") + header("domain", "Domain")
+             + "<th scope='col' class='num'><abbr title='Assets / domains / subdomains in the licence'>Quota</abbr></th>"
+             + header("scan", "Last scan (UTC)") + header("status", "Scan status") + "<th scope='col'>Interval</th>"
+             "<th scope='col'><abbr title='SpyCloud flag of the Leaked Credentials settings; the owner requires OFF on LC tenants'>SpyCloud</abbr></th>"
+             "<th scope='col'>Account</th></tr></thead><tbody>" + rows_html
+             + "</tbody></table></div><p class='note'>Last scan times are UTC. Snapshot: "
+             + escape(str(payload.get("environment"))) + " folder under %LOCALAPPDATA%\\SurfaceOnboarding\\leonardo-inventory "
+             "(CSV beside it).</p></section>")
+    return _app_shell(title, head + top + started + summary + table + note, active=active, wide=True)
 
 
 # Dashboard login (2026-10-03, owner decision): the operator's Salesforce SSO.
@@ -4141,12 +4629,13 @@ SESSION_GATED_ROUTES = {
     "/attended/start-ce-only-runner": "start", "/attended/start-co0702-ce-only-runner": "start",
     "/attended/start-surface-runner": "start",
     "/attended/validate": "read", "/attended/scan-status-refresh": "read", "/attended/verify-uncertain": "read",
+    "/attended/spycloud-check": "read",
 }
 
 
 POST_ROUTES = frozenset({
     "/attended/prepare-sessions", "/attended/session-recheck", "/attended/inventory-refresh",
-    "/attended/duplicate-precheck",
+    "/attended/duplicate-precheck", "/attended/production-duplicate-check",
     "/attended/salesforce-login", "/attended/leonardo-dev-session-check", "/attended/leonardo-dev-session-bootstrap",
     "/attended/leonardo-dev-session-reset", "/attended/leonardo-dev-browser-close",
     "/attended/rerun-comment-evaluation", "/attended/rerun-co0745-renewal-evaluation",
@@ -4155,7 +4644,7 @@ POST_ROUTES = frozenset({
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
-    "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain",
+    "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
 })
 
@@ -4271,14 +4760,26 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/":
                 selected_queue = parse_qs(parsed.query).get("queue", [""])[0]
                 scan_started = parse_qs(parsed.query).get("scan", [""])[0] == "started"
-                self.send_page(HTTPStatus.OK, render_dashboard(selected_queue, scan_started)); return
+                self.send_page(HTTPStatus.OK, render_dashboard(
+                    selected_queue, scan_started, parse_qs(parsed.query).get("sort", [""])[0],
+                    parse_qs(parsed.query).get("dir", [""])[0])); return
             if path == "/connection":
                 self.send_page(HTTPStatus.OK, page_salesforce_unavailable(failed=False)); return
             if path == "/history":
                 self.send_page(HTTPStatus.OK, render_history()); return
-            if path == "/inventory":
+            if path == "/inventory" and parse_qs(parsed.query).get("env", [""])[0] == "prod-clone":
+                # The production clone moved to its own tab; keep old links and bookmarks working.
+                kept = {key: value[0] for key, value in parse_qs(parsed.query).items()
+                        if key in ("q", "sort", "dir", "scan", "co") and value and value[0]}
+                self.send_redirect("/tenants" + ("?" + urlencode(kept) if kept else "")); return
+            if path in ("/inventory", "/tenants"):
                 params = parse_qs(parsed.query)
-                self.send_page(HTTPStatus.OK, render_inventory(params.get("q", [""])[0], params.get("refresh", [""])[0]))
+                clone = path == "/tenants"
+                self.send_page(HTTPStatus.OK, render_inventory(
+                    params.get("q", [""])[0], "" if clone else params.get("refresh", [""])[0],
+                    sort=params.get("sort", [""])[0], direction=params.get("dir", [""])[0],
+                    scan=params.get("scan", [""])[0], co=params.get("co", [""])[0],
+                    env="prod-clone" if clone else "dev", top=production_check_form() if clone else ""))
                 return
             if path in ("/attended/ce-only-runner-status", "/attended/co0702-runner-status"):
                 ref = parse_qs(parsed.query).get("ref", [CO0702_REFERENCE])[0]
@@ -4294,6 +4795,7 @@ class Handler(BaseHTTPRequestHandler):
             if notice not in {"verified", "blocked"}: notice = ""
             if parse_qs(parsed.query).get("scan", [""])[0] == "started": notice = "started"
             if parse_qs(parsed.query).get("validation", [""])[0] == "started": notice = "validation-started"
+            if parse_qs(parsed.query).get("spycloud", [""])[0] == "started": notice = "spycloud-started"
             id_write = parse_qs(parsed.query).get("id-write", [""])[0]
             if id_write in ID_WRITEBACK_RESULTS: notice = "id-write:" + id_write
             if match:
@@ -4623,6 +5125,16 @@ class Handler(BaseHTTPRequestHandler):
                                + "'>Return</a></p>"); return
             self.send_page(HTTPStatus.OK, page_duplicate_precheck(reference, run_inventory_precheck(reference, route)))
             return
+        if path == "/attended/production-duplicate-check":
+            # Read-only: one Salesforce source read and the production-clone snapshot; no Leonardo, no browser.
+            route = exact_form_value(form, "route") or CE_ENGINE
+            if route not in (CE_ENGINE, *SURFACE_ROUTES):
+                self.send_page(HTTPStatus.BAD_REQUEST, "<!doctype html><title>Invalid request</title><p>Choose a supported route.</p>")
+                return
+            self.send_page(HTTPStatus.OK, render_inventory(
+                env="prod-clone", top=production_check_form(reference, route_value=route)
+                + production_check_result(reference, run_production_duplicate_check(reference, route))))
+            return
         if path == "/attended/validate":
             if reference not in attended_leonardo_readbacks():
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not onboarded</title><p>No local readback exists for " + escape(reference) + ". Nothing was started.</p>")
@@ -4631,6 +5143,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Validation unavailable</title><p>The read-only validation could not be started on this desktop.</p>")
                 return
             self.send_redirect("/co/" + reference + "?validation=started")
+            return
+        if path == "/attended/spycloud-check":
+            # Read-only dry run (opens Edit, reports the checkbox, Cancel): never --confirm-write.
+            if reference not in attended_leonardo_readbacks():
+                self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not onboarded</title><p>No local readback exists for " + escape(reference) + ". Nothing was started.</p>")
+                return
+            if not start_attended_spycloud_check(reference):
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>SpyCloud check unavailable</title><p>The read-only SpyCloud check could not be started on this desktop.</p>")
+                return
+            self.send_redirect("/co/" + reference + "?spycloud=started")
             return
         if path == "/attended/scan-status-refresh":
             # Read-only: launches the runner's --scan-status mode for an onboarded CO.

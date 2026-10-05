@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 import json
 import os
 import re
@@ -280,7 +281,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         tile = dashboard.history_tile(self._history_fixture())
         self.assertIn("href='/history'", tile)
         self.assertIn("<b>41</b>", tile)
-        self.assertIn("<span>Completed <i aria-hidden='true'>&rarr;</i></span>", tile)
+        self.assertIn("</b> Completed <small>", tile)
         self.assertIn("30 days · +6 vs prior", tile)
         self.assertIn("Unavailable · open to retry", dashboard.history_tile(None, failed=True))
         self.assertIn("Monthly trend", dashboard.history_tile(None))  # cold cache on a filtered view
@@ -378,20 +379,21 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         page = page_queue(rows, runner_state={"CO-9003": {"source_revision": "r", "result": "readback_verified"}},
                           history=self._history_fixture(), read_at="20:45", today=date(2026, 9, 29))
         self.assertIn("class='side'", page)  # the shared Pentera shell
-        self.assertIn("<nav class='tiles' aria-label='Queues and history'>", page)
+        self.assertIn("<nav class='fbar' aria-label='Queues and history'>", page)
+        self.assertIn("<main class='wide'>", page)  # the full-width layout
         self.assertIn("<a href='/history'>History</a>", page)  # the History tab in the top navigation
         self.assertIn("aria-current='page'", page)  # "All open" tile is current
-        self.assertIn("<table class='q'>", page)
+        self.assertIn("<table class='dense'>", page)
         self.assertIn("Start onboarding", page)
         self.assertIn("Update Salesforce", page)  # an onboarded CO is a follow-up, not "ready" again
         self.assertIn("chip chip-ok'>Onboarded", page)
         self.assertIn("19 d", page)
         self.assertIn("Read from Salesforce at 20:45", page)
-        self.assertIn("<a class='tile hist' href='/history'><b>41</b>", page)  # the closed-queue summary tile
+        self.assertIn("<a class='fchip hist' href='/history'><b>41</b>", page)  # the closed-queue summary chip
         self.assertNotIn("id='history'", page)  # the full chart lives on the History tab
         self.assertNotIn("<script", page)
         filtered = page_queue(rows, "ready", history=self._history_fixture(), read_at="20:45")
-        self.assertIn("class='tile hist'", filtered)  # the tile stays put on filtered views
+        self.assertIn("class='fchip hist'", filtered)  # the chip stays put on filtered views
         self.assertIn("<h1>Ready to onboard</h1>", filtered)
 
     def test_dashboard_page_degrades_when_run_records_are_unreadable(self):
@@ -408,16 +410,18 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         rows = [{"Name": "CO-9002", "Onboarding_Approval_Status__c": "Pending", "Onboarding_Stage__c": "New"}]
         with patch.object(dashboard, "queue_rows", return_value=rows), \
                 patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "queue_start_dates", return_value={}), \
                 patch.object(dashboard, "closed_history", side_effect=dashboard.ReadUnavailable()):
             page = dashboard.render_dashboard("")
         self.assertIn("Unavailable · open to retry", page)
         self.assertIn("CO-9002", page)
         with patch.object(dashboard, "queue_rows", return_value=rows), \
                 patch.object(dashboard, "load_runner_state", return_value={}), \
+                patch.object(dashboard, "queue_start_dates", return_value={}), \
                 patch.object(dashboard, "cached_closed_history", return_value=self._history_fixture()), \
                 patch.object(dashboard, "closed_history", side_effect=AssertionError("filtered views skip the history read")):
             filtered = dashboard.render_dashboard("validation")
-        self.assertIn("<b>41</b><span>Completed", filtered)  # served from the cache peek
+        self.assertIn("<b>41</b> Completed", filtered)  # served from the cache peek
 
     def test_connection_page_only_claims_a_failure_on_the_failure_path(self):
         with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "desktop"}, clear=False):
@@ -722,6 +726,37 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("stale, refresh", stale)
         self.assertIn("Not read yet", missing)
         self.assertIn("action='/attended/scan-status-refresh'", missing)
+
+    def test_scan_status_card_shows_executions_escaped(self):
+        from datetime import datetime as _dt
+        base = {"state": "scan_started", "status_enum": "RUNNING", "last_recon_scan": None, "duration_ms": None,
+                "observed_at": "2026-10-01T12:00:00", "expires_at": "2026-10-01T18:00:00"}
+        done = [{"campaign_type": "LEAKED_CREDENTIALS_DISCOVERY", "execution_type": "SCHEDULED", "status": "DONE",
+                 "start": "2026-10-01T10:00:00+00:00", "end": "2026-10-01T10:30:05+00:00", "duration_ms": 1_805_000},
+                {"campaign_type": "SURFACE_RECON", "execution_type": None, "status": "DONE",
+                 "start": "2026-10-01T09:00:00+00:00", "end": "2026-10-01T11:00:00+00:00", "duration_ms": 7_200_000}]
+        running = [dict(done[0], status="PENDING", end=None, duration_ms=None)]
+        entries = {"CO-0649": dict(base, execution_state="done", executions=done),
+                   "CO-0650": dict(base, execution_state="running", running_since="2026-10-01T10:00:00+00:00",
+                                   executions=running),
+                   "CO-0651": dict(base, execution_state="done",
+                                   executions=[dict(done[0], campaign_type="<script>")]),
+                   "CO-0652": dict(base, execution_state="done", executions=[dict(done[0], start="soon")])}
+        with self._scan_file(entries):
+            now = _dt(2026, 10, 1, 13, 0)
+            finished = dashboard._scan_status_section("CO-0649", now=now)
+            active = dashboard._scan_status_section("CO-0650", now=now)
+            hostile = dashboard._scan_status_section("CO-0651", now=now)
+            malformed = dashboard._scan_status_section("CO-0652", now=now)
+        self.assertIn("Done · 02:00:00 (last finished execution)", finished)
+        self.assertIn("<code>LEAKED_CREDENTIALS_DISCOVERY</code>", finished)
+        self.assertIn("00:30:05", finished)
+        self.assertIn("Running since 2026-10-01", active)
+        self.assertIn("no duration", active)
+        self.assertNotIn("<script>", hostile)  # rejected at load; the row status still renders
+        self.assertIn("Leonardo scan status · Scan started", malformed)
+        self.assertNotIn("Done", malformed)
+        self.assertNotIn("<ul", malformed)
 
     def test_queue_shows_operator_step_after_a_completed_scan(self):
         row = {"Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
@@ -2276,6 +2311,85 @@ class SurfaceValidationCardTests(unittest.TestCase):
         page = page_queue(rows)
         self.assertIn("⚠ 1 setting(s) differ", page)
         self.assertIn("action='/attended/validate-all'", page)
+
+
+class QueueOrderingTests(unittest.TestCase):
+    """Open onboardings (2026-10-05): one table, soonest start first, filter chips."""
+
+    TODAY = date(2026, 10, 5)
+    ROWS = [
+        {"Name": "CO-9101", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+         "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding",
+         "Account__r.Name": "Late Co", "Submission_Date__c": "2026-09-20"},
+        {"Name": "CO-9102", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+         "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding",
+         "Account__r.Name": "Soon Co", "Submission_Date__c": "2026-09-25"},
+        {"Name": "CO-9103", "Onboarding_Approval_Status__c": "Pending", "Onboarding_Stage__c": "New",
+         "Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding",
+         "Account__r.Name": "Pending Co", "Submission_Date__c": "2026-10-01"},
+        {"Name": "CO-9104", "Onboarding_Approval_Status__c": "Pending", "Onboarding_Stage__c": "New",
+         "Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding",
+         "Account__r.Name": "No Date Co", "Submission_Date__c": "2026-09-01"},
+    ]
+    STARTS = {"CO-9101": "2026-11-20", "CO-9102": "2026-10-12", "CO-9103": "2026-10-03"}
+
+    def _page(self, queue="", **kwargs):
+        kwargs.setdefault("start_dates", self.STARTS)
+        return page_queue(self.ROWS, queue, read_at="09:00", today=self.TODAY, **kwargs)
+
+    @staticmethod
+    def _order(page):
+        return [ref for _, ref in sorted((page.index("href='/co/" + ref + "'"), ref)
+                                         for ref in ("CO-9101", "CO-9102", "CO-9103", "CO-9104"))]
+
+    def test_default_order_is_the_soonest_start_with_blank_dates_last(self):
+        page = self._page()
+        self.assertEqual(self._order(page), ["CO-9103", "CO-9102", "CO-9101", "CO-9104"])
+        self.assertIn("<b>Oct 12</b><span class='sub'>in 7d</span>", page)
+        self.assertIn("chip chip-bad'>overdue 2d", page)  # a pending CO whose start has passed
+        self.assertIn("aria-sort='ascending'><a class='sort' href='/?sort=start&amp;dir=desc'>Start", page)
+
+    def test_sort_links_and_directions(self):
+        by_start_desc = self._page(sort="start", direction="desc")
+        self.assertEqual(self._order(by_start_desc), ["CO-9101", "CO-9102", "CO-9103", "CO-9104"])
+        by_age = self._page(sort="age")
+        self.assertEqual(self._order(by_age), ["CO-9104", "CO-9101", "CO-9102", "CO-9103"])  # oldest submission first
+        by_queue = self._page(sort="queue")
+        self.assertEqual(self._order(by_queue)[:2], ["CO-9101", "CO-9102"])  # Ready rows come first, then by name
+        junk = self._page(sort="<script>", direction="sideways")
+        self.assertEqual(self._order(junk), ["CO-9103", "CO-9102", "CO-9101", "CO-9104"])
+        self.assertNotIn("<script", junk)
+
+    def test_ready_rows_stand_out_with_one_primary_action(self):
+        page = self._page()
+        self.assertEqual(page.count("<tr class='is-ready'>"), 2)
+        self.assertEqual(page.count("Review &amp; start"), 2)
+        self.assertIn("<a href='/co/CO-9103'>Open</a>", page)
+
+    def test_filter_chips_keep_the_sort_and_show_counts(self):
+        page = self._page(sort="co")
+        self.assertIn("href='/?sort=co'", page)  # All open
+        self.assertIn("href='/?queue=ready&amp;sort=co'", page)
+        self.assertIn("Ready to onboard <b>2</b>", page)
+        self.assertIn("Needs validation <b>2</b>", page)
+        filtered = self._page("validation")
+        self.assertIn("CO-9103", filtered)
+        self.assertNotIn("/co/CO-9101", filtered)
+        self.assertIn("aria-current='page'", filtered)
+
+    def test_without_start_dates_it_orders_by_submission_date_and_says_why(self):
+        failed = self._page(start_dates=None, start_dates_unavailable=True)
+        self.assertEqual(self._order(failed), ["CO-9104", "CO-9101", "CO-9102", "CO-9103"])
+        self.assertIn("start dates could not be read", failed)
+        self.assertNotIn("Oct 12", failed)
+        quiet = self._page(start_dates=None)
+        self.assertNotIn("could not be read", quiet)
+
+    def test_start_dates_keep_only_a_validated_date(self):
+        summaries = {"CO-9101": {"Subscription_Start": "2026-11-20", "Subscription_End": "2027-11-19"},
+                     "CO-9104": {"Subscription_Start": "Not verified", "Subscription_End": "Not verified"}}
+        with patch.object(dashboard, "subscription_summaries", return_value=summaries):
+            self.assertEqual(dashboard.queue_start_dates(("CO-9101", "CO-9104")), {"CO-9101": "2026-11-20"})
 
 
 class CreateUncertainDashboardTests(unittest.TestCase):

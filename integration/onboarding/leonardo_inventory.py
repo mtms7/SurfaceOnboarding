@@ -23,10 +23,12 @@ from typing import Any, Mapping
 
 SCHEMA_VERSION = 1
 MAX_TOTAL = 5000
+REDASH_MAX_TOTAL = 50_000  # the production clone holds ~5,400 tenants and grows
 MAX_PAGES = 200
 ACQUISITION = "ui_pagination_intercept"
+REDASH_ACQUISITION = "redash_saved_query_results"
 # <prefix>-inventory-<UTC stamp>.json; the unprefixed form is the first (2026-10-04) DEV export.
-SNAPSHOT_FILE = re.compile(r"(?:(leonardo-dev|backoffice-prod)-)?inventory-(\d{8}T\d{6}Z)\.json")
+SNAPSHOT_FILE = re.compile(r"(?:(leonardo-dev|backoffice-prod|redash-prod-clone)-)?inventory-(\d{8}T\d{6}Z)\.json")
 LATEST_FILE = "latest.json"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 _SAFE_KEY = re.compile(r"[A-Za-z_]\w{0,63}")
@@ -61,6 +63,11 @@ ENVIRONMENTS: dict[str, InventoryEnvironment] = {
     # Production BackOffice reads need a separate explicit approval.
     "prod": InventoryEnvironment("prod", "https://app.pentera.io", approved=False,
                                  label="PROD (BackOffice production)", file_prefix="backoffice-prod"),
+    # Owner approval 2026-10-05: read-only, automated use of the production *clone* (Redash data source
+    # "Prod (Cloned) - Mgmt") through one saved query (id 251). Never BackOffice itself, never a write.
+    "prod-clone": InventoryEnvironment("prod-clone", "https://redash.pentera.io", approved=True,
+                                       endpoint_path="/api/queries/251/results.json",
+                                       label="PROD (cloned copy via Redash)", file_prefix="redash-prod-clone"),
 }
 
 
@@ -136,7 +143,8 @@ _EXPECTED_SPEC: dict[str, str] = {
     "webDictionaryBruteForceEnabled": _FLAG, "webEnumerationCustomDictionaryPaths": _LIST,
     "webDorkingEnabled": _FLAG, "authenticatedTestingEnabled": _FLAG, "operatorAccounts": _LIST,
     "subDomainsReconEnabled": _FLAG, "leakedCredentialsSettings": "dict|NoneType",
-    "leakedCredentialsSettings.spyCloudSettings": "dict|NoneType", "campaignExecutionSettings": "dict|NoneType",
+    "leakedCredentialsSettings.spyCloudSettings": "dict|NoneType",
+    "leakedCredentialsSettings.spyCloudSettings.enabled": _FLAG, "campaignExecutionSettings": "dict|NoneType",
     "campaignExecutionSettings.domainsMultiAttackStackSettings": "dict|NoneType",
     "campaignExecutionSettings.domainsMultiAttackStackSettings.enabled": _FLAG,
     "campaignExecutionSettings.subDomainsMultiAttackStackSettings": "dict|NoneType",
@@ -163,7 +171,8 @@ _EXPECTED_SPEC: dict[str, str] = {
 EXPECTED_PATHS: dict[str, frozenset[str]] = {
     path: frozenset(types.split("|")) for path, types in _EXPECTED_SPEC.items()}
 # Newer fields not every tenant row carries yet: known when present, never "missing".
-OPTIONAL_PATHS = frozenset({"accountLicense.scanQuotaEnforcement", "accountLicense.authWebAttackQuotaEnforcement"})
+OPTIONAL_PATHS = frozenset({"accountLicense.scanQuotaEnforcement", "accountLicense.authWebAttackQuotaEnforcement",
+                            "leakedCredentialsSettings.spyCloudSettings.enabled"})
 # Objects whose further children are not modelled; only their listed children are compared.
 OPEN_PATHS = frozenset({
     "accountLicense.scanQuotaEnforcement", "accountLicense.authWebAttackQuotaEnforcement",
@@ -212,6 +221,16 @@ def _epoch_utc(value: Any) -> str | None:
         return datetime.fromtimestamp(epoch / 1000, tz=timezone.utc).strftime(_STAMP)
     except (OverflowError, OSError, ValueError):
         return None
+
+
+def spycloud_enabled(row: Mapping[str, Any]) -> bool | None:
+    """Owner decision 2026-10-05 (SpyCloud must be OFF on LC tenants): the ONLY thing kept from
+    ``leakedCredentialsSettings.spyCloudSettings`` is this boolean. True/False, or None when the
+    field is absent or not a boolean. Nothing else from that object (keys, ids, settings) is read.
+    """
+    settings = row.get("leakedCredentialsSettings")
+    spy = settings.get("spyCloudSettings") if isinstance(settings, dict) else None
+    return _typed(spy.get("enabled"), bool) if isinstance(spy, dict) else None
 
 
 def _terms_accepted(value: Any) -> bool | None:
@@ -271,10 +290,40 @@ def duplicate_precheck(payload: Mapping[str, Any], tenant_name: str, co_domains:
             reasons.append("alternate_domain")
         if reasons:
             matches.append({"id": tenant.get("id"), "account_name": tenant.get("account_name"),
-                            "is_deleted": tenant.get("is_deleted") is True, "reasons": reasons})
+                            "is_deleted": tenant.get("is_deleted") is True, "created": tenant.get("created"),
+                            "reasons": reasons})
     return {"result": "inventory_match" if matches else "inventory_no_match", "matches": matches,
             "tenants_checked": len(tenants),
             "alternate_domains_available": any("alternate_domains" in tenant for tenant in tenants)}
+
+
+PRODUCTION_GATE_MAX_AGE = timedelta(hours=6)  # the collector refreshes hourly; older data is not trusted for a gate
+
+
+def production_duplicate_gate(root: Path, tenant_name: str, co_domains: Any, *, now: datetime,
+                              max_age: timedelta = PRODUCTION_GATE_MAX_AGE) -> dict[str, Any]:
+    """Owner decision 2026-10-05: the duplicate validation for a PRODUCTION onboarding.
+
+    It reads only the production-clone snapshot (the Leonardo Development inventory keeps deciding Dev).
+    Fail closed: a match blocks, and so does a clone that is missing, stale, tampered with, or without
+    alternate domains. ``blocks`` False means only "continue to the live check in production": a missing
+    match is never a clearance.
+    """
+    try:
+        payload = load_latest(root, "prod-clone", max_age=max_age, now=now)
+    except InventoryError as error:
+        return {"result": "production_clone_unavailable", "blocks": True, "reason": error.reason, "matches": []}
+    found = duplicate_precheck(payload, tenant_name, co_domains)
+    gate = {"matches": found["matches"], "tenants_checked": found["tenants_checked"],
+            "captured_at": payload.get("captured_at"), "environment_label": payload.get("environment_label")}
+    if found["result"] == "inventory_match":
+        return {"result": "duplicate_production_clone_match", "blocks": True, **gate}
+    # The domain check is only as good as its data: no tenant with an alternate-domain list at all means the
+    # source dropped that field (an empty list is fine; null for every tenant is not).
+    if not any(isinstance(tenant, dict) and isinstance(tenant.get("alternate_domains"), list)
+               for tenant in payload.get("tenants") or ()):
+        return {"result": "production_clone_incomplete", "blocks": True, "reason": "alternate_domains_missing", **gate}
+    return {"result": "production_clone_no_match", "blocks": False, **gate}
 
 
 def minimize_row(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -321,6 +370,7 @@ def minimize_row(row: Mapping[str, Any]) -> dict[str, Any]:
             "allowed_modules": allowed_modules,
         },
         "toggles": {path: _typed(_path(row, path), bool) for path in TOGGLE_PATHS},
+        "spycloud_enabled": spycloud_enabled(row),
         "scan": {
             "last_recon_scan_ms": _typed(get("lastReconScan"), int),
             "last_recon_scan_utc": _epoch_utc(get("lastReconScan")),
@@ -368,6 +418,51 @@ def _page_parts(request: Any, response: Any) -> tuple[dict[str, Any], int, list[
     return server, total, rows
 
 
+def _validated_rows(table: Any, *, strict: bool = False) -> tuple[list[dict[str, Any]], int]:
+    """Check every row's identity fields; drop repeated ids; refuse an id/UUID conflict.
+
+    ``strict`` also refuses a repeated id whose name or deleted flag differs from its first row.
+    """
+    rows: list[dict[str, Any]] = []
+    first_seen: dict[str, tuple[Any, Any]] = {}
+    uuid_by_id: dict[str, str] = {}
+    id_by_uuid: dict[str, str] = {}
+    duplicates = 0
+    for row in table:
+        if not isinstance(row, dict) or not all(type(row.get(key)) is str and row[key]
+                                                for key in ("id", "accountName")):
+            raise InventoryError("inventory_schema_unavailable")
+        uuid = row.get("accountUuid", "")
+        if uuid is not None and (type(uuid) is not str or not uuid):
+            raise InventoryError("inventory_schema_unavailable")  # only an explicit null is tolerated
+        row_id, row_uuid = row["id"], uuid.casefold() if uuid else ""
+        if uuid_by_id.get(row_id, row_uuid) != row_uuid or (row_uuid and id_by_uuid.get(row_uuid, row_id) != row_id):
+            raise InventoryError("inventory_id_conflict")
+        if row_id in uuid_by_id:
+            if strict and first_seen[row_id] != (row["accountName"], row.get("isDeleted")):
+                raise InventoryError("inventory_id_conflict")
+            duplicates += 1
+            continue
+        first_seen[row_id] = (row["accountName"], row.get("isDeleted"))
+        uuid_by_id[row_id] = row_uuid
+        if row_uuid:
+            id_by_uuid[row_uuid] = row_id
+        rows.append(row)
+    return rows, duplicates
+
+
+def assemble_rows(table: Any, *, max_total: int = REDASH_MAX_TOTAL) -> AssembledInventory:
+    """A complete inventory that arrived as one result set (no paging): verify it and de-duplicate."""
+    rows, duplicates = _validated_rows(table, strict=True)
+    if not rows:
+        raise InventoryError("inventory_empty")
+    if len(rows) + duplicates > max_total:
+        raise InventoryError("inventory_too_large")
+    query = {"page_size": None, "sort": {"direction": None, "key": None}, "filter": "none"}
+    return AssembledInventory(tuple(rows), len(rows), 1, duplicates, sum(1 for row in rows if row.get("isDeleted") is True),
+                              query, sum(1 for row in rows if row.get("accountUuid") is None))
+
+
 def assemble_pages(pages: list[tuple[dict[str, Any], dict[str, Any]]], *, page_size: int) -> AssembledInventory:
     """Verify a complete, consistent capture of every page and return the de-duplicated rows."""
     if type(page_size) is not int or page_size <= 0:
@@ -391,28 +486,7 @@ def assemble_pages(pages: list[tuple[dict[str, Any], dict[str, Any]]], *, page_s
         if (type(offset) is not int or offset != index * page_size or server.get("items_per_page") != page_size
                 or server.get("sort") != first.get("sort") or server.get("filters") != first.get("filters")):
             raise InventoryError("inventory_inconsistent")
-    rows: list[dict[str, Any]] = []
-    uuid_by_id: dict[str, str] = {}
-    id_by_uuid: dict[str, str] = {}
-    duplicates = 0
-    for _, _, table in parts:
-        for row in table:
-            if not isinstance(row, dict) or not all(type(row.get(key)) is str and row[key]
-                                                    for key in ("id", "accountName")):
-                raise InventoryError("inventory_schema_unavailable")
-            uuid = row.get("accountUuid", "")
-            if uuid is not None and (type(uuid) is not str or not uuid):
-                raise InventoryError("inventory_schema_unavailable")  # only an explicit null is tolerated
-            row_id, row_uuid = row["id"], uuid.casefold() if uuid else ""
-            if uuid_by_id.get(row_id, row_uuid) != row_uuid or (row_uuid and id_by_uuid.get(row_uuid, row_id) != row_id):
-                raise InventoryError("inventory_id_conflict")
-            if row_id in uuid_by_id:
-                duplicates += 1
-                continue
-            uuid_by_id[row_id] = row_uuid
-            if row_uuid:
-                id_by_uuid[row_uuid] = row_id
-            rows.append(row)
+    rows, duplicates = _validated_rows(row for _, _, table in parts for row in table)
     if len(rows) != total_count:
         raise InventoryError("inventory_inconsistent")
     sort = first.get("sort") if isinstance(first.get("sort"), dict) else {}
@@ -466,21 +540,24 @@ def _rows_sha256(tenants: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def snapshot_payload(env: InventoryEnvironment, assembled: AssembledInventory, captured_at: datetime) -> dict[str, Any]:
+def snapshot_payload(env: InventoryEnvironment, assembled: AssembledInventory, captured_at: datetime, *,
+                     acquisition: str = ACQUISITION, source: Mapping[str, Any] | None = None,
+                     expected_paths: Mapping[str, frozenset[str]] = EXPECTED_PATHS) -> dict[str, Any]:
     if require_environment(env.name) != env:
         raise InventoryError("unknown_environment")
     if captured_at.tzinfo is None:
         raise ValueError("captured_at_requires_timezone")
     tenants = sorted((minimize_row(row) for row in assembled.rows), key=lambda tenant: tenant["id"])
     return {
+        **({"source": dict(source)} if source is not None else {}),
         "schema_version": SCHEMA_VERSION, "environment": env.name, "environment_label": env.label,
         "origin": env.origin,
-        "endpoint_path": env.endpoint_path, "acquisition": ACQUISITION,
+        "endpoint_path": env.endpoint_path, "acquisition": acquisition,
         "captured_at": captured_at.astimezone(timezone.utc).strftime(_STAMP), "query": dict(assembled.query),
         "total_count": assembled.total_count, "row_count": len(tenants), "deleted_count": assembled.deleted_count,
         "pages": assembled.pages, "duplicates_dropped": assembled.duplicates_dropped,
         "uuid_missing_count": assembled.uuid_missing_count,
-        "schema_drift": schema_drift(assembled.rows), "tenants": tenants, "rows_sha256": _rows_sha256(tenants),
+        "schema_drift": schema_drift(assembled.rows, expected_paths), "tenants": tenants, "rows_sha256": _rows_sha256(tenants),
     }
 
 
@@ -496,7 +573,7 @@ def env_dir(root: Path, env_name: str) -> Path:
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.{os.urandom(4).hex()}.tmp")  # unique per writer
     try:
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, path)
@@ -511,8 +588,8 @@ def _parse_stamp(value: Any) -> datetime:
         raise InventoryError("inventory_snapshot_tampered") from exc
 
 
-def prune(directory: Path, keep: int) -> list[str]:
-    """Delete snapshot files beyond the newest ``keep``; any other file is left alone."""
+def prune(directory: Path, keep: int, protect: str | None = None) -> list[str]:
+    """Delete snapshot files beyond the newest ``keep`` (never ``protect``); any other file is left alone."""
     if type(keep) is not int or keep < 1:
         raise ValueError("keep_must_be_positive")
     matches = [(SNAPSHOT_FILE.fullmatch(entry.name), entry.name) for entry in Path(directory).iterdir()
@@ -520,10 +597,11 @@ def prune(directory: Path, keep: int) -> list[str]:
     # Newest first by capture stamp (prefixed and legacy names sort differently by name).
     names = [name for match, name in sorted(((m, n) for m, n in matches if m), key=lambda item: item[0].group(2),
                                             reverse=True)]
-    for name in names[keep:]:
+    doomed = [name for name in names[keep:] if name != protect]
+    for name in doomed:
         (Path(directory) / name).unlink(missing_ok=True)
         (Path(directory) / name).with_suffix(".csv").unlink(missing_ok=True)  # its CSV goes with it
-    return names[keep:]
+    return doomed
 
 
 def write_snapshot(payload: Mapping[str, Any], root: Path, *, keep: int = 10) -> Path:
@@ -537,8 +615,9 @@ def write_snapshot(payload: Mapping[str, Any], root: Path, *, keep: int = 10) ->
     _write_json_atomic(target, payload)
     _write_json_atomic(directory / LATEST_FILE, {
         "file": target.name, "rows_sha256": payload["rows_sha256"], "captured_at": payload["captured_at"],
-        "schema_version": payload.get("schema_version"), "environment": environment.name})
-    prune(directory, keep)
+        "schema_version": payload.get("schema_version"), "environment": environment.name,
+        "row_count": payload.get("row_count")})
+    prune(directory, keep, protect=target.name)
     return target
 
 
@@ -600,6 +679,7 @@ CSV_COLUMNS: tuple[tuple[str, str], ...] = (
     ("license_subdomains_number", "license.subdomains_number"), ("scanning_interval", "scanning_interval"),
     ("last_recon_scan_utc", "scan.last_recon_scan_utc"), ("scan_duration_ms", "scan.duration_ms"),
     ("scan_status", "scan.status"), ("alternate_domains", "alternate_domains"),
+    ("spycloud_enabled", "spycloud_enabled"),
 )
 
 

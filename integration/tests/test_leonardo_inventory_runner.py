@@ -466,6 +466,11 @@ class DuplicatePrecheckPageTests(unittest.TestCase):
         self.assertEqual(dashboard.RUNNER_RESULT_MESSAGES["duplicate_inventory_match"][0], "blocked")
 
 
+def inventory_page_request(index: int) -> dict:
+    return {"tableServerData": {"offset": index, "items_per_page": 1, "sort": {"direction": "asc", "key": "accountName"},
+                                "filters": {}, "unique_fields": []}}
+
+
 class InventoryPageTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -497,6 +502,70 @@ class InventoryPageTests(unittest.TestCase):
         self.assertNotIn("<script", page.lower())
         self.assertIn("Example Tenant 2", filtered)
         self.assertNotIn("Example Tenant 1", filtered)
+
+    def _write_rows(self, rows):
+        pages = [(inventory_page_request(i), {"pagination_response": {"total_count": len(rows), "table_data": [row]}})
+                 for i, row in enumerate(rows)]
+        assembled = inventory.assemble_pages(pages, page_size=1)
+        inventory.write_snapshot(inventory.snapshot_payload(
+            inventory.ENVIRONMENTS["dev"], assembled, datetime.now(timezone.utc)), self.root)
+
+    def _sorted_rows(self):
+        self._write_rows([
+            tenant_row(1, accountName="Bravo", lastScanStatusEnum="COMPLETED", lastReconScan=1759400000000),
+            tenant_row(2, accountName="Alpha", lastScanStatusEnum="RUNNING", lastReconScan=1759500000000),
+            tenant_row(3, accountName="Charlie", lastScanStatusEnum=None, lastReconScan=None),
+            tenant_row(4, accountName="Delta", lastScanStatusEnum="COMPLETED", lastReconScan=1759300000000)])
+
+    @staticmethod
+    def _order(page, names):
+        return [name for _, name in sorted((page.index("<td class='stick'>" + name), name) for name in names)]
+
+    def test_wide_layout_and_every_column_are_present(self):
+        self._sorted_rows()
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
+            page = dashboard.render_inventory()
+        self.assertIn("<main class='wide'>", page)
+        for heading in ("Tenant", "CO", "Licence", "Domain", "Quota", "Last scan (UTC)", "Scan status", "Interval", "ID", "Account"):
+            self.assertIn(heading, page)
+        self.assertIn("10 / 2 / 50", page)  # assets / domains / subdomains
+        self.assertIn("<code>TENANTID00000001</code>", page)  # the ID sits under the tenant name
+        self.assertIn("tenant1.example.com", page)
+        self.assertIn("+1 alternate", page)
+        self.assertNotIn("<script", page.lower())
+
+    def test_sort_and_filter_come_from_the_query_and_blanks_sort_last(self):
+        self._sorted_rows()
+        names = ("Alpha", "Bravo", "Charlie", "Delta")
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
+            by_name = dashboard.render_inventory()
+            by_scan_desc = dashboard.render_inventory(sort="scan", direction="desc")
+            by_scan_asc = dashboard.render_inventory(sort="scan", direction="asc")
+            completed = dashboard.render_inventory(scan="COMPLETED")
+            no_status = dashboard.render_inventory(scan="NONE")
+            no_co = dashboard.render_inventory(co="none")
+            linked = dashboard.render_inventory(co="linked")
+            junk = dashboard.render_inventory(sort="<script>", direction="x", scan="y", co="z")
+        self.assertEqual(self._order(by_name, names), ["Alpha", "Bravo", "Charlie", "Delta"])
+        self.assertEqual(self._order(by_scan_desc, names), ["Alpha", "Bravo", "Delta", "Charlie"])
+        self.assertEqual(self._order(by_scan_asc, names), ["Delta", "Bravo", "Alpha", "Charlie"])
+        self.assertIn("aria-sort='descending'", by_scan_desc)
+        self.assertIn("href='/inventory?sort=scan&amp;dir=asc'", by_scan_desc)  # clicking the active column flips it
+        self.assertTrue(all(name in completed for name in ("Bravo", "Delta")) and "Alpha" not in completed.split("<tbody>")[1])
+        self.assertIn("Charlie", no_status)
+        self.assertNotIn("Bravo", no_status.split("<tbody>")[1])
+        self.assertIn("Alpha", no_co.split("<tbody>")[1])
+        self.assertNotIn("<td class='stick'>", linked)
+        self.assertNotIn("<script", junk.lower())
+        self.assertEqual(self._order(junk, names), ["Alpha", "Bravo", "Charlie", "Delta"])
+
+    def test_filters_keep_the_search_text_in_their_links(self):
+        self._sorted_rows()
+        with patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
+            page = dashboard.render_inventory("al", sort="end", scan="RUNNING")
+        self.assertIn("q=al&amp;sort=end&amp;dir=asc&amp;scan=COMPLETED", page)
+        self.assertIn("name='scan' value='RUNNING'", page)
+        self.assertIn("Alpha", page.split("<tbody>")[1])
 
     def _post_refresh(self, problem):
         class _FakeRequest:

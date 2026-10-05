@@ -92,7 +92,10 @@ class MinimizeRowTests(unittest.TestCase):
         # Owner decision 2026-10-04 (option B): alternate (company) domains are kept, normalised,
         # for the duplicate pre-check; nothing else from the domain lists is.
         self.assertEqual(tenant["alternate_domains"], ["alt.example.com"])
-        for kind, item in walk({key: value for key, value in tenant.items() if key != "alternate_domains"}):
+        # Owner decision 2026-10-05: the SpyCloud ON/OFF boolean is the only thing kept from that object.
+        self.assertIsNone(tenant["spycloud_enabled"])  # this row's object has no boolean (only a fake key)
+        for kind, item in walk({key: value for key, value in tenant.items()
+                                if key not in ("alternate_domains", "spycloud_enabled")}):
             text = str(item)
             for forbidden in ("@", "firstName", "lastName", "phone", "spyCloud", "Pat", "Sample", "secret-path",
                               "FAKE-NOT-A-KEY", "alt.example.com", "a.example.com", "jobTitle", "Analyst"):
@@ -110,6 +113,23 @@ class MinimizeRowTests(unittest.TestCase):
             self.assertIn(path, tenant["toggles"])
         self.assertIs(tenant["toggles"]["campaignExecutionSettings.domainsMultiAttackStackSettings.enabled"], True)
         self.assertIs(tenant["toggles"]["webAiAttackerEnabled"], False)
+
+    def test_spycloud_keeps_only_the_enabled_boolean(self):
+        for value, expected in ((True, True), (False, False), ("true", None), (1, None), (None, None)):
+            row = tenant_row(1)
+            row["leakedCredentialsSettings"] = {"spyCloudSettings": {"enabled": value, "apiKey": "FAKE-NOT-A-KEY"}}
+            tenant = minimize_row(row)
+            self.assertIs(tenant["spycloud_enabled"], expected, value)
+            self.assertNotIn("FAKE-NOT-A-KEY", json.dumps(tenant))
+        for settings in (None, {}, {"spyCloudSettings": None}, {"spyCloudSettings": "on"}):
+            row = tenant_row(1)
+            row["leakedCredentialsSettings"] = settings
+            self.assertIsNone(minimize_row(row)["spycloud_enabled"])
+        row = tenant_row(1)
+        del row["leakedCredentialsSettings"]
+        self.assertIsNone(minimize_row(row)["spycloud_enabled"])
+        self.assertNotIn("leakedCredentialsSettings.spyCloudSettings.enabled",
+                         schema_drift([{**tenant_row(1), "leakedCredentialsSettings": {"spyCloudSettings": {"enabled": True}}}])["unknown"])
 
     def test_missing_nested_objects_are_recorded_as_none(self):
         tenant = minimize_row({"id": "TENANTID00000001", "accountUuid": "a" * 32, "accountName": "Example Tenant",
@@ -440,6 +460,18 @@ class ViewTests(unittest.TestCase):
         self.assertEqual(names, ["'=HYPERLINK(\"http://example.com\")", "'+cmd", "'-2+3", "'@SUM(A1)",
                                  "'\tTabbed Example"])
         self.assertEqual(parsed[1][6], "true")
+        self.assertEqual(parsed[0][-1], "spycloud_enabled")
+        self.assertEqual({line[-1] for line in parsed[1:]}, {""})  # unknown, not ON/OFF, when absent
+
+    def test_csv_shows_spycloud_on_and_off(self):
+        rows = []
+        for index, value in enumerate((True, False)):
+            item = tenant_row(index)
+            item["leakedCredentialsSettings"] = {"spyCloudSettings": {"enabled": value}}
+            rows.append(item)
+        payload = snapshot_payload(DEV, assemble_pages([page(0, rows, 2, size=2)], page_size=2), NOW)
+        parsed = list(csv.reader(io.StringIO(to_csv(payload))))
+        self.assertEqual([line[-1] for line in parsed[1:]], ["true", "false"])
 
     def test_match_readbacks_match_conflict_and_orphan(self):
         payload = snapshot_payload(DEV, assemble_pages(capture(4, 2), page_size=2), NOW)

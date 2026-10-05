@@ -1409,7 +1409,10 @@ class _RPPage:
                     body = json.loads(post_data)
                     page.rewritten_bodies.append(body)
                     page.filled["Search"] = body["tableServerData"]["filters"]["and"][0]["value"]
-        self.route_handler(_Route())
+        routed = _Route()
+        # The reply to this reload carries the very request the runner rewrote (live Playwright identity).
+        page.routed_request = routed.request
+        self.route_handler(routed)
 
     def search_payload(self, text: str) -> dict:
         # The live getAllDetailedAccounts shape: rows under
@@ -1438,9 +1441,11 @@ class _RPPage:
         else:
             text = self.filled.get("Search", "")
             body = json.dumps({"filters": {"and": [{"method": "contains", "value": text}]}})
+            request = getattr(self, "routed_request", None) or types.SimpleNamespace(method="POST", post_data=body)
+            self.routed_request = None
             response = types.SimpleNamespace(
                 url=runner.DEVELOPMENT_ORIGIN + "/api/v1/backoffice/getAllDetailedAccounts", status=self.search_status,
-                request=types.SimpleNamespace(method="POST", post_data=body),
+                request=request,
                 json=lambda: self.search_payload(text))
         if not predicate(response):
             raise TimeoutError("fake: no matching response")
@@ -3338,6 +3343,47 @@ class CheckStateTests(unittest.TestCase):
                     runner.load_check_state()
 
 
+class InvisibleSearchReplyTests(unittest.TestCase):
+    """Live 2026-10-05: after an Edit save the app's own table refresh was in flight and was taken as the
+    search reply. Only the reply to the request the search rewrote may count."""
+
+    class _Page:
+        def __init__(self, reply_to_rewritten: bool):
+            self.reply_to_rewritten, self.handler = reply_to_rewritten, None
+
+        def route(self, pattern, handler):
+            self.handler = handler
+
+        def unroute(self, pattern, handler=None):
+            self.handler = None
+
+        @contextlib.contextmanager
+        def expect_response(self, predicate, timeout=None):
+            info = types.SimpleNamespace()
+            yield info
+            body = json.dumps({"tableServerData": {"offset": 0, "items_per_page": 10, "filters": {}}})
+            routed = types.SimpleNamespace(method="POST", post_data=body)
+            self.handler(types.SimpleNamespace(request=routed, continue_=lambda post_data=None: None))
+            in_flight = types.SimpleNamespace(method="POST", post_data=body)
+            response = types.SimpleNamespace(
+                url=runner.DEVELOPMENT_ORIGIN + runner.INVENTORY_API_PATH, status=200,
+                request=routed if self.reply_to_rewritten else in_flight,
+                json=lambda: {"pagination_response": {"table_data": [{"id": "x"}], "total_count": 1}})
+            if not predicate(response):
+                raise TimeoutError("fake: no matching response")
+            info.value = response
+
+        def reload(self, **kwargs):
+            pass
+
+    def test_an_in_flight_app_refresh_is_never_taken_as_the_search_reply(self):
+        self.assertIsNone(runner._search_tenants(self._Page(reply_to_rewritten=False), None, "Tango"))
+
+    def test_the_reply_to_the_rewritten_request_is_accepted(self):
+        result = runner._search_tenants(self._Page(reply_to_rewritten=True), None, "Tango")
+        self.assertEqual((len(result.rows), result.total_count), (1, 1))
+
+
 class RunLogTests(unittest.TestCase):
     def setUp(self):
         self.path = Path(tempfile.mkdtemp(prefix="ce_log_")) / "log.json"
@@ -3512,6 +3558,57 @@ class InventoryPrecheckRunTests(unittest.TestCase):
         source = RunEndToEndTests("test_readback_verified_happy_path")._source()
         self._write_inventory(alternateDomains=[source.email_domain])
         self.assertEqual(self._run()[0], "duplicate_inventory_match")
+
+    def _write_clone(self, hours_old=0, **row):
+        from integration.onboarding import leonardo_inventory as inventory
+        from integration.tests.test_leonardo_inventory import page as inventory_page, tenant_row
+
+        root = runner.inventory_root()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        assembled = inventory.assemble_pages([inventory_page(0, [tenant_row(7, **row)], 1, size=1)], page_size=1)
+        inventory.write_snapshot(inventory.snapshot_payload(
+            inventory.ENVIRONMENTS["prod-clone"], assembled, datetime.now(timezone.utc) - timedelta(hours=hours_old)),
+            root)
+
+    def test_a_production_gate_match_never_changes_the_dev_answer(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        self._write_inventory(accountName="Some Other Dev Tenant")
+        self._write_clone(accountName=source.tenant_name.upper())
+        contract = runner.ROUTES[runner.CE_ENGINE]
+        plain = runner._inventory_precheck(contract, source)
+        self.assertEqual(plain["result"], "inventory_no_match")
+        self.assertNotIn("production_clone", plain)  # a Start run never consults or logs the clone
+        full = runner._inventory_precheck(contract, source, include_clone=True)
+        self.assertEqual((full["result"], full["matches"]), ("inventory_no_match", []))
+        clone = full["production_clone"]
+        self.assertEqual((clone["result"], clone["blocks"], clone["tenants_checked"], len(clone["matches"])),
+                         ("duplicate_production_clone_match", True, 1, 1))
+        self.assertEqual(clone["matches"][0]["reasons"], ["tenant_name"])
+        self.assertEqual(clone["environment_label"], "PROD (cloned copy via Redash)")
+
+    def test_a_missing_or_stale_production_clone_never_breaks_the_check(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        self._write_inventory(accountName="Some Other Dev Tenant")
+        contract = runner.ROUTES[runner.CE_ENGINE]
+        full = runner._inventory_precheck(contract, source, include_clone=True)
+        self.assertEqual(full["result"], "inventory_no_match")
+        gate = full["production_clone"]
+        self.assertEqual((gate["result"], gate["blocks"], gate["reason"]),
+                         ("production_clone_unavailable", True, "inventory_snapshot_missing"))
+        self._write_clone(accountName="Unrelated")
+        gate = runner._inventory_precheck(contract, source, include_clone=True)["production_clone"]
+        self.assertEqual((gate["result"], gate["blocks"]), ("production_clone_no_match", False))
+        self._write_clone(hours_old=7, accountName="Unrelated")  # older than the 6 h the gate trusts
+        gate = runner._inventory_precheck(contract, source, include_clone=True)["production_clone"]
+        self.assertEqual((gate["result"], gate["blocks"], gate["reason"]),
+                         ("production_clone_unavailable", True, "inventory_snapshot_stale"))
+
+    def test_the_clone_answer_is_returned_even_when_the_dev_inventory_is_missing(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        self._write_clone(accountName=source.tenant_name)
+        report = runner._inventory_precheck(runner.ROUTES[runner.CE_ENGINE], source, include_clone=True)
+        self.assertEqual(report["result"], "inventory_unavailable")
+        self.assertEqual(report["production_clone"]["result"], "duplicate_production_clone_match")
 
     def test_co_domains_include_the_route_extras(self):
         contract = runner.RouteContract(engine="x", load_source=None, license_dates=None, build_fill=None,
@@ -4536,7 +4633,7 @@ class ScanStatusTests(unittest.TestCase):
                 patch.object(runner, "_sf_records", side_effect=AssertionError("no Salesforce read")):
             self.assertEqual(runner.run_scan_status("CO-0999"), "scan_status_not_onboarded")
 
-    def _run_with_rows(self, rows):
+    def _run_with_rows(self, rows, executions=None):
         import contextlib, sys, types
         fake = types.ModuleType("playwright.sync_api")
         fake.sync_playwright = lambda: contextlib.nullcontext(object())
@@ -4552,14 +4649,16 @@ class ScanStatusTests(unittest.TestCase):
                 patch.object(runner, "_scan_status_tenant_name", return_value="Sample Surface Co"), \
                 patch.object(runner, "_attended_page", page), \
                 patch.object(runner, "_open_search", return_value=object()), \
-                patch.object(runner, "_search_tenants", return_value=runner.TenantSearchResult(rows, len(rows))):
+                patch.object(runner, "_search_tenants", return_value=runner.TenantSearchResult(rows, len(rows))), \
+                patch.object(runner, "read_scan_executions", **(executions or {"side_effect": RuntimeError(
+                    "scan_status_executions_unavailable")})):
             return runner.run_scan_status("CO-0649")
 
     def test_exact_id_and_uuid_match_records_the_observation(self):
         rows = [{"id": "c" * 24, "accountUuid": "d" * 32, "lastReconScan": None},
                 {"id": self.ID, "accountUuid": self.UUID.upper(), "lastReconScan": "2026-10-01T03:00:00Z",
                  "lastScanStatusEnum": "RUNNING"}]
-        self.assertEqual(self._run_with_rows(rows), "scan_status_recorded")
+        self.assertEqual(self._run_with_rows(rows, {"return_value": {"executions": [], "execution_state": "no_executions"}}), "scan_status_recorded")
         stored = json.loads(self.status_path.read_text(encoding="utf-8"))["CO-0649"]
         self.assertEqual((stored["state"], stored["status_enum"]), ("scan_started", "RUNNING"))
         self.assertNotIn("id", stored)
@@ -4569,6 +4668,106 @@ class ScanStatusTests(unittest.TestCase):
         rows = [{"id": "c" * 24, "accountUuid": self.UUID, "accountName": "Sample Surface Co"}]
         self.assertEqual(self._run_with_rows(rows), "scan_status_tenant_not_found")
         self.assertFalse(self.status_path.exists())
+
+    # Executions (Details > Duration Per Scan, 2026-10-05).
+    EXEC_ROWS = [{"startDate": "2026-10-04T10:00:00Z", "endDate": "2026-10-04T10:30:05Z", "status": "DONE",
+                  "campaignTypeEnum": "LEAKED_CREDENTIALS_DISCOVERY", "campaignExecutionTypeEnum": "SCHEDULED", "extra": "x"}]
+
+    def test_parser_accepts_known_envelopes_and_keeps_only_allowed_fields(self):
+        for body in ({"pagination_response": {"table_data": self.EXEC_ROWS}}, {"table_data": self.EXEC_ROWS}, self.EXEC_ROWS):
+            parsed = runner.parse_scan_executions(body)
+            self.assertEqual(parsed["execution_state"], "done")
+            self.assertEqual(set(parsed["executions"][0]), {"campaign_type", "execution_type", "status", "start", "end",
+                                                            "duration_ms"})
+            self.assertEqual(parsed["executions"][0]["duration_ms"], 1_805_000)
+        for bad in (None, "x", {}, {"data": []}, {"table_data": [1]}, {"pagination_response": {"table_data": {}}}):
+            self.assertIsNone(runner.parse_scan_executions(bad))
+
+    def test_pending_with_end_date_is_running_and_reports_the_earliest_start(self):
+        rows = [dict(self.EXEC_ROWS[0], status="PENDING", startDate="2026-10-04T11:00:00Z", endDate="2026-10-04T11:05:00Z"),
+                dict(self.EXEC_ROWS[0], status="PENDING", startDate="2026-10-04T10:00:00Z", endDate=None),
+                dict(self.EXEC_ROWS[0])]
+        parsed = runner.parse_scan_executions(rows)
+        self.assertEqual((parsed["execution_state"], parsed["running_since"]), ("running", "2026-10-04T10:00:00+00:00"))
+
+    def test_empty_unknown_status_and_bad_dates_fail_closed(self):
+        self.assertEqual(runner.parse_scan_executions([])["execution_state"], "no_executions")
+        for status in ("FAILED", "<b>", None, 5):
+            rows = [self.EXEC_ROWS[0], dict(self.EXEC_ROWS[0], status=status)]
+            self.assertEqual(runner.parse_scan_executions(rows)["execution_state"], "unrecognized")
+        bad = runner.parse_scan_executions([dict(self.EXEC_ROWS[0], startDate="soon"),
+                                            dict(self.EXEC_ROWS[0], endDate="2026-10-04T09:00:00Z"),
+                                            dict(self.EXEC_ROWS[0], startDate=True)])
+        self.assertEqual([e["duration_ms"] for e in bad["executions"]], [None, None, None])
+
+    class _Response:
+        def __init__(self, url, status=200, body=None):
+            self.url, self.status, self._body = url, status, body
+            self.request = type("R", (), {"method": "POST"})()
+
+        def json(self):
+            return self._body
+
+    class _Page:
+        def __init__(self, response):
+            self.response, self.clicked, self.keys = response, [], []
+            self.keyboard = type("K", (), {"press": lambda _s, key: self.keys.append(key)})()
+
+        def _target(self, name):
+            page = self
+            return type("T", (), {"first": type("F", (), {"click": lambda _s, **kw: page.clicked.append(name)})(),
+                                  "filter": lambda _s, **kw: page._target(name)})()
+
+        def locator(self, selector):
+            return self._target(selector)
+
+        def get_by_text(self, text, exact=False):
+            return self._target(text)
+
+        def expect_response(self, predicate, timeout=0):
+            response = self.response
+            if response is None:
+                raise TimeoutError()
+            assert predicate(response)
+            return type("C", (), {"__enter__": lambda _s: _s, "__exit__": lambda _s, *a: False, "value": response})()
+
+    def test_read_executions_clicks_only_details_and_checks_the_id(self):
+        origin = runner.DEVELOPMENT_ORIGIN
+        url = f"{origin}/api/v1/backoffice/account/{self.ID}/campaign/executions"
+        page = self._Page(self._Response(url, 200, self.EXEC_ROWS))
+        self.assertEqual(runner.read_scan_executions(page, "Sample", self.ID)["execution_state"], "done")
+        self.assertEqual(page.clicked[1:], [runner.SCAN_EXEC_ROW_MENU_SELECTOR, runner.SCAN_EXEC_DETAILS_SELECTOR,
+                                            "Duration Per Scan"])
+        self.assertEqual(page.keys, ["Escape"])
+        for selector in page.clicked:
+            for hazard in ("Grid_Access", "Scan_Now", "Stop_Scan", "Delete"):
+                self.assertNotIn(hazard, selector)
+        other = f"{origin}/api/v1/backoffice/account/{'z' * 24}/campaign/executions"
+        for response, code in ((self._Response(other, 200, self.EXEC_ROWS), "scan_status_executions_id_mismatch"),
+                               (None, "scan_status_executions_unavailable"),
+                               (self._Response(url, 500), "scan_status_executions_unavailable"),
+                               (self._Response(url, 200, {"unexpected": 1}), "scan_status_executions_unavailable")):
+            page = self._Page(response)
+            with self.assertRaisesRegex(RuntimeError, code):
+                runner.read_scan_executions(page, "Sample", self.ID)
+            self.assertEqual(page.keys, ["Escape"])
+        with self.assertRaises(runner.LeonardoSessionExpired):
+            runner.read_scan_executions(self._Page(self._Response(url, 401)), "Sample", self.ID)
+
+    def test_executions_are_stored_beside_the_row_status(self):
+        rows = [{"id": self.ID, "accountUuid": self.UUID, "lastScanStatusEnum": "RUNNING"}]
+        parsed = runner.parse_scan_executions(self.EXEC_ROWS)
+        self.assertEqual(self._run_with_rows(rows, {"return_value": parsed}), "scan_status_recorded")
+        stored = json.loads(self.status_path.read_text(encoding="utf-8"))["CO-0649"]
+        self.assertEqual((stored["state"], stored["execution_state"]), ("scan_started", "done"))
+        self.assertEqual(len(stored["executions"]), 1)
+
+    def test_missing_executions_reply_keeps_the_row_status_and_reports_the_reason(self):
+        rows = [{"id": self.ID, "accountUuid": self.UUID, "lastScanStatusEnum": "RUNNING"}]
+        self.assertEqual(self._run_with_rows(rows), "scan_status_executions_unavailable")
+        stored = json.loads(self.status_path.read_text(encoding="utf-8"))["CO-0649"]
+        self.assertEqual(stored["state"], "scan_started")
+        self.assertNotIn("execution_state", stored)
 
 
 CASE3_EMAIL = "mail-sample.example"

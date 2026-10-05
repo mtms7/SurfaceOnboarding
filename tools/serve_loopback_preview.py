@@ -216,7 +216,7 @@ def _queue_rows() -> list[dict[str, str | None]]:
 
 def _finish(page: str) -> bytes:
     """Add the preview banner and disable every button (the preview takes no action)."""
-    page = page.replace("<main>", "<main>" + BANNER, 1)
+    page = re.sub(r"<main( class='wide')?>", lambda match: match.group(0) + BANNER, page, count=1)
     page = page.replace("Read from Salesforce at", "Synthetic data at")
     page = re.sub(r"<button(?![^>]*\bdisabled\b)", "<button disabled title='Preview only'", page)
     return page.encode("utf-8")
