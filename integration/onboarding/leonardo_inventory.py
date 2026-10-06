@@ -326,6 +326,55 @@ def production_duplicate_gate(root: Path, tenant_name: str, co_domains: Any, *, 
     return {"result": "production_clone_no_match", "blocks": False, **gate}
 
 
+def renewal_domain_gate(root: Path, target_names: Any, target_domain: str, new_domains: Any, *, now: datetime,
+                        max_age: timedelta = PRODUCTION_GATE_MAX_AGE) -> dict[str, Any]:
+    """Owner decision 2026-10-06 (Q3): production duplicate validation for the domains a RENEWAL adds.
+
+    Only domains the renewal ADDS (not already on the tenant) are checked; with none, no clone is needed
+    (``result`` "renewal_gate_not_needed", ``blocks`` False). Otherwise, fail closed, against the production
+    clone snapshot: the renewal's own target tenant (a tenant whose primary domain is ``target_domain`` and whose
+    name is one of ``target_names``) must match exactly once and is excluded; a new domain found as the primary or
+    an alternate domain of any OTHER tenant (deleted ones included) blocks. An unusable clone blocks too.
+    """
+    wanted = sorted({domain for domain in map(canonical_domain, new_domains or ()) if domain})
+    if not wanted:
+        return {"result": "renewal_gate_not_needed", "blocks": False, "matches": []}
+    try:
+        payload = load_latest(root, "prod-clone", max_age=max_age, now=now)
+    except InventoryError as error:
+        return {"result": "production_clone_unavailable", "blocks": True, "reason": error.reason, "matches": []}
+    tenants = [tenant for tenant in payload.get("tenants") or () if isinstance(tenant, dict)]
+    base = {"tenants_checked": len(tenants), "captured_at": payload.get("captured_at"),
+            "environment_label": payload.get("environment_label"), "new_domains_checked": len(wanted)}
+    if not any(isinstance(tenant.get("alternate_domains"), list) for tenant in tenants):
+        return {"result": "production_clone_incomplete", "blocks": True, "reason": "alternate_domains_missing",
+                "matches": [], **base}
+    names = {key for key in map(_name_key, target_names or ()) if key}
+    primary = canonical_domain(target_domain)
+    targets = [tenant for tenant in tenants if primary is not None
+               and canonical_domain(tenant.get("account_domain")) == primary
+               and _name_key(tenant.get("account_name")) in names]
+    if len(targets) != 1:
+        return {"result": ("renewal_target_not_in_production_clone" if not targets
+                           else "renewal_target_ambiguous_in_production_clone"),
+                "blocks": True, "matches": [], "target_matches": len(targets), **base}
+    target = targets[0]
+    matches = []
+    for tenant in tenants:
+        if tenant is target:
+            continue
+        held = {canonical_domain(tenant.get("account_domain")),
+                *map(canonical_domain, tenant.get("alternate_domains") or ())}
+        hit = [domain for domain in wanted if domain in held]
+        if hit:
+            matches.append({"id": tenant.get("id"), "account_name": tenant.get("account_name"),
+                            "is_deleted": tenant.get("is_deleted") is True, "created": tenant.get("created"),
+                            "reasons": ["new_domain"], "domains_matched": len(hit)})
+    if matches:
+        return {"result": "renewal_new_domain_in_production", "blocks": True, "matches": matches, **base}
+    return {"result": "renewal_gate_clear", "blocks": False, "matches": [], **base}
+
+
 def minimize_row(row: Mapping[str, Any]) -> dict[str, Any]:
     """Allow-list projection of one tenant row; no personal data, domain lists, or settings blobs."""
     get = row.get
