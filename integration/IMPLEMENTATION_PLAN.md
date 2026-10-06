@@ -1379,7 +1379,9 @@ Operator ran `redash_inventory_collector.py --collect`: `"refresh_failed": true,
 | 4 / 5 / 6 Renewals | Edit mode + prod→Dev mirror built locally (below); **not run live** |
 
 #### Owner decisions 2026-10-06 (supersede `docs/38` §4 for these items)
-- Q1: renewal expiration = new term start + 1 y − 1 d (capped by subscription end).
+- Q1 (**revised later the same day**): renewal expiration = the new term's DealHub Subscription End Date **exactly** (full multi-year term, e.g. 2026-09-30 → 2029-09-29). Production showed Toyota at Sep 30, 2029; owner chose DealHub end exactly.
+- Production target selection (owner, 2026-10-06): the renewal's production tenant = the one **live, paid** tenant (`is_live_paid_tenant`: not deleted, enabled, prepaid/PAYG) with the CO's **exact** tenant name. Trial / Evaluation / POV tenants on the same domain and disabled duplicates are never the target (CO-0770 had two "Toyota Motor Europe", one disabled; CO-0767 and CO-0758 have eval/POV tenants on their domains). Used by the mirror and by the Q3 gate.
+- Observed: CO-0770 (Toyota, → 2029-09-30) and CO-0758 (Etimad, → 2029-09-18) look **already renewed in production**; their renewal edit will stop with `renewal_expiration_would_shorten` (fail closed). CO-0770's Salesforce main domain is `toyotaeu.mail.onmicrosoft.com` (needs a CSM fix). **CO-0767 (A2A, expires 2026-10-25) is the first live Case 6 test.**
 - Q2: never change the tenant's start date, even if the old licence expired.
 - Q3: "Onboarding Approval Status = Approved" means a human (owner/team) validated the CO, for **all** cases; no extra manual review. Any domain/subdomain a renewal **adds** must pass the production duplicate validation on the Redash prod clone (own target tenant excluded and found exactly once; a match on any other tenant, or an unusable clone, stops).
 - Q9: test renewals against a **mirror** tenant created in Dev from the production clone (start date = today; Dev cannot backdate).

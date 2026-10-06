@@ -52,10 +52,43 @@ def plan_of(*rows, names=("Acme Corp",), domains=("acme.example",), emails=("acm
 
 
 class FindTenantTests(unittest.TestCase):
-    def test_one_match_by_name_or_domain_and_the_same_row_twice_is_one(self):
+    def test_one_exact_name_match_and_domain_alone_no_longer_matches(self):
         self.assertEqual(plan_of(prod_row(), tenant_row(2)).prod_id, "TENANTID00000001")
-        self.assertEqual(plan_of(prod_row(), names=("Other",)).tenant_name, "Acme Corp")  # domain only
         self.assertEqual(plan_of(prod_row(), domains=("nope.example",)).tenant_name, "Acme Corp")  # name only
+        self.assertEqual(plan_of(prod_row(), names=("ACME  corp",)).tenant_name, "Acme Corp")  # name key: case/space
+        with self.assertRaises(mirror.MirrorError) as caught:  # domain only: not a match key any more
+            plan_of(prod_row(), names=("Other",))
+        self.assertEqual(caught.exception.reason, "mirror_prod_tenant_not_found")
+
+    def test_trials_evaluations_and_a_disabled_twin_are_ignored(self):
+        paid = prod_row(1, accountName="A2A", accountDomain="a2a.example")
+        trial = prod_row(2, accountName="A2A - Ctrl POV", accountDomain="a2a.example", license_={"licenseType": "Trial"})
+        evaluation = prod_row(3, accountName="A2A - operator eval", accountDomain="a2a.example",
+                              license_={"licenseType": "Evaluation"})
+        plan = plan_of(trial, paid, evaluation, names=("A2A",), domains=("a2a.example",))
+        self.assertEqual((plan.prod_id, plan.tenant_name), ("TENANTID00000001", "A2A"))
+        live = prod_row(2, accountName="Toyota Motor Europe", accountDomain="toyota.example")
+        disabled = prod_row(3, accountName="Toyota Motor Europe", accountDomain="toyota.example", enabled=False)
+        for rows in ((disabled, live), (live, disabled)):
+            plan = plan_of(*rows, names=("Toyota Motor Europe",), domains=("toyota.example",))
+            self.assertEqual(plan.prod_id, "TENANTID00000002")
+
+    def test_two_live_paid_exact_name_tenants_are_ambiguous(self):
+        twin = prod_row(2, accountDomain="elsewhere.example")
+        with self.assertRaises(mirror.MirrorError) as caught:
+            plan_of(prod_row(), twin)
+        self.assertEqual(caught.exception.reason, "mirror_prod_tenant_ambiguous")
+        by_name = prod_row(2, accountName="acme  corp", accountDomain="elsewhere.example")  # name key: case/space
+        with self.assertRaises(mirror.MirrorError):
+            plan_of(prod_row(), by_name)
+
+    def test_only_non_paid_or_disabled_matches_are_not_found(self):
+        for label, row in (("trial", prod_row(license_={"licenseType": "Trial"})),
+                           ("evaluation", prod_row(license_={"licenseType": "Evaluation"})),
+                           ("disabled", prod_row(enabled=False))):
+            with self.subTest(label), self.assertRaises(mirror.MirrorError) as caught:
+                plan_of(row)
+            self.assertEqual(caught.exception.reason, "mirror_prod_tenant_not_found")
 
     def test_no_match_is_not_found_and_deleted_rows_never_count(self):
         with self.assertRaises(mirror.MirrorError) as caught:
@@ -65,19 +98,34 @@ class FindTenantTests(unittest.TestCase):
             plan_of(prod_row(isDeleted=True))
         self.assertEqual(caught.exception.reason, "mirror_prod_tenant_not_found")
 
-    def test_two_distinct_tenants_are_ambiguous(self):
-        other = prod_row(2, accountName="Other Co", accountDomain="acme.example")
-        with self.assertRaises(mirror.MirrorError) as caught:
-            plan_of(prod_row(), other)
-        self.assertEqual(caught.exception.reason, "mirror_prod_tenant_ambiguous")
-        by_name = prod_row(2, accountName="acme  corp", accountDomain="elsewhere.example")  # name key: case/space
-        with self.assertRaises(mirror.MirrorError):
-            plan_of(prod_row(), by_name)
-
     def test_a_co_without_any_identity_fails_closed(self):
         with self.assertRaises(mirror.MirrorError) as caught:
             plan_of(prod_row(), names=(), domains=())
         self.assertEqual(caught.exception.reason, "mirror_co_identity_unavailable")
+
+
+class LivePaidTenantTests(unittest.TestCase):
+    def tenant(self, kind="Prepaid annual subscription", **overrides):
+        return {"id": "t", "account_name": "Acme", "enabled": True, "is_deleted": False,
+                "license": {"type": kind}, **overrides}
+
+    def test_live_paid_types_are_accepted_whatever_the_casing_or_spacing(self):
+        for kind in ("Prepaid annual subscription", "PREPAID_ANNUAL_SUBSCRIPTION", " prepaid  Annual-Subscription ",
+                     "Prepaid monthly subscription", "PAYG monthly subscription", "paygmonthlysubscription"):
+            with self.subTest(kind=kind):
+                self.assertTrue(inventory.is_live_paid_tenant(self.tenant(kind)))
+
+    def test_everything_else_is_refused(self):
+        refused = {"enabled missing": {k: v for k, v in self.tenant().items() if k != "enabled"},
+                   "enabled false": self.tenant(enabled=False), "enabled truthy non-bool": self.tenant(enabled="true"),
+                   "deleted": self.tenant(is_deleted=True), "trial": self.tenant("Trial"),
+                   "evaluation": self.tenant("Evaluation"), "payg weekly": self.tenant("PAYG weekly"),
+                   "no licence": self.tenant(license=None), "licence without type": self.tenant(license={}),
+                   "non-string type": self.tenant(license={"type": 7}),
+                   "none": None, "list": [], "string": "Acme"}
+        for label, value in refused.items():
+            with self.subTest(label):
+                self.assertFalse(inventory.is_live_paid_tenant(value))
 
 
 class PlanTests(unittest.TestCase):
@@ -104,14 +152,16 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(mirror.mirror_dates(None, date(2028, 2, 29)), (date(2028, 2, 29), date(2029, 2, 27)))
 
     def test_unmapped_or_incomplete_values_fail_closed_with_a_code(self):
-        cases = [({"licenseType": "Enterprise"}, "mirror_license_type_unmapped"),
-                 ({"assetsNumber": None}, "mirror_prod_license_incomplete"),
+        cases = [({"assetsNumber": None}, "mirror_prod_license_incomplete"),
                  ({"subDomainsNumber": -1}, "mirror_prod_license_incomplete"),
                  ({"leakedCredentialsAllowed": None}, "mirror_prod_license_incomplete")]
         for override, reason in cases:
             with self.subTest(reason=reason, override=override), self.assertRaises(mirror.MirrorError) as caught:
                 plan_of(prod_row(license_=override))
             self.assertEqual(caught.exception.reason, reason)
+        with self.assertRaises(mirror.MirrorError) as caught:  # non-paid types never reach the type mapping
+            plan_of(prod_row(license_={"licenseType": "Enterprise"}))
+        self.assertEqual(caught.exception.reason, "mirror_prod_tenant_not_found")
         with self.assertRaises(mirror.MirrorError) as caught:
             plan_of(prod_row(scanningInterval="HOURLY"))
         self.assertEqual(caught.exception.reason, "mirror_interval_unmapped")

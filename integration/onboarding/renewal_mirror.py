@@ -11,7 +11,7 @@ a stable reason code and never returns or logs more than the plan needs.
 Reason codes (``MirrorError.reason``):
   mirror_clone_unavailable          snapshot missing, stale (> 6 h), tampered, or without alternate domains
   mirror_prod_tenant_not_found      no non-deleted production tenant matches the CO's name or primary domain
-  mirror_prod_tenant_ambiguous      more than one distinct non-deleted tenant matches
+  mirror_prod_tenant_ambiguous      more than one distinct live, paid tenant has the CO's exact name
   mirror_co_identity_unavailable    the CO supplied no usable tenant name / domain
   mirror_prod_license_incomplete    the production licence lacks a required count or date
   mirror_license_type_unmapped      the production licence type has no known Add Account option
@@ -102,17 +102,19 @@ def mirror_dates(production_expiration: date | None, today: date) -> tuple[date,
 
 
 def find_production_tenant(payload: Mapping[str, Any], tenant_names: Any, domains: Any) -> dict[str, Any]:
-    """The single non-deleted production tenant matching a CO's tenant name(s) or primary domain(s)."""
+    """The single live, paid production tenant with the CO's exact tenant name (owner decision 2026-10-06).
+
+    Trial / Evaluation / POV tenants sharing the customer's domain and disabled or deleted duplicates are never
+    chosen (``inventory.is_live_paid_tenant``). Domains are not a match key: they are shared by those tenants.
+    """
     names = {key for key in map(inventory._name_key, tenant_names or ()) if key}
-    wanted = {domain for domain in map(inventory.canonical_domain, domains or ()) if domain}
-    if not names and not wanted:
+    if not names:
         raise MirrorError("mirror_co_identity_unavailable")
     found: dict[str, dict[str, Any]] = {}
     for tenant in payload.get("tenants") or ():
-        if not isinstance(tenant, dict) or tenant.get("is_deleted") is True:
+        if not inventory.is_live_paid_tenant(tenant):
             continue
-        if (inventory._name_key(tenant.get("account_name")) in names
-                or inventory.canonical_domain(tenant.get("account_domain")) in wanted):
+        if inventory._name_key(tenant.get("account_name")) in names:
             identity = tenant.get("id")
             found[identity if isinstance(identity, str) and identity else f"#{len(found)}"] = tenant
     if not found:

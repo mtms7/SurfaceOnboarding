@@ -5904,8 +5904,8 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
 # then re-read the tenant row and verify BOTH the changed and the preserved fields). The runner never builds the
 # request. Row-menu allow-list: Details and Edit only (never Access, Scan now, Stop scan or Delete).
 #
-# Owner decisions (2026-10-06, binding): Q1 expiration = new licence-term start + 1 year - 1 day capped by the
-# subscription end (the CE rule); Q2 the tenant's existing start date is NEVER changed, even when the old licence
+# Owner decisions (2026-10-06, binding): Q1 expiration = the new term's DealHub Subscription End Date exactly
+# (revised the same day; was the annual cap); Q2 the tenant's existing start date is NEVER changed, even when the old licence
 # has expired (no start-date fallback, the start control is never written); Q3 "Onboarding Approval Status =
 # Approved" means a human validated the CO, BUT every domain or subdomain the renewal ADDS (not already on the
 # tenant) must pass the production duplicate validation against the Redash prod-clone snapshot (the renewal's own
@@ -6051,9 +6051,11 @@ def renewal_fill_source(reference: str, run_day: date | None = None) -> RenewalS
 
 
 def renewal_expiration(source: RenewalSource) -> date:
-    """Q1: the new term's start + 1 year - 1 day, capped by the subscription end (the CE rule). The tenant start is never used."""
-    term = source.surface_term
-    return ce_license_dates(date.fromisoformat(term["start"]), date.fromisoformat(term["end"]))[1]
+    """Q1 (owner, 2026-10-06, revised): the new term's DealHub Subscription End Date exactly (full multi-year term).
+
+    The tenant start is never used.
+    """
+    return date.fromisoformat(source.surface_term["end"])
 
 
 def _norm_list(value: Any) -> list[str]:

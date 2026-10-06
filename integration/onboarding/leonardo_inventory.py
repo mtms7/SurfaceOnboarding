@@ -326,6 +326,21 @@ def production_duplicate_gate(root: Path, tenant_name: str, co_domains: Any, *, 
     return {"result": "production_clone_no_match", "blocks": False, **gate}
 
 
+# Owner decision 2026-10-06: a customer's production tenant for a renewal is the one live, paid tenant with the
+# CO's exact tenant name. Trial / Evaluation / POV tenants on the same domain, and disabled or deleted
+# duplicates, are never the target.
+PAID_LICENSE_TYPES = frozenset({"prepaidannualsubscription", "prepaidmonthlysubscription", "paygmonthlysubscription"})
+
+
+def is_live_paid_tenant(tenant: Any) -> bool:
+    """Not deleted, ``enabled`` exactly True, and a paid licence type (prepaid or PAYG)."""
+    if not isinstance(tenant, dict) or tenant.get("is_deleted") is True or tenant.get("enabled") is not True:
+        return False
+    lic = tenant.get("license")
+    kind = lic.get("type") if isinstance(lic, dict) else None
+    return isinstance(kind, str) and re.sub(r"[^a-z0-9]", "", kind.casefold()) in PAID_LICENSE_TYPES
+
+
 def renewal_domain_gate(root: Path, target_names: Any, target_domain: str, new_domains: Any, *, now: datetime,
                         max_age: timedelta = PRODUCTION_GATE_MAX_AGE) -> dict[str, Any]:
     """Owner decision 2026-10-06 (Q3): production duplicate validation for the domains a RENEWAL adds.
@@ -333,7 +348,7 @@ def renewal_domain_gate(root: Path, target_names: Any, target_domain: str, new_d
     Only domains the renewal ADDS (not already on the tenant) are checked; with none, no clone is needed
     (``result`` "renewal_gate_not_needed", ``blocks`` False). Otherwise, fail closed, against the production
     clone snapshot: the renewal's own target tenant (a tenant whose primary domain is ``target_domain`` and whose
-    name is one of ``target_names``) must match exactly once and is excluded; a new domain found as the primary or
+    name is one of ``target_names``, live and paid: ``is_live_paid_tenant``) must match exactly once and is excluded; a new domain found as the primary or
     an alternate domain of any OTHER tenant (deleted ones included) blocks. An unusable clone blocks too.
     """
     wanted = sorted({domain for domain in map(canonical_domain, new_domains or ()) if domain})
@@ -353,7 +368,7 @@ def renewal_domain_gate(root: Path, target_names: Any, target_domain: str, new_d
     primary = canonical_domain(target_domain)
     targets = [tenant for tenant in tenants if primary is not None
                and canonical_domain(tenant.get("account_domain")) == primary
-               and _name_key(tenant.get("account_name")) in names]
+               and _name_key(tenant.get("account_name")) in names and is_live_paid_tenant(tenant)]
     if len(targets) != 1:
         return {"result": ("renewal_target_not_in_production_clone" if not targets
                            else "renewal_target_ambiguous_in_production_clone"),

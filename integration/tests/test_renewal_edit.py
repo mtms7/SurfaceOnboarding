@@ -90,7 +90,7 @@ CLEAR = {"result": "renewal_gate_clear", "blocks": False, "matches": []}
 def after_row(before: dict, **overrides) -> dict:
     """The row after a correct save: every planned field applied, everything else untouched."""
     row = copy.deepcopy(before)
-    put(row, "accountLicense.expirationDate", ms(date(2027, 10, 15)))
+    put(row, "accountLicense.expirationDate", ms(date(2029, 10, 15)))  # Q1: the term end, not start + 1 year
     put(row, "accountLicense.licenseType", "PREPAID_ANNUAL_SUBSCRIPTION")
     row["scanningInterval"] = "WEEKLY"
     put(row, "accountLicense.assetsNumber", 10000)
@@ -132,11 +132,13 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(read.engine, "case_6_renew_both")
         self.assertTrue(read.production_ids_present)  # expected on a renewal; it is not a gate
         self.assertEqual(read.licensed_subdomains, 1000)
-        self.assertEqual(runner.renewal_expiration(read), date(2027, 10, 15))  # Q1: start + 1 year - 1 day
+        self.assertEqual(runner.renewal_expiration(read), date(2029, 10, 15))  # Q1 (revised): the full term end
 
-    def test_expiration_is_capped_by_the_subscription_end(self):
-        capped = source(surface_term={**source().surface_term, "start": "2026-10-16", "end": "2027-03-01"})
-        self.assertEqual(runner.renewal_expiration(capped), date(2027, 3, 1))
+    def test_expiration_is_the_term_end_exactly(self):
+        short = source(surface_term={**source().surface_term, "start": "2026-10-16", "end": "2027-03-01"})
+        self.assertEqual(runner.renewal_expiration(short), date(2027, 3, 1))
+        multi = source(surface_term={**source().surface_term, "start": "2026-09-30", "end": "2029-09-29"})
+        self.assertEqual(runner.renewal_expiration(multi), date(2029, 9, 29))  # not start + 1 year - 1 day
 
     def test_case_4_and_5_types_are_accepted(self):
         for onboarding_type, engine in (("Renewal of Surface + New Credential Exposure Module", "case_4_renew_surface_new_ce"),
@@ -248,8 +250,8 @@ class PlanTests(unittest.TestCase):
 
     def test_expiration_guards(self):
         specs, _a, _e, row = self.plan()
-        self.assertEqual(runner.plan_renewal_changes(row, specs, date(2027, 10, 15))[1], "renewal_expiration_in_past")
-        later = tenant_row(accountLicense__expirationDate=ms(date(2028, 1, 1)))
+        self.assertEqual(runner.plan_renewal_changes(row, specs, date(2029, 10, 16))[1], "renewal_expiration_in_past")
+        later = tenant_row(accountLicense__expirationDate=ms(date(2030, 1, 1)))
         self.assertEqual(runner.plan_renewal_changes(later, specs, TODAY)[1], "renewal_expiration_would_shorten")
 
     def test_nothing_to_change_gives_an_empty_diff(self):
@@ -293,9 +295,11 @@ def prod_payload(tenants):
     return {"tenants": tenants, "captured_at": "2026-10-06T08:00:00+00:00", "environment_label": "Prod (Cloned)"}
 
 
-def prod_tenant(tenant_id, name, domain, alternates=(), deleted=False):
+def prod_tenant(tenant_id, name, domain, alternates=(), deleted=False, enabled=True,
+                license_type="Prepaid annual subscription"):
+    """Live and paid by default (the renewal's real target); pass enabled / license_type for the other cases."""
     return {"id": tenant_id, "account_name": name, "account_domain": domain, "alternate_domains": sorted(alternates),
-            "is_deleted": deleted, "created": "2024-01-01"}
+            "is_deleted": deleted, "enabled": enabled, "license": {"type": license_type}, "created": "2024-01-01"}
 
 
 class DomainGateTests(unittest.TestCase):
@@ -330,6 +334,14 @@ class DomainGateTests(unittest.TestCase):
         self.assertEqual(self.gate([other])["result"], "renewal_target_not_in_production_clone")
         twin = [prod_tenant("p1", TENANT, DOMAIN), prod_tenant("p9", TENANT, DOMAIN)]
         self.assertEqual(self.gate(twin + [other])["result"], "renewal_target_ambiguous_in_production_clone")
+        # A disabled same-name/same-domain twin is not a second target; two live paid twins still are.
+        disabled = prod_tenant("p8", TENANT, DOMAIN, enabled=False)
+        self.assertEqual(self.gate([prod_tenant("p1", TENANT, DOMAIN), disabled, other])["result"], "renewal_gate_clear")
+        self.assertEqual(self.gate([disabled, other])["result"], "renewal_target_not_in_production_clone")
+        # Trial / Evaluation tenants of the same name and domain are never the target.
+        for kind in ("Trial", "Evaluation"):
+            self.assertEqual(self.gate([prod_tenant("p7", TENANT, DOMAIN, license_type=kind), other])["result"],
+                             "renewal_target_not_in_production_clone")
         # Same name on another domain is a different tenant, not the target.
         self.assertEqual(self.gate([prod_tenant("p1", TENANT, "different.com"), other])["result"],
                          "renewal_target_not_in_production_clone")
@@ -398,7 +410,7 @@ class RenewTenantTests(unittest.TestCase):
         self.assertEqual(report["start_date"], "never_changed")
         self.assertEqual(report["added_domains"], 1)
         fields = {change["field"]: change for change in report["changes"]}
-        self.assertEqual(fields["license_end"]["target"], "2027-10-15")
+        self.assertEqual(fields["license_end"]["target"], "2029-10-15")
         self.assertEqual(fields["license_end"]["current"], "2026-10-15")
         self.assertEqual(fields["Number of subdomains"]["target"], 10)
         self.assertNotIn(CE_DOMAIN, json.dumps(report))  # domain lists are counts only
