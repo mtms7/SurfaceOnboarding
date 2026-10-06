@@ -1392,12 +1392,8 @@ Operator ran `redash_inventory_collector.py --collect`: `"refresh_failed": true,
 - `45d231c` renewal **edit mode**: `--co CO-XXXX --renew [--confirm-write] [--tenant-name ...]`; `RouteContract.mode`, `RENEWAL_ROUTES` (outside `ROUTES`), `renewal_domain_gate`, review item 20 fixes (no start fallback in edit, no run-day in plan, `select_ce_subscription` honours `DealHub_Status__c`, `production_ids_present` informational). Tests `integration/tests/test_renewal_edit.py` (58). Live-unverified selectors listed above `RENEWAL_ENGINES`.
 - `0dc79d8` **prod→Dev mirror**: `integration/onboarding/renewal_mirror.py` (pure plan), `--co CO-XXXX --mirror-renewal [--confirm-write]`, records in gitignored `integration/attended_renewal_mirrors.json` + readback store. Tests `integration/tests/test_renewal_mirror.py` (29). Licence-type labels other than "Prepaid annual subscription" are guesses (unmapped → fail closed).
 
-#### Next steps (in order; each live step needs operator go)
-1. Operator: report CO-0728 `--confirm-write`; then CO-0762 dry run → `--confirm-write`.
-2. Case 6 on CO-0770: `--mirror-renewal` dry run → `--confirm-write` → `--renew` dry run (with `--tenant-name` if the mirror name differs) → `--renew --confirm-write`.
-3. Case 4 on CO-0758, same sequence. Case 5: no open CO; synthetic fixture later.
-4. Follow-ups: "DEV mirror" label + skip in `--validate-all`/dashboard; stale-tab fast fail; renewal outcome state file; dashboard card for renew/mirror.
-5. Operator: push.
+#### Next steps
+Superseded by "End of day 2026-10-06" below.
 
 **Boundaries preserved (2026-10-06):** assistant actions were local code/tests and one read-only Redash `--collect`. Operator-run Leonardo Development reads (SpyCloud dry runs). No Salesforce write, no production access, no Redash change, no VM change. No credential, key, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
 
@@ -1406,3 +1402,39 @@ Operator ran `redash_inventory_collector.py --collect`: `"refresh_failed": true,
 - Derivation (`derive_onboarding_stage`, pure): each stage needs all earlier ones plus its own proof; missing/unknown evidence stops at the last provable stage. Approved = Approval Status Approved; Account Scanning = Leonardo readback (or verified run record); Scan Completed = scan-status read with execution state `done`; User Created = operator account AND customer user present in the local inventory snapshot; Onboarding Completed only from Salesforce. Salesforce's own stage counts as evidence for itself; when the derived stage is ahead the page shows "Salesforce still shows: <stage>".
 - **User Created data gaps:** the DEV snapshot keeps only `operator_assigned` (bool), `primary_user.present` (an object exists) and `mfa_required`; it cannot tell a user entered in the form from an activated/invited/logged-in one. `terms_accepted` (shape unconfirmed live) is not used. The production clone (Redash) carries only the operator flag, so for production COs the customer user stays "not collected" and the stage never advances to User Created from the clone. Snapshots are as fresh as the last export. No new Leonardo reads were added.
 - Layout: tracker, header, summary (now with licence dates and short tenant id), one next-step card; tenant checks (validation, scan status, SpyCloud), Salesforce IDs, record, and renewal sign-in/manual sections are collapsed. Renewal plan card updated to the decided rules (Q1 term end exactly, Q2 start never changes, Q3, Q10) and points to the CLI `--renew` / `--mirror-renewal`; still informational.
+
+#### End of day 2026-10-06 (authoritative; continue here)
+
+**Live today (Leonardo Development, operator-run):**
+- CO-0767 (Case 6): production tenant chosen = "A2A" (live, paid, exact name; Trial/Eval/POV tenants ignored). `--mirror-renewal` dry run → `mirror_dry_run_verified`; `--confirm-write` → **`mirror_created_verified`** (account/add 200, readback 1 row, mirror record verified; Dev ids in the readback store). SpyCloud-after-create stopped `spycloud_row_ambiguous` ("A2A" matched 4 rows) → fixed by `_search_one_row` (narrow by the row's own domain); `--spycloud-off` dry run → `spycloud_dry_run_on` (narrowing verified live). **`--confirm-write` approved; result not yet reported.**
+- `--probe-tenant-details` (read-only) on the A2A mirror: Details tabs = Details, Pending Requests, Configuration, Duration Per Scan; API calls seen: userProfile, accountInfo, `inventory/metadatas/{id}`, `runConfiguration/{id}`, `account/{id}/campaign/executions`. **BackOffice Details exposes no tenant user list** → Dev "User Created" can only be confirmed manually (the row's Access action stays forbidden). Also **verified live:** the executions reply envelope `pagination_response.table_data` with `startDate`/`endDate`/`status`/`campaignTypeEnum`/`campaignExecutionTypeEnum` (was unverified).
+- CO-0728 SpyCloud: dry run `spycloud_dry_run_on`; `--confirm-write` approved, **result not reported**. CO-0762 not started.
+- Leonardo Development reliability: many reload hangs (30 s, zero events) and `ERR_CONNECTION_RESET` on the 5.2 MB `assets/index-*.js`; plain GETs answered in 1.4–3.9 s; by 15:13 reloads took 4–6 s. No browser-code change between the last good run on 10-05 and the first hang → environmental (network/VPN or Leonardo Dev). Request interception disables Chrome's HTTP cache, so every search reload re-downloads the bundle.
+
+**Code today (local commits after `9d96407`; 1053 tests OK, 1 skipped; both guards pass; not pushed):**
+| Commit | Change |
+| --- | --- |
+| `3a71eaa` | Q1 = DealHub term end exactly; production target = one live paid exact-name tenant (`is_live_paid_tenant`) for mirror and Q3 gate |
+| `2b6af1b`, `5bca5c7`, `0bb50e7` | Search: one retry by navigation after a reload timeout (hung document retired first, only that attempt's reply counts); 45 s reply wait; `page_unresponsive` hint; diagnostics title fix |
+| `6746fa1` | Search toolbar: wait up to 45 s for Leonardo to render before failing closed |
+| `b1564cf` | `_search_one_row` (name, then the row's own primary domain; exactly one row with the expected id) for SpyCloud and renewal edit; standalone SpyCloud OFF allowed on verified CE renewal mirrors (Cases 4, 6) |
+| `c76b509` (merge) | CO page redesign: six-step stage tracker (dashboard-only; **ask the owner again at the production move: Salesforce Onboarding Stage must then be updated**), compact header, one next-step card, details collapsed; renewal card updated to the decided rules |
+| `8717461` | Search trigger: header sort click first, reload/navigate fallbacks; live: `thead th button` **not found** (`in_app_unavailable`) → reload used. Needs the real header selector (read-only probe) |
+| `c28c2a9` (merge) | User Created: `primary_user_matches` (boolean only) from validation; "Confirm user created"/Undo (POST `/attended/confirm-user-created`, `/attended/unconfirm-user-created`, existing guards; gitignored `integration/attended_user_created_confirmations.json`). Note: our creates use the fixed attended user as Primary User |
+| `b4c5b8c` | `--co CO-XXXX --probe-tenant-details` (read-only; tab labels, masked API paths, reply key names only) |
+
+**Owner decisions (later on 2026-10-06):** stage tracker dashboard-only until production; "User Created" = the CO's primary user exists as an **extra user** on the tenant (owner answer (b)) — production: detect via a Redash users query (store only SHA-256 of lower-cased emails per tenant); Dev: manual confirmation (no user list in BackOffice).
+
+**Case status:** 1 ✅ live (CO-0649) · 2 ✅ live (CO-0679/0728/0762) · 3 ✅ live (CO-0757) · 6 🟡 mirror created live (CO-0767), edit not yet run · 4 🟡 built; CO-0758 looks already renewed in production (expect `renewal_expiration_would_shorten` unless only CE is added) · 5 🟡 built; no open CO.
+
+**Next steps (in order; each live write needs operator go):**
+1. Operator: report the CO-0767 (A2A mirror) and CO-0728 SpyCloud `--confirm-write` results (expect `spycloud_off_verified`); then CO-0762 dry run → `--confirm-write`.
+2. Case 6: `--co CO-0767 --renew` dry run (expect `renewal_dry_run_planned`: expiration 2026-10-25 → DealHub term end 2029-10-26, start unchanged, counts per DealHub, CE overlay) → review the plan → `--renew --confirm-write` → `renewal_edit_verified`. Live-unverified Edit selectors are listed above `RENEWAL_ENGINES`.
+3. Case 4 on CO-0758: `--mirror-renewal` dry run → create → `--renew` dry run (expected stop on shorten, or a CE-only diff) — owner to decide how to treat already-renewed tenants.
+4. Case 5: pick a CO or a synthetic fixture.
+5. Operator (Redash): users-per-tenant query (account id, user email, status) on `Prod (Cloned) - Mgmt`; send query id + column names. Assistant: collector allow-list + hashed emails + "User Created" automatic proof for production COs. Also the v2 accounts query (Salesforce account id / aliases).
+6. Assistant: probe the real tenant-table header selector (read-only) so the in-app search trigger works; "DEV mirror" label and skip in `--validate-all`/dashboard; renewal outcome state file.
+7. Operator: restart the dashboard (`tools\start_attended_dashboard.ps1 -Restart`) to see the stage tracker; push (`git push origin main`); delete `_to_delete/`.
+8. Carried over: 2026-10-05 item 7 (scan-status decisions a–d) and item 8.
+
+**Boundaries preserved (2026-10-06, end of day):** Leonardo Development only. Leonardo writes today (operator-run, approved): CO-0767 mirror create; SpyCloud saves for CO-0767 mirror and CO-0728 if run. Assistant live actions: read-only Redash `--collect`, local prod-clone reads, unauthenticated timing GETs of the Leonardo Dev front page and bundle. No Salesforce write, no production BackOffice access, no Redash change, no VM change. No credential, key, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
