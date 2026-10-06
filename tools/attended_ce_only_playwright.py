@@ -411,13 +411,19 @@ def _parse_subscription_date(value: Any) -> date | None:
         return None
 
 
-def select_ce_subscription(rows: list[Any]) -> tuple[date, date]:
+def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False) -> tuple[date, date]:
     """Select the CE license subscription dates, failing closed.
 
     Prefers "Pentera Core Plus Commercial" rows (all Pentera Core Plus
     subscriptions include CE); "Bulk"/"Additional" rows never match the
     prefix. Every matching row must carry parseable dates with end after
     start, and all matching rows must agree on the same (start, end) pair.
+
+    Review item 20 (2026-10-06): a row whose DealHub_Status__c is Expired /
+    Cancelled / Inactive is ignored, so an expired term next to an active
+    Core Plus term is no longer ambiguous (rows without a status key keep
+    the old behaviour). ``prefer_latest`` (renewals: the old active term and
+    the new pending term coexist) keeps only the rows with the latest start.
     """
     matches: list[tuple[date, date]] = []
     for row in rows:
@@ -432,6 +438,8 @@ def select_ce_subscription(rows: list[Any]) -> tuple[date, date]:
         # product name starts with the Core Plus prefix.
         if "bulk" in product.casefold() or "additional" in product.casefold():
             continue
+        if "DealHub_Status__c" in row and _row_status(row) in _INACTIVE_STATUSES:
+            continue
         start = _parse_subscription_date(row.get("DealHub_Subscription_Start_Date__c"))
         end = _parse_subscription_date(row.get("DealHub_Subscription_End_Date__c"))
         if start is None or end is None or end <= start:
@@ -439,6 +447,9 @@ def select_ce_subscription(rows: list[Any]) -> tuple[date, date]:
         matches.append((start, end))
     if not matches:
         raise RuntimeError("ce_subscription_unavailable")
+    if prefer_latest:
+        latest = max(pair[0] for pair in matches)
+        matches = [pair for pair in matches if pair[0] == latest]
     if any(pair != matches[0] for pair in matches[1:]):
         raise RuntimeError("ce_subscription_ambiguous")
     return matches[0]
@@ -548,7 +559,7 @@ def ce_fill_source(reference: str) -> CeFillSource:
             raise ValueError()
         names = ce_only_names(account_name)
         subscription_rows = _sf_records(
-            "SELECT Product_Full_Name__c, DealHub_Subscription_Start_Date__c, "
+            "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
             "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
             "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
         subscription_start, subscription_end = select_ce_subscription(subscription_rows)
@@ -1333,6 +1344,9 @@ class RouteContract:
     allow_scan_started: bool
 
     extra_lookups: Any = None  # (source) -> tuple[(name, lookup, expected_domain), ...]
+    # Review item 19: "create" (Add Account; the only mode _run accepts) or "edit" (renewals: edit one existing
+    # tenant, identified by its captured Dev ids + name + domain; see run_renewal).
+    mode: str = "create"
 
     def duplicate_lookups(self, source: Any) -> tuple[tuple[str, str], ...]:
         """Duplicate check: tenant name, then primary domain, then any route extras."""
@@ -3811,7 +3825,7 @@ def _license_date_value(page: Any, key: str) -> date | None:
         return None
 
 
-def _ensure_confirm_enabled(page: Any, confirm: Any, plan: dict[str, Any]) -> bool:
+def _ensure_confirm_enabled(page: Any, confirm: Any, plan: dict[str, Any], *, allow_start_fallback: bool = True) -> bool:
     """Wait for Confirm; if it stays disabled, retry once with the start one day earlier.
 
     Live 2026-09-30 (CO-0649, operator-verified by hand): Leonardo Development
@@ -3825,6 +3839,10 @@ def _ensure_confirm_enabled(page: Any, confirm: Any, plan: dict[str, Any]) -> bo
     """
     if _confirm_enabled(page, confirm):
         return True
+    if not allow_start_fallback:
+        # Edit mode (renewals): the tenant's start date is never changed, so there is no fallback.
+        _log().event("license_start_fallback", "disabled_in_edit_mode")
+        return False
     log = _log()
     start, end = plan.get("license_start"), plan.get("license_end")
     if not isinstance(start, date) or not isinstance(end, date):
@@ -4616,7 +4634,7 @@ def run(reference: str, acknowledged_revision: str, *, review_wait_seconds: floa
     _ACTIVE_RUN_LOG.timeline = diagnose
     try:
         contract = ROUTES.get(route)
-        if contract is None:
+        if contract is None or contract.mode != "create":
             return _finish(reference, acknowledged_revision, "route_unsupported")
         try:
             return _run(reference, acknowledged_revision, review_wait_seconds=review_wait_seconds, dry_run=dry_run,
@@ -5878,6 +5896,608 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
         _ACTIVE_RUN_LOG = None
 
 
+# --- Renewal EDIT mode (Cases 4-6, owner decisions 2026-10-06) -----------------------------
+# Edits ONE existing tenant of a renewing customer in Leonardo DEVELOPMENT (the edit target is a "mirror" tenant
+# created for the test, Q9), guarded exactly like SpyCloud OFF: the default is a DRY RUN (search the tenant, open
+# its Edit form, read current values, compute and report the planned diff, Cancel); only --confirm-write applies
+# it (set the changed fields, Confirm once, the app's own POST /account/{id}/edit must be 2xx for the expected id,
+# then re-read the tenant row and verify BOTH the changed and the preserved fields). The runner never builds the
+# request. Row-menu allow-list: Details and Edit only (never Access, Scan now, Stop scan or Delete).
+#
+# Owner decisions (2026-10-06, binding): Q1 expiration = new licence-term start + 1 year - 1 day capped by the
+# subscription end (the CE rule); Q2 the tenant's existing start date is NEVER changed, even when the old licence
+# has expired (no start-date fallback, the start control is never written); Q3 "Onboarding Approval Status =
+# Approved" means a human validated the CO, BUT every domain or subdomain the renewal ADDS (not already on the
+# tenant) must pass the production duplicate validation against the Redash prod-clone snapshot (the renewal's own
+# target tenant excluded; fail closed); Q9 the target is identified by the CO's local Dev readback ids + tenant
+# name + domain, never by production ids; Q10 only "Surface & Credential Exposure" renewals (Cases 4-6); the
+# single-product renewals (surface_renewal, ce_renewal) are refused.
+#
+# UNVERIFIED LIVE (nothing below has run against Leonardo yet; each failure is a fail-closed reason code):
+#   1. The Edit form shows the same label/name/data-am controls as Add Account for: the "Type", "Scanning
+#      interval" and "Leaked Credentials scanning interval" selects, "Number of assets/domains/subdomains",
+#      "Alternate Domains"/"SubDomains"/"Leaked Credentials scanned domains" text controls, the
+#      leakedCredentialsAllowed / phishingEnabled checkboxes, and data-am AddEditTenantModal-date-expirationDate
+#      (the date control may be readonly: the Material-UI picker path is used then).
+#   2. The Edit form is prefilled and its values can be read with the Add helpers (cross-checked with the row).
+#   3. The Leaked Credentials interval and scanned-domain controls are present / editable once the Leaked
+#      Credentials checkbox is ON (they are applied after it).
+#   4. Edit's unique "Confirm" button, and the app posting /api/v1/backoffice/account/{id}/edit for this form.
+#   5. The row paths used for the before/after read: the probed 2026-10-02 schema (VALIDATION_*_PATHS) for the
+#      planned fields; for the preserved fields userEmailDomains, accountCountryCode, operatorAccounts,
+#      additionalNetworks, primaryUser.*, campaignsTimeoutInHours and the SpyCloud flag are comparisons only.
+#   6. A saved edit does not rewrite the preserved fields (start date, SpyCloud, toggles) on the server side.
+#   7. Licence type "Prepaid annual subscription" for every renewal case (Case 6 "per Salesforce" has no source
+#      field yet) and the production tenant name = the Surface name or the "- CE Only" name (gate target match).
+RENEWAL_ENGINES = frozenset({"case_4_renew_surface_new_ce", "case_5_renew_ce_new_surface", "case_6_renew_both"})
+RENEWAL_LICENSE_TYPE = "Prepaid annual subscription"
+RENEWAL_LC_INTERVAL = "Weekly"
+RENEWAL_EDIT_SELECTOR = SPYCLOUD_EDIT_SELECTOR  # the only row-menu item the renewal edit clicks
+RENEWAL_NEVER_SET = frozenset({"license_start"})  # Q2: the start date control is never written
+# Row paths that must be identical before and after the save (besides the toggles not in the plan).
+RENEWAL_PRESERVE_PATHS = (
+    "accountName", "accountDomain", "accountType", "accountCountryCode", "enabled", "isDeleted",
+    "accountLicense.enabled", "accountLicense.startDate", "userEmailDomains", "additionalNetworks",
+    "operatorAccounts", "primaryUser.email", "primaryUser.firstName", "primaryUser.lastName",
+    "primaryUser.isMfaRequired", "campaignsTimeoutInHours", "leakedCredentialsSettings.spyCloudSettings.enabled",
+)
+RENEWAL_AFTER_CONFIRM_RESULTS = frozenset({
+    "renewal_save_no_signal", "renewal_save_id_mismatch", "renewal_save_failed", "renewal_saved_unverified",
+    "renewal_readback_changed_mismatch", "renewal_readback_preserved_mismatch", "leonardo_session_expired"})
+
+
+@dataclass(frozen=True, slots=True)
+class FieldSpec:
+    """One field of an edit plan (review item 19): what to set, where to read it back.
+
+    kind: date | select | number | list | checkbox; key: the form control (label, checkbox name, or date key);
+    path: the tenant search-row path used for the before/after read; target: a date, str, int, bool, or (list) the
+    full desired item tuple; requires: key of a checkbox spec that must be applied first.
+    """
+
+    kind: str
+    key: str
+    path: str
+    target: Any
+    requires: str | None = None
+
+
+@dataclass(frozen=True)
+class RenewalSource:
+    """One renewal CO's source values (in memory only). Production ids are expected on a renewal and unused."""
+
+    reference: str
+    source_revision: str
+    engine: str
+    label: str
+    account_name: str
+    tenant_name: str  # the Surface name
+    ce_tenant_name: str  # the "- CE Only" name (a production CE tenant may carry it)
+    main_domain: str
+    alternate_domains: tuple[str, ...]
+    subdomains: tuple[str, ...]
+    ce_email_domain: str
+    surface_term: dict[str, Any]
+    ce_term: dict[str, Any]
+    # Review item 20: informational only. On a renewal the PRODUCTION ids are present by definition, so the create
+    # route's "salesforce_id_already_present" gate does not apply; the Dev target comes from the local readback.
+    production_ids_present: bool = False
+
+    @property
+    def licensed_subdomains(self) -> int:
+        return int(self.surface_term["subdomains"])
+
+
+def renewal_fill_source(reference: str, run_day: date | None = None) -> RenewalSource:
+    """Fresh, fixed-field renewal source read (one CO row, one DealHub read); fails closed with a SurfaceSourceError code.
+
+    Codes: renewal_route_mismatch (not a renewal CO), renewal_route_not_supported (single-product renewal, Q10),
+    renewal_not_approved (Q3), renewal_ce_email_domain_invalid, renewal_blocked_<blocker> (build_renewal_plan),
+    surface_* domain codes, surface_domains_exceed_license, renewal_source_unavailable.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise RuntimeError("invalid_co_reference")
+    try:
+        rows = _sf_records(
+            "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
+            "Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Onboarding_Product__c, Onboarding_Type__c, "
+            "Surface_Account_ID__c, Account_UUID__c, Onboarding_Approval_Status__c "
+            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+            raise ValueError()
+        row = rows[0]
+        pair = (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+        case = renewal_case(*pair)
+        if case is None:
+            raise SurfaceSourceError("renewal_route_mismatch")
+        if case[0] not in RENEWAL_ENGINES:
+            raise SurfaceSourceError("renewal_route_not_supported")
+        if row.get("Onboarding_Approval_Status__c") != APPROVED_STATUS:
+            raise SurfaceSourceError("renewal_not_approved")
+        revision, account_id, account_name = row.get("LastModifiedDate"), row.get("Account__c"), row.get("Account_Name__c")
+        if not isinstance(revision, str) or not revision:
+            raise ValueError()
+        if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
+            raise ValueError()
+        if not isinstance(account_name, str) or not " ".join(account_name.split()):
+            raise ValueError()
+        main, roots, subdomains = classify_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
+        ce_domain = one_email_domain(row.get("Email_Domains__c"))
+        if ce_domain is None:
+            raise SurfaceSourceError("renewal_ce_email_domain_invalid")
+        subscription_rows = _sf_records(
+            "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
+            "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
+            "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
+        plan = build_renewal_plan(*pair, subscription_rows, run_day)
+        if plan is None:
+            raise SurfaceSourceError("renewal_route_mismatch")
+        if plan["blockers"]:
+            raise SurfaceSourceError("renewal_blocked_" + str(plan["blockers"][0]))
+        surface_term, ce_term = plan["surface_term"], plan["ce_term"]
+        if not surface_term or not ce_term:
+            raise SurfaceSourceError("renewal_blocked_term_missing")
+        if 1 + len(roots) > int(surface_term["subdomains"]):
+            raise SurfaceSourceError("surface_domains_exceed_license")
+        names, ce_names = surface_names(account_name), ce_only_names(account_name)
+        present = any((row.get(field) or "").strip() for field in ("Surface_Account_ID__c", "Account_UUID__c"))
+        return RenewalSource(reference, revision, case[0], case[1], " ".join(account_name.split()), names.tenant_name,
+                             ce_names.tenant_name, main, roots, subdomains, ce_domain, surface_term, ce_term,
+                             production_ids_present=present)
+    except SurfaceSourceError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise SurfaceSourceError("renewal_source_unavailable") from exc
+
+
+def renewal_expiration(source: RenewalSource) -> date:
+    """Q1: the new term's start + 1 year - 1 day, capped by the subscription end (the CE rule). The tenant start is never used."""
+    term = source.surface_term
+    return ce_license_dates(date.fromisoformat(term["start"]), date.fromisoformat(term["end"]))[1]
+
+
+def _norm_list(value: Any) -> list[str]:
+    return [_norm_text(item) for item in value] if isinstance(value, list) else []
+
+
+def _row_domains(row: dict[str, Any]) -> set[str]:
+    """Every domain already on the tenant (primary, alternate, sub, Leaked Credentials)."""
+    found = {_norm_text(row.get("accountDomain"))}
+    for key in ("alternateDomains", "subDomains", "leakedCredentialsScannedDomains"):
+        found.update(_norm_list(row.get(key)))
+    return {domain for domain in found if domain}
+
+
+def build_renewal_specs(source: RenewalSource, row: dict[str, Any]) -> tuple[list[FieldSpec], set[str], list[str]]:
+    """(specs, domains the renewal ADDS to the tenant, errors) from the source and the tenant's current row.
+
+    Pure. Never plans the start date. Domain lists are add-only: the target is the tenant's current items plus the
+    CO's items that are missing (nothing is ever removed). A list or toggle the row does not report in the expected
+    shape is an error (renewal_row_schema_unexpected) rather than a guess.
+    """
+    term = source.surface_term
+    specs = [
+        FieldSpec("date", "license_end", "accountLicense.expirationDate", renewal_expiration(source)),
+        FieldSpec("select", "Type", VALIDATION_SELECT_PATHS["Type"], RENEWAL_LICENSE_TYPE),
+        FieldSpec("select", "Scanning interval", VALIDATION_SELECT_PATHS["Scanning interval"],
+                  str(term["scanning_interval"])),
+        FieldSpec("number", "Number of assets", VALIDATION_NUMBER_PATHS["Number of assets"], int(term["assets"])),
+        FieldSpec("number", "Number of domains", VALIDATION_NUMBER_PATHS["Number of domains"], int(term["domains"])),
+        FieldSpec("number", "Number of subdomains", VALIDATION_NUMBER_PATHS["Number of subdomains"],
+                  int(term["subdomains"])),
+        FieldSpec("checkbox", "leakedCredentialsAllowed", VALIDATION_TOGGLE_PATHS["leakedCredentialsAllowed"], True),
+        FieldSpec("checkbox", "phishingEnabled", VALIDATION_TOGGLE_PATHS["phishingEnabled"], False),
+        FieldSpec("select", "Leaked Credentials scanning interval",
+                  VALIDATION_SELECT_PATHS["Leaked Credentials scanning interval"], RENEWAL_LC_INTERVAL,
+                  requires="leakedCredentialsAllowed"),
+    ]
+    errors: list[str] = []
+    for spec in specs:
+        if spec.kind == "checkbox" and not isinstance(_row_value(row, spec.path), bool):
+            errors.append("renewal_row_schema_unexpected")
+    wanted = (
+        (ALTERNATE_DOMAINS_LABEL, "alternateDomains", source.alternate_domains, None),
+        (SUBDOMAINS_LABEL, "subDomains", source.subdomains, None),
+        (LC_SCANNED_DOMAINS_LABEL, "leakedCredentialsScannedDomains", (source.ce_email_domain,),
+         "leakedCredentialsAllowed"),
+    )
+    existing_all = _row_domains(row)
+    added: set[str] = set()
+    for label, path, items, requires in wanted:
+        current = row.get(path)
+        have = _norm_list(current)
+        missing = [_norm_text(item) for item in items if _norm_text(item) not in have]
+        if not missing:
+            continue
+        if not isinstance(current, list):
+            errors.append("renewal_row_schema_unexpected")
+            continue
+        added.update(domain for domain in missing if domain not in existing_all)
+        specs.append(FieldSpec("list", label, path, tuple([str(item) for item in current] + missing), requires))
+    return specs, added, errors
+
+
+def _spec_equal(spec: FieldSpec, value: Any) -> bool:
+    if spec.kind == "date":
+        return spec.target.isoformat() in _epoch_dates(value)
+    if spec.kind == "select":
+        return _norm_enum(spec.target) == _norm_enum(value)
+    if spec.kind == "number":
+        return isinstance(value, int) and not isinstance(value, bool) and value == spec.target
+    if spec.kind == "checkbox":
+        return value is spec.target
+    if spec.kind == "list":
+        return isinstance(value, list) and {_norm_text(item) for item in value} == {_norm_text(i) for i in spec.target}
+    return False
+
+
+def _spec_display(spec: FieldSpec, value: Any) -> Any:
+    """A report-safe rendering: dates, enums, counts and flags only; domain lists as item counts."""
+    if spec.kind == "date":
+        if isinstance(value, date):
+            return value.isoformat()
+        found = sorted(_epoch_dates(value))
+        return found[0] if found else None
+    if spec.kind == "list":
+        return f"{len(value)} item(s)" if isinstance(value, (list, tuple)) else None
+    return value if isinstance(value, (bool, int, str)) or value is None else "unreadable"
+
+
+def plan_renewal_changes(row: dict[str, Any], specs: list[FieldSpec], today: date) -> tuple[list[dict[str, Any]], str | None]:
+    """The planned diff: only specs whose current row value differs. (changes, error code)."""
+    changes: list[dict[str, Any]] = []
+    for spec in specs:
+        if spec.key in RENEWAL_NEVER_SET:
+            return [], "renewal_start_date_protected"
+        value = _row_value(row, spec.path)
+        if spec.kind == "date":
+            if spec.target <= today:
+                return [], "renewal_expiration_in_past"
+            current = sorted(_epoch_dates(value))
+            if current and date.fromisoformat(current[0]) > spec.target:
+                return [], "renewal_expiration_would_shorten"
+        if _spec_equal(spec, value):
+            continue
+        changes.append({"spec": spec, "current": value})
+    # Checkboxes first (the Leaked Credentials controls depend on theirs), then the rest in plan order.
+    changes.sort(key=lambda change: change["spec"].kind != "checkbox")
+    return changes, None
+
+
+def _stable(value: Any) -> str:
+    if isinstance(value, list) and all(item is None or isinstance(item, (str, int, bool)) for item in value):
+        value = sorted(value, key=str)
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def renewal_preserve_snapshot(row: dict[str, Any], specs: list[FieldSpec]) -> dict[str, str]:
+    """Stable fingerprints of every row path the edit must NOT change (never logged: paths only)."""
+    changing = {spec.path for spec in specs}
+    paths = list(RENEWAL_PRESERVE_PATHS)
+    paths += [path for path in VALIDATION_TOGGLE_PATHS.values() if path not in paths]
+    paths += [path for path in ("alternateDomains", "subDomains", "leakedCredentialsScannedDomains") if path not in paths]
+    return {path: _stable(_row_value(row, path)) for path in paths if path not in changing}
+
+
+def verify_renewal_row(after: dict[str, Any], changes: list[dict[str, Any]],
+                       preserved_before: dict[str, str]) -> tuple[list[str], list[str]]:
+    """(changed fields that did not take, preserved paths that moved) after the save; both empty = verified."""
+    changed_bad = [change["spec"].key for change in changes
+                   if not _spec_equal(change["spec"], _row_value(after, change["spec"].path))]
+    preserved_bad = [path for path, before in preserved_before.items() if _stable(_row_value(after, path)) != before]
+    return changed_bad, preserved_bad
+
+
+def renewal_profile_drift(row: dict[str, Any]) -> list[str]:
+    """Report-only (never applied): Surface-profile toggles whose value differs from the Guru profile (R5)."""
+    expected = {**SURFACE_ADVANCED_TOGGLES, "notificationsAllowed": True, "multipleUsersAllowed": True,
+                "apiAccessAllowed": True, "provisioningEnabled": True}
+    return sorted(key for key, want in expected.items()
+                  if VALIDATION_TOGGLE_PATHS.get(key) and _row_value(row, VALIDATION_TOGGLE_PATHS[key]) is not want)
+
+
+def _renewal_row(page: Any, tenant_name: str, expected_domain: str, expected_id: str,
+                 expected_uuid: str | None) -> tuple[str, dict[str, Any]]:
+    """Search the tenant; ("ok", row) only for exactly one row whose id, uuid, name and primary domain all match."""
+    searched = _search_tenants(page, None, tenant_name)
+    if searched is None:
+        return "renewal_readback_unavailable", {}
+    matches = [row for row in searched.rows if isinstance(row, dict) and row.get("id") == expected_id
+               and (expected_uuid is None or (isinstance(row.get("accountUuid"), str)
+                                              and row["accountUuid"].casefold() == expected_uuid.casefold()))]
+    if len(matches) != 1:
+        return "renewal_tenant_not_found", {}
+    if len(searched.rows) != 1 or searched.total_count != 1:
+        return "renewal_row_ambiguous", {}
+    row = matches[0]
+    if _norm_text(row.get("accountName")) != _norm_text(tenant_name):
+        return "renewal_name_mismatch", {}
+    if _norm_text(row.get("accountDomain")) != _norm_text(expected_domain):
+        return "renewal_domain_mismatch", {}
+    if row.get("isDeleted") is True:
+        return "renewal_tenant_deleted", {}
+    return "ok", row
+
+
+def _renewal_gate(source: RenewalSource, new_domains: Any) -> dict[str, Any]:
+    """Q3: production duplicate validation of the domains the renewal adds (prod-clone snapshot; fail closed)."""
+    from integration.onboarding import leonardo_inventory as inventory
+
+    domains = list(new_domains)
+    gate = inventory.renewal_domain_gate(inventory_root(), (source.tenant_name, source.ce_tenant_name),
+                                         source.main_domain, domains, now=datetime.now(timezone.utc))
+    _log().event("renewal_gate", gate["result"],
+                 detail=f"blocks={gate['blocks']} new={len(domains)} matches={len(gate['matches'])}")
+    return gate
+
+
+def _cancel_edit_form(page: Any) -> bool:
+    """Close the Edit form without saving (shared with SpyCloud OFF)."""
+    return _spycloud_cancel(page)
+
+
+def _form_current(page: Any, spec: FieldSpec) -> Any:
+    """The Edit form's own current value for one spec (None = unreadable). Used to cross-check the row."""
+    try:
+        if spec.kind == "select":
+            control = _locate_select(page, spec.key)
+            return _selected_option_text(control.first) if control is not None else None
+        if spec.kind == "number":
+            text = _text_control_value(page, spec.key)
+            return int(text.strip()) if text is not None and text.strip().isdigit() else None
+        if spec.kind == "date":
+            return _license_date_value(page, spec.key)
+        if spec.kind == "list":
+            text = _text_control_value(page, spec.key)
+            return None if text is None else [item for item in (part.strip() for part in text.split(",")) if item]
+        if spec.kind == "checkbox":
+            control = _locate_checkbox(page, spec.key)
+            return control.first.is_checked() if control is not None else None
+    except Exception as exc:  # noqa: BLE001
+        _log().error("renewal", f"form_read:{spec.key}", exc)
+    return None
+
+
+def _form_matches_row(spec: FieldSpec, form: Any, row_value: Any) -> bool:
+    if spec.kind == "date":
+        return isinstance(form, date) and form.isoformat() in _epoch_dates(row_value)
+    if spec.kind == "select":
+        return _norm_enum(form) == _norm_enum(row_value)
+    if spec.kind == "list":
+        return isinstance(row_value, list) and {_norm_text(i) for i in form} == {_norm_text(i) for i in row_value}
+    return form == row_value
+
+
+def _apply_spec(page: Any, spec: FieldSpec) -> str | None:
+    """Set one planned field (each helper re-reads the control); a reason code on failure."""
+    if spec.key in RENEWAL_NEVER_SET:
+        return "renewal_start_date_protected"
+    failure: str | None
+    if spec.kind == "date":
+        ok = _fill_license_date(page, spec.key, spec.target) and _license_date_value(page, spec.key) == spec.target
+        failure = None if ok else "fill_value_mismatch"
+    elif spec.kind == "select":
+        failure = _fill_select(page, spec.key, str(spec.target))
+    elif spec.kind == "number":
+        failure, _control = _fill_text_control(page, spec.key, str(spec.target), "renewal_text")
+    elif spec.kind == "list":
+        failure, _control = _fill_text_control(page, spec.key, ", ".join(spec.target), "renewal_text")
+    elif spec.kind == "checkbox":
+        failure = None if _set_checkbox(page, spec.key, bool(spec.target)) else "fill_form_schema_unavailable"
+    else:
+        failure = "fill_form_schema_unavailable"
+    if failure is None:
+        return None
+    return "renewal_value_mismatch" if failure == "fill_value_mismatch" else "renewal_field_unavailable"
+
+
+def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id: str, *, expected_uuid: str | None = None,
+                 gate: Any = None, confirm_write: bool = False, today: date | None = None) -> tuple[str, dict[str, Any]]:
+    """Plan (and, only with confirm_write, apply) a renewal edit on one Leonardo Development tenant.
+
+    Returns (result, report). Outcomes: renewal_dry_run_planned (Edit opened, diff computed, cancelled),
+    renewal_already_current (nothing to change, Edit never opened), renewal_edit_verified (saved; the re-read row
+    shows every changed field AND every preserved field). Reason codes: renewal_environment_not_supported,
+    renewal_readback_unavailable, renewal_tenant_not_found, renewal_row_ambiguous, renewal_name_mismatch,
+    renewal_domain_mismatch, renewal_tenant_deleted, renewal_row_schema_unexpected, renewal_expiration_in_past,
+    renewal_expiration_would_shorten, renewal_start_date_protected, the domain-gate codes
+    (renewal_new_domain_in_production, renewal_target_not_in_production_clone,
+    renewal_target_ambiguous_in_production_clone, production_clone_unavailable, production_clone_incomplete),
+    renewal_edit_unavailable, renewal_form_unreadable, renewal_form_mismatch, renewal_field_unavailable,
+    renewal_value_mismatch, renewal_start_date_changed, renewal_confirm_unavailable, renewal_confirm_disabled,
+    renewal_cancel_unavailable, and after Confirm: renewal_save_no_signal, renewal_save_id_mismatch,
+    renewal_save_failed, renewal_saved_unverified, renewal_readback_changed_mismatch,
+    renewal_readback_preserved_mismatch. A 401/403 raises LeonardoSessionExpired. The form is cancelled (or Escape
+    pressed) wherever nothing was saved. The report carries dates, enums, counts and flags only (no domain values).
+    """
+    report: dict[str, Any] = {"engine": source.engine, "mode": "write" if confirm_write else "dry_run",
+                              "start_date": "never_changed", "changes": [], "added_domains": 0,
+                              "profile_drift": [], "gate": None}
+    if _url_origin(page.url) != DEVELOPMENT_ORIGIN or not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, expected_id or ""):
+        return "renewal_environment_not_supported", report
+    code, row = _renewal_row(page, tenant_name, source.main_domain, expected_id, expected_uuid)
+    if code != "ok":
+        return code, report
+    specs, added, errors = build_renewal_specs(source, row)
+    if errors:
+        return errors[0], report
+    changes, error = plan_renewal_changes(row, specs, today or _run_day())
+    if error:
+        return error, report
+    report["changes"] = [{"field": c["spec"].key, "kind": c["spec"].kind, "current": _spec_display(c["spec"], c["current"]),
+                          "target": _spec_display(c["spec"], c["spec"].target)} for c in changes]
+    report["added_domains"] = len(added)
+    report["profile_drift"] = renewal_profile_drift(row)
+    if not changes:
+        return "renewal_already_current", report
+    found_gate = (gate or (lambda domains: _renewal_gate(source, domains)))(sorted(added))
+    report["gate"] = found_gate["result"]
+    if found_gate["blocks"]:
+        return found_gate["result"], report
+    preserved_before = renewal_preserve_snapshot(row, specs)
+    try:
+        _open_row_action(page, tenant_name, RENEWAL_EDIT_SELECTOR)
+    except Exception as exc:  # noqa: BLE001
+        _log().error("renewal", "edit_open", exc)
+        _cancel_edit_form(page)
+        return "renewal_edit_unavailable", report
+
+    def stop(reason: str) -> tuple[str, dict[str, Any]]:
+        """Nothing was saved: close the form and report the reason (a form that stays open is reported)."""
+        closed = _cancel_edit_form(page)
+        if closed or reason != "renewal_dry_run_planned":
+            return reason, report
+        return "renewal_cancel_unavailable", report
+
+    # Cross-check the form's own prefilled values against the row (not the Leaked Credentials controls, which may
+    # exist only while that checkbox is ON): a different reading means the form is not what the row says.
+    for change in changes:
+        if change["spec"].requires is not None or change["spec"].key == "leakedCredentialsAllowed":
+            continue
+        form = _form_current(page, change["spec"])
+        if form is None:
+            return stop("renewal_form_unreadable")
+        if not _form_matches_row(change["spec"], form, change["current"]):
+            _log().event("renewal", "form_row_mismatch", change["spec"].key)
+            return stop("renewal_form_mismatch")
+    start_before = _license_date_value(page, "license_start")
+    if not confirm_write:
+        return stop("renewal_dry_run_planned")
+    for change in changes:
+        failure = _apply_spec(page, change["spec"])
+        if failure:
+            _log().event("renewal", failure, change["spec"].key)
+            return stop(failure)
+    if start_before is not None and _license_date_value(page, "license_start") != start_before:
+        return stop("renewal_start_date_changed")
+    confirm = page.get_by_role("button", name="Confirm", exact=True)
+    try:
+        if confirm.count() != 1:
+            return stop("renewal_confirm_unavailable")
+    except Exception as exc:  # noqa: BLE001
+        _log().error("renewal", "confirm_locate", exc)
+        return stop("renewal_confirm_unavailable")
+    # Q2: no start-date fallback in edit mode (the Add form's retry with an earlier start must never run here).
+    if not _ensure_confirm_enabled(page, confirm, {}, allow_start_fallback=False):
+        return stop("renewal_confirm_disabled")
+    try:
+        with page.expect_response(_is_spycloud_edit_response, timeout=SPYCLOUD_EDIT_TIMEOUT_MS) as info:
+            confirm.first.click(timeout=FIELD_TIMEOUT_MS)
+        response = info.value
+    except Exception as exc:  # noqa: BLE001
+        # Uncertain: the click may or may not have saved. Never re-click; a dry run shows the state.
+        _log().error("renewal", "save_response", exc)
+        _cancel_edit_form(page)
+        return "renewal_save_no_signal", report
+    match = SPYCLOUD_EDIT_PATH.fullmatch(_url_path(response.url))
+    if match is None or match.group(1) != expected_id:
+        _log().event("renewal", "wrong_tenant_edit_observed")
+        _cancel_edit_form(page)
+        return "renewal_save_id_mismatch", report
+    if response.status in (401, 403):
+        _log().event("renewal", str(response.status), detail="leonardo session expired")
+        raise LeonardoSessionExpired()
+    if not 200 <= response.status < 300:
+        _log().event("renewal", "save_status", detail=str(response.status))
+        _cancel_edit_form(page)
+        return "renewal_save_failed", report
+    # Read-after-write: a 2xx save with a failed re-read is "saved, unverified" (one retry), never "nothing written".
+    code, after = _renewal_row(page, tenant_name, source.main_domain, expected_id, expected_uuid)
+    if code != "ok":
+        code, after = _renewal_row(page, tenant_name, source.main_domain, expected_id, expected_uuid)
+    if code != "ok":
+        _log().event("renewal", "saved_readback", detail=code)
+        return "renewal_saved_unverified", report
+    changed_bad, preserved_bad = verify_renewal_row(after, changes, preserved_before)
+    report["readback"] = {"changed_ok": len(changes) - len(changed_bad), "changed_bad": changed_bad,
+                          "preserved_ok": len(preserved_before) - len(preserved_bad), "preserved_bad": preserved_bad}
+    if changed_bad:
+        return "renewal_readback_changed_mismatch", report
+    if preserved_bad:
+        return "renewal_readback_preserved_mismatch", report
+    return "renewal_edit_verified", report
+
+
+def renewal_write_label(result: str, confirm_write: bool) -> str:
+    """What the CLI may claim about the Leonardo write; never "attempted" for a run that stopped before Confirm."""
+    if result == "renewal_edit_verified":
+        return "verified"
+    if confirm_write and result in RENEWAL_AFTER_CONFIRM_RESULTS:
+        return "attempted_unverified"
+    return "not_performed"
+
+
+def run_renewal(reference: str, *, confirm_write: bool = False, env_name: str = "dev",
+                tenant_name_override: str | None = None) -> tuple[str, dict[str, Any]]:
+    """Renewal edit for one Case 4-6 CO in Leonardo Development. Dry run by default; --confirm-write applies it.
+
+    Needs the CO's local Dev readback (id + accountUuid of the Dev/mirror tenant). Any environment other than dev,
+    a missing readback, a non-renewal route, a single-product renewal, or a CO that is not Approved is refused
+    before any browser work. Salesforce is never written. Returns (result, report).
+    """
+    global _ACTIVE_RUN_LOG
+    if env_name != "dev":
+        return "renewal_environment_not_supported", {}
+    if not REFERENCE.fullmatch(reference):
+        return "invalid_co_reference", {}
+    ids = _readback_ids(reference)
+    if ids is None:
+        return "renewal_not_onboarded", {}
+    try:
+        source = renewal_fill_source(reference)
+    except RuntimeError as error:  # SurfaceSourceError is a RuntimeError
+        return str(error), {}
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable", {}
+    tenant_name = " ".join((tenant_name_override or source.tenant_name).split())
+    _ACTIVE_RUN_LOG = RunLog(reference, "renewal_edit" if confirm_write else "renewal_dry_run", route=source.engine)
+    log = _ACTIVE_RUN_LOG
+    log.add_redactions(source.account_name, source.tenant_name, source.ce_tenant_name, tenant_name, source.main_domain,
+                       source.ce_email_domain, *source.alternate_domains, *source.subdomains)
+    result, report = "attended_ce_runner_unavailable", {}
+    try:
+        with sync_playwright() as playwright:
+            try:
+                with _attended_page(playwright) as page:
+                    log.attach(page)
+                    result, report = renew_tenant(page, source, tenant_name, ids[0], expected_uuid=ids[1],
+                                                  confirm_write=confirm_write)
+            except LoginTimeout:
+                result = "development_login_timeout"
+            except RuntimeError as error:
+                result = str(error)
+            except Exception as exc:  # noqa: BLE001
+                log.error("runner", "unexpected", exc)
+                result = "attended_ce_runner_unavailable"
+        return result, report
+    finally:
+        log.event("finish", result)
+        log.write(result)
+        _ACTIVE_RUN_LOG = None
+
+
+def _renewal_contract(engine: str) -> RouteContract:
+    return RouteContract(
+        engine=engine,
+        load_source=lambda reference: renewal_fill_source(reference),
+        license_dates=lambda source, run_day=None: (None, renewal_expiration(source)),  # the start is never planned
+        build_fill=lambda source, run_day=None: {"expiration": renewal_expiration(source),
+                                                 "licensed_subdomains": source.licensed_subdomains},
+        primary_domain=lambda source: source.main_domain,
+        redactions=lambda source: (source.account_name, source.tenant_name, source.ce_tenant_name, source.main_domain,
+                                   source.ce_email_domain, *source.alternate_domains, *source.subdomains),
+        allow_scan_started=True,
+        mode="edit",
+    )
+
+
+# Edit-mode contracts. Deliberately NOT in ROUTES: _run (create) never sees them, and run() refuses any
+# contract whose mode is not "create".
+RENEWAL_ROUTES = {engine: _renewal_contract(engine) for engine in sorted(RENEWAL_ENGINES)}
+
+
 # --- Leonardo tenant inventory (2026-10-03) ----------------------------------
 # Read-only. The runner never builds its own API request: it reloads Tenant
 # Management and clicks the table's Next button, and captures the
@@ -6477,8 +7097,10 @@ def main() -> int:
                         help="With --co (and --route): read-only duplicate check against the production clone (Redash snapshot; no Leonardo, no browser).")
     parser.add_argument("--spycloud-off", action="store_true",
                         help="With --co: open the tenant's Edit form in Leonardo Development and report the SpyCloud checkbox (dry run: Cancel, nothing saved). Add --confirm-write to turn it OFF.")
+    parser.add_argument("--renew", action="store_true",
+                        help="With --co: renewal EDIT of a Case 4-6 CO's existing Leonardo Development (mirror) tenant. Dry run: open Edit, read current values, report the planned diff, Cancel (nothing saved). Add --confirm-write to apply it.")
     parser.add_argument("--confirm-write", action="store_true",
-                        help="With --spycloud-off: explicitly approve the Leonardo Development save that turns SpyCloud OFF (Edit > Confirm). Without it nothing is saved.")
+                        help="With --spycloud-off or --renew: explicitly approve the Leonardo Development save (Edit > Confirm). Without it nothing is saved.")
     parser.add_argument("--open-dashboard", type=int, metavar="PORT",
                         help="Open (or bring to the front) the local dashboard's sign-in page as a tab of the automation window.")
     parser.add_argument("--probe-inventory-shape", action="store_true",
@@ -6494,8 +7116,19 @@ def main() -> int:
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
-    if args.confirm_write and not args.spycloud_off:
-        parser.error("--confirm-write is only valid with --spycloud-off")
+    if args.confirm_write and not (args.spycloud_off or args.renew):
+        parser.error("--confirm-write is only valid with --spycloud-off or --renew")
+    if args.renew and args.spycloud_off:
+        parser.error("--renew and --spycloud-off are separate runs")
+    if args.renew:
+        if not args.co:
+            parser.error("--co is required with --renew")
+        result, report = run_renewal(args.co, confirm_write=args.confirm_write, env_name=args.env,
+                                     tenant_name_override=args.tenant_name)
+        # Codes, dates, enums, counts and flags only; no domain values, ids, or names.
+        print(json.dumps({"result": result, "leonardo_write": renewal_write_label(result, args.confirm_write),
+                          "plan": report, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
     if args.spycloud_off:
         if not args.co:
             parser.error("--co is required with --spycloud-off")
