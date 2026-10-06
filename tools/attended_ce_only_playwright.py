@@ -1752,7 +1752,7 @@ def _capture_search_diagnostics(page: Any) -> None:
             return default
     try:
         url = _safe(lambda: page.url, "").split("?", 1)[0].split("#", 1)[0]
-        title = _safe(lambda: page.title, "")
+        title = _safe(lambda: page.title(), "")
         roles: list[dict[str, str]] = []
         for role in ("textbox", "searchbox", "combobox", "button"):
             try:
@@ -4467,6 +4467,9 @@ def _fill_select(page: Any, label: str, option: str) -> str | None:
     return None
 
 
+SEARCH_RELOAD_RETRIES = 1  # one read-only retry after a reload timeout (2026-10-06)
+
+
 def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult | None":
     """One invisible, server-side tenant search (owner decision 2026-10-04, Development).
 
@@ -4501,15 +4504,32 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
         _log().error("tenant_search", "route", exc)
         return None
     try:
-        # Only the reply to the rewritten request counts: an app refresh already in flight (e.g. after an
-        # Edit save) also matches the path but carries the unfiltered table.
-        with page.expect_response(lambda r: _is_inventory_response(r) and any(r.request is q for q in rewritten),
-                                  timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
-            page.reload(wait_until="domcontentloaded")
-        status = info.value.status
-    except Exception as exc:
-        _log().error("tenant_search", "response", exc)
-        return None
+        status = None
+        for attempt in range(1 + SEARCH_RELOAD_RETRIES):
+            try:
+                # Only the reply to a rewritten request counts: an app refresh already in flight (e.g. after an
+                # Edit save) also matches the path but carries the unfiltered table.
+                with page.expect_response(lambda r: _is_inventory_response(r)
+                                          and any(r.request is q for q in rewritten),
+                                          timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
+                    if attempt == 0:
+                        page.reload(wait_until="domcontentloaded")
+                    else:
+                        # A fresh navigation instead of a second reload (2026-10-06: Leonardo Development
+                        # intermittently never answers a reload). Read-only: the search is only re-sent.
+                        document = page.goto(TENANT_MANAGEMENT, wait_until="domcontentloaded")
+                        _log().event("tenant_search", "retry_document",
+                                     detail=str(getattr(document, "status", "none")))
+                status = info.value.status
+                break
+            except Exception as exc:
+                _log().error("tenant_search", "response", exc)
+                if attempt < SEARCH_RELOAD_RETRIES and "Timeout" in type(exc).__name__ + str(exc)[:80]:
+                    _log().event("tenant_search", "retry", detail="reload timed out; navigating once more")
+                    continue
+                _log().event("tenant_search", "page_unresponsive",
+                             detail="Leonardo did not answer: close the automation browser, then Prepare sessions")
+                return None
     finally:
         try:
             page.unroute(INVENTORY_ROUTE_PATTERN, rewrite)
