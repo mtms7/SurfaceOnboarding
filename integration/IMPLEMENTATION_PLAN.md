@@ -1361,3 +1361,40 @@ Operator ran `redash_inventory_collector.py --collect`: `"refresh_failed": true,
 8. Carried over from 2026-10-04 items 4–5 (identity-only pre-check, own-tenant label, drop extra Leonardo check at Start, timed checks on run page; review items 5, 7–12, 16–17; `docs/38` Q1–Q3, Q7, Q9–Q11; VM staging r21; CO-0679 tenant fix; CO-0735 Salesforce correction; start-date quirk note; Slack). Wire prod-clone `lastScanStatusEnum` into the CO page (later, production COs).
 
 **Boundaries preserved (2026-10-05):** Leonardo Development only. Live actions today: Redash read-only query/collection (operator-run) and task registration; operator-run Leonardo Development reads (dry runs, scan-status attempt) and two Leonardo Development SpyCloud saves (CO-0757, CO-0679). No Salesforce write, no production BackOffice access, no Redash change by the assistant, no VM change. No credential, key, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
+
+### Handoff — 2026-10-06 (continue here)
+
+**Authoritative handoff for the next session.** Supersedes the 2026-10-05 "Next steps" where stated. Focus today: make onboarding Cases 4–6 (renewals) functional in Leonardo Development.
+
+#### Verified today
+- Step 1 (Redash refresh) **done**: `--collect` at 18:28Z → `inventory_collected`, `data_age_minutes: 0`, 5,440 rows, `refreshed: false` (Redash refreshes query 251 on its own schedule). Step 3 (push of `500d30c`) was already done.
+- CO-0728 SpyCloud dry run: first two runs `spycloud_readback_unavailable` (`Page.reload` timeout 30 s with **zero** browser events → stale/frozen automation tab after an SSO sign-in); after closing the automation browser and **Prepare sessions**, `spycloud_dry_run_on`. Operator approved `--confirm-write` for CO-0728; result not yet reported. Follow-up idea (not built): detect a stale tab before the search reload and fail fast with a clear reason.
+
+#### Case status (Leonardo Development)
+| Case | Status |
+| --- | --- |
+| 1 New Surface only | Working live (CO-0649) |
+| 2 New CE only | Working live (CO-0679, CO-0728, CO-0762; CO-0702 manual + verified) |
+| 3 New Surface + CE | Working live (CO-0757) |
+| 4 / 5 / 6 Renewals | Edit mode + prod→Dev mirror built locally (below); **not run live** |
+
+#### Owner decisions 2026-10-06 (supersede `docs/38` §4 for these items)
+- Q1: renewal expiration = new term start + 1 y − 1 d (capped by subscription end).
+- Q2: never change the tenant's start date, even if the old licence expired.
+- Q3: "Onboarding Approval Status = Approved" means a human (owner/team) validated the CO, for **all** cases; no extra manual review. Any domain/subdomain a renewal **adds** must pass the production duplicate validation on the Redash prod clone (own target tenant excluded and found exactly once; a match on any other tenant, or an unusable clone, stops).
+- Q9: test renewals against a **mirror** tenant created in Dev from the production clone (start date = today; Dev cannot backdate).
+- Q10: `Surface & Credential Exposure` + `Renewal of Existing Product` = Case 6; single-product renewals out of scope.
+- Accepted: Surface advanced toggles report-only on renewal (`profile_drift`); renewal requires Approved + exactly one CE email domain; domain lists add-only; mirror scanning interval from prod `scanningInterval`, LC weekly; LC scanned domains = CO email domains capped at the prod count; mirror fails closed when two prod tenants match; mirrors to be labelled "DEV mirror" and skipped by drift validation (**follow-up, not built**).
+
+#### Built today (local; parallel Sonnet agents, merged `eb93daa`, `b12043b`; 1000 integration tests OK, 1 skipped; artifact and offline-boundary guards pass)
+- `45d231c` renewal **edit mode**: `--co CO-XXXX --renew [--confirm-write] [--tenant-name ...]`; `RouteContract.mode`, `RENEWAL_ROUTES` (outside `ROUTES`), `renewal_domain_gate`, review item 20 fixes (no start fallback in edit, no run-day in plan, `select_ce_subscription` honours `DealHub_Status__c`, `production_ids_present` informational). Tests `integration/tests/test_renewal_edit.py` (58). Live-unverified selectors listed above `RENEWAL_ENGINES`.
+- `0dc79d8` **prod→Dev mirror**: `integration/onboarding/renewal_mirror.py` (pure plan), `--co CO-XXXX --mirror-renewal [--confirm-write]`, records in gitignored `integration/attended_renewal_mirrors.json` + readback store. Tests `integration/tests/test_renewal_mirror.py` (29). Licence-type labels other than "Prepaid annual subscription" are guesses (unmapped → fail closed).
+
+#### Next steps (in order; each live step needs operator go)
+1. Operator: report CO-0728 `--confirm-write`; then CO-0762 dry run → `--confirm-write`.
+2. Case 6 on CO-0770: `--mirror-renewal` dry run → `--confirm-write` → `--renew` dry run (with `--tenant-name` if the mirror name differs) → `--renew --confirm-write`.
+3. Case 4 on CO-0758, same sequence. Case 5: no open CO; synthetic fixture later.
+4. Follow-ups: "DEV mirror" label + skip in `--validate-all`/dashboard; stale-tab fast fail; renewal outcome state file; dashboard card for renew/mirror.
+5. Operator: push.
+
+**Boundaries preserved (2026-10-06):** assistant actions were local code/tests and one read-only Redash `--collect`. Operator-run Leonardo Development reads (SpyCloud dry runs). No Salesforce write, no production access, no Redash change, no VM change. No credential, key, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
