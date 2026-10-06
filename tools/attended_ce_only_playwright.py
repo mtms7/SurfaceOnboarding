@@ -5701,26 +5701,57 @@ def _spycloud_cancel(page: Any) -> bool:
     return False
 
 
+def _search_one_row(page: Any, tenant_name: str, expected_id: str,
+                    expected_uuid: str | None) -> tuple[str, dict[str, Any] | None]:
+    """Invisible search that leaves exactly the expected tenant in the table: ("ok" | "unavailable" |
+    "not_found" | "ambiguous", row).
+
+    Searched by name first. When other tenants also contain that name (2026-10-06 live: "A2A" returned 4 rows),
+    the search is repeated once with the expected row's own primary domain, read from the reply. Either way the
+    result must be exactly one row with the expected id (and accountUuid), so the row clicked next is that tenant.
+    """
+    def expected(row: Any) -> bool:
+        return (isinstance(row, dict) and row.get("id") == expected_id
+                and (expected_uuid is None or (isinstance(row.get("accountUuid"), str)
+                                               and row["accountUuid"].casefold() == expected_uuid.casefold())))
+
+    searched = _search_tenants(page, None, tenant_name)
+    if searched is None:
+        return "unavailable", None
+    matches = [row for row in searched.rows if expected(row)]
+    if len(matches) != 1:
+        return "not_found", None
+    if len(searched.rows) == 1 and searched.total_count == 1:
+        return "ok", matches[0]
+    domain = matches[0].get("accountDomain")
+    if not (isinstance(domain, str) and domain.strip()):
+        return "ambiguous", None
+    _log().event("tenant_search", "narrow_by_domain", detail=f"name rows={len(searched.rows)}")
+    searched = _search_tenants(page, None, domain.strip())
+    if searched is None:
+        return "unavailable", None
+    matches = [row for row in searched.rows if expected(row)]
+    if len(matches) != 1:
+        return "not_found", None
+    if len(searched.rows) != 1 or searched.total_count != 1:
+        return "ambiguous", None
+    return "ok", matches[0]
+
+
 def _spycloud_row(page: Any, tenant_name: str, expected_id: str, expected_uuid: str | None) -> tuple[str, bool | None]:
     """Search the tenant and return (result, spycloud_enabled): result "ok" or a reason code.
 
     The search must return exactly the one expected row (id, and accountUuid when given), so the
-    row the runner clicks next is that tenant and no other (a name that is a substring of another
-    tenant's is ambiguous: fail closed).
+    row the runner clicks next is that tenant and no other (``_search_one_row``: narrowed by the row's own
+    primary domain when the name also matches other tenants; still ambiguous → fail closed).
     """
     from integration.onboarding import leonardo_inventory as inventory
 
-    searched = _search_tenants(page, None, tenant_name)
-    if searched is None:
-        return "spycloud_readback_unavailable", None
-    matches = [row for row in searched.rows if isinstance(row, dict) and row.get("id") == expected_id
-               and (expected_uuid is None or (isinstance(row.get("accountUuid"), str)
-                                              and row["accountUuid"].casefold() == expected_uuid.casefold()))]
-    if len(matches) != 1:
-        return "spycloud_tenant_not_found", None
-    if len(searched.rows) != 1 or searched.total_count != 1:
-        return "spycloud_row_ambiguous", None
-    return "ok", inventory.spycloud_enabled(matches[0])
+    found, row = _search_one_row(page, tenant_name, expected_id, expected_uuid)
+    if found != "ok":
+        return {"unavailable": "spycloud_readback_unavailable", "not_found": "spycloud_tenant_not_found",
+                "ambiguous": "spycloud_row_ambiguous"}[found], None
+    return "ok", inventory.spycloud_enabled(row)
 
 
 def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_uuid: str | None = None,
@@ -5882,6 +5913,27 @@ def spycloud_write_label(result: str, confirm_write: bool) -> str:
     return "not_performed"
 
 
+SPYCLOUD_MIRROR_ROUTES = frozenset({"case_4_renew_surface_new_ce", "case_6_renew_both"})
+
+
+def _spycloud_mirror_target(reference: str) -> tuple[str, str] | None:
+    """(renewal engine, tenant name) for a renewal CO with a verified Dev mirror that renews CE, else None."""
+    record = _mirror_records().get(reference)
+    if not (isinstance(record, dict) and record.get("mirror_of_production") is True
+            and record.get("status") == "verified"):
+        return None
+    rows = _sf_records(
+        "SELECT Name, Account_Name__c, Onboarding_Product__c, Onboarding_Type__c "
+        "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+    if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+        raise ValueError()
+    case = renewal_case(rows[0].get("Onboarding_Product__c"), rows[0].get("Onboarding_Type__c"))
+    account_name = rows[0].get("Account_Name__c")
+    if case is None or not case[3] or not isinstance(account_name, str) or not " ".join(account_name.split()):
+        return None
+    return case[0], surface_names(account_name).tenant_name
+
+
 def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: str = "dev") -> str:
     """Standalone SpyCloud OFF for one onboarded CE / Case 3 CO in Leonardo Development.
 
@@ -5898,12 +5950,18 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
     if ids is None:
         return "spycloud_not_onboarded"
     try:
-        route, tenant_name = _validation_route(reference)
-    except SurfaceSourceError as error:
-        return str(error)
+        try:
+            route, tenant_name = _validation_route(reference)
+        except SurfaceSourceError as error:
+            # A renewal CO onboarded as a verified Dev mirror (2026-10-06): its mirror carries Leaked Credentials
+            # when the renewal covers CE (Cases 4 and 6), so SpyCloud must be OFF there too.
+            mirrored = _spycloud_mirror_target(reference)
+            if mirrored is None:
+                return str(error)
+            route, tenant_name = mirrored
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
         return "spycloud_source_unavailable"
-    if route not in SPYCLOUD_ROUTES:
+    if route not in SPYCLOUD_ROUTES and route not in SPYCLOUD_MIRROR_ROUTES:
         return "spycloud_route_not_applicable"
     try:
         from playwright.sync_api import sync_playwright
@@ -6240,17 +6298,10 @@ def renewal_profile_drift(row: dict[str, Any]) -> list[str]:
 def _renewal_row(page: Any, tenant_name: str, expected_domain: str, expected_id: str,
                  expected_uuid: str | None) -> tuple[str, dict[str, Any]]:
     """Search the tenant; ("ok", row) only for exactly one row whose id, uuid, name and primary domain all match."""
-    searched = _search_tenants(page, None, tenant_name)
-    if searched is None:
-        return "renewal_readback_unavailable", {}
-    matches = [row for row in searched.rows if isinstance(row, dict) and row.get("id") == expected_id
-               and (expected_uuid is None or (isinstance(row.get("accountUuid"), str)
-                                              and row["accountUuid"].casefold() == expected_uuid.casefold()))]
-    if len(matches) != 1:
-        return "renewal_tenant_not_found", {}
-    if len(searched.rows) != 1 or searched.total_count != 1:
-        return "renewal_row_ambiguous", {}
-    row = matches[0]
+    found, row = _search_one_row(page, tenant_name, expected_id, expected_uuid)
+    if found != "ok" or row is None:
+        return {"unavailable": "renewal_readback_unavailable", "not_found": "renewal_tenant_not_found",
+                "ambiguous": "renewal_row_ambiguous"}.get(found, "renewal_tenant_not_found"), {}
     if _norm_text(row.get("accountName")) != _norm_text(tenant_name):
         return "renewal_name_mismatch", {}
     if _norm_text(row.get("accountDomain")) != _norm_text(expected_domain):

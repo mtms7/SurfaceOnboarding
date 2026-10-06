@@ -538,7 +538,8 @@ class RenewTenantTests(unittest.TestCase):
         cases = (
             ([result_of()], "renewal_tenant_not_found"),
             ([result_of(dict(self.before, id="y" * 24))], "renewal_tenant_not_found"),
-            ([result_of(self.before, tenant_row(id="x" * 24, accountUuid="c" * 32), total=2)], "renewal_row_ambiguous"),
+            ([result_of(self.before, tenant_row(id="x" * 24, accountUuid="c" * 32), total=2)] * 2,
+             "renewal_row_ambiguous"),  # still two rows after narrowing by the row's own domain
             ([result_of(dict(self.before, accountDomain="other.com"))], "renewal_domain_mismatch"),
             ([result_of(dict(self.before, accountName="Acme Holdings"))], "renewal_name_mismatch"),
             ([result_of(dict(self.before, isDeleted=True))], "renewal_tenant_deleted"),

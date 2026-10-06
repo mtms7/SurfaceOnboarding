@@ -180,5 +180,51 @@ class SearchToolbarWaitTests(unittest.TestCase):
             self.assertIsNone(runner._open_search(self.page(_Count([0]), _Count([2]))))
 
 
+class SearchOneRowTests(unittest.TestCase):
+    """2026-10-06 live: searching "A2A" returned 4 rows; the row is narrowed by its own primary domain."""
+
+    ID, UUID = "a" * 24, "b" * 32
+
+    def row(self, ident=None, name="A2A", domain="a2a.eu"):
+        return {"id": ident or self.ID, "accountUuid": self.UUID, "accountName": name, "accountDomain": domain}
+
+    def run_with(self, *replies):
+        calls = []
+
+        def fake(page, search, lookup):
+            calls.append(lookup)
+            return replies[len(calls) - 1]
+        with unittest.mock.patch.object(runner, "_search_tenants", fake):
+            return runner._search_one_row(object(), "A2A", self.ID, self.UUID), calls
+
+    def result(self, *rows, total=None):
+        return runner.TenantSearchResult(list(rows), len(rows) if total is None else total)
+
+    def test_a_unique_name_needs_one_search(self):
+        (found, row), calls = self.run_with(self.result(self.row()))
+        self.assertEqual((found, row["id"], calls), ("ok", self.ID, ["A2A"]))
+
+    def test_a_shared_name_is_narrowed_by_the_rows_own_domain(self):
+        many = self.result(self.row(), self.row("c" * 24, "A2A - Trial", "a2a.it"), self.row("d" * 24, "A2A - Ctrl POV"))
+        (found, row), calls = self.run_with(many, self.result(self.row()))
+        self.assertEqual((found, calls), ("ok", ["A2A", "a2a.eu"]))
+
+    def test_still_several_rows_after_narrowing_is_ambiguous(self):
+        many = self.result(self.row(), self.row("d" * 24, "A2A - Ctrl POV"))
+        (found, row), _ = self.run_with(many, many)
+        self.assertEqual((found, row), ("ambiguous", None))
+
+    def test_the_expected_row_must_be_in_every_reply(self):
+        many = self.result(self.row(), self.row("d" * 24, "A2A - Ctrl POV"))
+        self.assertEqual(self.run_with(many, self.result(self.row("d" * 24)))[0][0], "not_found")
+        self.assertEqual(self.run_with(self.result(self.row("d" * 24)))[0][0], "not_found")
+        self.assertEqual(self.run_with(many, None)[0][0], "unavailable")
+        self.assertEqual(self.run_with(None)[0][0], "unavailable")
+
+    def test_no_domain_on_the_row_stays_ambiguous(self):
+        many = self.result(self.row(domain=""), self.row("d" * 24, "A2A - Ctrl POV"))
+        self.assertEqual(self.run_with(many)[0], ("ambiguous", None))
+
+
 if __name__ == "__main__":
     unittest.main()

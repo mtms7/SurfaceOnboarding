@@ -382,6 +382,25 @@ class StandaloneRunTests(unittest.TestCase):
         with patch.object(runner, "_validation_route", return_value=(route, "Tango - CE Only")):
             return runner.run_spycloud_off("CO-0757", **kw)
 
+    def test_a_verified_ce_renewal_mirror_is_eligible(self):
+        unsupported = runner.SurfaceSourceError("validation_route_unsupported")
+        record = {"CO-0767": {"mirror_of_production": True, "status": "verified"}}
+        sf_row = [{"Name": "CO-0767", "Account_Name__c": "A2A", "Onboarding_Product__c": "Surface & Credential Exposure",
+                   "Onboarding_Type__c": "Renewal of Existing Product"}]
+        with patch.object(runner, "_validation_route", side_effect=unsupported),                 patch.object(runner, "_mirror_records", return_value=record),                 patch.object(runner, "_sf_records", return_value=sf_row),                 patch.object(runner, "set_spycloud_off", return_value="spycloud_dry_run_on") as call:
+            self.assertEqual(runner.run_spycloud_off("CO-0767"), "spycloud_dry_run_on")
+        self.assertEqual(call.call_args.args[1], "A2A")
+
+    def test_no_mirror_or_a_surface_only_renewal_stays_unsupported(self):
+        unsupported = runner.SurfaceSourceError("validation_route_unsupported")
+        surface_only = [{"Name": "CO-0767", "Account_Name__c": "A2A", "Onboarding_Product__c": "Surface",
+                         "Onboarding_Type__c": "Renewal of Existing Product"}]
+        for records, rows in (({}, surface_only),
+                              ({"CO-0767": {"mirror_of_production": True, "status": "create_attempted"}}, surface_only),
+                              ({"CO-0767": {"mirror_of_production": True, "status": "verified"}}, surface_only)):
+            with patch.object(runner, "_validation_route", side_effect=unsupported),                     patch.object(runner, "_mirror_records", return_value=records),                     patch.object(runner, "_sf_records", return_value=rows),                     patch.object(runner, "set_spycloud_off", side_effect=AssertionError("untouched")):
+                self.assertEqual(runner.run_spycloud_off("CO-0767"), "validation_route_unsupported")
+
     def test_production_is_refused_before_anything_else(self):
         with patch.object(runner, "_readback_ids", side_effect=AssertionError("untouched")), \
                 patch.object(runner, "set_spycloud_off", side_effect=AssertionError("untouched")):
