@@ -1438,3 +1438,19 @@ Superseded by "End of day 2026-10-06" below.
 8. Carried over: 2026-10-05 item 7 (scan-status decisions a–d) and item 8.
 
 **Boundaries preserved (2026-10-06, end of day):** Leonardo Development only. Leonardo writes today (operator-run, approved): CO-0767 mirror create; SpyCloud saves for CO-0767 mirror and CO-0728 if run. Assistant live actions: read-only Redash `--collect`, local prod-clone reads, unauthenticated timing GETs of the Leonardo Dev front page and bundle. No Salesforce write, no production BackOffice access, no Redash change, no VM change. No credential, key, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
+
+#### Handoff for 2026-10-07 (latest; supersedes the "Next steps" above)
+
+**Since the end-of-day entry:** CO-0767 A2A mirror SpyCloud `--confirm-write` → **`spycloud_off_verified`** (`"leonardo_write":"verified"`). Owner approved the assistant to create a **new** Redash users query (never modify existing queries; copy or create new only) and to restart the dashboard and push — but this session's auto-mode permission classifier **blocked** `git push` and every Redash-directed action ("Out-of-Place Publication"). Nothing was pushed or created in Redash. Dashboard restart (`start_attended_dashboard.ps1 -Restart`) was launched and may be waiting for SSO sign-in in the automation window.
+
+**Start tomorrow with (in order):**
+1. **Operator:** `git push origin main` (19 local commits ahead of `origin/main`). To let the assistant push or work in Redash, add a Claude Code permission rule from an interactive `claude` terminal first.
+2. **Operator:** open http://127.0.0.1:8012/ (sign in via SSO) and review the new CO page (stage tracker; "Confirm user created").
+3. **Case 6 (read-only first):** `--co CO-0767 --renew` → expect `renewal_dry_run_planned` (expiration 2026-10-25 → 2029-10-26, start unchanged, counts per DealHub, CE overlay); paste the plan JSON; then, with owner go, `--renew --confirm-write` → expect `renewal_edit_verified`. Edit-form selectors are live-unverified (list above `RENEWAL_ENGINES`); a mismatch fails closed.
+4. **SpyCloud clean-up:** CO-0728 `--confirm-write` result still unreported (re-run the dry run to read the state); CO-0762 dry run → `--confirm-write`.
+5. **Redash users query (owner rule: new query only, never edit 251 or any existing one):** in `Prod (Cloned) - Mgmt` → New Query; find the users collection in the schema browser; send collection + field names (tenant/account id, email, status). Assistant drafts the query text; operator saves it unpublished and sends the query id (never the key). Assistant then adds a pinned allow-list entry + own DPAPI key file, stores only SHA-256 of lower-cased emails per tenant, and wires "User Created" (CO primary user present as an extra user) for production COs. Dev stays manual (BackOffice Details has no user list).
+6. **Case 4 (CO-0758):** owner decision first — the production tenant already expires 2029-09-18 (looks renewed); options: skip, or apply only the CE part. Then mirror dry run → create → renew dry run.
+7. **Case 5:** choose a CO or a synthetic fixture.
+8. **Assistant (local):** read-only probe for the real tenant-table header selector (in-app search trigger currently falls back to reload); "DEV mirror" label + skip in `--validate-all`/dashboard; renewal outcome state file; delete `_to_delete/` (operator).
+
+**Run commands with the project runtime** (PowerShell): `& "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" toolsttended_ce_only_playwright.py --co CO-XXXX <flags>`. If Leonardo hangs: close the automation browser → dashboard **Prepare sessions** → re-run.
