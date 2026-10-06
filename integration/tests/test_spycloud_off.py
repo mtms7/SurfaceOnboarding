@@ -314,9 +314,10 @@ class AfterCreateHookTests(unittest.TestCase):
     def stored(self):
         return json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
-    def test_disabled_by_default_so_no_create_path_changes(self):
-        self.assertIs(runner.SPYCLOUD_AFTER_CREATE_ENABLED, False)
-        with patch.object(runner, "set_spycloud_off", side_effect=AssertionError("must not run")):
+    def test_enabled_by_owner_decision_and_the_switch_still_turns_it_off(self):
+        self.assertIs(runner.SPYCLOUD_AFTER_CREATE_ENABLED, True)  # owner, 2026-10-05
+        with patch.object(runner, "SPYCLOUD_AFTER_CREATE_ENABLED", False), \
+                patch.object(runner, "set_spycloud_off", side_effect=AssertionError("must not run")):
             self.hook(runner.CE_ENGINE)
             self.hook(runner.CASE3_ENGINE)
         self.assertEqual(self.stored(), {})

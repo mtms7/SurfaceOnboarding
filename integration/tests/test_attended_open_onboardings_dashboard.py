@@ -2546,3 +2546,57 @@ class RenewalPlanCardTests(unittest.TestCase):
             with self.assertRaises(dashboard.ReadUnavailable):
                 dashboard.renewal_subscription_rows("x'; DELETE")
 
+class ProductionMarkerTests(unittest.TestCase):
+    """2026-10-05: a CO stopped by the automatic production duplicate check is marked on its page and queue row."""
+
+    MATCH = {"kind": "production_duplicate", "result": "duplicate_production_clone_match", "completed_on": "2026-10-05T10:00:00",
+             "detail": json.dumps({"matches": [{"id": "T-<9>", "name": "<b>Acme</b>", "created": "2026-03-01T00:00:00Z"}]})}
+    UNAVAILABLE = {"kind": "production_duplicate", "result": "production_clone_unavailable",
+                   "completed_on": "2026-10-05T10:00:00", "detail": json.dumps({"reason": "inventory_snapshot_stale"})}
+    ROW = {"Name": "CO-0702", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Request Approved",
+           "Onboarding_Product__c": dashboard.CE_ROUTE_PRODUCT, "Onboarding_Type__c": dashboard.CE_ROUTE_TYPE}
+
+    def _co_page(self, check, result):
+        evaluation = dashboard.CredentialExposureFillPreflight("CO-0702", "rev1", 1, ())
+        state = {"CO-0702": {"source_revision": "rev1", "result": result, "completed_on": "2026-10-05T10:00:00"}}
+        with patch.object(dashboard, "evaluate_ce_only_fill_preflight", return_value=evaluation), \
+                patch.object(dashboard, "load_runner_state", return_value=state), \
+                patch.object(dashboard, "load_check_state", return_value={"CO-0702": check}):
+            return dashboard._ce_only_onboard_section("CO-0702")
+
+    def test_a_match_is_marked_on_the_co_page_escaped_with_id_name_and_created_date(self):
+        section = self._co_page(self.MATCH, "duplicate_production_match")
+        self.assertIn("Already in production", section)
+        self.assertIn("&lt;b&gt;Acme&lt;/b&gt;", section)
+        self.assertIn("<code>T-&lt;9&gt;</code>", section)
+        self.assertIn("created 2026-03-01", section)
+        self.assertNotIn("<b>Acme</b>", section)
+        self.assertIn("Already in production — duplicate", section)
+
+    def test_an_unusable_clone_shows_the_reason_and_the_collector_hint(self):
+        section = self._co_page(self.UNAVAILABLE, "production_clone_unavailable")
+        self.assertIn("Production check unavailable — inventory_snapshot_stale", section)
+        self.assertIn("redash_inventory_collector.py --collect", section)
+
+    def test_no_marker_for_a_clear_check_or_another_check_kind(self):
+        for check in ({"kind": "production_duplicate", "result": "production_clone_no_match", "completed_on": "x"},
+                      {"kind": "readback", "result": "readback_verified", "completed_on": "x"}):
+            self.assertEqual(dashboard._production_marker(check), "")
+            self.assertEqual(dashboard._production_chip(check), "")
+        self.assertEqual(dashboard._production_marker(None), "")
+
+    def test_a_malformed_detail_still_renders_safely(self):
+        check = dict(self.MATCH, detail="not json")
+        self.assertIn("Already in production", dashboard._production_marker(check))
+
+    def test_the_queue_row_shows_the_chip_for_both_outcomes(self):
+        for check, result, label in ((self.MATCH, "duplicate_production_match", "Already in production"),
+                                     (self.UNAVAILABLE, "production_clone_unavailable", "Production check unavailable")):
+            with self.subTest(result=result):
+                state = {"CO-0702": {"source_revision": "r", "result": result, "completed_on": "2026-10-05T10:00:00"}}
+                page = page_queue([self.ROW], runner_state=state, check_state={"CO-0702": check})
+                self.assertIn(label, page)
+        # A duplicate production match is a manual-review item, like the other duplicate results.
+        self.assertIn("duplicate_production_match", dashboard.DUPLICATE_RESULTS)
+        state = {"CO-0702": {"source_revision": "r", "result": "duplicate_production_match"}}
+        self.assertEqual(dashboard.classify_queue_row(self.ROW, state["CO-0702"])[0], "review")

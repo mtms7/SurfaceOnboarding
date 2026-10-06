@@ -70,6 +70,7 @@ from tools.attended_ce_only_playwright import (
     SURFACE_ROUTE_TYPE,
     _chrome_executable,
     close_automation_browser,
+    load_check_state,
     load_runner_state,
     start_blocker,
     create_uncertain,
@@ -78,7 +79,6 @@ from tools.attended_ce_only_playwright import (
     reset_leonardo_profile,
     reset_runner_record,
     run_inventory_precheck,
-    run_production_duplicate_check,
     surface_fill_source,
     surface_scope_summary,
 )
@@ -2597,7 +2597,7 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
                history: ClosedHistory | None = None, history_failed: bool = False,
                read_at: str | None = None, today: date | None = None, scan_started: bool = False,
                start_dates: dict[str, str] | None = None, start_dates_unavailable: bool = False,
-               sort: str = "", direction: str = "") -> str:
+               sort: str = "", direction: str = "", check_state: dict[str, dict[str, str]] | None = None) -> str:
     """Render the open-onboardings dashboard: one filter bar (queues, history) and one sortable table.
 
     Default order is the soonest subscription start first (blank dates last),
@@ -2702,6 +2702,9 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
         product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
         leonardo = row.get("Local_Leonardo_State")
         run = _run_chip(record)
+        production = _production_chip((check_state or {}).get(row.get("Name") or ""))
+        if production and (record or {}).get("result") in ("duplicate_production_match", "production_clone_unavailable"):
+            run = production
         drift = row.get("Local_Validation_Drift")
         automation = (_route_chip(row) + (f"<span class='run'>{run}</span>" if run else "")
                       + (f"<span class='sub'>Leonardo: {escape(leonardo)}</span>" if leonardo else "")
@@ -3053,7 +3056,11 @@ def render_dashboard(selected_queue: str = "", scan_started: bool = False, sort:
             start_dates = queue_start_dates(tuple(row["Name"] or "" for row in rows))
         except ReadUnavailable:
             start_dates_unavailable = True
-    return page_queue(rows, selected_queue, runner_state=runner_state,
+    try:
+        check_state: dict[str, dict[str, str]] | None = load_check_state()
+    except ValueError:
+        check_state = None
+    return page_queue(rows, selected_queue, runner_state=runner_state, check_state=check_state,
                       runner_state_unavailable=runner_state_unavailable,
                       history=history, history_failed=history_failed, read_at=display_read_at(),
                       scan_started=scan_started, start_dates=start_dates,
@@ -3260,8 +3267,11 @@ def page_ce_only_fill_preflight(evaluation: CredentialExposureFillPreflight,
 
 
 # Run results that mean "a tenant like this may already exist" (live check or inventory pre-check).
-DUPLICATE_RESULTS = frozenset({"duplicate_found", "duplicate_ambiguous", "duplicate_inventory_match"})
+DUPLICATE_RESULTS = frozenset({"duplicate_found", "duplicate_ambiguous", "duplicate_inventory_match",
+                               "duplicate_production_match"})
 RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
+    "duplicate_production_match": ("blocked", "The production tenant list already has a tenant with this tenant name, primary domain, or one of its alternate domains. No browser was opened and nothing was created in Leonardo. Review the production tenant; this CO should not be onboarded again."),
+    "production_clone_unavailable": ("blocked", "The production tenant list could not be used (missing, stale, or incomplete), so the production duplicate check could not answer. No browser was opened and nothing was created. Refresh it with tools\\redash_inventory_collector.py --collect, then try again."),
     "duplicate_inventory_match": ("blocked", "The latest DEV tenant inventory already has a tenant with this tenant name, primary domain, or one of its alternate domains. No browser was opened and nothing was created. Review that tenant; if it was removed, refresh the inventory and try again."),
     "readback_verified": ("success", "Tenant created and read back. Surface Account ID, Account UUID, and Account Scanning state were captured locally."),
     "duplicate_found": ("blocked", "A tenant with this tenant name or primary domain already exists in Leonardo Development. Nothing was created. Review the existing tenant; this CO should not be onboarded again."),
@@ -3370,6 +3380,8 @@ RUNNER_HEADLINES = {
     "duplicate_found": "Already exists — duplicate",
     "duplicate_ambiguous": "Possible duplicate — review",
     "duplicate_inventory_match": "Already in the tenant inventory — duplicate",
+    "duplicate_production_match": "Already in production — duplicate",
+    "production_clone_unavailable": "Production check unavailable",
     "leonardo_session_expired": "Leonardo session expired",
 }
 
@@ -3658,6 +3670,60 @@ def _onboarding_chip(reference: str) -> str:
     return "<span class='chip chip-bad'>Onboarding failed</span>"
 
 
+PRODUCTION_GATE_NOTE = ("<p class='note'>Every onboarding Start checks this production list first; a match stops it.</p>")
+PRODUCTION_COLLECT_HINT = "tools\\redash_inventory_collector.py --collect"
+
+
+def _production_mark(check: dict[str, str] | None) -> tuple[str, list[dict], str] | None:
+    """(result, matches, reason) for a recorded production duplicate check that stopped the Start; else None."""
+    if not check or check.get("kind") != "production_duplicate":
+        return None
+    result = check.get("result")
+    if result not in ("duplicate_production_clone_match", "production_clone_unavailable", "production_clone_incomplete"):
+        return None
+    try:
+        detail = json.loads(check.get("detail") or "{}")
+    except ValueError:
+        detail = {}
+    detail = detail if isinstance(detail, dict) else {}
+    matches = [m for m in detail.get("matches") or () if isinstance(m, dict)]
+    return result, matches, str(detail.get("reason") or result)
+
+
+def _production_chip(check: dict[str, str] | None) -> str:
+    """Queue-row chip for a CO whose last Start was stopped by the production duplicate check."""
+    mark = _production_mark(check)
+    if mark is None:
+        return ""
+    if mark[0] == "duplicate_production_clone_match":
+        return "<span class='chip chip-bad'>Already in production</span>"
+    return "<span class='chip chip-warn'>Production check unavailable</span>"
+
+
+def _production_marker(check: dict[str, str] | None) -> str:
+    """CO-page marker: the tenant(s) already in production, or why the production check could not answer."""
+    mark = _production_mark(check)
+    if mark is None:
+        return ""
+    result, matches, reason = mark
+    if result == "duplicate_production_clone_match":
+        items = "".join(
+            "<li>" + escape(str(m.get("name") or "—")) + " · <code>" + escape(str(m.get("id") or "—")) + "</code> · created "
+            + escape(_created_date(m.get("created"))) + "</li>" for m in matches)
+        return ("<div class='banner banner-warn'><span class='chip chip-bad'>Already in production</span> "
+                "<strong>This CO already has a tenant in production.</strong> Nothing was created in Leonardo."
+                "<ul>" + items + "</ul></div>")
+    return ("<div class='banner banner-warn'><strong>Production check unavailable — " + escape(reason) + "</strong> "
+            "Start stops until the production list is fresh. Run <code>" + PRODUCTION_COLLECT_HINT + "</code>.</div>")
+
+
+def _production_marker_for(reference: str) -> str:
+    try:
+        return _production_marker(load_check_state().get(reference))
+    except ValueError:
+        return ""
+
+
 def _outcome_banner(kind: str, message: str, result: str, completed: str | None = None,
                     headline: str | None = None, compact: bool = False) -> str:
     """Render one attended-run outcome with a green check or red cross icon.
@@ -3782,7 +3848,7 @@ def _ce_only_onboard_section(reference: str, lede: str = "") -> str:
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
         runner_note = (_outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
-                       + _entered_license_note(record))
+                       + _entered_license_note(record) + _production_marker_for(reference))
     elif same_revision:
         runner_note = _running_note(ref, record)
     elif start_blocker(record) == "run_in_progress":
@@ -3921,7 +3987,7 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE, lede: 
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
         runner_note = (_outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
-                       + _entered_license_note(record))
+                       + _entered_license_note(record) + _production_marker_for(reference))
     elif same_revision:
         runner_note = _running_note(ref, record)
     elif record is not None and record.get("result") == "readback_verified":
@@ -4161,34 +4227,6 @@ def page_duplicate_precheck(reference: str, report: dict[str, object]) -> str:
     return _app_shell(reference + " duplicate pre-check", main_html, active="onboardings")
 
 
-PRODUCTION_CHECK_ROUTES = ((CE_ENGINE, "New CE (credential exposure)"), (SURFACE_ENGINE, "New Surface"),
-                           (CASE3_ENGINE, "Case 3 (Surface and CE)"))
-
-
-def production_check_form(reference: str = "", route_value: str = CE_ENGINE) -> str:
-    """Read-only duplicate check of one CO against the production clone (Redash); never writes anywhere."""
-    options = "".join("<option value='" + value + "'" + (" selected" if value == route_value else "") + ">"
-                      + escape(label) + "</option>" for value, label in PRODUCTION_CHECK_ROUTES)
-    return ("<section class='card'><h2 class='section-title'>Check a CO for duplicates in production</h2>"
-            "<form method='post' action='/attended/production-duplicate-check' class='filterbar'>"
-            "<input name='reference' value='" + escape(reference[:20]) + "' placeholder='CO-0801' pattern='CO-[0-9]{4,10}' "
-            "required aria-label='CO reference'><select name='route' aria-label='Route'>" + options + "</select>"
-            "<button type='submit'>Check production clone</button></form>"
-            "<div class='banner banner-warn'>The production clone is a copy that can be up to about a day behind "
-            "production. A \"no match\" is not a clearance: a production onboarding must still pass the live check. "
-            "If the clone is missing or stale the check fails closed.</div></section>")
-
-
-def production_check_result(reference: str, report: dict[str, object]) -> str:
-    """The production gate's answer for one CO, or why the CO could not be checked."""
-    gate = report.get("production_clone")
-    ref = escape(reference)
-    if not isinstance(gate, dict):
-        return ("<section class='card'><div class='banner banner-warn'><strong>" + ref + " could not be checked</strong> "
-                "(<code>" + escape(str(report.get("result"))) + "</code>). Nothing was started or written.</div></section>")
-    return "<section class='card'><h2 class='section-title'>" + ref + "</h2>" + _clone_precheck_section(gate) + "</section>"
-
-
 INVENTORY_SCAN_FILTERS = (("", "All"), ("COMPLETED", "Completed"), ("RUNNING", "Running"),
                           ("INCOMPLETE", "Incomplete"), ("NONE", "No status"))
 INVENTORY_CO_FILTERS = (("", "Any CO"), ("linked", "With CO"), ("none", "No CO"))
@@ -4232,7 +4270,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
     """Server-rendered tenant table (the CSP blocks scripts); sort and filters are query parameters.
 
     One environment per tab: "dev" is the DevOps tab (/inventory), "prod-clone" the Tenants tab (/tenants).
-    ``top`` is extra HTML shown above the table (the production duplicate-check form and result).
+    ``top`` is extra HTML shown above the table (the Tenants tab's production-gate note).
     """
     now = datetime.now(timezone.utc)
     env = env if env in INVENTORY_ENVIRONMENTS else "dev"
@@ -4248,7 +4286,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
     if clone:
         note = ("<p class='note'>Read-only copy of the <b>production</b> tenant list through Redash (saved query 251 on the "
                 "cloned database), with personal data removed. It refreshes on a schedule and needs no sign-in. It is "
-                "informational: a match can block a duplicate, a missing match never clears one, and Start always "
+                "the Start gate: a match stops an onboarding, a missing match never clears one, and Start also "
                 "re-checks Leonardo live. Dashboard CO links are not shown for production tenants.</p>")
     else:
         note = ("<p class='note'>Read-only copy of Leonardo Development's tenant list, with personal data removed (no user "
@@ -4635,7 +4673,7 @@ SESSION_GATED_ROUTES = {
 
 POST_ROUTES = frozenset({
     "/attended/prepare-sessions", "/attended/session-recheck", "/attended/inventory-refresh",
-    "/attended/duplicate-precheck", "/attended/production-duplicate-check",
+    "/attended/duplicate-precheck",
     "/attended/salesforce-login", "/attended/leonardo-dev-session-check", "/attended/leonardo-dev-session-bootstrap",
     "/attended/leonardo-dev-session-reset", "/attended/leonardo-dev-browser-close",
     "/attended/rerun-comment-evaluation", "/attended/rerun-co0745-renewal-evaluation",
@@ -4779,7 +4817,7 @@ class Handler(BaseHTTPRequestHandler):
                     params.get("q", [""])[0], "" if clone else params.get("refresh", [""])[0],
                     sort=params.get("sort", [""])[0], direction=params.get("dir", [""])[0],
                     scan=params.get("scan", [""])[0], co=params.get("co", [""])[0],
-                    env="prod-clone" if clone else "dev", top=production_check_form() if clone else ""))
+                    env="prod-clone" if clone else "dev", top=PRODUCTION_GATE_NOTE if clone else ""))
                 return
             if path in ("/attended/ce-only-runner-status", "/attended/co0702-runner-status"):
                 ref = parse_qs(parsed.query).get("ref", [CO0702_REFERENCE])[0]
@@ -5124,16 +5162,6 @@ class Handler(BaseHTTPRequestHandler):
                                "covers new CE, Surface, and Case 3 onboardings only.</p><p><a href='/co/" + escape(reference)
                                + "'>Return</a></p>"); return
             self.send_page(HTTPStatus.OK, page_duplicate_precheck(reference, run_inventory_precheck(reference, route)))
-            return
-        if path == "/attended/production-duplicate-check":
-            # Read-only: one Salesforce source read and the production-clone snapshot; no Leonardo, no browser.
-            route = exact_form_value(form, "route") or CE_ENGINE
-            if route not in (CE_ENGINE, *SURFACE_ROUTES):
-                self.send_page(HTTPStatus.BAD_REQUEST, "<!doctype html><title>Invalid request</title><p>Choose a supported route.</p>")
-                return
-            self.send_page(HTTPStatus.OK, render_inventory(
-                env="prod-clone", top=production_check_form(reference, route_value=route)
-                + production_check_result(reference, run_production_duplicate_check(reference, route))))
             return
         if path == "/attended/validate":
             if reference not in attended_leonardo_readbacks():

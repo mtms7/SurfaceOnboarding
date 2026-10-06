@@ -742,14 +742,13 @@ class TenantsTabTests(unittest.TestCase):
         self.assertIn("<a href='/tenants' class='active'>", dashboard.render_inventory(env="prod-clone"))
         self.assertIn("<a href='/inventory' class='active'>", dashboard.render_inventory(env="dev"))
 
-    def test_tenants_tab_has_the_check_form_and_no_refresh_while_devops_keeps_refresh(self):
+    def test_tenants_tab_has_the_gate_note_and_no_manual_check_or_refresh_while_devops_keeps_refresh(self):
         self._collect()
-        tenants = dashboard.render_inventory(env="prod-clone", top=dashboard.production_check_form())
-        self.assertIn("Check a CO for duplicates in production", tenants)
-        self.assertIn("action='/attended/production-duplicate-check'", tenants)
-        self.assertIn("pattern='CO-[0-9]{4,10}'", tenants)
-        self.assertIn("up to about a day behind", tenants)
-        self.assertIn("not a clearance", tenants)
+        tenants = dashboard.render_inventory(env="prod-clone", top=dashboard.PRODUCTION_GATE_NOTE)
+        self.assertIn("Every onboarding Start checks this production list first; a match stops it.", tenants)
+        self.assertNotIn("Check a CO for duplicates in production", tenants)
+        self.assertNotIn("production-duplicate-check", tenants)
+        self.assertNotIn("<form method='post'", tenants)
         self.assertNotIn("/attended/inventory-refresh", tenants)
         devops = dashboard.render_inventory(env="dev")
         self.assertIn("/attended/inventory-refresh", devops)
@@ -774,61 +773,16 @@ class TenantsTabTests(unittest.TestCase):
             tenants = _Request("/tenants")
             dashboard.Handler.do_GET(tenants)
             self.assertEqual((tenants.redirects, tenants.pages[0][0]), ([], 200))
-            self.assertIn("Check a CO for duplicates in production", tenants.pages[0][1])
+            self.assertIn("Every onboarding Start checks this production list first", tenants.pages[0][1])
+            self.assertNotIn("Check a CO for duplicates in production", tenants.pages[0][1])
 
-    def test_the_new_post_is_allow_listed(self):
-        self.assertIn("/attended/production-duplicate-check", dashboard.POST_ROUTES)
-
-    def _post(self, form, report=None):
-        class _Request:
-            path = "/attended/production-duplicate-check"
-            headers: dict = {}
-            def __init__(self):
-                self.pages = []
-            def send_page(self, status, page):
-                self.pages.append((int(status), page))
-        request, calls = _Request(), []
-        with patch.object(dashboard, "login_required", return_value=False),                 patch.object(dashboard, "post_form", return_value=form),                 patch.object(dashboard, "run_production_duplicate_check",
-                             side_effect=lambda ref, route: calls.append((ref, route)) or report):
-            dashboard.Handler.do_POST(request)
-        return request.pages[0], calls
-
-    def test_an_invalid_reference_or_route_is_rejected_without_a_check(self):
-        for form in ({"reference": ["CO-1"]}, {"reference": ["co-0801"]}, {"reference": ["CO-0801; x"]}, {},
-                     {"reference": ["CO-0801", "CO-0802"]}, {"reference": ["CO-0801"], "route": ["case_9_nope"]}):
-            with self.subTest(form=form):
-                (status, _page), calls = self._post(form)
-                self.assertEqual((status, calls), (400, []))
-
-    def test_a_match_is_rendered_escaped_with_the_banner_and_the_chosen_route(self):
-        report = {"result": "duplicate_production_clone_match", "production_clone": {
-            "result": "duplicate_production_clone_match", "blocks": True, "tenants_checked": 5439,
-            "captured_at": "2026-10-05T17:00:00Z",
-            "matches": [{"id": "T9", "account_name": "<b>Acme</b>", "is_deleted": True,
-                         "reasons": ["alternate_domain", "tenant_name"]}]}}
-        self._collect()
-        (status, page), calls = self._post({"reference": ["CO-0801"], "route": ["case_1_new_surface_only"]}, report)
-        self.assertEqual((status, calls), (200, [("CO-0801", "case_1_new_surface_only")]))
-        self.assertIn("&lt;b&gt;Acme&lt;/b&gt;", page)
-        self.assertNotIn("<b>Acme</b>", page)
-        self.assertIn("<code>T9</code>", page)
-        self.assertIn("deleted", page)
-        self.assertIn("a CO domain is this tenant&#x27;s alternate domain", page)
-        self.assertIn("up to about a day behind", page)
-        self.assertIn("<option value='case_1_new_surface_only' selected>", page)
-        self.assertNotIn("<script", page.lower())
-
-    def test_an_unreadable_co_and_an_unusable_clone_fail_closed_visibly(self):
-        (_status, page), _ = self._post({"reference": ["CO-0801"]},
-                                        {"result": "salesforce_source_unavailable", "matches": []})
-        self.assertIn("could not be checked", page)
-        self.assertIn("salesforce_source_unavailable", page)
-        gone = {"result": "production_clone_unavailable", "production_clone": {
-            "result": "production_clone_unavailable", "blocks": True, "reason": "inventory_snapshot_stale", "matches": []}}
-        (_status, page), _ = self._post({"reference": ["CO-0801"]}, gone)
-        self.assertIn("inventory_snapshot_stale", page)
-        self.assertIn("A production onboarding would be blocked", page)
-        self.assertNotIn("No match among", page)
+    def test_the_manual_check_endpoint_and_form_are_gone(self):
+        # Owner decision 2026-10-05: the production check is automatic at Start, never a manual option.
+        self.assertNotIn("/attended/production-duplicate-check", dashboard.POST_ROUTES)
+        for name in ("production_check_form", "production_check_result", "run_production_duplicate_check"):
+            self.assertFalse(hasattr(dashboard, name), name)
+        source = Path(dashboard.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("production-duplicate-check", source)
 
 
 class ProductionDuplicateCheckRunnerTests(unittest.TestCase):

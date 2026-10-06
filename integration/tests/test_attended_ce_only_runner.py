@@ -14,7 +14,7 @@ import unittest
 import unittest.mock
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import tools.attended_ce_only_playwright as runner
 from tools.attended_ce_only_playwright import (
@@ -3276,6 +3276,34 @@ _ORIGINAL_RUNTIME_PATHS = {name: getattr(runner, name)
 
 
 _ORIGINAL_INVENTORY_ROOT = runner.inventory_root
+_REAL_PRODUCTION_GATE = runner._production_gate
+_REAL_GATE_ON = [False]
+
+
+def _test_production_gate(contract, source, log):
+    """Owner decision 2026-10-05: every Start runs the production gate first. Fake runs get a "no match" answer
+    unless a test turns the real gate on (``_use_real_production_gate``) and provides its own clone snapshot."""
+    if _REAL_GATE_ON[0]:
+        return _REAL_PRODUCTION_GATE(contract, source, log)
+    gate = {"result": "production_clone_no_match", "blocks": False, "matches": [], "tenants_checked": 0}
+    log.event("production_gate", gate["result"], detail="blocks=False tenants=0 matches=0")
+    return gate
+
+
+def _use_real_production_gate(case):
+    _REAL_GATE_ON[0] = True
+    case.addCleanup(_REAL_GATE_ON.__setitem__, 0, False)
+
+
+def _write_prod_clone(case, hours_old=0, **row):
+    from integration.onboarding import leonardo_inventory as inventory
+    from integration.tests.test_leonardo_inventory import page as inventory_page, tenant_row
+
+    root = runner.inventory_root()
+    case.addCleanup(shutil.rmtree, root, ignore_errors=True)
+    assembled = inventory.assemble_pages([inventory_page(0, [tenant_row(7, **row)], 1, size=1)], page_size=1)
+    inventory.write_snapshot(inventory.snapshot_payload(
+        inventory.ENVIRONMENTS["prod-clone"], assembled, datetime.now(timezone.utc) - timedelta(hours=hours_old)), root)
 
 
 def setUpModule():
@@ -3290,10 +3318,12 @@ def setUpModule():
     runner.RUNNER_STATE_PATH = _RUN_LOG_DIR / "runner_state.json"
     # Never read the operator's real tenant inventory: the pre-check sees no snapshot.
     runner.inventory_root = lambda: _RUN_LOG_DIR / "inventory"
+    runner._production_gate = _test_production_gate
 
 
 def tearDownModule():
     runner.inventory_root = _ORIGINAL_INVENTORY_ROOT
+    runner._production_gate = _REAL_PRODUCTION_GATE
     runner.RUN_LOG_PATH = _ORIGINAL_RUN_LOG_PATH
     runner.CHECK_STATE_PATH = _ORIGINAL_CHECK_STATE_PATH
     for name, value in _ORIGINAL_RUNTIME_PATHS.items():
@@ -3489,6 +3519,8 @@ CE_GOLDEN_PLAN = {
 CE_GOLDEN_EVENTS = [
     ["source_read", "start", "", ""], ["source_read", "ok", "", ""],
     ["license_dates", "ok", "", "start=2026-09-29 end=2027-09-27"],
+    # 2026-10-05: the production gate runs first on every Start (a fresh clone with one unrelated tenant here).
+    ["production_gate", "production_clone_no_match", "", "blocks=False tenants=1 matches=0"],
     # 2026-10-04: the DEV inventory pre-check runs before any browser work (no snapshot here).
     ["inventory_precheck", "inventory_unavailable", "", "inventory_snapshot_missing"],
     ["tenant_search", "200", "", "rows=0 total=0"], ["duplicate_check", "duplicate_clear", "tenant_name", ""],
@@ -3529,6 +3561,9 @@ def _events(log_path: Path) -> list[list[str]]:
 class InventoryPrecheckRunTests(unittest.TestCase):
     """2026-10-04: a match in the DEV tenant inventory stops Start before any browser work."""
 
+    def setUp(self):
+        _use_real_production_gate(self)
+
     def _write_inventory(self, **row):
         from integration.onboarding import leonardo_inventory as inventory
         from integration.tests.test_leonardo_inventory import page as inventory_page, tenant_row
@@ -3543,6 +3578,7 @@ class InventoryPrecheckRunTests(unittest.TestCase):
         case = RunEndToEndTests("test_readback_verified_happy_path")
         self.addCleanup(case.doCleanups)
         source = case._source()
+        self._write_clone(accountName="Unrelated Production Tenant")  # a fresh production clone with no match
         with patch.object(runner, "ce_fill_source", return_value=source),                 patch.object(runner, "RUNNER_STATE_PATH", case._temp_path("state.json")),                 patch.object(runner, "_attach_attended_browser", side_effect=AssertionError("no browser")),                 patch.object(runner, "_run_day", return_value=date(2026, 9, 29)):
             return runner.run("CO-0702", REVISION, review_wait_seconds=1), source
 
@@ -3623,6 +3659,97 @@ class InventoryPrecheckRunTests(unittest.TestCase):
             self.assertEqual(runner.run_inventory_precheck("CO-0702", "nope")["result"], "route_unsupported")
 
 
+class ProductionGateStartTests(unittest.TestCase):
+    """2026-10-05: every Start (create and dry run) validates against production FIRST, before any browser work."""
+
+    def setUp(self):
+        _use_real_production_gate(self)
+
+    def _write_dev(self, **row):
+        from integration.onboarding import leonardo_inventory as inventory
+        from integration.tests.test_leonardo_inventory import page as inventory_page, tenant_row
+
+        root = runner.inventory_root()
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        assembled = inventory.assemble_pages([inventory_page(0, [tenant_row(1, **row)], 1, size=1)], page_size=1)
+        inventory.write_snapshot(inventory.snapshot_payload(inventory.ENVIRONMENTS["dev"], assembled,
+                                                            datetime.now(timezone.utc)), root)
+
+    def _start(self, dry_run=False):
+        case = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(case.doCleanups)
+        source = case._source()
+        attach = MagicMock(side_effect=AssertionError("no browser"))
+        with patch.object(runner, "ce_fill_source", return_value=source), \
+                patch.object(runner, "RUNNER_STATE_PATH", case._temp_path("state.json")), \
+                patch.object(runner, "_attach_attended_browser", attach), \
+                patch.object(runner, "_inventory_precheck", wraps=runner._inventory_precheck) as dev_check, \
+                patch.object(runner, "_run_day", return_value=date(2026, 9, 29)):
+            result = runner.run("CO-0702", REVISION, review_wait_seconds=1, dry_run=dry_run)
+        return result, source, attach, dev_check
+
+    def _checks(self):
+        return runner.load_check_state().get("CO-0702", {})
+
+    def test_a_production_match_stops_before_the_dev_check_leonardo_and_any_browser(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        _write_prod_clone(self, accountName=source.tenant_name.upper())
+        result, _, attach, dev_check = self._start()
+        self.assertEqual(result, "duplicate_production_match")
+        attach.assert_not_called()
+        dev_check.assert_not_called()
+        events = _events(runner.RUN_LOG_PATH)
+        self.assertIn(["production_gate", "duplicate_production_clone_match", "", "blocks=True tenants=1 matches=1"],
+                      events)
+        self.assertFalse([e for e in events if e[0] in ("inventory_precheck", "duplicate_check", "tenant_search")])
+        record = self._checks()
+        self.assertEqual((record["kind"], record["result"]), ("production_duplicate", "duplicate_production_clone_match"))
+        detail = json.loads(record["detail"])
+        self.assertEqual(len(detail["matches"]), 1)
+        self.assertEqual(set(detail["matches"][0]), {"id", "name", "created"})  # ids, names, dates only
+
+    def test_an_unusable_clone_fails_closed_with_the_reason(self):
+        for hours_old, reason in ((None, "inventory_snapshot_missing"), (7, "inventory_snapshot_stale")):
+            with self.subTest(reason=reason):
+                if hours_old is not None:
+                    _write_prod_clone(self, hours_old=hours_old, accountName="Unrelated")
+                result, _, attach, dev_check = self._start()
+                self.assertEqual(result, "production_clone_unavailable")
+                attach.assert_not_called()
+                dev_check.assert_not_called()
+                record = self._checks()
+                self.assertEqual((record["kind"], record["result"]), ("production_duplicate", "production_clone_unavailable"))
+                self.assertEqual(json.loads(record["detail"]), {"reason": reason})
+                shutil.rmtree(runner.inventory_root(), ignore_errors=True)
+
+    def test_no_match_proceeds_to_the_dev_pre_check_which_still_decides(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        _write_prod_clone(self, accountName="Unrelated Production Tenant")
+        self._write_dev(accountName=source.tenant_name)
+        result, _, attach, dev_check = self._start()
+        self.assertEqual(result, "duplicate_inventory_match")  # the DEV gate is unchanged and still runs
+        dev_check.assert_called_once()
+        attach.assert_not_called()
+        events = _events(runner.RUN_LOG_PATH)
+        self.assertLess(events.index(["production_gate", "production_clone_no_match", "", "blocks=False tenants=1 matches=0"]),
+                        [e[0] for e in events].index("inventory_precheck"))
+        self.assertEqual(self._checks()["result"], "production_clone_no_match")
+        self.assertNotIn("detail", self._checks())
+
+    def test_a_dry_run_is_gated_too(self):
+        source = RunEndToEndTests("test_readback_verified_happy_path")._source()
+        _write_prod_clone(self, accountName=source.tenant_name)
+        result, _, attach, dev_check = self._start(dry_run=True)
+        self.assertEqual(result, "duplicate_production_match")
+        attach.assert_not_called()
+        dev_check.assert_not_called()
+
+    def test_only_the_three_new_tenant_routes_reach_run_so_renewals_are_never_gated(self):
+        self.assertEqual(set(runner.ROUTES), {runner.CE_ENGINE, runner.SURFACE_ENGINE, runner.CASE3_ENGINE})
+        with patch.object(runner, "_production_gate", side_effect=AssertionError("gated")):
+            self.assertEqual(runner.run("CO-0702", REVISION, route="renewal_of_existing_product"), "route_unsupported")
+
+
 class CeGoldenTests(unittest.TestCase):
     def test_build_ce_only_fill_is_unchanged(self):
         source = BuildCeOnlyFillTests()._source()
@@ -3636,7 +3763,12 @@ class CeGoldenTests(unittest.TestCase):
         self.addCleanup(case.doCleanups)
         tracker: dict = {}
         page = case._install_fake_playwright(case._base(), tracker)
-        with patch.object(runner, "_run_day", return_value=date(2026, 9, 29)):
+        _use_real_production_gate(self)
+        _write_prod_clone(self, accountName="Unrelated Production Tenant")
+        # The golden pins the create path itself; the after-create SpyCloud step (owner-enabled
+        # 2026-10-05) is covered by test_a_spycloud_failure_after_create_keeps_readback_verified.
+        with patch.object(runner, "_run_day", return_value=date(2026, 9, 29)), \
+                patch.object(runner, "SPYCLOUD_AFTER_CREATE_ENABLED", False):
             result = case._run_scenario(page, tracker)
         self.assertEqual(result, "readback_verified")
         self.assertEqual(_events(runner.RUN_LOG_PATH), CE_GOLDEN_EVENTS)
@@ -3644,6 +3776,29 @@ class CeGoldenTests(unittest.TestCase):
         # The default route is CE and the ce_only_names output is unchanged.
         self.assertIs(runner.ROUTES[runner.CE_ENGINE], runner.CE_ROUTE)
         self.assertEqual(ce_only_names("Sample Group Ltd."), runner.CeOnlyNames("Sample Group Ltd - CE Only", "sgl"))
+
+    def test_a_spycloud_failure_after_create_keeps_readback_verified(self):
+        # The fake page has no Edit form, so the enabled after-create step fails: the create result,
+        # the golden create events, and the finish stay as they were; the failure is a visible warning.
+        case = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(case.doCleanups)
+        tracker: dict = {}
+        page = case._install_fake_playwright(case._base(), tracker)
+        state = Path(tempfile.mkdtemp()) / "attended_spycloud.json"
+        _use_real_production_gate(self)
+        _write_prod_clone(self, accountName="Unrelated Production Tenant")
+        with patch.object(runner, "_run_day", return_value=date(2026, 9, 29)), \
+                patch.object(runner, "SPYCLOUD_STATE_PATH", state), \
+                patch.object(runner, "SPYCLOUD_AFTER_CREATE_ENABLED", True):
+            result = case._run_scenario(page, tracker)
+        self.assertEqual(result, "readback_verified")
+        events = _events(runner.RUN_LOG_PATH)
+        self.assertEqual(events[:len(CE_GOLDEN_EVENTS) - 1], CE_GOLDEN_EVENTS[:-1])
+        self.assertEqual(events[-1], CE_GOLDEN_EVENTS[-1])
+        self.assertIn(["spycloud_warning", "not_verified_off", "", "SpyCloud still ON or unknown: run SpyCloud off"],
+                      events)
+        self.assertTrue(json.loads(state.read_text(encoding="utf-8"))[next(iter(json.loads(
+            state.read_text(encoding="utf-8"))))]["warning"])
 
     def test_fill_ce_form_alias_is_the_generic_filler(self):
         self.assertIs(runner._fill_ce_form, runner._fill_add_account_form)

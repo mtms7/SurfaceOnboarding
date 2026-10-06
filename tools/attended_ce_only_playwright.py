@@ -90,7 +90,7 @@ RUNNER_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "atten
 # Latest read-only check per CO (duplicate check / readback): local evidence
 # for the dashboard only; it never gates or consumes a create run.
 CHECK_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_check_state.json"
-CHECK_KINDS = frozenset({"duplicate_check", "readback", "scan_status", "validation"})
+CHECK_KINDS = frozenset({"duplicate_check", "production_duplicate", "readback", "scan_status", "validation"})
 READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
 # Surface-only scan observations (plan §5: Surface-owned, short-lived, never in Salesforce).
 SCAN_STATUS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_status.json"
@@ -1939,7 +1939,7 @@ def load_check_state() -> dict[str, dict[str, str]]:
     for reference, value in raw.items():
         if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict)
                 or value.get("kind") not in CHECK_KINDS
-                or set(value) - {"kind", "started_on", "completed_on", "result"}
+                or set(value) - {"kind", "started_on", "completed_on", "result", "detail"}
                 or not all(isinstance(item, str) and item for item in value.values())):
             raise ValueError("check_state_unreadable")
         state[reference] = dict(value)
@@ -1955,13 +1955,15 @@ def record_check_start(reference: str, kind: str, started_on: str) -> None:
     _write_json_atomic(CHECK_STATE_PATH, state)
 
 
-def record_check_result(reference: str, kind: str, result: str, completed_on: str) -> None:
-    """Record a read-only check's result (keeps the recorded start when it matches)."""
+def record_check_result(reference: str, kind: str, result: str, completed_on: str, detail: str = "") -> None:
+    """Record a read-only check's result (keeps the recorded start when it matches); ``detail`` is optional text."""
     if not REFERENCE.fullmatch(reference) or kind not in CHECK_KINDS or not result:
         raise ValueError("invalid_check_record")
     state = load_check_state()
     previous = state.get(reference, {})
     record = {"kind": kind, "result": result, "completed_on": completed_on}
+    if detail:
+        record["detail"] = detail
     if previous.get("kind") == kind and "result" not in previous and previous.get("started_on"):
         record["started_on"] = previous["started_on"]
     state[reference] = record
@@ -4672,6 +4674,16 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
     except ValueError as error:
         return _finish(reference, acknowledged_revision, str(error))
     log.event("license_dates", "ok", detail=f"start={license_start.isoformat()} end={license_end.isoformat()}")
+    # Owner decision 2026-10-05: the production duplicate gate runs FIRST, automatically, on every Start (create and
+    # dry run; all three new-tenant routes -- renewal routes are not in ROUTES and never reach here). A CO already in
+    # production, or a production clone that cannot answer, stops the run before any browser work (fail closed).
+    gate = _production_gate(contract, source, log)
+    _record_check(reference, "production_duplicate", gate["result"], _production_check_detail(gate))
+    if gate["blocks"]:
+        return _finish(reference, acknowledged_revision, "duplicate_production_match"
+                       if gate["result"] == "duplicate_production_clone_match" else "production_clone_unavailable")
+    # TODO(owner 2026-10-05): When onboarding moves to production, remove the Leonardo Development duplicate
+    # validation (this DEV inventory pre-check and the live Leonardo check below).
     # Duplicate pre-check against the latest DEV tenant inventory, before any browser
     # work (owner decision 2026-10-04). It can only stop a run; the live check below
     # still decides every run it lets through.
@@ -5591,11 +5603,11 @@ SPYCLOUD_OK_OUTCOMES = frozenset({"spycloud_off_verified", "spycloud_already_off
 # The only row-menu items this runner may click (Details: scan status; Edit: SpyCloud). Everything else
 # in that menu (_Access, _Scan_Now, _Stop_Scan, _Delete) is a hazard.
 ROW_ACTIONS_ALLOWED = frozenset({SCAN_EXEC_DETAILS_SELECTOR, SPYCLOUD_EDIT_SELECTOR})
-# After-create hook (CE and Case 3, after readback_verified). OFF until the operator's first live
-# standalone SpyCloud save (--spycloud-off --confirm-write) has been verified; flip this in a reviewed
-# commit afterwards. While False, no create path changes behaviour. When True, a SpyCloud failure never
+# After-create hook (CE and Case 3, after readback_verified). Enabled by the owner on 2026-10-05 after
+# the first live standalone save was verified (CO-0679: spycloud_off_verified). A SpyCloud failure never
 # undoes or alters the create result: it is recorded as a warning (run log, state file, dashboard).
-SPYCLOUD_AFTER_CREATE_ENABLED = False
+# Set False to stop SpyCloud OFF after create (the standalone --spycloud-off stays available).
+SPYCLOUD_AFTER_CREATE_ENABLED = True
 
 
 def _is_spycloud_edit_response(response: Any) -> bool:
@@ -6256,10 +6268,10 @@ def _co_domains(contract: RouteContract, source: Any) -> tuple[str, ...]:
     return (contract.primary_domain(source), *(domain for _name, _lookup, domain in extras))
 
 
-# Owner decision 2026-10-05: Dev keeps the Leonardo Development inventory as its duplicate validation; the
-# duplicate validation for PRODUCTION is the production clone (Redash, collected hourly). The gate below is what a
-# production onboarding will call at the place `run()` calls `_inventory_precheck`; production onboarding is not
-# enabled yet, so today it is only reported (pre-check page and CLI) and never changes a Dev result.
+# Owner decision 2026-10-05: before creating anything, validate whether the CO already exists in PRODUCTION (the
+# production clone from Redash, collected hourly); if it does, mark it and do not create it in Leonardo; only
+# otherwise proceed to the Leonardo checks and create. `_run` calls this gate first on every Start (an automatic
+# validation, not a manual option). Once onboarding moves to production, the Leonardo duplicate validation is removed.
 def _production_gate(contract: RouteContract, source: Any, log: "RunLog") -> dict[str, Any]:
     """The production duplicate gate for one loaded CO source (see ``production_duplicate_gate``)."""
     from integration.onboarding import leonardo_inventory as inventory
@@ -6269,6 +6281,17 @@ def _production_gate(contract: RouteContract, source: Any, log: "RunLog") -> dic
     log.event("production_gate", gate["result"],
               detail=f"blocks={gate['blocks']} tenants={gate.get('tenants_checked', 0)} matches={len(gate['matches'])}")
     return gate
+
+
+def _production_check_detail(gate: dict[str, Any]) -> str:
+    """Local evidence for the dashboard marker: tenant ids, names, created dates, or the reason (no emails/users)."""
+    if gate["result"] == "duplicate_production_clone_match":
+        matches = [{"id": str(m.get("id") or "")[:80], "name": str(m.get("account_name") or "")[:120],
+                    "created": m.get("created")} for m in gate["matches"][:5] if isinstance(m, dict)]
+        return json.dumps({"matches": matches}, sort_keys=True)
+    if gate["blocks"]:
+        return json.dumps({"reason": str(gate.get("reason") or gate["result"])[:120]})
+    return ""
 
 
 def _inventory_precheck(contract: RouteContract, source: Any, log: "RunLog | None" = None, *,
@@ -6408,10 +6431,10 @@ def _duplicate_check(reference: str, log: RunLog, contract: RouteContract = CE_R
             return "attended_ce_runner_unavailable"
 
 
-def _record_check(reference: str, kind: str, result: str) -> None:
+def _record_check(reference: str, kind: str, result: str, detail: str = "") -> None:
     """Best-effort: record a read-only check result for the dashboard."""
     try:
-        record_check_result(reference, kind, result, datetime.now().isoformat(timespec="seconds"))
+        record_check_result(reference, kind, result, datetime.now().isoformat(timespec="seconds"), detail)
     except (OSError, ValueError):
         pass
 
