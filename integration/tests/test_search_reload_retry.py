@@ -265,5 +265,24 @@ class InAppTriggerTests(unittest.TestCase):
         self.assertEqual(page.calls, ["reload"])
 
 
+class DetailsProbeShapeTests(unittest.TestCase):
+    """The Details probe reports structure only: never values, and data used as keys is masked."""
+
+    def test_values_never_appear_and_data_keys_are_masked(self):
+        reply = {"users": [{"email": "someone@example.com", "firstName": "Ann", "active": True}],
+                 "someone@example.com": {"role": "admin"}, "a1b2c3d4e5f6a7b8c9d0e1f2": 1, "total": 3}
+        shape = runner._key_shape(reply)
+        text = json.dumps(shape)
+        for secret in ("someone@example.com", "Ann", "admin"):
+            self.assertNotIn(secret, text)
+        self.assertEqual(shape["users"], [{"email": "str", "firstName": "str", "active": "bool"}])
+        self.assertEqual(shape["total"], "int")
+        self.assertIn("<masked>", shape)
+
+    def test_ids_in_paths_are_masked(self):
+        path = "/api/v1/backoffice/account/6ac567799e40ad1f7283fa41/users"
+        self.assertEqual(runner._ID_SEGMENT.sub("/{id}", path), "/api/v1/backoffice/account/{id}/users")
+
+
 if __name__ == "__main__":
     unittest.main()

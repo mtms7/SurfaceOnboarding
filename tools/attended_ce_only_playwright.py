@@ -7568,6 +7568,128 @@ def _mirror_in_browser(page: Any, reference: str, plan: Any, source: MirrorSourc
     return "mirror_created_verified"
 
 
+# --- Tenant Details probe (read-only, 2026-10-06) -----------------------------
+# Owner decision (b): the customer user (e.g. CO-0767's primary user) is added as an EXTRA user. To find where
+# BackOffice shows a tenant's users, this probe opens the row's Details (allow-listed), clicks only its tabs
+# (role=tab), and reports structure only: tab labels, the app's own API paths (ids masked) with status, and the
+# key names of their JSON replies. No values, names, or emails are read out, logged, or stored.
+PROBE_TAB_WAIT_MS = 3_000
+_ID_SEGMENT = re.compile(r"/[0-9a-f]{24}(?=/|$)|/[0-9a-f]{32}(?=/|$)", re.IGNORECASE)
+
+
+_SAFE_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,39}")
+
+
+def _safe_key(key: Any) -> str:
+    """A key name as is only when it looks like a field name; data used as keys (emails, ids) is masked."""
+    return key if isinstance(key, str) and _SAFE_KEY.fullmatch(key) and not re.search(r"\d{6,}", key) else "<masked>"
+
+
+def _key_shape(value: Any, depth: int = 0) -> Any:
+    """Key names and value types only (nested up to 3 levels; lists show their first object)."""
+    if depth > 3:
+        return type(value).__name__
+    if isinstance(value, dict):
+        return {_safe_key(key): _key_shape(item, depth + 1) for key, item in list(value.items())[:60]}
+    if isinstance(value, list):
+        first = next((item for item in value if isinstance(item, dict)), None)
+        return [_key_shape(first, depth + 1)] if first is not None else [f"list[{len(value)}]"]
+    return type(value).__name__
+
+
+def probe_tenant_details(page: Any, tenant_name: str, expected_id: str, expected_uuid: str | None) -> dict[str, Any]:
+    found, _row = _search_one_row(page, tenant_name, expected_id, expected_uuid)
+    if found != "ok":
+        return {"result": f"probe_row_{found}"}
+    seen: list[Any] = []
+
+    def on_response(response: Any) -> None:
+        try:
+            if _url_origin(response.url) == DEVELOPMENT_ORIGIN and "/api/" in response.url:
+                seen.append(response)
+        except Exception:
+            pass
+
+    page.on("response", on_response)
+    tabs: list[str] = []
+    try:
+        _open_row_action(page, tenant_name, SCAN_EXEC_DETAILS_SELECTOR)
+        page.wait_for_timeout(PROBE_TAB_WAIT_MS)
+        tab_locator = page.get_by_role("tab")
+        for index in range(min(tab_locator.count(), 12)):
+            tab = tab_locator.nth(index)
+            label = " ".join((tab.inner_text(timeout=FIELD_TIMEOUT_MS) or "").split())[:40]
+            tabs.append(label)
+            tab.click(timeout=FIELD_TIMEOUT_MS)
+            page.wait_for_timeout(PROBE_TAB_WAIT_MS)
+    except Exception as exc:
+        _log().error("details_probe", "open", exc)
+    finally:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
+    calls = []
+    for response in seen:
+        entry = {"method": response.request.method, "path": _ID_SEGMENT.sub("/{id}", _url_path(response.url)),
+                 "status": response.status}
+        try:
+            entry["keys"] = _key_shape(response.json())
+        except Exception:
+            entry["keys"] = None
+        calls.append(entry)
+    _log().event("details_probe", "done", detail=f"tabs={len(tabs)} calls={len(calls)}")
+    return {"result": "probe_details_read", "tabs": tabs, "calls": calls}
+
+
+def run_probe_tenant_details(reference: str) -> dict[str, Any]:
+    """CLI: --co CO-XXXX --probe-tenant-details (Leonardo Development, read-only)."""
+    global _ACTIVE_RUN_LOG
+    if not REFERENCE.fullmatch(reference):
+        return {"result": "invalid_co_reference"}
+    ids = _readback_ids(reference)
+    if ids is None:
+        return {"result": "probe_not_onboarded"}
+    try:
+        try:
+            _route, tenant_name = _validation_route(reference)
+        except SurfaceSourceError:
+            mirrored = _spycloud_mirror_target(reference)
+            if mirrored is None:
+                return {"result": "probe_route_unsupported"}
+            _route, tenant_name = mirrored
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {"result": "probe_source_unavailable"}
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return {"result": "playwright_runtime_unavailable"}
+    _ACTIVE_RUN_LOG = RunLog(reference, "details_probe")
+    log = _ACTIVE_RUN_LOG
+    report: dict[str, Any] = {"result": "attended_ce_runner_unavailable"}
+    try:
+        with sync_playwright() as playwright:
+            try:
+                with _attended_page(playwright) as page:
+                    log.attach(page)
+                    report = probe_tenant_details(page, tenant_name, ids[0], ids[1])
+            except LoginTimeout:
+                report = {"result": "development_login_timeout"}
+            except RuntimeError as error:
+                report = {"result": str(error)}
+            except Exception as exc:  # noqa: BLE001
+                log.error("runner", "unexpected", exc)
+        return report
+    finally:
+        log.event("finish", report.get("result", ""))
+        log.write(report.get("result", ""))
+        _ACTIVE_RUN_LOG = None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Attended Leonardo Development CE-only auto-confirm runner.")
     parser.add_argument("--co", required=False, help="Customer Onboarding reference (e.g. CO-0702).")
@@ -7614,6 +7736,8 @@ def main() -> int:
                         help="With --co: create (dry run unless --confirm-write) a Leonardo Development mirror of the renewal CO's production tenant, from the production clone.")
     parser.add_argument("--open-dashboard", type=int, metavar="PORT",
                         help="Open (or bring to the front) the local dashboard's sign-in page as a tab of the automation window.")
+    parser.add_argument("--probe-tenant-details", action="store_true",
+                        help="With --co: read-only. Open the tenant's Details and report tab labels, API paths and reply key names (no values).")
     parser.add_argument("--probe-inventory-shape", action="store_true",
                         help="Read-only: reload Tenant Management and report how the tenant table pages (key names and counts only).")
     parser.add_argument("--export-tenants", action="store_true",
@@ -7680,6 +7804,13 @@ def main() -> int:
         return 0
     if args.open_dashboard is not None:
         print(json.dumps({"result": open_dashboard_tab(args.open_dashboard)}, separators=(",", ":")))
+        return 0
+    if args.probe_tenant_details:
+        if not args.co:
+            parser.error("--co is required with --probe-tenant-details")
+        report = run_probe_tenant_details(args.co)
+        print(json.dumps({**report, "leonardo_write": "not_performed", "salesforce_writeback": "not_performed"},
+                         separators=(",", ":")))
         return 0
     if args.probe_inventory_shape:
         report = run_probe_inventory_shape()
