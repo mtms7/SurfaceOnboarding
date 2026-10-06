@@ -492,7 +492,8 @@ class ValidationCheckTests(unittest.TestCase):
     def test_a_warning_is_not_a_validation_drift(self):
         stored = {}
         with patch.object(runner, "write_validation", lambda *a, **k: stored.update(checks=a[2])), \
-                patch.object(runner, "write_scan_status"):
+                patch.object(runner, "write_scan_status"), \
+                patch.object(runner, "_salesforce_primary_user", return_value=None):
             result = runner._record_validation("CO-0757", runner.CE_ENGINE, self.row(True), None, "", None)
         self.assertEqual(result, "validation_recorded")
         self.assertIn("warn", {c["status"] for c in stored["checks"]})

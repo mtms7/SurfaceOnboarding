@@ -5389,8 +5389,33 @@ def _epoch_dates(value: Any) -> set[str]:
         return set()
 
 
+def primary_user_match(row: dict[str, Any], salesforce: dict[str, Any] | None) -> tuple[bool | None, str]:
+    """Pure: does the tenant's Leonardo primaryUser equal the CO's Salesforce primary user?
+
+    Returns (True | False | None, reason code); never the values. The Add Account form is
+    filled with the fixed attended user, so the match only becomes true once the customer's
+    primary user exists on the tenant. Salesforce supplies one full name (Primary_User_Name__c)
+    and optionally an email; first + last name are compared as one case/space-insensitive name
+    and the email, when Salesforce has one, case-insensitively. Missing data never matches.
+    """
+    want_name = _norm_text((salesforce or {}).get("name"))
+    if not want_name:
+        return None, "salesforce_primary_user_missing"
+    user = row.get("primaryUser") if isinstance(row, dict) else None
+    if not isinstance(user, dict):
+        return False, "primary_user_missing_on_tenant"
+    found_name = _norm_text(" ".join(str(user.get(key) or "") for key in ("firstName", "lastName")))
+    if found_name != want_name:
+        return False, "primary_user_name_differs"
+    want_email = _norm_text((salesforce or {}).get("email"))
+    if want_email and _norm_text(user.get("email")) != want_email:
+        return False, "primary_user_email_differs"
+    return True, "primary_user_matches"
+
+
 def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
-                 entered: tuple[str, str] | None = None, route: str | None = None) -> list[dict[str, Any]]:
+                 entered: tuple[str, str] | None = None, route: str | None = None,
+                 primary_user: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Compare one tenant search row with the route's fill plan (read-only, pure).
 
     Each check is {"check", "group", "status"} with status ok / drift /
@@ -5485,6 +5510,10 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
             add("Settings", "SpyCloud is OFF", "ok", False, False)
         else:
             add("Settings", "SpyCloud state not readable", "unknown")
+    if primary_user is not None:
+        matches, _reason = primary_user_match(row, primary_user)
+        add("People", "Primary user is the Salesforce primary user", "unknown" if matches is None else "ok" if matches else "info",
+            None, None if matches is None else "yes" if matches else "not yet")
     operators = _row_value(row, "operatorAccounts")
     add("People", "Operator Account", "info", None, "assigned" if operators else "not assigned")
     add("People", "Customer accepted terms of use", "info", None,
@@ -5501,7 +5530,8 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
 
 
 def write_validation(reference: str, route: str, checks: list[dict[str, Any]], observed_at: datetime,
-                     plan_note: str = "") -> None:
+                     plan_note: str = "", primary_user_matches: bool | None = None,
+                     primary_user_reason: str = "") -> None:
     if not REFERENCE.fullmatch(reference):
         raise ValueError("invalid_validation_reference")
     try:
@@ -5513,6 +5543,11 @@ def write_validation(reference: str, route: str, checks: list[dict[str, Any]], o
     state[reference] = {"route": route, "checks": checks, "plan_note": plan_note,
                         "observed_at": observed_at.isoformat(timespec="seconds"),
                         "expires_at": (observed_at + VALIDATION_TTL).isoformat(timespec="seconds")}
+    if primary_user_reason:
+        # Booleans, a reason code and a date only; never the names or emails compared.
+        state[reference].update({"primary_user_matches": primary_user_matches,
+                                 "primary_user_reason": primary_user_reason,
+                                 "primary_user_checked_on": observed_at.date().isoformat()})
     _write_json_atomic(VALIDATION_PATH, state)
 
 
@@ -5535,6 +5570,19 @@ def _validation_route(reference: str) -> tuple[str, str]:
     if pair == (CE_ROUTE_PRODUCT, CE_ROUTE_TYPE):
         return CE_ENGINE, ce_only_names(account_name).tenant_name
     raise SurfaceSourceError("validation_route_unsupported")
+
+
+def _salesforce_primary_user(reference: str) -> dict[str, str] | None:
+    """The CO's Salesforce primary user (name, optional email), in memory only; None when unreadable."""
+    for fields in ("Primary_User_Name__c, Primary_User_Email__c", "Primary_User_Name__c"):
+        try:
+            rows = _sf_records("SELECT " + fields + " FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        except Exception:  # noqa: BLE001 - fall back to the name-only read, then to "not checked"
+            continue
+        if len(rows) == 1 and isinstance(rows[0], dict):
+            name, email = rows[0].get("Primary_User_Name__c"), rows[0].get("Primary_User_Email__c")
+            return {"name": name if isinstance(name, str) else "", "email": email if isinstance(email, str) else ""}
+    return None
 
 
 def run_validate(reference: str) -> str:
@@ -5611,10 +5659,12 @@ def _validation_inputs(reference: str) -> "str | tuple[str, str, tuple[str, str]
 def _record_validation(reference: str, route: str, row: dict[str, Any], plan: dict[str, Any] | None,
                        plan_note: str, entered: tuple[str, str] | None) -> str:
     """Compare one matched tenant row with its plan; store the checks and the scan observation."""
-    checks = validate_row(row, plan, entered, route)
+    salesforce_user = _salesforce_primary_user(reference)
+    checks = validate_row(row, plan, entered, route, salesforce_user)
+    matches, reason = primary_user_match(row, salesforce_user) if salesforce_user is not None else (None, "salesforce_primary_user_unreadable")
     try:
         now = datetime.now()
-        write_validation(reference, route, checks, now, plan_note)
+        write_validation(reference, route, checks, now, plan_note, matches, reason)
         write_scan_status(reference, scan_status_from_row(row), now)
     except (OSError, ValueError):
         return "validation_write_unavailable"

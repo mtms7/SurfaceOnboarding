@@ -107,6 +107,8 @@ ATTENDED_CE_ONLY_RUNNER = Path(__file__).resolve().with_name("attended_ce_only_p
 ATTENDED_REMINDERS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_reminders.json"
 REMINDER_FIELDS = {"scan_settings_off": "scan_settings_off_on", "ce_enabled": "ce_enabled_on",
                    "operator_assigned": "operator_assigned_on"}
+# Manual "User created" confirmation (gitignored): {CO: {confirmed, confirmed_on, confirmed_by}}; no names or emails.
+USER_CREATED_CONFIRMATION_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_user_created_confirmations.json"
 LEONARDO_READBACK_STATES = frozenset({"Account Scanning", "No scan started"})
 CASE4_PRODUCT = "Surface & Credential Exposure"
 CASE4_TYPE = "Renewal of Surface + New Credential Exposure Module"
@@ -606,7 +608,11 @@ def attended_validations() -> dict[str, dict[str, object]]:
                     isinstance(c, dict) and c.get("status") in VALIDATION_STATUSES
                     and isinstance(c.get("check"), str) and c.get("group") in VALIDATION_GROUPS for c in checks):
                 continue
-            results[reference] = {"checks": checks, "plan_note": str(value.get("plan_note") or ""),
+            matches = value.get("primary_user_matches")
+            checked_on = value.get("primary_user_checked_on")
+            results[reference] = {"primary_user_matches": matches if type(matches) is bool else None,
+                                  "primary_user_checked_on": checked_on if isinstance(checked_on, str) else "",
+                                  "checks": checks, "plan_note": str(value.get("plan_note") or ""),
                                   "observed_at": datetime.fromisoformat(value["observed_at"]),
                                   "expires_at": datetime.fromisoformat(value["expires_at"])}
         except (KeyError, TypeError, ValueError):
@@ -1080,6 +1086,39 @@ def load_attended_reminders() -> dict[str, dict[str, str]]:
                 raise ReadUnavailable() from exc
         reminders[reference] = dict(value)
     return reminders
+
+
+def load_user_created_confirmations() -> dict[str, dict[str, object]]:
+    """Local manual confirmations; absence means none, an unreadable file counts as none (fails closed)."""
+    try:
+        raw = json.loads(USER_CREATED_CONFIRMATION_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    result: dict[str, dict[str, object]] = {}
+    for reference, value in raw.items():
+        if (isinstance(reference, str) and REFERENCE.fullmatch(reference) and isinstance(value, dict)
+                and value.get("confirmed") is True and isinstance(value.get("confirmed_on"), str)
+                and isinstance(value.get("confirmed_by"), str)):
+            result[reference] = {"confirmed": True, "confirmed_on": value["confirmed_on"][:10],
+                                 "confirmed_by": value["confirmed_by"][:80]}
+    return result
+
+
+def set_user_created_confirmation(reference: str, confirmed: bool, operator: str | None) -> None:
+    """Record or undo the manual confirmation (local only; no Leonardo or Salesforce action)."""
+    if not REFERENCE.fullmatch(reference):
+        raise ValueError("invalid_confirmation_record")
+    records = load_user_created_confirmations()
+    if confirmed:
+        records[reference] = {"confirmed": True, "confirmed_on": datetime.now().date().isoformat(),
+                              "confirmed_by": operator or "operator"}
+    else:
+        records.pop(reference, None)
+    temporary = USER_CREATED_CONFIRMATION_PATH.with_name(USER_CREATED_CONFIRMATION_PATH.name + ".tmp")
+    temporary.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, USER_CREATED_CONFIRMATION_PATH)
 
 
 def record_attended_reminder(reference: str, kind: str) -> None:
@@ -2851,6 +2890,26 @@ def user_created_evidence(tenant: object, environment: str) -> dict[str, object]
             "terms_accepted": terms if type(terms) is bool else None}
 
 
+def user_created_proof(primary_user_matches: object, operator_assigned: object, manual: dict[str, object] | None,
+                       checked_on: str = "") -> dict[str, object]:
+    """Pure: "User Created" = (primary user verified AND operator assigned) OR a manual confirmation."""
+    verified = primary_user_matches is True
+    operator = operator_assigned is True
+    if manual and manual.get("confirmed") is True:
+        proof, text = "manual", "Confirmed manually on " + str(manual.get("confirmed_on") or "an earlier date")
+    elif verified and operator:
+        proof, text = "automatic", "Primary user verified in Leonardo" + (" on " + checked_on if checked_on else "")
+    else:
+        proof = None
+        missing = []
+        if not verified:
+            missing.append("Primary user not verified — run Validate")
+        if not operator:
+            missing.append("No operator assigned")
+        text = "; ".join(missing)
+    return {"created": proof is not None, "proof": proof, "text": text}
+
+
 def _stage_tenant(reference: str, row: dict[str, str | None], readback: dict[str, str] | None,
                   now: datetime | None = None) -> tuple[dict[str, object] | None, str, str]:
     """Local, read-only: (inventory row, environment, captured_at) for this CO, else (None, "", "").
@@ -2892,14 +2951,29 @@ def _stage_state(reference: str, row: dict[str, str | None], readback: dict[str,
     scan_done = bool(scan and scan.get("execution_state") == "done")
     tenant, environment, captured = _stage_tenant(reference, row, readback)
     evidence = user_created_evidence(tenant, environment) if tenant is not None else None
+    try:
+        validation = attended_validations().get(reference) or {}
+    except Exception:  # noqa: BLE001
+        validation = {}
+    try:
+        reminder_operator = bool(load_attended_reminders().get(reference, {}).get(REMINDER_FIELDS["operator_assigned"]))
+    except ReadUnavailable:
+        reminder_operator = False
+    operator = (evidence["operator"] is True if evidence else False) or reminder_operator
+    proof = user_created_proof(validation.get("primary_user_matches"), operator,
+                               load_user_created_confirmations().get(reference),
+                               str(validation.get("primary_user_checked_on") or ""))
     result = derive_onboarding_stage(row.get("Onboarding_Stage__c"), row.get("Onboarding_Approval_Status__c"),
                                      tenant_created=tenant_created, scan_done=scan_done,
-                                     user_created=evidence["created"] if evidence else None)  # type: ignore[index]
-    return {**result, "evidence": evidence, "environment": environment, "captured_at": captured,
+                                     user_created=proof["created"])  # type: ignore[arg-type]
+    return {**result, "evidence": evidence, "user_proof": proof, "environment": environment, "captured_at": captured,
             "tenant": tenant, "scan_done": scan_done, "tenant_created": tenant_created}
 
 
 def _user_evidence_text(state: dict[str, object]) -> str:
+    proof = state.get("user_proof")
+    if isinstance(proof, dict):
+        return "User Created: " + str(proof["text"]) + "."
     evidence = state.get("evidence")
     if not isinstance(evidence, dict):
         return "User Created: not checked (no matching tenant in the local inventory snapshot)."
@@ -2911,7 +2985,18 @@ def _user_evidence_text(state: dict[str, object]) -> str:
             + part("customer user", evidence["customer"]))
 
 
-def _stage_tracker_html(state: dict[str, object]) -> str:
+def _user_confirm_form(state: dict[str, object], reference: str) -> str:
+    """Small secondary button: confirm the customer user manually, or undo that confirmation."""
+    proof = state.get("user_proof")
+    manual = isinstance(proof, dict) and proof.get("proof") == "manual"
+    if state.get("index") is None or (not manual and int(state["index"]) >= 5):  # type: ignore[call-overload]
+        return ""
+    action, label = ("/attended/unconfirm-user-created", "Undo") if manual else ("/attended/confirm-user-created", "Confirm user created")
+    return ("<form method='post' action='" + action + "'><input type='hidden' name='reference' value='" + escape(reference)
+            + "'><button type='submit' class='ghost sm'>" + label + "</button></form>")
+
+
+def _stage_tracker_html(state: dict[str, object], reference: str = "") -> str:
     """Horizontal stepper (done / current / upcoming) with accessible text; no scripts or assets."""
     index = int(state["index"])  # type: ignore[call-overload]
     items = []
@@ -2935,7 +3020,8 @@ def _stage_tracker_html(state: dict[str, object]) -> str:
         sf_note = "<span class='note'>Salesforce stage: " + escape(ONBOARDING_STAGES[int(sf_index)]) + " (matches).</span>"  # type: ignore[call-overload]
     return ("<nav class='tracker' aria-label='Onboarding stage'><ol class='stages'>" + "".join(items) + "</ol>"
             "<p class='tracker-note'>" + sf_note + "</p>"
-            "<p class='tracker-note note'>" + escape(_STAGE_HINT[index]) + " " + escape(_user_evidence_text(state)) + "</p></nav>")
+            "<p class='tracker-note note'>" + escape(_STAGE_HINT[index]) + " " + escape(_user_evidence_text(state)) + "</p>"
+            + (_user_confirm_form(state, reference) if reference else "") + "</nav>")
 
 
 def _detail_summary(row: dict[str, str | None], extra: tuple[tuple[str, str], ...] = ()) -> str:
@@ -3186,7 +3272,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
               + str(len(DETAIL_DISPLAY_FIELDS)) + " fields</span></summary><div class='body'><dl>" + rows + "</dl></div></details>")
     account = row.get("Account_Name__c")
     stage_state = _stage_state(reference, row, readback)
-    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + _stage_tracker_html(stage_state)
+    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + _stage_tracker_html(stage_state, reference)
                  + "<div class='page-head'><h1>" + escape(reference) + "</h1>"
                  + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + _route_chip(row)
                  + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
@@ -4868,7 +4954,8 @@ POST_ROUTES = frozenset({
     "/attended/rerun-ce-only-fill-preflight", "/attended/rerun-co0702-fill-preflight",
     "/attended/start-ce-only-runner", "/attended/start-co0702-ce-only-runner", "/attended/reset-ce-only-runner",
     "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
-    "/attended/mark-operator-assigned", "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
+    "/attended/mark-operator-assigned", "/attended/confirm-user-created", "/attended/unconfirm-user-created",
+    "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
     "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
@@ -5403,6 +5490,16 @@ class Handler(BaseHTTPRequestHandler):
                 record_attended_reminder(reference, kind)
             except (OSError, ValueError, ReadUnavailable):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Reminder unavailable</title><p>The local reminders file could not be written. Nothing was changed in Leonardo or Salesforce.</p>")
+                return
+            self.send_redirect("/co/" + reference)
+            return
+        if path in ("/attended/confirm-user-created", "/attended/unconfirm-user-created"):
+            # Local acknowledgement only: no Leonardo, browser, or Salesforce write.
+            try:
+                set_user_created_confirmation(reference, path == "/attended/confirm-user-created",
+                                              dashboard_operator(self.headers.get("Cookie")))
+            except (OSError, ValueError):
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Confirmation unavailable</title><p>The local confirmation file could not be written. Nothing was changed in Leonardo or Salesforce.</p>")
                 return
             self.send_redirect("/co/" + reference)
             return
