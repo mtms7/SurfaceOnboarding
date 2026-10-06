@@ -70,6 +70,10 @@ class FakePage:
         self._app_request()
 
     def goto(self, url, **kwargs):
+        if url == "about:blank":
+            self.calls.append("blank")
+            self._pending = None  # the hung document and its late reply are gone
+            return None
         self.calls.append("goto")
         if self.goto_hangs:
             raise PlaywrightTimeout("Page.goto: Timeout 30000ms exceeded.")
@@ -104,15 +108,26 @@ class SearchRetryTests(unittest.TestCase):
         page = FakePage(reload_hangs=True, goto_hangs=False)
         result = runner._search_tenants(page, None, "acme.example")
         self.assertIsNotNone(result)
-        self.assertEqual(page.calls, ["reload", "goto"])
+        self.assertEqual(page.calls, ["reload", "blank", "goto"])
         self.assertEqual(page.sent_bodies[-1]["tableServerData"]["filters"],
                          {"and": [{"method": "search", "value": "acme.example"}]})
         self.assertIsNone(page.handler)  # route removed afterwards
 
+    def test_a_late_reply_of_the_hung_document_never_counts_on_the_retry(self):
+        page = FakePage(reload_hangs=False, goto_hangs=True)
+        original_reload = page.reload
+
+        def late(**kwargs):
+            original_reload()  # the app's request goes out and is rewritten ...
+            raise PlaywrightTimeout("Page.reload: Timeout 30000ms exceeded.")  # ... but the load never ends
+        page.reload = late
+        self.assertIsNone(runner._search_tenants(page, None, "acme.example"))
+        self.assertEqual(page.calls, ["reload", "blank", "goto"])
+
     def test_two_failures_fail_closed_without_a_third_attempt(self):
         page = FakePage(reload_hangs=True, goto_hangs=True)
         self.assertIsNone(runner._search_tenants(page, None, "acme.example"))
-        self.assertEqual(page.calls, ["reload", "goto"])
+        self.assertEqual(page.calls, ["reload", "blank", "goto"])
         self.assertIsNone(page.handler)
 
     def test_a_non_timeout_error_is_not_retried(self):

@@ -4517,6 +4517,14 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
     try:
         status = None
         for attempt in range(1 + SEARCH_RELOAD_RETRIES):
+            if attempt:
+                # Retire the hung document first (2026-10-06 live: its late table reply matched during the
+                # retry and its body was gone after the navigation). Only this attempt's request counts.
+                try:
+                    page.goto("about:blank", wait_until="domcontentloaded", timeout=FIELD_TIMEOUT_MS)
+                except Exception as exc:
+                    _log().error("tenant_search", "retire_document", exc)
+                rewritten.clear()
             try:
                 # Only the reply to a rewritten request counts: an app refresh already in flight (e.g. after an
                 # Edit save) also matches the path but carries the unfiltered table.
