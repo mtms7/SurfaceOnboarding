@@ -205,7 +205,7 @@ FORM_CLOSE_POLL_SECONDS = 0.5
 # Server-side tenant search (getAllDetailedAccounts per edit, HAR-verified):
 # wait for the response that carries this lookup instead of a fixed sleep.
 TENANT_SEARCH_API = "getAllDetailedAccounts"
-SEARCH_RESPONSE_TIMEOUT_MS = 15_000
+SEARCH_RESPONSE_TIMEOUT_MS = 45_000  # 2026-10-06: Leonardo Development took 20-30 s to load the table
 # Rows per invisible search; more matches than this is ambiguous (fail closed).
 API_SEARCH_PAGE_SIZE = 100
 ACCOUNT_ADD_API = "/backoffice/account/add"
@@ -4536,7 +4536,7 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
                     else:
                         # A fresh navigation instead of a second reload (2026-10-06: Leonardo Development
                         # intermittently never answers a reload). Read-only: the search is only re-sent.
-                        document = page.goto(TENANT_MANAGEMENT, wait_until="domcontentloaded")
+                        document = page.goto(TENANT_MANAGEMENT, wait_until="domcontentloaded", timeout=SEARCH_RESPONSE_TIMEOUT_MS)
                         _log().event("tenant_search", "retry_document",
                                      detail=str(getattr(document, "status", "none")))
                 status = info.value.status
