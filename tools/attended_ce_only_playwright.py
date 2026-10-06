@@ -7059,6 +7059,340 @@ def _record_check(reference: str, kind: str, result: str, detail: str = "") -> N
         pass
 
 
+# --- Renewal mirror (owner decision 2026-10-06) -------------------------------
+# Renewal COs (Cases 4-6) target tenants that exist only in production. To test a renewal in Leonardo
+# Development, create a MIRROR of the production tenant from the production clone (integration/onboarding/
+# renewal_mirror.py). It is a Leonardo Development WRITE: dry run by default; --confirm-write creates it.
+# The mirror is recorded in integration/attended_renewal_mirrors.json AND in the standard readback store so
+# the renewal edit can find it with _readback_ids. Salesforce is never written. Selectors are the ones the
+# create path already uses; the mirror flow itself has not run live.
+MIRROR_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_renewal_mirrors.json"
+MIRROR_ENGINE = "renewal_mirror"
+# Outcomes reached after Confirm was (or may have been) clicked: the tenant may exist, unverified.
+MIRROR_AFTER_CONFIRM_RESULTS = frozenset({
+    "mirror_confirm_no_create", "mirror_create_unverified", "mirror_readback_value_mismatch",
+    "mirror_readback_write_unavailable", "mirror_readback_id_conflict", "mirror_record_write_unavailable",
+    "mirror_search_unavailable", "leonardo_session_expired"})
+
+
+@dataclass(frozen=True, slots=True)
+class MirrorSource:
+    reference: str
+    account_name: str
+    country: str
+    tenant_name: str  # the candidate Surface tenant name; replaced by the production name for the mirror
+    primary_domain: str
+    candidate_names: tuple[str, ...]
+    candidate_domains: tuple[str, ...]
+    email_domains: tuple[str, ...]
+    primary_user_alias: str
+    renews_surface: bool
+    renews_ce: bool
+
+
+def _domain_tokens(value: object) -> tuple[str, ...]:
+    from integration.onboarding import leonardo_inventory as inventory
+
+    if not isinstance(value, str):
+        return ()
+    return tuple(dict.fromkeys(d for d in map(inventory.canonical_domain, re.split(r"[,;\s]+", value)) if d))
+
+
+def mirror_source(reference: str) -> MirrorSource:
+    """Read-only Salesforce read of a renewal CO's identity (names and domains); fails closed."""
+    if not REFERENCE.fullmatch(reference):
+        raise RuntimeError("invalid_co_reference")
+    try:
+        rows = _sf_records(
+            "SELECT Name, Account_Name__c, Account_Country__c, Email_Domains__c, Main_Domain__c, "
+            "Onboarding_Product__c, Onboarding_Type__c FROM Customer_Onboarding__c "
+            "WHERE Name = '" + reference + "' LIMIT 2")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+            raise ValueError()
+        row = rows[0]
+        case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+        if case is None:
+            raise RuntimeError("mirror_not_renewal")
+        account, country = row.get("Account_Name__c"), row.get("Account_Country__c")
+        if not (isinstance(account, str) and " ".join(account.split()) and isinstance(country, str)
+                and " ".join(country.split())):
+            raise ValueError()
+        emails = _domain_tokens(row.get("Email_Domains__c"))
+        domains = tuple(dict.fromkeys((*_domain_tokens(row.get("Main_Domain__c")), *emails)))
+        if not domains:
+            raise ValueError()
+        surface, ce_only = surface_names(account), ce_only_names(account)
+        return MirrorSource(reference, " ".join(account.split()), " ".join(country.split()), surface.tenant_name,
+                            domains[0], tuple(dict.fromkeys((surface.tenant_name, ce_only.tenant_name))), domains,
+                            emails, surface.primary_user_alias, case[2], case[3])
+    except RuntimeError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("salesforce_fill_source_unavailable") from exc
+
+
+def build_mirror_fill(plan: Any, source: MirrorSource) -> dict[str, Any]:
+    """The Add Account fill plan for a mirror: production values plus the standard new-tenant profile."""
+    texts: dict[str, str] = {"Company name": plan.tenant_name, "Company primary domain": plan.primary_domain}
+    blank = [SUBDOMAINS_LABEL, NETWORKS_LABEL, "Phone number", "Job title"]
+    if plan.alternate_domains:
+        texts[ALTERNATE_DOMAINS_LABEL] = ", ".join(plan.alternate_domains)
+    else:
+        blank.append(ALTERNATE_DOMAINS_LABEL)
+    texts.update({
+        USER_EMAIL_DOMAINS_LABEL: CE_USER_EMAIL_DOMAIN, "First name": CE_PRIMARY_USER_FIRST_NAME,
+        "Last name": CE_PRIMARY_USER_LAST_NAME,
+        "Organization Email": f"{CE_PRIMARY_USER_EMAIL_LOCAL}+{source.primary_user_alias}@{CE_USER_EMAIL_DOMAIN}",
+        "Number of assets": str(plan.assets), "Number of domains": str(plan.domains),
+        "Number of subdomains": str(plan.subdomains)})
+    selects = {"Account Type": "Customer", "Country": source.country, "Scanning interval": plan.scanning_interval,
+               "Type": plan.license_type}
+    lc = plan.leaked_credentials_allowed
+    if lc:
+        texts["Leaked Credentials scanned domains (Comma Separated Values)"] = ", ".join(plan.lc_domains)
+        selects["Leaked Credentials scanning interval"] = "Weekly"
+    # A mirror never starts a scan: "Scan now" exists only while the interval is None and is left OFF.
+    interval_none = plan.scanning_interval == "None"
+    toggles = SURFACE_ADVANCED_TOGGLES if source.renews_surface else {key: False for key in ADVANCED_TOGGLES_OFF}
+    return {
+        "texts": texts, "selects": selects,
+        "absent_checkboxes": () if interval_none else ("scan_now",),
+        "checkboxes": {
+            "mfaRequired": True, **({"scan_now": False} if interval_none else {}), **toggles,
+            "notificationsAllowed": source.renews_surface, "multipleUsersAllowed": source.renews_surface,
+            "apiAccessAllowed": source.renews_surface, "phishingEnabled": False,
+            "leakedCredentialsAllowed": lc, "provisioningEnabled": True, "subDomainsNumberAllowed": True},
+        "advanced_texts": ({SURFACE_MAX_SCAN_DURATION_LABEL: SURFACE_MAX_SCAN_DURATION_HOURS}
+                           if source.renews_surface else {}),
+        "blank_texts": tuple(blank), "operator_account_empty": True,
+        "license_start": plan.start_date, "license_end": plan.end_date,
+    }
+
+
+def _mirror_records() -> dict[str, Any]:
+    try:
+        raw = json.loads(MIRROR_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ValueError("mirror_record_unreadable") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("mirror_record_unreadable")
+    return raw
+
+
+def write_mirror_record(reference: str, prod_id: str, status: str, created_on: str,
+                        surface_account_id: str | None = None, account_uuid: str | None = None) -> None:
+    """Minimal local record: ids, status, date; never names, domains, or payloads."""
+    if not REFERENCE.fullmatch(reference) or status not in ("create_attempted", "verified"):
+        raise ValueError("invalid_mirror_record")
+    date.fromisoformat(created_on)
+    raw = _mirror_records()
+    record: dict[str, Any] = {"mirror_of_production": True, "source_prod_id": prod_id, "created_on": created_on,
+                              "status": status, "environment": "dev"}
+    if status == "verified":
+        record.update({"surface_account_id": surface_account_id, "account_uuid": account_uuid})
+    raw[reference] = record
+    _write_json_atomic(MIRROR_PATH, raw)
+
+
+def mirror_write_label(result: str, confirm_write: bool) -> str:
+    """What the CLI may claim about the Leonardo write (same pattern as spycloud_write_label)."""
+    if result == "mirror_created_verified":
+        return "verified"
+    if confirm_write and result in MIRROR_AFTER_CONFIRM_RESULTS:
+        return "attempted_unverified"
+    return "not_performed"
+
+
+def _mirror_contract() -> RouteContract:
+    """Duplicate-check contract for a mirror (not in ROUTES: a mirror is never a Start route)."""
+    return RouteContract(
+        engine=MIRROR_ENGINE, load_source=lambda reference: mirror_source(reference),
+        license_dates=lambda source, run_day=None: (run_day or _run_day(), _run_day()),
+        build_fill=lambda source, run_day=None: {}, primary_domain=lambda source: source.primary_domain,
+        redactions=lambda source: (source.account_name, source.tenant_name, *source.candidate_domains),
+        allow_scan_started=False)
+
+
+def run_renewal_mirror(reference: str, confirm_write: bool = False, env_name: str = "dev") -> str:
+    """Create (or dry-run) the Leonardo Development mirror of a renewal CO's production tenant.
+
+    Checks, in order, before any browser work: dev only; valid reference; renewal CO; no mirror or readback
+    already recorded locally; a fresh production clone with exactly one matching tenant; no Dev inventory
+    duplicate. Then in Leonardo: live duplicate lookups (any hit stops), Add Account fill, and either Cancel
+    (dry run: ``mirror_dry_run_verified``) or Confirm (``mirror_created_verified`` after a one-row readback).
+    Never writes Salesforce, never runs against production.
+    """
+    global _ACTIVE_RUN_LOG, _ENTERED_LICENSE
+    from integration.onboarding import renewal_mirror
+
+    if env_name != "dev":
+        return "mirror_environment_not_supported"
+    if not REFERENCE.fullmatch(reference):
+        return "invalid_co_reference"
+    try:
+        if reference in _mirror_records():
+            return "mirror_already_exists"
+    except ValueError as error:
+        return str(error)
+    if _readback_ids(reference) is not None:
+        return "mirror_readback_exists"
+    try:
+        source = mirror_source(reference)
+    except RuntimeError as error:
+        return str(error)
+    try:
+        plan = renewal_mirror.plan_mirror(inventory_root(), source.candidate_names, source.candidate_domains,
+                                          source.email_domains, now=datetime.now(timezone.utc), today=_run_day())
+    except renewal_mirror.MirrorError as error:
+        return error.reason
+    contract = _mirror_contract()
+    fill_source = dataclasses.replace(source, tenant_name=plan.tenant_name, primary_domain=plan.primary_domain)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return "playwright_runtime_unavailable"
+    _ENTERED_LICENSE = None
+    _ACTIVE_RUN_LOG = RunLog(reference, "renewal_mirror" if confirm_write else DRY_RUN_MODE, route=MIRROR_ENGINE)
+    log = _ACTIVE_RUN_LOG
+    log.add_redactions(*contract.redactions(fill_source), plan.tenant_name, plan.primary_domain,
+                       *plan.alternate_domains)
+    result = "attended_ce_runner_unavailable"
+    try:
+        if _inventory_precheck(contract, fill_source, log)["result"] == "inventory_match":
+            result = "mirror_duplicate_inventory_match"
+            return result
+        with sync_playwright() as playwright:
+            try:
+                with _attended_page(playwright) as page:
+                    log.attach(page)
+                    result = _mirror_in_browser(page, reference, plan, fill_source, contract, confirm_write, log)
+            except LoginTimeout:
+                result = "development_login_timeout"
+            except LeonardoSessionExpired:
+                result = "leonardo_session_expired"
+            except RuntimeError as error:
+                result = str(error)
+            except Exception as exc:  # noqa: BLE001
+                log.error("runner", "unexpected", exc)
+                result = "attended_ce_runner_unavailable"
+        return result
+    finally:
+        log.event("finish", result)
+        log.write(result)
+        _ACTIVE_RUN_LOG = None
+
+
+def _mirror_in_browser(page: Any, reference: str, plan: Any, source: MirrorSource, contract: RouteContract,
+                       confirm_write: bool, log: RunLog) -> str:
+    global _ENTERED_LICENSE
+    name, domain = plan.tenant_name, plan.primary_domain
+    search = _open_search(page)
+    if search is None:
+        _capture_search_diagnostics(page)
+        return "duplicate_search_schema_unavailable"
+    for lookup_name, lookup in contract.duplicate_lookups(source):
+        searched = _search_tenants(page, search, lookup)
+        if searched is None:
+            duplicate = "duplicate_schema_unavailable"
+        else:
+            duplicate = _settled_tenant_rows(page, name, domain)
+            if duplicate == "duplicate_clear":
+                duplicate = _api_duplicate(searched, name, domain)
+        log.event("duplicate_check", duplicate, lookup_name)
+        if duplicate != "duplicate_clear":
+            if duplicate in ("duplicate_schema_unavailable", "duplicate_ambiguous"):
+                _capture_search_diagnostics(page)
+            return "mirror_" + duplicate  # mirror_duplicate_found, mirror_duplicate_ambiguous, ...
+    add_account = page.get_by_role("button", name="Add Account", exact=True)
+    if add_account.count() != 1:
+        _capture_search_diagnostics(page)
+        return "add_account_schema_unavailable"
+    add_account.click()
+    log.event("add_account_open", "clicked")
+    try:
+        page.get_by_label("Company name", exact=True).first.wait_for(state="attached", timeout=5_000)
+    except Exception:
+        pass
+    fill = build_mirror_fill(plan, source)
+    failure, account_name_control = _fill_add_account_form(page, fill)
+    if failure is not None:
+        _capture_search_diagnostics(page)
+        _cancel_add_account(page)
+        return failure
+    confirm = _locate_confirm_button(page)
+    if confirm is None:
+        _capture_search_diagnostics(page)
+        _cancel_add_account(page)
+        return "confirm_button_schema_unavailable"
+    if not _ensure_confirm_enabled(page, confirm, fill):  # includes the start-date-one-day-earlier fallback
+        _capture_search_diagnostics(page)
+        _cancel_add_account(page)
+        return "confirm_button_not_enabled"
+    if not confirm_write:
+        return "mirror_dry_run_verified" if _cancel_add_account(page) else "dry_run_cancel_unavailable"
+    _ENTERED_LICENSE = (fill["license_start"], fill["license_end"])
+    try:  # recorded BEFORE Confirm: an uncertain create blocks a second attempt until reconciled
+        write_mirror_record(reference, plan.prod_id, "create_attempted", date.today().isoformat())
+    except (OSError, ValueError):
+        _cancel_add_account(page)
+        return "mirror_record_write_unavailable_before_create"
+    create_status = None
+    try:
+        with page.expect_response(lambda r: ACCOUNT_ADD_API in r.url, timeout=30_000) as created:
+            confirm.first.click(timeout=5_000)
+        create_status = created.value.status
+    except Exception as exc:
+        log.error("confirm_click", "Confirm", exc)  # uncertain: never re-click
+    log.event("confirm_click", "clicked", detail=f"account_add_status={create_status}")
+    deadline = monotonic() + 60.0
+    form_closed = False
+    while monotonic() < deadline:
+        try:
+            if account_name_control.count() == 0:
+                form_closed = True
+                break
+        except Exception:
+            pass
+        sleep(FORM_CLOSE_POLL_SECONDS)
+    if not form_closed and not (isinstance(create_status, int) and 200 <= create_status < 300):
+        _capture_search_diagnostics(page)
+        return "mirror_confirm_no_create"
+    search = _open_search(page)
+    if search is None:
+        return "mirror_search_unavailable"
+    searched = None
+    for attempt in range(3):  # read-only retries; exactly one exact row is required
+        if attempt:
+            page.wait_for_timeout(2_000)
+        searched = _search_tenants(page, search, name)
+        if searched is not None and _settled_tenant_rows(page, name, domain) == "duplicate_found":
+            break
+        searched = None
+    details = _api_readback(searched, name, domain) if searched is not None else None
+    if details is None:
+        return "mirror_create_unverified"
+    surface_account_id, account_uuid, state = details
+    if not (re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, surface_account_id)
+            and re.fullmatch(ACCOUNT_UUID_PATTERN, account_uuid) and state in READBACK_STATES):
+        return "mirror_readback_value_mismatch"
+    try:
+        write_readback_evidence(reference, surface_account_id, account_uuid, date.today().isoformat(), state)
+    except ReadbackConflict:
+        return "mirror_readback_id_conflict"
+    except (OSError, ValueError):
+        return "mirror_readback_write_unavailable"
+    try:
+        write_mirror_record(reference, plan.prod_id, "verified", date.today().isoformat(),
+                            surface_account_id, account_uuid)
+    except (OSError, ValueError):
+        return "mirror_record_write_unavailable"
+    if plan.leaked_credentials_allowed:  # SpyCloud OFF after create (never changes this result)
+        _spycloud_after_create(page, reference, CASE3_ENGINE, name, surface_account_id, account_uuid)
+    return "mirror_created_verified"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Attended Leonardo Development CE-only auto-confirm runner.")
     parser.add_argument("--co", required=False, help="Customer Onboarding reference (e.g. CO-0702).")
@@ -7100,7 +7434,9 @@ def main() -> int:
     parser.add_argument("--renew", action="store_true",
                         help="With --co: renewal EDIT of a Case 4-6 CO's existing Leonardo Development (mirror) tenant. Dry run: open Edit, read current values, report the planned diff, Cancel (nothing saved). Add --confirm-write to apply it.")
     parser.add_argument("--confirm-write", action="store_true",
-                        help="With --spycloud-off or --renew: explicitly approve the Leonardo Development save (Edit > Confirm). Without it nothing is saved.")
+                        help="With --spycloud-off, --renew or --mirror-renewal: explicitly approve the Leonardo Development write. Without it nothing is saved.")
+    parser.add_argument("--mirror-renewal", action="store_true",
+                        help="With --co: create (dry run unless --confirm-write) a Leonardo Development mirror of the renewal CO's production tenant, from the production clone.")
     parser.add_argument("--open-dashboard", type=int, metavar="PORT",
                         help="Open (or bring to the front) the local dashboard's sign-in page as a tab of the automation window.")
     parser.add_argument("--probe-inventory-shape", action="store_true",
@@ -7116,10 +7452,17 @@ def main() -> int:
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
-    if args.confirm_write and not (args.spycloud_off or args.renew):
-        parser.error("--confirm-write is only valid with --spycloud-off or --renew")
-    if args.renew and args.spycloud_off:
-        parser.error("--renew and --spycloud-off are separate runs")
+    if args.confirm_write and not (args.spycloud_off or args.renew or args.mirror_renewal):
+        parser.error("--confirm-write is only valid with --spycloud-off, --renew or --mirror-renewal")
+    if sum(bool(x) for x in (args.renew, args.spycloud_off, args.mirror_renewal)) > 1:
+        parser.error("--renew, --spycloud-off and --mirror-renewal are separate runs")
+    if args.mirror_renewal:
+        if not args.co:
+            parser.error("--co is required with --mirror-renewal")
+        result = run_renewal_mirror(args.co, confirm_write=args.confirm_write, env_name=args.env)
+        print(json.dumps({"result": result, "leonardo_write": mirror_write_label(result, args.confirm_write),
+                          "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
     if args.renew:
         if not args.co:
             parser.error("--co is required with --renew")
