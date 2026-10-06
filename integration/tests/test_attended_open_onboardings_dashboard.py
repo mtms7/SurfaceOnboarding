@@ -2507,9 +2507,9 @@ class RenewalPlanCardTests(unittest.TestCase):
         with patch.object(dashboard, "renewal_subscription_rows", return_value=list(self.ROWS)):
             card = dashboard._renewal_plan_section(dict(self.ROW), _date(2026, 10, 2))
         self.assertIn("Renewal plan · Case 6 · renew Surface + CE", card)
-        self.assertIn("Manual in production · plan only", card)
+        self.assertIn("Plan only · applied by CLI", card)
         self.assertIn("Prime · Weekly", card)
-        self.assertIn("annual cap 2027-10-26 · or term end 2029-10-26", card)
+        self.assertIn("DealHub term end exactly: 2029-10-26", card)
         self.assertIn("from 2026-10-13", card)
         self.assertIn("✓ Surface and Core Plus agree", card)
         self.assertIn("find the tenant by name and primary domain", card)

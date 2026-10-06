@@ -2147,7 +2147,7 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None)
         return ""
     head = ("<section class='card' aria-labelledby='renewal-plan-title'><div class='card-head'>"
             "<h2 id='renewal-plan-title' class='pill'>Renewal plan · " + escape(case[1]) + "</h2>"
-            "<span class='chip chip-neutral'>Manual in production · plan only</span></div>")
+            "<span class='chip chip-neutral'>Plan only · applied by CLI</span></div>")
     try:
         rows = renewal_subscription_rows(row.get("Account__c") or "")
     except ReadUnavailable:
@@ -2174,23 +2174,26 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None)
     if term:
         when = "now" if term["applicable_now"] else "from " + term["apply_from"]
         facts += [("Apply", when + " (up to 14 days before the new term starts)"),
-                  ("Expiration (Q1 open)", f"annual cap {term['annual_expiration']} · or term end {term['end']}"),
-                  ("Start date", "never change (Renew card)")]
+                  ("Expiration (Q1)", f"DealHub term end exactly: {term['end']}"),
+                  ("Start date (Q2)", "never changed")]
     if "terms_agree" in plan:
         agree = plan["terms_agree"]
-        facts.append(("Term check", "✓ Surface and Core Plus agree" if agree["annual"] and agree["term_end"]
+        facts.append(("Term check", "✓ Surface and Core Plus agree" if agree["term_end"]
                       else "✗ the terms differ — manual review"))
     if plan["legacy_ignored"]:
         facts.append(("Legacy rows ignored (Q11)", str(len(plan["legacy_ignored"])) + " older-model product row(s)"))
     blockers = "".join("<p class='note' style='color:var(--bad)'><b>" + escape(RENEWAL_BLOCKER_TEXT.get(code, code))
                        + "</b> <code>" + escape(code) + "</code></p>" for code in plan["blockers"])
-    checklist = ["Open the tenant in Back Office › ⋮ › Edit", "Apply the changes above; never change the start date",
-                 "Check the user email domains for the primary user", "Update the Operator Account if the TA changed",
-                 "Save; Salesforce updates stay manual"]
+    name = row.get("Name") or "CO-XXXX"
+    checklist = ["Dry run: tools\\attended_ce_only_playwright.py --co " + name + " --renew (reads the Edit form, saves nothing)",
+                 "Apply: the same command plus --confirm-write, against the Dev mirror (create it first with --mirror-renewal)",
+                 "Added domains must pass the production duplicate gate (Q3); Salesforce updates stay manual"]
     return (head + blockers + "<dl>" + "".join("<dt>" + escape(k) + "</dt><dd>" + escape(v) + "</dd>" for k, v in facts)
             + "</dl><p class='note'>Checklist: " + " · ".join("☐ " + escape(item) for item in checklist) + "</p>"
             "<p class='login-safety'>Read-only: built from Salesforce and DealHub. Nothing is opened, changed, or "
-            "saved in Leonardo or Salesforce. Rules marked Q1/Q7/Q10/Q11 await owner answers (docs/38).</p></section>")
+            "saved in Leonardo or Salesforce. Rules: Q1 expiration = DealHub term end; Q2 start never changes; Q3 Approved = human-validated, and added "
+            "domains must pass the production duplicate gate; Q10 routing by product + type (Case 6 = Surface + CE renewal). "
+            "Applied only by the CLI, never from this page (docs/38).</p></section>")
 
 
 def surface_commercial_readiness(row: dict[str, str | None]) -> dict[str, object] | None:
@@ -2776,7 +2779,8 @@ def ce_only_eligible(row: dict[str, str | None]) -> bool:
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", domain))
 
 
-RENEWAL_MANUAL_NOTE = ("Renewals are applied manually in BackOffice until the renewal rules (docs/38) are decided.")
+RENEWAL_MANUAL_NOTE = ("Renewals are applied by the CLI --renew (dry run first, then --confirm-write) against the Dev mirror "
+                       "(--mirror-renewal); this page only shows the plan. Production writes need separate approval.")
 
 
 def _domain_count(raw: str | None) -> str:
@@ -2784,7 +2788,157 @@ def _domain_count(raw: str | None) -> str:
     return str(len(items)) if items else "—"
 
 
-def _detail_summary(row: dict[str, str | None]) -> str:
+# --- Stage tracker (2026-10-06) ------------------------------------------------
+# DASHBOARD-ONLY and derived: nothing here is written to Salesforce.
+# TODO: on the move to production ask the owner again: Salesforce Onboarding Stage
+# must then be updated (today Salesforce's own stage is only displayed next to it).
+ONBOARDING_STAGES = ("New", "Request Approved", "Account Scanning", "Scan Completed Successfully",
+                     "User Created", "Onboarding Completed")
+_STAGE_HINT = (
+    "Waiting for the approval in Salesforce.",
+    "Approved; the tenant is not created yet.",
+    "Tenant created; the first scan is running or pending.",
+    "Scan finished; assign the Operator Account and create the customer user.",
+    "Operator account and customer user exist; complete the onboarding in Salesforce.",
+    "Onboarding is completed in Salesforce.",
+)
+
+
+def derive_onboarding_stage(salesforce_stage: str | None, approval_status: str | None, *,
+                            tenant_created: bool = False, scan_done: bool = False,
+                            user_created: bool | None = None) -> dict[str, object]:
+    """Pure: the furthest stage that is PROVABLE, never beyond the first missing proof.
+
+    Each stage needs every earlier stage plus its own evidence: approval "Approved"
+    (stage 2), a verified create/readback (3), a finished scan read (4), operator AND
+    customer user present (5). Salesforce's own stage also counts as evidence for itself
+    and everything before it. "Onboarding Completed" can only come from Salesforce.
+    Unknown (None) or false evidence stops the chain.
+    """
+    sf_index = ONBOARDING_STAGES.index(salesforce_stage) if salesforce_stage in ONBOARDING_STAGES else None
+    floor = -1 if sf_index is None else sf_index
+    local = (approval_status == "Approved", tenant_created is True, scan_done is True, user_created is True, False)
+    index = 0
+    for step, proven in enumerate(local, start=1):
+        if proven or floor >= step:
+            index = step
+        else:
+            break
+    return {"index": index, "stage": ONBOARDING_STAGES[index], "salesforce_index": sf_index,
+            "ahead": sf_index is not None and index > sf_index,
+            "behind": sf_index is not None and index < sf_index}
+
+
+def user_created_evidence(tenant: object, environment: str) -> dict[str, object]:
+    """Pure: operator / customer-user parts of "User Created" from one minimized inventory row.
+
+    Each part is True, False, or None (not collected). The production clone (Redash) only
+    carries the operator flag, so there the customer user stays None (never guessed).
+    """
+    row = tenant if isinstance(tenant, dict) else {}
+    operator = row.get("operator_assigned")
+    operator = operator if type(operator) is bool else None
+    primary = row.get("primary_user")
+    customer = primary.get("present") if environment == "dev" and isinstance(primary, dict) else None
+    customer = customer if type(customer) is bool else None
+    parts = {"operator account": operator, "customer user": customer}
+    created = (False if any(value is False for value in parts.values())
+               else None if any(value is None for value in parts.values()) else True)
+    terms = row.get("terms_accepted")
+    return {"created": created, "operator": operator, "customer": customer,
+            "missing": [name for name, value in parts.items() if value is False],
+            "unknown": [name for name, value in parts.items() if value is None],
+            "terms_accepted": terms if type(terms) is bool else None}
+
+
+def _stage_tenant(reference: str, row: dict[str, str | None], readback: dict[str, str] | None,
+                  now: datetime | None = None) -> tuple[dict[str, object] | None, str, str]:
+    """Local, read-only: (inventory row, environment, captured_at) for this CO, else (None, "", "").
+
+    Dev snapshot for a CO with a Leonardo readback; production clone for a CO that already
+    carries both Salesforce IDs. Same id AND uuid must match (inventory.match_readbacks).
+    """
+    if readback is not None:
+        environment, ids = "dev", readback
+    elif (row.get("Surface_Account_ID__c") or "").strip() and (row.get("Account_UUID__c") or "").strip():
+        environment = "prod-clone"
+        ids = {"surface_account_id": (row.get("Surface_Account_ID__c") or "").strip(),
+               "account_uuid": (row.get("Account_UUID__c") or "").strip()}
+    else:
+        return None, "", ""
+    try:
+        payload = inventory.load_latest(inventory_root(), environment, max_age=INVENTORY_DISPLAY_MAX_AGE,
+                                        now=now or datetime.now(timezone.utc))
+        tenant_id = inventory.match_readbacks(payload, {reference: ids})["by_reference"].get(reference)
+    except (inventory.InventoryError, OSError, ValueError, TypeError, AttributeError):
+        return None, environment, ""
+    for tenant in payload.get("tenants") or ():
+        if isinstance(tenant, dict) and tenant_id not in (None, "conflict") and tenant.get("id") == tenant_id:
+            return tenant, environment, str(payload.get("captured_at") or "")
+    return None, environment, ""
+
+
+def _stage_state(reference: str, row: dict[str, str | None], readback: dict[str, str] | None) -> dict[str, object]:
+    """Gather the local evidence once and derive the stage (dashboard-only)."""
+    try:
+        record = load_runner_state().get(reference)
+    except Exception:  # noqa: BLE001 - a missing or unreadable run record is simply no evidence
+        record = None
+    tenant_created = readback is not None or (isinstance(record, dict) and record.get("result") in _TENANT_RESULTS)
+    try:
+        scan = attended_scan_statuses().get(reference)
+    except Exception:  # noqa: BLE001
+        scan = None
+    scan_done = bool(scan and scan.get("execution_state") == "done")
+    tenant, environment, captured = _stage_tenant(reference, row, readback)
+    evidence = user_created_evidence(tenant, environment) if tenant is not None else None
+    result = derive_onboarding_stage(row.get("Onboarding_Stage__c"), row.get("Onboarding_Approval_Status__c"),
+                                     tenant_created=tenant_created, scan_done=scan_done,
+                                     user_created=evidence["created"] if evidence else None)  # type: ignore[index]
+    return {**result, "evidence": evidence, "environment": environment, "captured_at": captured,
+            "tenant": tenant, "scan_done": scan_done, "tenant_created": tenant_created}
+
+
+def _user_evidence_text(state: dict[str, object]) -> str:
+    evidence = state.get("evidence")
+    if not isinstance(evidence, dict):
+        return "User Created: not checked (no matching tenant in the local inventory snapshot)."
+    def part(label: str, value: object) -> str:
+        return label + ": " + ("present" if value is True else "missing" if value is False else "not collected")
+    source = "Leonardo Development snapshot" if state.get("environment") == "dev" else "production clone"
+    when = " · captured " + str(state["captured_at"])[:16] if state.get("captured_at") else ""
+    return ("User Created (" + source + when + "): " + part("operator account", evidence["operator"]) + " · "
+            + part("customer user", evidence["customer"]))
+
+
+def _stage_tracker_html(state: dict[str, object]) -> str:
+    """Horizontal stepper (done / current / upcoming) with accessible text; no scripts or assets."""
+    index = int(state["index"])  # type: ignore[call-overload]
+    items = []
+    for number, name in enumerate(ONBOARDING_STAGES):
+        if number < index or (number == index == len(ONBOARDING_STAGES) - 1 and index > 0):
+            cls, word, mark = "done", "done", "✓"
+        elif number == index:
+            cls, word, mark = "current", "current stage", str(number + 1)
+        else:
+            cls, word, mark = "upcoming", "upcoming", str(number + 1)
+        items.append("<li class='st " + cls + "'" + (" aria-current='step'" if cls == "current" else "") + ">"
+                     "<span class='dot' aria-hidden='true'>" + mark + "</span><span class='lbl'>" + escape(name)
+                     + "<span class='sr'> — " + word + "</span></span></li>")
+    sf_index = state.get("salesforce_index")
+    if state.get("ahead"):
+        sf_note = ("<span class='chip chip-warn'>Salesforce still shows: " + escape(ONBOARDING_STAGES[int(sf_index)])  # type: ignore[call-overload]
+                   + "</span> <span class='note'>The tracker is derived on this dashboard; nothing is written to Salesforce.</span>")
+    elif sf_index is None:
+        sf_note = "<span class='note'>Salesforce stage: not populated or not recognized.</span>"
+    else:
+        sf_note = "<span class='note'>Salesforce stage: " + escape(ONBOARDING_STAGES[int(sf_index)]) + " (matches).</span>"  # type: ignore[call-overload]
+    return ("<nav class='tracker' aria-label='Onboarding stage'><ol class='stages'>" + "".join(items) + "</ol>"
+            "<p class='tracker-note'>" + sf_note + "</p>"
+            "<p class='tracker-note note'>" + escape(_STAGE_HINT[index]) + " " + escape(_user_evidence_text(state)) + "</p></nav>")
+
+
+def _detail_summary(row: dict[str, str | None], extra: tuple[tuple[str, str], ...] = ()) -> str:
     """One line of key CO facts under the header (the full record is folded below)."""
     product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
     items = (
@@ -2797,7 +2951,21 @@ def _detail_summary(row: dict[str, str | None]) -> str:
         ("Email domains", _domain_count(row.get("Email_Domains__c"))),
     )
     return "<div class='summary'>" + "".join(
-        "<span>" + escape(label) + "<b>" + escape(value) + "</b></span>" for label, value in items) + "</div>"
+        "<span>" + escape(label) + "<b>" + escape(value) + "</b></span>" for label, value in items + extra) + "</div>"
+
+
+def _stage_facts(state: dict[str, object], readback: dict[str, str] | None,
+                 row: dict[str, str | None]) -> tuple[tuple[str, str], ...]:
+    """Licence dates and a short tenant id for the key-facts line (from local evidence only)."""
+    facts: list[tuple[str, str]] = []
+    tenant = state.get("tenant")
+    lic = tenant.get("license") if isinstance(tenant, dict) else None
+    if isinstance(lic, dict) and (lic.get("start_date") or lic.get("expiration_date")):
+        facts.append(("Licence", _inventory_date(lic.get("start_date")) + " → " + _inventory_date(lic.get("expiration_date"))))
+    tenant_id = (readback or {}).get("surface_account_id") or (row.get("Surface_Account_ID__c") or "").strip()
+    if tenant_id:
+        facts.append(("Tenant id", tenant_id[:8] + "…"))
+    return tuple(facts)
 
 
 def page_detail(reference: str, row: dict[str, str | None], notification: str = "", commercial_readiness: dict[str, object] | None = None) -> str:
@@ -2992,7 +3160,9 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
             tiles += _scan_status_section(reference, notification)
         if route_for(row) in (CE_ENGINE, CASE3_ENGINE):
             tiles += _spycloud_section(reference, notification)
-        health = "<div class='health'>" + tiles + "</div>"
+        health = ("<details class='more'" + (" open" if notification else "") + "><summary><h2 class='sum-h'>Tenant checks</h2>"
+                  "<span class='note'>Validation · scan status" + (" · SpyCloud" if route_for(row) in (CE_ENGINE, CASE3_ENGINE) else "")
+                  + "</span></summary><div class='body'><div class='health'>" + tiles + "</div></div></details>")
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     toast = ""
     if notification.startswith("id-write:") and notification[9:] in ID_WRITEBACK_RESULTS:
@@ -3015,13 +3185,14 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     record = ("<details class='more'><summary><h2 class='sum-h'>Salesforce record</h2><span class='note'>"
               + str(len(DETAIL_DISPLAY_FIELDS)) + " fields</span></summary><div class='body'><dl>" + rows + "</dl></div></details>")
     account = row.get("Account_Name__c")
-    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>"
-                 "<div class='page-head'><h1>" + escape(reference) + "</h1>"
+    stage_state = _stage_state(reference, row, readback)
+    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + _stage_tracker_html(stage_state)
+                 + "<div class='page-head'><h1>" + escape(reference) + "</h1>"
                  + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + _route_chip(row)
                  + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
                  "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
                  "<button class='ghost' type='submit'>Refresh</button></form></div></div>"
-                 + _detail_summary(row) + toast + next_step + health + ids_html + record)
+                 + _detail_summary(row, _stage_facts(stage_state, readback, row)) + toast + next_step + health + ids_html + record)
     return _app_shell(reference, main_html, active="onboardings")
 
 
@@ -3620,6 +3791,23 @@ PENTERA_CSS = (
     "details.more>.body{padding:0 20px 14px}"
     "details.more .readiness-icon{flex:0 0 20px;height:20px;font-size:11px}"
     "details.more .login-preflight,details.more .manual-action{box-shadow:none;margin:10px 0 0;padding:12px 14px}"
+    # Stage tracker (2026-10-06): horizontal stepper, plain CSS, no assets.
+    ".tracker{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 20px 10px;margin:8px 0 8px;"
+    "box-shadow:0 1px 2px #1018280a}"
+    ".stages{list-style:none;margin:0;padding:0;display:flex;gap:0}"
+    ".st{flex:1 1 0;min-width:0;position:relative;display:flex;flex-direction:column;align-items:center;gap:6px;"
+    "text-align:center;font-size:12.5px;color:var(--muted)}"
+    ".st::before{content:'';position:absolute;top:13px;left:-50%;width:100%;height:2px;background:var(--line);z-index:0}"
+    ".st:first-child::before{display:none}.st.done::before,.st.current::before{background:var(--ok)}"
+    ".dot{position:relative;z-index:1;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;"
+    "font-weight:700;font-size:13px;background:var(--pill);color:var(--muted);border:2px solid var(--line)}"
+    ".st.done .dot{background:var(--ok);border-color:var(--ok);color:#fff}"
+    ".st.current .dot{background:#fff;border-color:var(--primary);color:var(--primary-dark)}"
+    ".st.current .lbl{color:var(--text);font-weight:700}.st.done .lbl{color:var(--heading)}"
+    ".sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}"
+    ".tracker-note{margin:10px 0 0;font-size:12.5px}.tracker-note+.tracker-note{margin-top:4px}"
+    "@media(max-width:760px){.stages{flex-direction:column;gap:8px}.st{flex-direction:row;text-align:left}"
+    ".st::before{display:none}}"
     "@media(max-width:760px){dl.compact,.stat dl{display:block}.health{grid-template-columns:1fr}.summary{margin-top:0}"
     ".todo li{flex-wrap:wrap}}"
 )
