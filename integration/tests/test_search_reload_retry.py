@@ -9,6 +9,7 @@ import contextlib
 import json
 import types
 import unittest
+import unittest.mock
 
 import tools.attended_ce_only_playwright as runner
 
@@ -129,6 +130,39 @@ class DiagnosticsTitleTests(unittest.TestCase):
     def test_title_is_called_not_its_bound_method(self):
         import inspect
         self.assertIn("page.title()", inspect.getsource(runner._capture_search_diagnostics))
+
+
+class _Count:
+    def __init__(self, counts):
+        self.counts = list(counts)
+
+    def count(self):
+        return self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
+
+    def click(self):
+        pass
+
+
+class SearchToolbarWaitTests(unittest.TestCase):
+    """2026-10-06: wait for the slowly rendered tenant toolbar instead of failing closed at once."""
+
+    def page(self, textbox, button):
+        return types.SimpleNamespace(get_by_role=lambda role, **kw: textbox if role == "textbox" else button)
+
+    def test_a_late_toolbar_is_waited_for(self):
+        textbox, button = _Count([0, 0, 0, 1]), _Count([0, 0, 1])
+        with unittest.mock.patch.object(runner, "sleep", lambda s: None):
+            self.assertIs(runner._open_search(self.page(textbox, button)), textbox)
+
+    def test_a_toolbar_that_never_renders_fails_closed_after_the_wait(self):
+        clock = iter(range(0, 1000, 10))
+        with unittest.mock.patch.object(runner, "sleep", lambda s: None),                 unittest.mock.patch.object(runner, "monotonic", lambda: next(clock)):
+            self.assertIsNone(runner._open_search(self.page(_Count([0]), _Count([0]))))
+
+    def test_two_search_buttons_never_count(self):
+        clock = iter(range(0, 1000, 10))
+        with unittest.mock.patch.object(runner, "sleep", lambda s: None),                 unittest.mock.patch.object(runner, "monotonic", lambda: next(clock)):
+            self.assertIsNone(runner._open_search(self.page(_Count([0]), _Count([2]))))
 
 
 if __name__ == "__main__":

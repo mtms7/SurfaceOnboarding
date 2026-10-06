@@ -2398,6 +2398,9 @@ def _readback_details_optional_state(page: Any, tenant_name: str,
     return surface_account_id, account_uuid, _detail_value(page, "Account Scanning")
 
 
+SEARCH_TOOLBAR_WAIT_SECONDS = 45.0
+
+
 def _open_search(page: Any) -> Any | None:
     """Open the tenant-list search and return its input control.
 
@@ -2407,11 +2410,19 @@ def _open_search(page: Any) -> Any | None:
     locator when exactly one is present, or None so the caller fails closed.
     """
     search_input = page.get_by_role("textbox", name="Search", exact=True)
-    if search_input.count() == 1:
-        return search_input
     search_button = page.get_by_role("button", name="Search", exact=True)
-    if search_button.count() != 1:
-        return None
+    # 2026-10-06: Leonardo Development can take ~45 s to render the tenant table; wait for the toolbar before
+    # failing closed. The rule is unchanged: exactly one Search input, or exactly one Search button.
+    deadline = monotonic() + SEARCH_TOOLBAR_WAIT_SECONDS
+    while True:
+        if search_input.count() == 1:
+            return search_input
+        if search_button.count() == 1:
+            break
+        if monotonic() >= deadline:
+            _log().event("search_toolbar", "not_rendered", detail=f"waited {SEARCH_TOOLBAR_WAIT_SECONDS:.0f}s")
+            return None
+        sleep(0.5)
     search_button.click()
     deadline = monotonic() + 5.0
     while monotonic() < deadline:
