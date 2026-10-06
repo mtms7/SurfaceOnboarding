@@ -4479,6 +4479,30 @@ def _fill_select(page: Any, label: str, option: str) -> str | None:
 
 
 SEARCH_RELOAD_RETRIES = 1  # one read-only retry after a reload timeout (2026-10-06)
+SEARCH_IN_APP_TIMEOUT_MS = 10_000
+# 2026-10-06: every reload re-downloads Leonardo's ~5 MB bundle (request interception disables the HTTP cache)
+# and Leonardo Development reset such downloads. The app's own table request is first triggered in place by a
+# column-header sort click (read-only; it only re-sorts the table); reload and navigation remain the fallbacks.
+SEARCH_IN_APP_TRIGGER = True
+SEARCH_SORT_HEADER_SELECTOR = "thead th button"
+
+
+def _search_triggers() -> list[tuple[str, int]]:
+    triggers = [("in_app", SEARCH_IN_APP_TIMEOUT_MS)] if SEARCH_IN_APP_TRIGGER else []
+    triggers.append(("reload", SEARCH_RESPONSE_TIMEOUT_MS))
+    triggers.extend(("navigate", SEARCH_RESPONSE_TIMEOUT_MS) for _ in range(SEARCH_RELOAD_RETRIES))
+    return triggers
+
+
+def _in_app_sort_header(page: Any) -> Any | None:
+    """The first sortable column header of the tenant table, or None (then the reload is used)."""
+    try:
+        headers = page.locator(SEARCH_SORT_HEADER_SELECTOR)
+        return headers.first if headers.count() >= 1 else None
+    except Exception:
+        return None
+
+
 
 
 def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult | None":
@@ -4516,39 +4540,48 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
         return None
     try:
         status = None
-        for attempt in range(1 + SEARCH_RELOAD_RETRIES):
-            if attempt:
+        for kind, timeout in _search_triggers():
+            if kind == "in_app":
+                header = _in_app_sort_header(page)
+                if header is None:
+                    _log().event("tenant_search", "in_app_unavailable")
+                    continue
+            elif kind == "navigate":
                 # Retire the hung document first (2026-10-06 live: its late table reply matched during the
-                # retry and its body was gone after the navigation). Only this attempt's request counts.
+                # retry and its body was gone after the navigation).
                 try:
                     page.goto("about:blank", wait_until="domcontentloaded", timeout=FIELD_TIMEOUT_MS)
                 except Exception as exc:
                     _log().error("tenant_search", "retire_document", exc)
-                rewritten.clear()
+            # Only this attempt's request counts: an earlier attempt's late reply may belong to a document that
+            # is about to be replaced (its body is then gone), and an app refresh in flight carries no filter.
+            rewritten.clear()
             try:
-                # Only the reply to a rewritten request counts: an app refresh already in flight (e.g. after an
-                # Edit save) also matches the path but carries the unfiltered table.
                 with page.expect_response(lambda r: _is_inventory_response(r)
-                                          and any(r.request is q for q in rewritten),
-                                          timeout=SEARCH_RESPONSE_TIMEOUT_MS) as info:
-                    if attempt == 0:
+                                          and any(r.request is q for q in rewritten), timeout=timeout) as info:
+                    if kind == "in_app":
+                        header.click(timeout=FIELD_TIMEOUT_MS)
+                    elif kind == "reload":
                         page.reload(wait_until="domcontentloaded")
                     else:
-                        # A fresh navigation instead of a second reload (2026-10-06: Leonardo Development
-                        # intermittently never answers a reload). Read-only: the search is only re-sent.
-                        document = page.goto(TENANT_MANAGEMENT, wait_until="domcontentloaded", timeout=SEARCH_RESPONSE_TIMEOUT_MS)
+                        document = page.goto(TENANT_MANAGEMENT, wait_until="domcontentloaded", timeout=timeout)
                         _log().event("tenant_search", "retry_document",
                                      detail=str(getattr(document, "status", "none")))
                 status = info.value.status
+                _log().event("tenant_search", "trigger", detail=kind)
                 break
             except Exception as exc:
                 _log().error("tenant_search", "response", exc)
-                if attempt < SEARCH_RELOAD_RETRIES and "Timeout" in type(exc).__name__ + str(exc)[:80]:
+                if kind == "in_app":
+                    continue  # no table request from the sort click: fall back to the reload
+                if kind == "reload" and "Timeout" in type(exc).__name__ + str(exc)[:80]:
                     _log().event("tenant_search", "retry", detail="reload timed out; navigating once more")
                     continue
-                _log().event("tenant_search", "page_unresponsive",
-                             detail="Leonardo did not answer: close the automation browser, then Prepare sessions")
-                return None
+                break
+        if status is None:
+            _log().event("tenant_search", "page_unresponsive",
+                         detail="Leonardo did not answer: close the automation browser, then Prepare sessions")
+            return None
     finally:
         try:
             page.unroute(INVENTORY_ROUTE_PATTERN, rewrite)

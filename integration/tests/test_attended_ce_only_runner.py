@@ -3523,7 +3523,9 @@ CE_GOLDEN_EVENTS = [
     ["production_gate", "production_clone_no_match", "", "blocks=False tenants=1 matches=0"],
     # 2026-10-04: the DEV inventory pre-check runs before any browser work (no snapshot here).
     ["inventory_precheck", "inventory_unavailable", "", "inventory_snapshot_missing"],
+    ["tenant_search", "in_app_unavailable", "", ""], ["tenant_search", "trigger", "", "reload"],
     ["tenant_search", "200", "", "rows=0 total=0"], ["duplicate_check", "duplicate_clear", "tenant_name", ""],
+    ["tenant_search", "in_app_unavailable", "", ""], ["tenant_search", "trigger", "", "reload"],
     ["tenant_search", "200", "", "rows=0 total=0"], ["duplicate_check", "duplicate_clear", "primary_domain", ""],
     ["add_account_open", "clicked", "", ""],
     ["fill_select", "ok", "Account Type", ""], ["fill_select", "ok", "Scanning interval", ""],
@@ -3546,7 +3548,8 @@ CE_GOLDEN_EVENTS = [
     ["fill_text", "ok", "Number of subdomains", ""],
     ["fill_date", "ok", "license_start", ""], ["fill_date", "ok", "license_end", ""],
     ["verify_form", "ok", "", ""], ["confirm_click", "clicked", "", "account_add_status=200"],
-    ["form_close_wait", "closed", "", ""], ["tenant_search", "200", "", "rows=1 total=1"],
+    ["form_close_wait", "closed", "", ""], ["tenant_search", "in_app_unavailable", "", ""], ["tenant_search", "trigger", "", "reload"],
+    ["tenant_search", "200", "", "rows=1 total=1"],
     ["post_create_search", "duplicate_found", "attempt=1", ""], ["readback", "api", "", ""],
     ["finish", "readback_verified", "", ""],
 ]

@@ -226,5 +226,44 @@ class SearchOneRowTests(unittest.TestCase):
         self.assertEqual(self.run_with(many)[0], ("ambiguous", None))
 
 
+class InAppTriggerTests(unittest.TestCase):
+    """2026-10-06: the table request is first triggered by a header sort click (no 5 MB page reload)."""
+
+    def page_with_header(self, sends_request: bool):
+        page = FakePage(reload_hangs=False, goto_hangs=False)
+
+        class _Header:
+            def click(self, timeout=None):
+                page.calls.append("sort_click")
+                if sends_request:
+                    page._app_request()
+
+        class _Headers:
+            first = _Header()
+
+            def count(self):
+                return 1
+        page.locator = lambda selector: _Headers() if selector == runner.SEARCH_SORT_HEADER_SELECTOR else None
+        return page
+
+    def test_a_sort_click_carries_the_search_without_any_reload(self):
+        page = self.page_with_header(sends_request=True)
+        result = runner._search_tenants(page, None, "acme.example")
+        self.assertEqual((len(result.rows), page.calls), (1, ["sort_click"]))
+        self.assertEqual(page.sent_bodies[-1]["tableServerData"]["filters"],
+                         {"and": [{"method": "search", "value": "acme.example"}]})
+
+    def test_a_sort_click_without_a_table_request_falls_back_to_the_reload(self):
+        page = self.page_with_header(sends_request=False)
+        self.assertIsNotNone(runner._search_tenants(page, None, "acme.example"))
+        self.assertEqual(page.calls, ["sort_click", "reload"])
+
+    def test_the_trigger_can_be_switched_off(self):
+        page = self.page_with_header(sends_request=True)
+        with unittest.mock.patch.object(runner, "SEARCH_IN_APP_TRIGGER", False):
+            self.assertIsNotNone(runner._search_tenants(page, None, "acme.example"))
+        self.assertEqual(page.calls, ["reload"])
+
+
 if __name__ == "__main__":
     unittest.main()
