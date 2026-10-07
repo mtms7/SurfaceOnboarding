@@ -3272,7 +3272,8 @@ _ORIGINAL_CHECK_STATE_PATH = runner.CHECK_STATE_PATH
 # Safety net for tests that do not patch these paths themselves (for example
 # the readback-only failure paths capture diagnostics).
 _ORIGINAL_RUNTIME_PATHS = {name: getattr(runner, name)
-                           for name in ("DIAGNOSTICS_PATH", "READBACK_PATH", "RUNNER_STATE_PATH")}
+                           for name in ("DIAGNOSTICS_PATH", "READBACK_PATH", "RUNNER_STATE_PATH", "SCAN_STATUS_PATH",
+                                        "VALIDATION_PATH", "SPYCLOUD_STATE_PATH", "RENEWAL_OUTCOMES_PATH", "MIRROR_PATH")}
 
 
 _ORIGINAL_INVENTORY_ROOT = runner.inventory_root
@@ -3316,6 +3317,13 @@ def setUpModule():
     runner.DIAGNOSTICS_PATH = _RUN_LOG_DIR / "diagnostics.json"
     runner.READBACK_PATH = _RUN_LOG_DIR / "readbacks.json"
     runner.RUNNER_STATE_PATH = _RUN_LOG_DIR / "runner_state.json"
+    # 2026-10-07: a CE create scenario (after-create SpyCloud hook) wrote the real attended_spycloud.json;
+    # every local state file the runner writes now points to the temp folder too.
+    runner.SCAN_STATUS_PATH = _RUN_LOG_DIR / "scan_status.json"
+    runner.VALIDATION_PATH = _RUN_LOG_DIR / "validation.json"
+    runner.SPYCLOUD_STATE_PATH = _RUN_LOG_DIR / "spycloud.json"
+    runner.RENEWAL_OUTCOMES_PATH = _RUN_LOG_DIR / "renewal_outcomes.json"
+    runner.MIRROR_PATH = _RUN_LOG_DIR / "renewal_mirrors.json"
     # Never read the operator's real tenant inventory: the pre-check sees no snapshot.
     runner.inventory_root = lambda: _RUN_LOG_DIR / "inventory"
     runner._production_gate = _test_production_gate
