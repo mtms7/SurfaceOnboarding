@@ -90,6 +90,7 @@ RUNNER_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "atten
 # Latest read-only check per CO (duplicate check / readback): local evidence
 # for the dashboard only; it never gates or consumes a create run.
 CHECK_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_check_state.json"
+DEV_MIRROR_SKIP_REASON = "dev_mirror_skipped"  # same code as integration.onboarding.renewal_mirror
 CHECK_KINDS = frozenset({"duplicate_check", "production_duplicate", "readback", "scan_status", "validation"})
 READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
 # Surface-only scan observations (plan §5: Surface-owned, short-lived, never in Salesforce).
@@ -5662,6 +5663,8 @@ def _validation_inputs(reference: str) -> "str | tuple[str, str, tuple[str, str]
     ids = _readback_ids(reference)
     if ids is None:
         return "validation_not_onboarded"
+    if is_dev_mirror_tenant(ids[0]):  # owner 2026-10-06: a renewal mirror is labelled and not drift-validated
+        return DEV_MIRROR_SKIP_REASON
     try:
         route, tenant_name = _validation_route(reference)
     except SurfaceSourceError as error:
@@ -6602,6 +6605,71 @@ def renewal_write_label(result: str, confirm_write: bool) -> str:
     return "not_performed"
 
 
+# Latest outcome of each --renew run per CO (dry run or confirm-write), for the dashboard's CO page. Codes, dates,
+# counts and the Dev tenant id only (the id the readback store already holds); no names, domains, emails or payloads.
+RENEWAL_OUTCOMES_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_renewal_outcomes.json"
+RENEWAL_OUTCOME_MODES = ("dry_run", "confirm_write")
+RENEWAL_WRITE_LABELS = ("verified", "attempted_unverified", "not_performed")
+RENEWAL_OUTCOME_CODE = re.compile(r"[a-z0-9_]{1,64}")
+
+
+def _renewal_outcome_date(value: Any) -> str | None:
+    try:
+        return date.fromisoformat(value).isoformat() if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
+def _renewal_outcomes() -> dict[str, Any]:
+    try:
+        raw = json.loads(RENEWAL_OUTCOMES_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise ValueError("renewal_outcome_unreadable") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("renewal_outcome_unreadable")
+    return raw
+
+
+def write_renewal_outcome(reference: str, result: str, confirm_write: bool, leonardo_write: str,
+                          observed_at: datetime, tenant_id: str | None = None,
+                          report: dict[str, Any] | None = None) -> None:
+    """Store one CO's latest renewal outcome (replaces the previous; atomic). An unreadable file is never overwritten."""
+    if (not REFERENCE.fullmatch(reference) or not RENEWAL_OUTCOME_CODE.fullmatch(result or "")
+            or leonardo_write not in RENEWAL_WRITE_LABELS):
+        raise ValueError("invalid_renewal_outcome")
+    report = report if isinstance(report, dict) else {}
+    changes = [c for c in report.get("changes") or () if isinstance(c, dict)]
+    expiration = next((c for c in changes if c.get("field") == "license_end"), {})
+    added = report.get("added_domains")
+    gate = report.get("gate")
+    engine = report.get("engine")
+    record: dict[str, Any] = {
+        "result": result, "mode": RENEWAL_OUTCOME_MODES[1] if confirm_write else RENEWAL_OUTCOME_MODES[0],
+        "leonardo_write": leonardo_write, "observed_at": observed_at.isoformat(timespec="seconds"),
+        "route": engine if isinstance(engine, str) and engine in RENEWAL_ENGINES else None,
+        "tenant_id": tenant_id if isinstance(tenant_id, str) and re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, tenant_id) else None,
+        "old_expiration": _renewal_outcome_date(expiration.get("current")),
+        "new_expiration": _renewal_outcome_date(expiration.get("target")),
+        "changes": len(changes),
+        "added_domains": added if type(added) is int and added >= 0 else None,
+        "gate": gate if isinstance(gate, str) and RENEWAL_OUTCOME_CODE.fullmatch(gate) else None}
+    state = _renewal_outcomes()
+    state[reference] = record
+    _write_json_atomic(RENEWAL_OUTCOMES_PATH, state)
+
+
+def record_renewal_outcome(reference: str, result: str, confirm_write: bool, report: dict[str, Any]) -> None:
+    """Best-effort local record of a --renew run; never changes the run's result."""
+    try:
+        ids = _readback_ids(reference) if REFERENCE.fullmatch(reference) else None
+        write_renewal_outcome(reference, result, confirm_write, renewal_write_label(result, confirm_write),
+                              datetime.now(), ids[0] if ids else None, report)
+    except (OSError, ValueError):
+        pass
+
+
 def run_renewal(reference: str, *, confirm_write: bool = False, env_name: str = "dev",
                 tenant_name_override: str | None = None) -> tuple[str, dict[str, Any]]:
     """Renewal edit for one Case 4-6 CO in Leonardo Development. Dry run by default; --confirm-write applies it.
@@ -7344,6 +7412,16 @@ def build_mirror_fill(plan: Any, source: MirrorSource) -> dict[str, Any]:
     }
 
 
+def is_dev_mirror_tenant(tenant_id: Any) -> bool:
+    """Id match against the verified mirror records; an unreadable store means "not a mirror" (never hides drift)."""
+    from integration.onboarding.renewal_mirror import is_dev_mirror
+
+    try:
+        return is_dev_mirror(tenant_id, _mirror_records())
+    except ValueError:
+        return False
+
+
 def _mirror_records() -> dict[str, Any]:
     try:
         raw = json.loads(MIRROR_PATH.read_text(encoding="utf-8"))
@@ -7767,6 +7845,7 @@ def main() -> int:
             parser.error("--co is required with --renew")
         result, report = run_renewal(args.co, confirm_write=args.confirm_write, env_name=args.env,
                                      tenant_name_override=args.tenant_name)
+        record_renewal_outcome(args.co, result, args.confirm_write, report)
         # Codes, dates, enums, counts and flags only; no domain values, ids, or names.
         print(json.dumps({"result": result, "leonardo_write": renewal_write_label(result, args.confirm_write),
                           "plan": report, "salesforce_writeback": "not_performed"}, separators=(",", ":")))

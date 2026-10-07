@@ -62,3 +62,4 @@ integration/attended_salesforce_id_writebacks.json
 integration/attended_salesforce_id_writebacks.tmp
 integration/attended_surface_validation.json
 integration/attended_renewal_mirrors.json
+integration/attended_renewal_outcomes.json
