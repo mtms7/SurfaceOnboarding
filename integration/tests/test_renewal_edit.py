@@ -682,6 +682,13 @@ class RunRenewalTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, directory, ignore_errors=True)
+        patcher = patch.object(runner, "RENEWAL_OUTCOMES_PATH", directory / "outcomes.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def main(self, *argv):
         with patch.object(sys, "argv", ["runner", *argv]), patch("builtins.print") as printed:
             code = runner.main()

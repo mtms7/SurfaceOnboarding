@@ -183,3 +183,33 @@ def plan_mirror(root: Path, tenant_names: Any, domains: Any, email_domains: Any,
                for t in payload.get("tenants") or ()):
         raise MirrorError("mirror_clone_unavailable")
     return plan_from_payload(payload, tenant_names, domains, email_domains, today or now.date())
+
+
+DEV_MIRROR_SKIP_REASON = "dev_mirror_skipped"
+
+
+def mirror_tenant_ids(mirror_records: Any) -> frozenset[str]:
+    """Dev tenant ids of the verified mirrors in the mirror record store (``attended_renewal_mirrors.json``).
+
+    Only a record that says it is a verified, Development mirror of a production tenant and carries a Dev tenant
+    id counts; ``create_attempted`` records and anything malformed are ignored (so they never hide a tenant).
+    """
+    if not isinstance(mirror_records, Mapping):
+        return frozenset()
+    ids = set()
+    for record in mirror_records.values():
+        if (isinstance(record, Mapping) and record.get("mirror_of_production") is True
+                and record.get("status") == "verified" and record.get("environment") == "dev"):
+            tenant_id = record.get("surface_account_id")
+            if isinstance(tenant_id, str) and tenant_id:
+                ids.add(tenant_id)
+    return frozenset(ids)
+
+
+def is_dev_mirror(tenant_id: Any, mirror_records: Any) -> bool:
+    """True only when ``tenant_id`` equals the Dev tenant id of a verified mirror record (id match, no name guess).
+
+    A mirror's licence is deliberately edited by the renewal, so its drift is expected; skipping anything else
+    would hide real problems, so an unknown id, a missing id, or an unreadable store is NOT a mirror.
+    """
+    return isinstance(tenant_id, str) and bool(tenant_id) and tenant_id in mirror_tenant_ids(mirror_records)

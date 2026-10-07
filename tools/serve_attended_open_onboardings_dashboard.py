@@ -36,6 +36,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory
+from integration.onboarding.renewal_mirror import mirror_tenant_ids
 from integration.onboarding import session_readiness as readiness
 from integration.onboarding.session_readiness import SessionState, SessionStatus
 from phase1_validator.onboarding_comment_dates import extract_dealhub_dates
@@ -49,6 +50,9 @@ from tools.attended_ce_only_playwright import (
     SCAN_STATUS_FAILED,
     SCAN_STATUS_PATH,
     SPYCLOUD_OK_OUTCOMES,
+    MIRROR_PATH,
+    RENEWAL_OUTCOME_MODES,
+    RENEWAL_OUTCOMES_PATH,
     SPYCLOUD_STATE_PATH,
     VALIDATION_PATH,
     RunnerStateUnavailable,
@@ -630,8 +634,25 @@ def _validation_value(value: object) -> str:
     return str(value)
 
 
-def _validation_section(reference: str, notice: str = "", now: datetime | None = None) -> str:
+def dev_mirror_ids() -> frozenset[str]:
+    """Dev tenant ids of the verified renewal mirrors; an unreadable record file means none (never hides a tenant)."""
+    try:
+        return mirror_tenant_ids(json.loads(MIRROR_PATH.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        return frozenset()
+
+
+DEV_MIRROR_CHIP = ("<span class='chip chip-info' title='Renewal test copy of a production tenant; "
+                   "drift validation is skipped'>DEV mirror</span>")
+
+
+def _validation_section(reference: str, notice: str = "", now: datetime | None = None, mirror: bool = False) -> str:
     """Surface validation checklist for an onboarded CO (local, read-only observation)."""
+    if mirror:
+        return ("<section class='stat' aria-labelledby='validation-title'><div class='stat-head'>"
+                "<h2 id='validation-title'>Surface validation</h2></div><p>" + DEV_MIRROR_CHIP + " This tenant is the "
+                "Development mirror of a production tenant, used to test the renewal. Its licence is edited on purpose, "
+                "so drift validation is skipped (<code>dev_mirror_skipped</code>).</p></section>")
     result = attended_validations().get(reference)
     now = now or datetime.now()
     button = ("<form method='post' action='/attended/validate'><input type='hidden' name='reference' value='"
@@ -1879,8 +1900,12 @@ def queue_rows() -> list[dict[str, str | None]]:
         if scan is not None:
             row["Local_Scan_State"] = str(scan["state"])
     validations = attended_validations()
+    mirrors = dev_mirror_ids()
     for row in rows:
         result = validations.get(row["Name"] or "")
+        readback = readbacks.get(row["Name"] or "")
+        if readback is not None and readback["surface_account_id"] in mirrors:
+            continue  # a DEV mirror is not drift-validated; an old result is not shown
         if result is not None:
             row["Local_Validation_Drift"] = str(sum(1 for c in result["checks"] if c["status"] == "drift"))  # type: ignore[union-attr]
     return rows
@@ -2233,6 +2258,61 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None)
             "saved in Leonardo or Salesforce. Rules: Q1 expiration = DealHub term end; Q2 start never changes; Q3 Approved = human-validated, and added "
             "domains must pass the production duplicate gate; Q10 routing by product + type (Case 6 = Surface + CE renewal). "
             "Applied only by the CLI, never from this page (docs/38).</p></section>")
+
+
+RENEWAL_OUTCOME_DATES = ("old_expiration", "new_expiration")
+
+
+def attended_renewal_outcomes() -> dict[str, dict[str, object]]:
+    """Load the per-CO latest --renew outcome; absence means none, an unreadable file counts as none (fails closed)."""
+    try:
+        raw = json.loads(RENEWAL_OUTCOMES_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    outcomes: dict[str, dict[str, object]] = {}
+    for reference, value in raw.items():
+        try:
+            if not isinstance(reference, str) or not REFERENCE.fullmatch(reference) or not isinstance(value, dict):
+                continue
+            result, label = value.get("result"), value.get("leonardo_write")
+            if (not isinstance(result, str) or not re.fullmatch(r"[a-z0-9_]{1,64}", result)
+                    or value.get("mode") not in RENEWAL_OUTCOME_MODES
+                    or label not in ("verified", "attempted_unverified", "not_performed")):
+                continue
+            outcomes[reference] = {"result": result, "mode": value["mode"], "leonardo_write": label,
+                                   "observed_at": datetime.fromisoformat(value["observed_at"]),
+                                   "changes": value["changes"] if type(value.get("changes")) is int else None,
+                                   "added_domains": value["added_domains"] if type(value.get("added_domains")) is int else None,
+                                   **{key: date.fromisoformat(value[key]).isoformat() if isinstance(value.get(key), str) else None
+                                      for key in RENEWAL_OUTCOME_DATES}}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return outcomes
+
+
+def _renewal_outcome_section(reference: str) -> str:
+    """Latest CLI renewal run for this CO (local record; the dashboard never runs or applies a renewal)."""
+    outcome = attended_renewal_outcomes().get(reference)
+    if outcome is None:
+        return ""
+    verified = outcome["leonardo_write"] == "verified"
+    facts = [("Result", "<code>" + escape(str(outcome["result"])) + "</code>"),
+             ("Mode", escape(str(outcome["mode"]).replace("_", " "))),
+             ("Leonardo write", escape(str(outcome["leonardo_write"]).replace("_", " "))),
+             ("Observed", escape(outcome["observed_at"].strftime("%Y-%m-%d %H:%M")))]  # type: ignore[union-attr]
+    if outcome["new_expiration"]:
+        facts.append(("Expiration", escape(str(outcome["old_expiration"] or "—")) + " → " + escape(str(outcome["new_expiration"]))))
+    if outcome["changes"] is not None:
+        facts.append(("Planned changes", str(outcome["changes"]) + (
+            " · " + str(outcome["added_domains"]) + " added domain(s)" if outcome["added_domains"] else "")))
+    return ("<section class='card' aria-labelledby='renewal-outcome-title'><div class='card-head'>"
+            "<h2 id='renewal-outcome-title' class='pill'>Latest renewal run</h2><span class='chip "
+            + ("chip-ok" if verified else "chip-neutral") + "'>" + ("Verified" if verified else "Not applied") + "</span></div><dl>"
+            + "".join("<dt>" + k + "</dt><dd>" + v + "</dd>" for k, v in facts)
+            + "</dl><p class='login-safety'>Local record of the last <code>--renew</code> run (Leonardo Development); "
+            "Salesforce is not changed.</p></section>")
 
 
 def surface_commercial_readiness(row: dict[str, str | None]) -> dict[str, object] | None:
@@ -3233,7 +3313,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     readback_html = ""
     if readback is not None:
         readback_html = ("<div class='sub-block' aria-labelledby='leonardo-readback-title'>"
-                         "<h3 id='leonardo-readback-title' class='sub-h'>Leonardo Development readback</h3>"
+                         "<h3 id='leonardo-readback-title' class='sub-h'>Leonardo Development readback"
+                         + (" " + DEV_MIRROR_CHIP if readback["surface_account_id"] in dev_mirror_ids() else "") + "</h3>"
                          "<p class='note'>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
                          f"<dt>Environment</dt><dd><span class='chip chip-info'>{escape(ID_ENVIRONMENT_LABEL)}</span> Leonardo Development</dd>"
                          f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
@@ -3241,7 +3322,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     ids_html = _salesforce_ids_section(route_for(row), readback, row, reference, readback_html)
     health = ""
     if readback is not None:
-        tiles = _validation_section(reference, notification)
+        tiles = _validation_section(reference, notification, mirror=readback["surface_account_id"] in dev_mirror_ids())
         if route_for(row) != CE_ENGINE:
             tiles += _scan_status_section(reference, notification)
         if route_for(row) in (CE_ENGINE, CASE3_ENGINE):
@@ -3260,7 +3341,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     if is_renewal:
         # Owner decision 2026-10-04: no primary action on a renewal CO.
         folded = renewal_preflight + comment_repair_action + renewal_comment_evaluation_action + manual_action
-        next_step = (case4_panel + _renewal_plan_section(row)
+        next_step = (case4_panel + _renewal_plan_section(row) + _renewal_outcome_section(reference)
                      + "<p class='lede renewal-note'>" + escape(RENEWAL_MANUAL_NOTE) + "</p>" + readiness
                      + ("<details class='more'><summary><h2 class='sum-h'>Sign-in and manual onboarding</h2>"
                         "<span class='note'>Production sign-in · Leonardo Development session check</span></summary>"
@@ -4620,6 +4701,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
     filled = sorted((item for item in selected if item[2]), key=lambda item: (item[2], name_key(item)), reverse=descending)
     empty = sorted((item for item in selected if not item[2]), key=name_key)  # blanks always last
     rows_html = ""
+    mirrors = frozenset() if clone else dev_mirror_ids()
     for tenant, ref, _value in filled + empty:
         licence = tenant.get("license") or {}
         tenant_scan = tenant.get("scan") or {}
@@ -4646,6 +4728,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
             "<tr><td class='stick'>" + escape(str(tenant.get("account_name") or "")) + "<span class='sub'><code>"
             + escape(str(tenant.get("id") or "")) + "</code>"
             + ("" if tenant.get("account_uuid") else " <span class='chip chip-warn'>no UUID</span>")
+            + (" " + DEV_MIRROR_CHIP if tenant.get("id") in mirrors else "")
             + "</span></td><td>" + co_cell
             + "</td><td>" + escape(str(licence.get("type") or "—")) + "<span class='sub'>"
             + _inventory_date(licence.get("start_date")) + " → " + _inventory_date(licence.get("expiration_date"))
