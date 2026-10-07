@@ -909,10 +909,74 @@ def attended_scan_statuses() -> dict[str, dict[str, object]]:
     return statuses
 
 
+SCAN_CHECK_TEXT = {
+    "scan_status_recorded": "the scan status was read and saved",
+    "scan_status_route_unsupported": "this CO's product/type has no scan-status read (unsupported route)",
+    "scan_status_renewal_mirror_missing": "this renewal has no development mirror tenant to read; create the mirror first",
+    "duplicate_search_schema_unavailable": "Leonardo's tenant search page did not look as expected; nothing was read",
+    "scan_status_schema_unavailable": "Leonardo's scan columns did not look as expected; nothing was read",
+    "scan_status_tenant_not_found": "no matching tenant was found in Leonardo Development",
+    "scan_status_not_onboarded": "this CO is not onboarded yet, so there is no tenant to read",
+    "scan_status_not_applicable": "this tenant has no scan (Credential Exposure only)",
+    "scan_status_source_unavailable": "the Salesforce source could not be read",
+    "scan_status_write_unavailable": "the scan status was read but could not be saved locally",
+    "development_login_timeout": "the Leonardo Development sign-in timed out; sign in again in the automation browser",
+    "leonardo_session_expired": "the Leonardo session expired; sign in again in the automation browser",
+    "playwright_runtime_unavailable": "the automation browser runtime is not available on this computer",
+    "attended_ce_runner_unavailable": "the attended runner is not available on this computer",
+}
+
+
+def _read_age_text(moment: datetime, now: datetime) -> str:
+    """Plain age such as "3 days ago" (naive local clock; a timezone-aware time is converted to local)."""
+    if moment.tzinfo is not None:
+        moment = moment.astimezone().replace(tzinfo=None)
+    if now.tzinfo is not None:
+        now = now.astimezone().replace(tzinfo=None)
+    seconds = int((now - moment).total_seconds())
+    if seconds < 0:
+        return "just now"
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size:
+            count = seconds // size
+            return f"{count} {unit}{'' if count == 1 else 's'} ago"
+    return "just now"
+
+
+def _scan_check_for(reference: str) -> dict[str, str] | None:
+    """The latest scan-status check the runner recorded for this CO (local state), else None."""
+    try:
+        check = load_check_state().get(reference)
+    except (ValueError, OSError):
+        return None
+    return check if isinstance(check, dict) and check.get("kind") == "scan_status" else None
+
+
+def _scan_check_line(check: dict[str, str] | None) -> str:
+    """"Last scan-status read: ok|failed - reason - local time" from the latest recorded check."""
+    if check is None:
+        return ""
+    result = check.get("result")
+    moment_text = check.get("completed_on") or check.get("started_on") or ""
+    try:
+        when = _clock(datetime.fromisoformat(moment_text))
+    except ValueError:
+        when = "unknown time"
+    if result is None:
+        return ("<p class='note'>Last scan-status read: <b>started</b> · no result recorded yet (still running or it "
+                "ended without a result) · " + escape(when) + "</p>")
+    ok = result == "scan_status_recorded"
+    reason = SCAN_CHECK_TEXT.get(result, result)
+    style = "" if ok else " style='color:var(--bad)'"
+    return ("<p class='note'" + style + ">Last scan-status read: <b>" + ("ok" if ok else "failed") + "</b> · "
+            + escape(reason) + " · " + escape(when) + "</p>")
+
+
 def _scan_status_section(reference: str, notice: str = "", now: datetime | None = None) -> str:
     """Leonardo scan-status card for an onboarded CO (local, read-only observation)."""
     observation = attended_scan_statuses().get(reference)
     now = now or datetime.now()
+    check_line = _scan_check_line(_scan_check_for(reference))
     refresh = ("<form method='post' action='/attended/scan-status-refresh'><input type='hidden' name='reference' value='"
                + escape(reference) + "'><button type='submit' class='ghost sm'>Refresh scan status</button></form>")
     started = ("<p class='note'>A read-only scan-status read was started in the automation browser. "
@@ -921,7 +985,7 @@ def _scan_status_section(reference: str, notice: str = "", now: datetime | None 
         return ("<section class='stat' aria-labelledby='scan-status-title'><div class='stat-head'>"
                 "<h2 id='scan-status-title'>Leonardo scan status</h2></div>"
                 "<p>Not read yet. Refresh reads the tenant's scan fields from Leonardo Development (read-only).</p>"
-                + started + refresh + "</section>")
+                + check_line + started + refresh + "</section>")
     cls, title, message = SCAN_STATES[str(observation["state"])]
     stale = now > observation["expires_at"]  # type: ignore[operator]
     icon_style = "" if cls else " style='background:#9aa1ad'"
@@ -931,11 +995,13 @@ def _scan_status_section(reference: str, notice: str = "", now: datetime | None 
             f"<dt>Leonardo status</dt><dd><code>{escape(str(observation['status_enum'] or 'None'))}</code></dd>"
             f"<dt>Duration</dt><dd>{escape(f'{duration / 3_600_000:.1f} h' if isinstance(duration, int) else 'None')}</dd>"
             f"<dt>Observed</dt><dd>{escape(observation['observed_at'].strftime('%Y-%m-%d %H:%M'))}"  # type: ignore[union-attr]
-            + (" · <b>stale, refresh</b>" if stale else "") + "</dd>")
+            f" · read {escape(_read_age_text(observation['observed_at'], now))}"  # type: ignore[arg-type]
+            + (" · <b>stale, refresh</b> (this read is past its expiry; the status may have changed)" if stale else "")
+            + "</dd>")
     return ("<section class='stat" + (" " + cls if cls else "") + "' aria-labelledby='scan-status-title'><div class='stat-head'>"
             f"<span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span>"
             f"<h2 id='scan-status-title'>Leonardo scan status · {escape(title)}</h2></div><p>{escape(message)}</p>"
-            + _scan_executions_html(observation) + "<dl>" + rows + "</dl>" + started + refresh
+            + _scan_executions_html(observation) + "<dl>" + rows + "</dl>" + check_line + started + refresh
             + "<p class='meta-line'>Local observation from Leonardo Development; Salesforce is not changed.</p></section>")
 
 
@@ -2333,6 +2399,10 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None)
 
 
 RENEWAL_OUTCOME_DATES = ("old_expiration", "new_expiration")
+RENEWAL_RESULT_TEXT = {
+    "renewal_domains_mismatch_manual_review":
+        "Salesforce domains differ from the tenant's domains — manual review; nothing was saved",
+}
 
 
 def attended_renewal_outcomes() -> dict[str, dict[str, object]]:
@@ -2370,10 +2440,13 @@ def _renewal_outcome_section(reference: str) -> str:
     if outcome is None:
         return ""
     verified = outcome["leonardo_write"] == "verified"
-    facts = [("Result", "<code>" + escape(str(outcome["result"])) + "</code>"),
-             ("Mode", escape(str(outcome["mode"]).replace("_", " "))),
-             ("Leonardo write", escape(str(outcome["leonardo_write"]).replace("_", " "))),
-             ("Observed", escape(outcome["observed_at"].strftime("%Y-%m-%d %H:%M")))]  # type: ignore[union-attr]
+    reason = RENEWAL_RESULT_TEXT.get(str(outcome["result"]))
+    facts = [("Result", "<code>" + escape(str(outcome["result"])) + "</code>")]
+    if reason:
+        facts.append(("Reason", escape(reason)))
+    facts += [("Mode", escape(str(outcome["mode"]).replace("_", " "))),
+              ("Leonardo write", escape(str(outcome["leonardo_write"]).replace("_", " "))),
+              ("Observed", escape(outcome["observed_at"].strftime("%Y-%m-%d %H:%M")))]  # type: ignore[union-attr]
     if outcome["new_expiration"]:
         facts.append(("Expiration", escape(str(outcome["old_expiration"] or "—")) + " → " + escape(str(outcome["new_expiration"]))))
     if outcome["changes"] is not None:
@@ -2983,7 +3056,7 @@ _STAGE_HINT = (
     "Waiting for the approval in Salesforce.",
     "Approved; the tenant is not created yet.",
     "Tenant created; the first scan is running or pending.",
-    "Scan finished; assign the Operator Account and create the customer user.",
+    "Scan finished (Leonardo shows a completed status or finished executions); assign the Operator Account and create the customer user.",
     "Operator account and customer user exist; complete the onboarding in Salesforce.",
     "Onboarding is completed in Salesforce.",
 )
@@ -3094,7 +3167,9 @@ def _stage_state(reference: str, row: dict[str, str | None], readback: dict[str,
         scan = attended_scan_statuses().get(reference)
     except Exception:  # noqa: BLE001
         scan = None
-    scan_done = bool(scan and scan.get("execution_state") == "done")
+    # Proof of a finished scan: the Details executions read says "done", OR Leonardo's own row status is a
+    # confirmed completed value (observation state scan_completed). Running/failed/unrecognized/no_scan never count.
+    scan_done = bool(scan and (scan.get("execution_state") == "done" or scan.get("state") == "scan_completed"))
     tenant, environment, captured = _stage_tenant(reference, row, readback)
     evidence = user_created_evidence(tenant, environment) if tenant is not None else None
     try:
