@@ -5343,12 +5343,19 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[
             seen.append(candidate)
 
     page.on("response", on_response)
+    step = "details_open"
     try:
         _open_row_action(page, tenant_name, SCAN_EXEC_DETAILS_SELECTOR)
+        _log().event("scan_executions", "details_opened", detail=f"replies={len(seen)}")
         if not seen:
+            step = "tab_click"
             tab = page.get_by_role("tab", name=SCAN_EXEC_DURATION_TEXT, exact=True)
-            target = tab.first if tab.count() else page.get_by_text(SCAN_EXEC_DURATION_TEXT, exact=True).first
+            tabs = tab.count()
+            _log().event("scan_executions", "tab_lookup", detail=f"role_tabs={tabs}")
+            target = tab.first if tabs else page.get_by_text(SCAN_EXEC_DURATION_TEXT, exact=True).first
             target.click(timeout=FIELD_TIMEOUT_MS)
+            _log().event("scan_executions", "tab_clicked", detail=f"replies={len(seen)}")
+        step = "reply_wait"
         waited = 0
         while not seen and waited < SCAN_EXEC_TIMEOUT_MS:
             page.wait_for_timeout(250)
@@ -5358,7 +5365,7 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[
         response = seen[-1]
         _log().event("scan_executions", "reply", detail=f"replies={len(seen)}")
     except Exception as exc:
-        _log().error("scan_executions", "response", exc)
+        _log().error("scan_executions", step, exc)
         raise RuntimeError("scan_status_executions_unavailable") from exc
     finally:
         try:
@@ -5371,17 +5378,26 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[
             pass
     match = SCAN_EXEC_PATH.fullmatch(_url_path(response.url))
     if match is None or match.group(1) != expected_id:
+        _log().event("scan_executions", "id_mismatch")
         raise RuntimeError("scan_status_executions_id_mismatch")
     if response.status in (401, 403):
         raise LeonardoSessionExpired()
     if not 200 <= response.status < 300:
+        _log().event("scan_executions", "reply_status", detail=str(response.status))
         raise RuntimeError("scan_status_executions_unavailable")
     try:
-        parsed = parse_scan_executions(response.json())
-    except Exception:
-        parsed = None
+        body = response.json()
+        parsed = parse_scan_executions(body)
+    except Exception as exc:
+        _log().error("scan_executions", "reply_json", exc)
+        body, parsed = None, None
     if parsed is None:
+        # Shape only (key names / row count), never values: tells an envelope change from too many rows.
+        keys = sorted(body)[:8] if isinstance(body, dict) else type(body).__name__
+        _log().event("scan_executions", "parse_failed", detail=f"keys={keys}")
         raise RuntimeError("scan_status_executions_unavailable")
+    _log().event("scan_executions", "parsed", detail=f"executions={len(parsed['executions'])} "
+                                                       f"state={parsed['execution_state']}")
     return parsed
 
 
@@ -5469,7 +5485,18 @@ def run_scan_status(reference: str, surface_only: bool = False) -> str:
     The result code (success or failure) is stored with a timestamp through the check-state mechanism so the
     dashboard can show the latest one. ``scan_status_not_applicable`` (a skipped CE-only CO) is not recorded.
     """
-    result = _run_scan_status(reference, surface_only)
+    global _ACTIVE_RUN_LOG
+    # Its own run log (2026-10-07): outside a run _log() was a throwaway, so the executions failure left no trace.
+    # Step names, counts, response paths and exception types only (RunLog's redaction rules).
+    _ACTIVE_RUN_LOG = RunLog(reference, "scan_status")
+    log = _ACTIVE_RUN_LOG
+    result = "attended_ce_runner_unavailable"
+    try:
+        result = _run_scan_status(reference, surface_only)
+    finally:
+        log.event("finish", result)
+        log.write(result)
+        _ACTIVE_RUN_LOG = None
     if result != "scan_status_not_applicable":
         _record_check(reference, "scan_status", result)
     return result
@@ -5505,6 +5532,7 @@ def _run_scan_status(reference: str, surface_only: bool = False) -> str:
     with sync_playwright() as playwright:
         try:
             with _attended_page(playwright) as page:
+                _log().attach(page)
                 # _search_one_row leaves exactly the expected tenant in the table (narrowed by its own domain when
                 # other tenants share the name; live 2026-10-07: "A2A" returned 4 rows and the Details click below
                 # then could not reach the right row), so the executions read opens that tenant only.
