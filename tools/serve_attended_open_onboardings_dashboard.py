@@ -59,6 +59,7 @@ from tools.attended_ce_only_playwright import (
     bootstrap_leonardo_session,
     check_leonardo_session,
     CE_ENGINE,
+    format_surface_domains,
     CE_ROUTE_PRODUCT,
     CE_ROUTE_TYPE,
     SURFACE_ENGINE,
@@ -3134,6 +3135,73 @@ def _stage_facts(state: dict[str, object], readback: dict[str, str] | None,
     return tuple(facts)
 
 
+_DOMAIN_NOTE_TEXT = {
+    "space_separated": "entries were separated by spaces",
+    "duplicate_removed": "duplicate entries were removed",
+    "main_repeated": "the main domain was repeated in Alternate Domains",
+    "lowercased": "uppercase letters were lowercased",
+    "trailing_dot_removed": "a trailing dot was removed",
+    "www_removed": "a leading www. was removed",
+    "url_reduced_to_host": "a URL was reduced to its domain",
+}
+_DOMAIN_REJECT_TEXT = {
+    "wildcard": "wildcards are not supported", "url": "a URL, not a domain", "email": "an email address, not a domain",
+    "public_suffix": "a public suffix, not a registrable domain", "network": "an IP or network (not supported)",
+    "malformed": "not a valid domain", "whitespace": "contains whitespace",
+}
+_COPY_SCRIPT = (
+    "var b=document.getElementById('copy-domains'),i=document.getElementById('clean-domains');"
+    "if(b&&i){b.addEventListener('click',function(){var d=function(){b.textContent='Copied'};"
+    "var f=function(){i.select();try{document.execCommand('copy');d()}catch(e){}};"
+    "if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(i.value).then(d,f)}"
+    "else{f()}})}"
+)
+
+
+def _page_csp(page: str) -> str:
+    """Strict CSP; a script is allowed only through the per-response nonce the page itself carries."""
+    csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    found = re.search(r"<script nonce='([A-Za-z0-9_-]{8,64})'>", page)
+    return csp + "; script-src 'nonce-" + found.group(1) + "'" if found else csp
+
+
+def _domains_card(row: dict[str, str | None]) -> str:
+    """Read-only 'Domains for the tenant' card: exactly what the tenant form will receive.
+
+    Built from the Salesforce row already loaded (no extra read). Cleanups are
+    shown with the clean value to paste back into Salesforce; rejected entries
+    block the run until Salesforce is corrected. Nothing is written anywhere.
+    """
+    info = format_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
+    chip = "<span class='chip chip-ok'>Ready</span>" if info["result"] == "ok" else "<span class='chip chip-bad'>Blocked</span>"
+    shown = (("Main domain", info["main"] or "Not valid"),
+             ("Alternate Domains", info["alternate_domains"] or "None"),
+             ("SubDomains", info["subdomains"] or "None"))
+    body = "<dl>" + "".join("<dt>" + escape(label) + "</dt><dd>" + escape(value) + "</dd>" for label, value in shown) + "</dl>"
+    if info["main_error"]:
+        body += ("<div class='banner banner-bad'><b>Main_Domain__c is not a single registrable domain.</b> Nothing can run "
+                 "until it is corrected in Salesforce.</div>")
+    if info["rejected"]:
+        items = "".join("<li><code>" + escape(item["entry"]) + "</code> — "
+                        + escape(_DOMAIN_REJECT_TEXT.get(item["reason"], item["reason"])) + "</li>" for item in info["rejected"])
+        body += ("<div class='banner banner-bad'><b>These Alternate Domains entries are rejected:</b><ul>" + items
+                 + "</ul>Nothing can run until Salesforce is corrected.</div>")
+    script = ""
+    if info["notes"]:
+        human = "; ".join(_DOMAIN_NOTE_TEXT.get(code, code) for code in info["notes"])
+        body += "<div class='banner banner-warn'><b>The Salesforce value was cleaned</b> (" + escape(human) + ")."
+        if info["salesforce_clean_value"]:
+            nonce = token_urlsafe(16)
+            body += (" Paste this into Alternate_Domains__c:<br><input id='clean-domains' readonly size='60' value='"
+                     + escape(info["salesforce_clean_value"], quote=True) + "'> "
+                     "<button type='button' id='copy-domains' class='ghost'>Copy</button>")
+            script = "<script nonce='" + nonce + "'>" + _COPY_SCRIPT + "</script>"
+        body += "</div>"
+    return ("<section class='card' aria-labelledby='domains-title'><div class='card-head'><h2 id='domains-title' class='pill'>"
+            "Domains for the tenant</h2>" + chip + "</div>" + body
+            + "<p class='note'>Read-only preview from Salesforce; nothing is written back.</p>" + script + "</section>")
+
+
 def page_detail(reference: str, row: dict[str, str | None], notification: str = "", commercial_readiness: dict[str, object] | None = None) -> str:
     """CO detail: header + summary, one next-step card, tenant health, then folded records.
 
@@ -3359,7 +3427,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                  + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
                  "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
                  "<button class='ghost' type='submit'>Refresh</button></form></div></div>"
-                 + _detail_summary(row, _stage_facts(stage_state, readback, row)) + toast + next_step + health + ids_html + record)
+                 + _detail_summary(row, _stage_facts(stage_state, readback, row)) + (_domains_card(row) if route_for(row) in SURFACE_ROUTES else "") + toast + next_step + health + ids_html + record)
     return _app_shell(reference, main_html, active="onboardings")
 
 
@@ -3863,7 +3931,7 @@ PENTERA_CSS = (
     ".sessions th{width:190px}.trouble{margin-top:14px}.trouble summary{cursor:pointer;color:var(--muted);font-size:13px}"
     ".banner{background:var(--info-bg);color:var(--text);border-radius:6px;padding:10px 14px;margin:0 0 14px}"
     ".operator{margin:14px 0 0;font-size:12px;color:#c9d1e0;word-break:break-all}.operator form{margin-top:6px}"
-    ".banner-warn{background:var(--warn-bg)}.inv{overflow-x:auto}.inv th,.inv td{text-align:left!important;white-space:nowrap}"
+    ".banner-bad{background:var(--bad-bg)}.banner-warn{background:var(--warn-bg)}.inv{overflow-x:auto}.inv th,.inv td{text-align:left!important;white-space:nowrap}"
     ".inv td:first-child{white-space:normal;min-width:160px}"
     # Wide pages (2026-10-05): full-width main, filter bar, scrolling table with sticky header and first column.
     "main.wide{max-width:none}.inv-card{padding:14px 16px}"
@@ -5090,7 +5158,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
     def send_page(self, status: HTTPStatus, page: str) -> None:
-        data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", REFERRER_POLICY); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"); self.end_headers(); self.wfile.write(data)
+        data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", REFERRER_POLICY); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", _page_csp(page)); self.end_headers(); self.wfile.write(data)
     def _claim_and_launch(self, reference: str, revision: str, launch: Any, **start_fields: str) -> bool:
         """Record the start first (the claim), then launch; a failed launch is recorded as such."""
         try:
