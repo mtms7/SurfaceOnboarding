@@ -633,7 +633,12 @@ SURFACE_ENGINE = "case_1_new_surface_only"
 SURFACE_ROUTE_PRODUCT = "Surface"
 SURFACE_ROUTE_TYPE = "New Product Onboarding"
 # Engine values a runner-state record may carry in its optional "route" key.
-RUNNER_STATE_ROUTES = frozenset({CE_ENGINE, SURFACE_ENGINE, "case_3_combined_baseline"})
+RUNNER_STATE_ROUTES = frozenset({CE_ENGINE, SURFACE_ENGINE, "case_3_combined_baseline",
+                                 "case_4_renew_surface_new_ce", "case_5_renew_ce_new_surface", "case_6_renew_both"})
+# Renewal runs (owner decision 2026-10-07) share the runner state. A run that may have written to Leonardo
+# Development carries "uncertain": the apply step ("renewal_write") or the mirror create ("mirror_create").
+RENEWAL_UNCERTAIN_STAGES = ("renewal_write", "mirror_create")
+RUNNER_SETTLED_VALUES = ("no_tenant", "not_applied")
 # Core Plus detection lives behind is_core_plus_baseline_row so the rule can
 # change in one place: any "Pentera Core Plus ..." baseline row (Commercial,
 # Enterprise, any tier); "Bulk"/"Additional" rows are add-ons of a Core Plus
@@ -2006,7 +2011,7 @@ def load_runner_state() -> dict[str, dict[str, str]]:
                 raise ValueError()
             if set(value) - {"source_revision", "started_on", "result", "completed_on",
                              "scope_reviewed_on", "route", "license_start_entered", "license_end_entered",
-                             "settled", "settled_from", "settled_on"}:
+                             "settled", "settled_from", "settled_on", "uncertain"}:
                 raise ValueError()
             record: dict[str, str] = {"source_revision": revision}
             if "route" in value:
@@ -2027,9 +2032,13 @@ def load_runner_state() -> dict[str, dict[str, str]]:
                     date.fromisoformat(value[key])
                     record[key] = value[key]
             if "settled" in value:
-                if value["settled"] != "no_tenant":
+                if value["settled"] not in RUNNER_SETTLED_VALUES:
                     raise ValueError()
                 record["settled"] = value["settled"]
+            if "uncertain" in value:
+                if value["uncertain"] not in RENEWAL_UNCERTAIN_STAGES:
+                    raise ValueError()
+                record["uncertain"] = value["uncertain"]
             if "settled_from" in value:
                 if not isinstance(value["settled_from"], str) or not value["settled_from"]:
                     raise ValueError()
@@ -2113,6 +2122,32 @@ def create_uncertain(record: dict[str, str] | None) -> bool:
                 and record["result"] != "readback_verified" and record.get("settled") != "no_tenant")
 
 
+def renewal_uncertain(record: dict[str, str] | None) -> bool:
+    """True when a renewal run stopped after a Leonardo write that may have happened but was not verified."""
+    return bool(record and record.get("uncertain") in RENEWAL_UNCERTAIN_STAGES and record.get("result")
+                and record["result"] != "renewal_edit_verified" and not record.get("settled"))
+
+
+def settle_uncertain_renewal(reference: str, dry_run_result: str, settled_on: str) -> str | None:
+    """Apply a read-only renewal dry run to an uncertain APPLY: current = verified, still planned = not applied."""
+    if not REFERENCE.fullmatch(reference):
+        return None
+    state = load_runner_state()
+    record = state.get(reference)
+    if not renewal_uncertain(record) or record.get("uncertain") != "renewal_write":
+        return None
+    if dry_run_result == "renewal_already_current":
+        record["settled_from"], record["result"], record["settled_on"] = record["result"], "renewal_edit_verified", settled_on
+        change = "applied"
+    elif dry_run_result == "renewal_dry_run_planned":
+        record["settled"], record["settled_on"] = "not_applied", settled_on
+        change = "not_applied"
+    else:
+        return None
+    _write_json_atomic(RUNNER_STATE_PATH, state)
+    return change
+
+
 def settle_uncertain_create(reference: str, readback_result: str, settled_on: str) -> str | None:
     """Apply a read-only readback outcome to an uncertain create; returns what changed, if anything."""
     if not REFERENCE.fullmatch(reference):
@@ -2149,6 +2184,8 @@ def start_blocker(record: dict[str, str] | None) -> str | None:
         return "tenant_already_verified"
     if create_uncertain(record):
         return "create_uncertain"
+    if renewal_uncertain(record):
+        return "renewal_uncertain"
     return None
 
 
@@ -2186,7 +2223,7 @@ def record_runner_start(reference: str, revision: str, started_on: str, *,
 
 
 def record_runner_result(reference: str, revision: str, result: str, completed_on: str,
-                         license_entered: tuple[date, date] | None = None) -> None:
+                         license_entered: tuple[date, date] | None = None, uncertain: str | None = None) -> None:
     """Record the final result for the acknowledged revision; the first result wins.
 
     ``license_entered`` is the (start, end) actually entered before Confirm,
@@ -2206,6 +2243,8 @@ def record_runner_result(reference: str, revision: str, result: str, completed_o
     if license_entered is not None:
         record["license_start_entered"] = license_entered[0].isoformat()
         record["license_end_entered"] = license_entered[1].isoformat()
+    if uncertain in RENEWAL_UNCERTAIN_STAGES:
+        record["uncertain"] = uncertain
     _write_json_atomic(RUNNER_STATE_PATH, state)
 
 
@@ -3409,6 +3448,8 @@ def reset_runner_record(reference: str) -> bool:
         raise ValueError("runner_result_cannot_be_reset")
     if create_uncertain(record):
         raise ValueError("create_uncertain_cannot_be_reset")
+    if renewal_uncertain(record):
+        raise ValueError("renewal_uncertain_cannot_be_reset")
     del state[reference]
     _write_json_atomic(RUNNER_STATE_PATH, state)
     return True
@@ -6908,7 +6949,8 @@ def record_renewal_outcome(reference: str, result: str, confirm_write: bool, rep
 
 
 def run_renewal(reference: str, *, confirm_write: bool = False, env_name: str = "dev",
-                tenant_name_override: str | None = None) -> tuple[str, dict[str, Any]]:
+                tenant_name_override: str | None = None,
+                expected_revision: str | None = None) -> tuple[str, dict[str, Any]]:
     """Renewal edit for one Case 4-6 CO in Leonardo Development. Dry run by default; --confirm-write applies it.
 
     Needs the CO's local Dev readback (id + accountUuid of the Dev/mirror tenant). Any environment other than dev,
@@ -6927,6 +6969,8 @@ def run_renewal(reference: str, *, confirm_write: bool = False, env_name: str = 
         source = renewal_fill_source(reference)
     except RuntimeError as error:  # SurfaceSourceError is a RuntimeError
         return str(error), {}
+    if expected_revision is not None and source.source_revision != expected_revision:
+        return "source_revision_drift", {}  # the CO changed since it was acknowledged: nothing is opened
     try:
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
@@ -7883,6 +7927,111 @@ def _mirror_in_browser(page: Any, reference: str, plan: Any, source: MirrorSourc
     return "mirror_created_verified"
 
 
+# --- Orchestrated renewal run (owner decision 2026-10-07; reverses "renewals CLI-only") ---------------
+# The dashboard launches ``--co CO-XXXX --revision R --renew-run`` exactly like a create run. Leonardo
+# Development only. Sequence, failing closed at every step, one run-log event per step (codes only):
+#   1. source/route checks (renewal_fill_source: Cases 4-6, Approved, one CE email domain, ...) + revision
+#   2. Dev mirror: skipped when a verified mirror record matches the readback; else the existing mirror flow
+#      (a "maybe created" result stops the run: the operator verifies)
+#   3. renewal dry run: renewal_already_current finishes OK; anything but renewal_dry_run_planned stops
+#   4. apply (--confirm-write equivalent): must end renewal_edit_verified
+#   5. SpyCloud on the tenant must end OFF (a failure is a warning only)
+#   6. renewal outcome record
+RENEWAL_RUN_MODE = "renewal_run"
+RENEWAL_RUN_OK_RESULTS = frozenset({"renewal_edit_verified", "renewal_already_current"})
+
+
+def renewal_mirror_verified(reference: str) -> bool:
+    """A verified mirror record whose Dev id equals this CO's readback id (anything unreadable means no)."""
+    try:
+        record = _mirror_records().get(reference)
+    except ValueError:
+        return False
+    ids = _readback_ids(reference)
+    return bool(isinstance(record, dict) and record.get("mirror_of_production") is True
+                and record.get("status") == "verified" and ids is not None
+                and record.get("surface_account_id") == ids[0])
+
+
+def _renewal_run_steps(reference: str, revision: str | None, log: RunLog) -> tuple[str, str]:
+    """(result, uncertain stage or "") of one orchestrated renewal run; never raises on expected failures."""
+    try:
+        source = renewal_fill_source(reference)
+    except RuntimeError as error:  # SurfaceSourceError is a RuntimeError
+        log.event("source", str(error))
+        return str(error), ""
+    if revision is not None and source.source_revision != revision:
+        log.event("source", "source_revision_drift")
+        return "source_revision_drift", ""
+    log.event("source", "ok", detail=source.engine)
+    if source.engine not in RENEWAL_ENGINES:
+        return "renewal_route_not_supported", ""
+    # 2. Dev mirror
+    if renewal_mirror_verified(reference):
+        log.event("mirror", "skipped_verified_mirror")
+    else:
+        mirror = run_renewal_mirror(reference, confirm_write=True)
+        log.event("mirror", mirror)
+        if mirror != "mirror_created_verified":
+            return mirror, ("mirror_create" if mirror in MIRROR_AFTER_CONFIRM_RESULTS else "")
+    # 3. dry run
+    result, report = run_renewal(reference, confirm_write=False, expected_revision=source.source_revision)
+    log.event("renewal_dry_run", result)
+    report = report if isinstance(report, dict) else {}
+    report.pop("manual_review", None)  # domain lists never reach a record
+    record_renewal_outcome(reference, result, False, report)
+    if result != "renewal_dry_run_planned":  # includes renewal_already_current (finishes OK) and every stop code
+        return result, ""
+    # 4. apply
+    result, report = run_renewal(reference, confirm_write=True, expected_revision=source.source_revision)
+    log.event("renewal_apply", result)
+    report = report if isinstance(report, dict) else {}
+    report.pop("manual_review", None)
+    record_renewal_outcome(reference, result, True, report)
+    if result != "renewal_edit_verified":
+        return result, ("renewal_write" if renewal_write_label(result, True) == "attempted_unverified" else "")
+    # 5. SpyCloud must end OFF; a failure is a visible warning only (never changes the renewal result)
+    try:
+        spy = run_spycloud_off(reference, confirm_write=True)
+    except Exception as exc:  # noqa: BLE001
+        log.error("spycloud", "after_renewal", exc)
+        spy = "spycloud_hook_error"
+    log.event("spycloud", spy)
+    if spy not in SPYCLOUD_OK_OUTCOMES and spy != "spycloud_route_not_applicable":
+        log.event("spycloud_warning", "not_verified_off", detail="SpyCloud still ON or unknown: run SpyCloud off")
+    return result, ""
+
+
+def run_renewal_onboarding(reference: str, revision: str | None = None, env_name: str = "dev") -> str:
+    """One orchestrated renewal run for a Case 4-6 CO (Leonardo Development only); returns the final result code.
+
+    Records the final result in the runner state when a ``revision`` is given (the dashboard's claim), including
+    the "uncertain" stage when a Leonardo write may have happened unverified. Never writes Salesforce.
+    """
+    log = RunLog(reference, RENEWAL_RUN_MODE, route="renewal_run")
+    result, uncertain = "runner_crashed", ""
+    try:
+        if env_name != "dev":
+            result = "renewal_environment_not_supported"
+        elif not REFERENCE.fullmatch(reference):
+            result = "invalid_co_reference"
+        else:
+            result, uncertain = _renewal_run_steps(reference, revision, log)
+    except Exception as exc:  # noqa: BLE001 - the record must never stay "Running"
+        log.error("run", "crashed", exc)
+        result, uncertain = "runner_crashed", ""
+    finally:
+        log.event("finish", result)
+        log.write(result)
+        if revision and REFERENCE.fullmatch(reference):
+            try:
+                record_runner_result(reference, revision, result, datetime.now().isoformat(timespec="seconds"),
+                                     uncertain=uncertain or None)
+            except (OSError, ValueError, RunnerStateUnavailable):
+                pass
+    return result
+
+
 # --- Tenant Details probe (read-only, 2026-10-06) -----------------------------
 # Owner decision (b): the customer user (e.g. CO-0767's primary user) is added as an EXTRA user. To find where
 # BackOffice shows a tenant's users, this probe opens the row's Details (allow-listed), clicks only its tabs
@@ -8047,6 +8196,8 @@ def main() -> int:
                         help="With --co: open the tenant's Edit form in Leonardo Development and report the SpyCloud checkbox (dry run: Cancel, nothing saved). Add --confirm-write to turn it OFF.")
     parser.add_argument("--renew", action="store_true",
                         help="With --co: renewal EDIT of a Case 4-6 CO's existing Leonardo Development (mirror) tenant. Dry run: open Edit, read current values, report the planned diff, Cancel (nothing saved). Add --confirm-write to apply it.")
+    parser.add_argument("--renew-run", action="store_true",
+                        help="With --co and --revision: the orchestrated renewal run the dashboard launches (Dev mirror if needed, renewal dry run, apply, SpyCloud OFF). Leonardo Development only; the result is recorded in the runner state.")
     parser.add_argument("--confirm-write", action="store_true",
                         help="With --spycloud-off, --renew or --mirror-renewal: explicitly approve the Leonardo Development write. Without it nothing is saved.")
     parser.add_argument("--mirror-renewal", action="store_true",
@@ -8070,8 +8221,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.confirm_write and not (args.spycloud_off or args.renew or args.mirror_renewal):
         parser.error("--confirm-write is only valid with --spycloud-off, --renew or --mirror-renewal")
-    if sum(bool(x) for x in (args.renew, args.spycloud_off, args.mirror_renewal)) > 1:
-        parser.error("--renew, --spycloud-off and --mirror-renewal are separate runs")
+    if sum(bool(x) for x in (args.renew, args.spycloud_off, args.mirror_renewal, args.renew_run)) > 1:
+        parser.error("--renew, --spycloud-off, --mirror-renewal and --renew-run are separate runs")
+    if args.renew_run:
+        if not args.co or not args.revision:
+            parser.error("--co and --revision are required with --renew-run")
+        if args.confirm_write:
+            parser.error("--confirm-write is not used with --renew-run (the run applies after its own dry run)")
+        result = run_renewal_onboarding(args.co, args.revision, env_name=args.env)
+        print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        return 0
     if args.mirror_renewal:
         if not args.co:
             parser.error("--co is required with --mirror-renewal")
@@ -8087,6 +8246,11 @@ def main() -> int:
         # The domain lists of a mismatch are terminal-only: removed before anything is recorded.
         manual_review = report.pop("manual_review", None) if isinstance(report, dict) else None
         record_renewal_outcome(args.co, result, args.confirm_write, report)
+        if not args.confirm_write:  # a read-only dry run settles an uncertain apply (dashboard Verify)
+            try:
+                settle_uncertain_renewal(args.co, result, datetime.now().isoformat(timespec="seconds"))
+            except (OSError, ValueError, RunnerStateUnavailable):
+                pass
         # Codes, dates, enums, counts and flags only; no domain values, ids, or names (except manual_review below).
         printed: dict[str, Any] = {"result": result, "leonardo_write": renewal_write_label(result, args.confirm_write),
                                    "plan": report, "salesforce_writeback": "not_performed"}

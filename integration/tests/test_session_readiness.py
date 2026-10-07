@@ -264,7 +264,7 @@ class GatedRouteTests(unittest.TestCase):
     def test_start_routes_need_the_strict_start_gate(self):
         self.assertEqual({k for k, v in dashboard.SESSION_GATED_ROUTES.items() if v == "start"},
                          {"/attended/start-ce-only-runner", "/attended/start-co0702-ce-only-runner",
-                          "/attended/start-surface-runner"})
+                          "/attended/start-surface-runner", "/attended/start-renewal"})
         self.assertTrue(set(dashboard.SESSION_GATED_ROUTES) <= dashboard.POST_ROUTES)
 
 

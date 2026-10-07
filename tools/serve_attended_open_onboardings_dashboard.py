@@ -83,6 +83,7 @@ from tools.attended_ce_only_playwright import (
     load_runner_state,
     start_blocker,
     create_uncertain,
+    renewal_uncertain,
     record_runner_result,
     record_runner_start,
     reset_leonardo_profile,
@@ -545,6 +546,43 @@ def start_attended_ce_only_runner(reference: str, revision: str) -> bool:
         return False
 
 
+# One-time acknowledgement of the Start renewal form: bound to the CO's source revision, 15 minutes, consumed once.
+RENEWAL_START_ACK_TTL_SECONDS = 15 * 60
+_renewal_start_acks: dict[str, tuple[str, str, float]] = {}
+_renewal_start_lock = Lock()
+
+
+def renewal_start_ack_nonce(reference: str, row: dict[str, str | None], *, now: float | None = None) -> str | None:
+    """The form's nonce for the CO's current revision (an active one is reused); None when not Approved or no revision."""
+    token = _source_revision_token(reference, row)
+    if token is None or not source_ready_to_onboard(row):
+        return None
+    current = monotonic() if now is None else now
+    with _renewal_start_lock:
+        ack = _renewal_start_acks.get(reference)
+        if ack is not None and ack[0] == token and ack[2] > current:
+            return ack[1]
+        nonce = token_urlsafe(24)
+        _renewal_start_acks[reference] = (token, nonce, current + RENEWAL_START_ACK_TTL_SECONDS)
+        return nonce
+
+
+def consume_renewal_start_ack(reference: str, row: dict[str, str | None], nonce: str, *, now: float | None = None) -> bool:
+    """Consume exactly one matching acknowledgement (any failure also discards the stored one)."""
+    if not isinstance(nonce, str) or not nonce:
+        return False
+    token = _source_revision_token(reference, row)
+    current = monotonic() if now is None else now
+    with _renewal_start_lock:
+        ack = _renewal_start_acks.get(reference)
+        if ack is None or token is None or not source_ready_to_onboard(row) or ack[0] != token or ack[2] <= current \
+                or not hmac.compare_digest(ack[1], nonce):
+            _renewal_start_acks.pop(reference, None)
+            return False
+        _renewal_start_acks.pop(reference, None)
+        return True
+
+
 # Routes that use the Surface scope review and Start card (Case 1 and Case 3).
 SURFACE_ROUTES = frozenset({SURFACE_ENGINE, CASE3_ENGINE})
 
@@ -557,6 +595,23 @@ def start_attended_surface_runner(reference: str, revision: str, route: str = SU
     try:
         subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--co", reference, "--revision", revision,
                           "--route", route],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+def start_attended_renewal_runner(reference: str, revision: str) -> bool:
+    """Launch one desktop-only orchestrated renewal run (Dev mirror if needed, dry run, apply, SpyCloud OFF).
+
+    Same launch shape as a create run; Leonardo Development only (the runner has no production mode).
+    """
+    if (not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
+            or not ATTENDED_CE_ONLY_RUNNER.is_file()):
+        return False
+    try:
+        subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--co", reference, "--revision", revision,
+                          "--renew-run"],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except OSError:
@@ -1260,6 +1315,10 @@ SALESFORCE_ID_MAPPING: dict[str, tuple[tuple[str, str, str], ...]] = {
     SURFACE_ENGINE: (("surface_account_id", "Surface_Account_ID__c", "Surface Account ID"),),
     CASE3_ENGINE: (("surface_account_id", "Surface_Account_ID__c", "Surface Account ID"),
                    ("account_uuid", "Account_UUID__c", "Account UUID")),
+    # Owner decision 2026-10-07: renewals (Cases 4-6) carry both, like Case 3. The Dev mirror's IDs are shown on the
+    # page only; Salesforce keeps the production IDs (ID_WRITEBACK_ENABLED stays off).
+    **{engine: (("surface_account_id", "Surface_Account_ID__c", "Surface Account ID"),
+                ("account_uuid", "Account_UUID__c", "Account UUID")) for engine in sorted(RENEWAL_ENGINES)},
 }
 
 
@@ -2377,7 +2436,7 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None,
         return ""
     head = ("<section class='card' aria-labelledby='renewal-plan-title'><div class='card-head'>"
             "<h2 id='renewal-plan-title' class='pill'>Renewal plan · " + escape(case[1]) + "</h2>"
-            "<span class='chip chip-neutral'>Plan only · applied by CLI</span></div>")
+            "<span class='chip chip-neutral'>Plan</span></div>")
     readable, plan = data if data is not None else _renewal_plan_data(row, today)
     if not readable:
         return head + "<p class='note'>The DealHub subscriptions could not be read. No plan is shown.</p></section>"
@@ -2412,16 +2471,11 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None,
         facts.append(("Legacy rows ignored (Q11)", str(len(plan["legacy_ignored"])) + " older-model product row(s)"))
     blockers = "".join("<p class='note' style='color:var(--bad)'><b>" + escape(RENEWAL_BLOCKER_TEXT.get(code, code))
                        + "</b> <code>" + escape(code) + "</code></p>" for code in plan["blockers"])
-    name = row.get("Name") or "CO-XXXX"
-    checklist = ["Dry run: tools\\attended_ce_only_playwright.py --co " + name + " --renew (reads the Edit form, saves nothing)",
-                 "Apply: the same command plus --confirm-write, against the Dev mirror (create it first with --mirror-renewal)",
-                 "Added domains must pass the production duplicate gate (Q3); Salesforce updates stay manual"]
     return (head + blockers + "<dl>" + "".join("<dt>" + escape(k) + "</dt><dd>" + escape(v) + "</dd>" for k, v in facts)
-            + "</dl><p class='note'>Checklist: " + " · ".join("☐ " + escape(item) for item in checklist) + "</p>"
-            "<p class='login-safety'>Read-only: built from Salesforce and DealHub. Nothing is opened, changed, or "
-            "saved in Leonardo or Salesforce. Rules: Q1 expiration = DealHub term end; Q2 start never changes; Q3 Approved = human-validated, and added "
+            + "</dl><p class='login-safety'>Read-only plan built from Salesforce and DealHub; showing it opens and saves "
+            "nothing. Rules: Q1 expiration = DealHub term end; Q2 start never changes; Q3 Approved = human-validated, and added "
             "domains must pass the production duplicate gate; Q10 routing by product + type (Case 6 = Surface + CE renewal). "
-            "Applied only by the CLI, never from this page (docs/38).</p></section>")
+            "A renewal is applied only by Start renewal in What to do now (Leonardo Development; Dev mirror first).</p></section>")
 
 
 RENEWAL_OUTCOME_DATES = ("old_expiration", "new_expiration")
@@ -2461,7 +2515,7 @@ def attended_renewal_outcomes() -> dict[str, dict[str, object]]:
 
 
 def _renewal_outcome_section(reference: str) -> str:
-    """Latest CLI renewal run for this CO (local record; the dashboard never runs or applies a renewal)."""
+    """Latest renewal dry run / apply for this CO (local record written by the runner; Salesforce is never changed)."""
     outcome = attended_renewal_outcomes().get(reference)
     if outcome is None:
         return ""
@@ -2482,7 +2536,7 @@ def _renewal_outcome_section(reference: str) -> str:
             "<h2 id='renewal-outcome-title' class='pill'>Latest renewal run</h2><span class='chip "
             + ("chip-ok" if verified else "chip-neutral") + "'>" + ("Verified" if verified else "Not applied") + "</span></div><dl>"
             + "".join("<dt>" + k + "</dt><dd>" + v + "</dd>" for k, v in facts)
-            + "</dl><p class='login-safety'>Local record of the last <code>--renew</code> run (Leonardo Development); "
+            + "</dl><p class='login-safety'>Local record of the last renewal dry run or apply (Leonardo Development); "
             "Salesforce is not changed.</p></section>")
 
 
@@ -2774,6 +2828,14 @@ def classify_queue_row(row: dict[str, str | None], record: dict[str, str] | None
     result = record.get("result") if record else None
     if create_uncertain(record):
         return "review", "<b>Check Leonardo</b><span class='sub'>Create uncertain · verify read-only</span>", "you"
+    if record is not None and record.get("route") in RENEWAL_ENGINES:
+        if result is None:
+            return "ready", "<span class='wait'>Waiting · runner</span><span class='sub'>A renewal run is in progress</span>", "runner"
+        if renewal_uncertain(record):
+            return "review", "<b>Check Leonardo</b><span class='sub'>Renewal uncertain · verify</span>", "you"
+        if result in RENEWAL_RUN_SUCCESS:
+            return "scanning", "<b>Renewed in Dev</b><span class='sub'>Salesforce updates stay manual</span>", "you"
+        return "review", "<b>Review stopped renewal</b><span class='sub'>See the reason on the CO page</span>", "you"
     if record is not None and result is not None and result not in _TENANT_RESULTS:
         if result in DUPLICATE_RESULTS:
             return "review", "<b>Review existing tenant</b><span class='sub'>Duplicate check stopped the run</span>", "you"
@@ -2820,6 +2882,12 @@ def _run_chip(record: dict[str, str] | None) -> str:
         return "<span class='chip chip-ok'>Onboarded</span>"
     if create_uncertain(record):
         return "<span class='chip chip-warn'>Create uncertain</span>"
+    if record.get("route") in RENEWAL_ENGINES:
+        if renewal_uncertain(record):
+            return "<span class='chip chip-warn'>Renewal uncertain</span>"
+        if result in RENEWAL_RUN_SUCCESS:
+            return "<span class='chip chip-ok'>Renewed (Dev)</span>"
+        return "<span class='chip chip-bad'>Renewal stopped</span>"
     if result in DUPLICATE_RESULTS:
         return "<span class='chip chip-bad'>Duplicate</span>"
     return "<span class='chip chip-bad'>Onboarding failed</span>"
@@ -3061,10 +3129,6 @@ def ce_only_eligible(row: dict[str, str | None]) -> bool:
         return False
     domain = domains[0].casefold()
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", domain))
-
-
-RENEWAL_MANUAL_NOTE = ("Renewals are applied by the CLI --renew (dry run first, then --confirm-write) against the Dev mirror "
-                       "(--mirror-renewal); this page only shows the plan. Production writes need separate approval.")
 
 
 def _domain_count(raw: str | None) -> str:
@@ -3494,7 +3558,13 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         validation_all = {}
     scan_obs = stage_state.get("scan") if isinstance(stage_state.get("scan"), dict) else None
     spycloud = attended_spycloud_states().get(reference) if readback is not None and route in (CE_ENGINE, CASE3_ENGINE) else None
-    tenant_id = (readback or {}).get("surface_account_id") or (row.get("Surface_Account_ID__c") or "").strip()
+    renewal_record, renewal_state_error = None, False
+    if is_renewal:
+        try:
+            renewal_record = load_runner_state().get(reference)
+        except RunnerStateUnavailable:
+            renewal_state_error = True
+    id_route = route or (case[0] if case is not None and case[0] in RENEWAL_ENGINES else None)
     ctx = SimpleNamespace(
         reference=reference, row=row, route=route, case=case, approval=approval, source_ready=source_ready,
         commercial_ready=commercial_ready, commercial_manual_review=commercial_manual_review,
@@ -3502,7 +3572,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         ce_automated=ce_automated, surface_automated=surface_automated, readback=readback, stage_state=stage_state,
         index=index, mirror=mirror, sf_id_blocked=sf_id_blocked, parts=parts, plan_data=plan_data, outcome=outcome,
         domain_info=domain_info, validation=validation_all.get(reference), scan=scan_obs, spycloud=spycloud,
-        tenant_id=tenant_id, notification=notification)
+        id_route=id_route, renewal_record=renewal_record, renewal_state_error=renewal_state_error,
+        notification=notification)
     toast = ""
     notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     if notification.startswith("id-write:") and notification[9:] in ID_WRITEBACK_RESULTS:
@@ -3529,7 +3600,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
         health = _fold("Tenant checks", "Validation · scan status" + (" · SpyCloud" if route in (CE_ENGINE, CASE3_ENGINE) else ""),
                        "<div class='health'>" + tiles + "</div>" + readback_html,
                        open_=bool(notification) or _tenant_checks_need_attention(ctx))
-    ids_html = _salesforce_ids_section(route, readback, row, reference, "", force_open=index == 4)
+    ids_html = _salesforce_ids_section(id_route, readback, row, reference, "", force_open=index == 4)
     ids_open = "' open " in ids_html[:160]
     domain_lists = ""
     if domain_info is not None:
@@ -3538,7 +3609,12 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                         "<dl>" + rows + "</dl>" + domain_lists + ids_html, open_=ids_open)
     history_html = _run_history_html(ctx)
     history = _fold("Run history", "Outcomes · licence entered · plan · scope", history_html) if history_html else ""
-    diagnostics_html = renewal_preflight + comment_repair_action + renewal_comment_evaluation_action + manual_action
+    cli_hint = ""
+    if is_renewal and renewal_supported(case):
+        cli_hint = ("<p class='note'>" + RENEWAL_CLI_HINT_TEXT + "<code>tools\\attended_ce_only_playwright.py --co "
+                    + escape(reference) + " --renew</code> (dry run), <code>--mirror-renewal</code>, "
+                    "<code>--confirm-write</code>.</p>")
+    diagnostics_html = cli_hint + renewal_preflight + comment_repair_action + renewal_comment_evaluation_action + manual_action
     if parts is not None:
         diagnostics_html += ("" if parts["state"] != "duplicate" else str(parts["reset"])) + str(parts["meta"])
     diagnostics = (_fold("Diagnostics", "Manual start · sign-in preflight · repair actions · source revision", diagnostics_html)
@@ -3549,12 +3625,11 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     route_chip = ("<span class='chip chip-info'>" + escape(case[1]) + "</span>" if case is not None else _route_chip(row))
     header = ("<div class='page-head'><h1>" + escape(reference) + "</h1>"
               + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + route_chip + approval_chip
-              + ("<span class='chip chip-neutral' title='Tenant id (first 8 characters)'>Tenant " + escape(tenant_id[:8]) + "…</span>"
-                 if tenant_id else "")
               + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
               "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
               "<button class='ghost' type='submit'>Refresh</button></form></div></div>")
-    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + header + _stage_tracker_html(stage_state, reference)
+    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + header + _tenant_ids_block(ctx)
+                 + _stage_tracker_html(stage_state, reference)
                  + toast + ("<div class='pinned' role='region' aria-label='Alerts'>" + pinned + "</div>" if pinned else "")
                  + _do_now_card(ctx) + _key_facts_grid(_key_facts(ctx)) + health + record_fold + history + diagnostics
                  + "<p class='footline'>" + escape(DETAIL_FOOTER_NOTE) + "</p>")
@@ -3662,7 +3737,7 @@ def _pinned_banners(ctx: SimpleNamespace, case4_panel: str, commercial_readiness
 
 
 def _renewal_blockers(ctx: SimpleNamespace) -> list[str]:
-    """Plain-text blockers of a renewal CO: plan blockers plus the last --renew refusal (Q3 gate, domains, shorten)."""
+    """Plain-text blockers of a renewal CO from its DealHub plan (these keep the Start renewal form away)."""
     readable, plan = ctx.plan_data
     blockers: list[str] = []
     if not readable:
@@ -3671,14 +3746,19 @@ def _renewal_blockers(ctx: SimpleNamespace) -> list[str]:
         blockers.append("No renewal plan could be built from DealHub.")
     else:
         blockers += [RENEWAL_BLOCKER_TEXT.get(code, code) for code in plan["blockers"]]
+    return blockers
+
+
+def _renewal_outcome_notes(ctx: SimpleNamespace) -> list[str]:
+    """What the last renewal dry run / apply said when it stopped (informational; a Start re-checks everything)."""
     result = str(ctx.outcome["result"]) if ctx.outcome else ""
     if result in RENEWAL_CLI_BLOCK_TEXT:
-        blockers.append(RENEWAL_CLI_BLOCK_TEXT[result])
-    elif result == "renewal_already_current":
-        blockers.append(RENEWAL_ALREADY_TEXT)
-    elif result and result not in _RENEWAL_OK_RESULTS:
-        blockers.append("The last --renew run stopped with " + result + ".")
-    return blockers
+        return [RENEWAL_CLI_BLOCK_TEXT[result]]
+    if result == "renewal_already_current":
+        return [RENEWAL_ALREADY_TEXT]
+    if result and result not in _RENEWAL_OK_RESULTS:
+        return ["The last renewal run stopped with " + result + "."]
+    return []
 
 
 def _renewal_term(ctx: SimpleNamespace) -> dict[str, Any] | None:
@@ -3698,7 +3778,7 @@ def _renewal_old_expiry(ctx: SimpleNamespace) -> str:
 def _renewal_gate_text(ctx: SimpleNamespace) -> str:
     outcome = ctx.outcome
     if outcome is None:
-        return "Not checked yet (the --renew dry run checks it)"
+        return "Checked when the run starts"
     result = str(outcome["result"])
     if result in RENEWAL_DOMAIN_GATE_CODES:
         return "Blocked (" + result + ")"
@@ -3715,49 +3795,118 @@ def _renewal_domains_text(ctx: SimpleNamespace) -> str:
     return "Not checked yet" if not ctx.outcome else "Matches the tenant"
 
 
-def _renewal_do_now(ctx: SimpleNamespace) -> tuple[str, str, str]:
-    """(headline, body, chip) of a renewal: no button, the next CLI step as text (docs/38)."""
-    reference, outcome, blockers = ctx.reference, ctx.outcome, _renewal_blockers(ctx)
-    result = str(outcome["result"]) if outcome else ""
-    cli = "tools\\attended_ce_only_playwright.py --co " + reference
-    already = RENEWAL_ALREADY_TEXT in blockers
-    if [item for item in blockers if item != RENEWAL_ALREADY_TEXT]:
-        headline = "Resolve the blockers, then re-run the --renew dry run"
-        step = "After the blockers are cleared, re-run <code>" + escape(cli + " --renew") + "</code> (dry run)."
-    elif not ctx.mirror and not already:
-        headline = "Create the Dev mirror first (CLI)"
-        step = ("No verified Development mirror of this tenant exists yet. Run <code>" + escape(cli + " --mirror-renewal")
-                + "</code> (dry run), then the same command with <code>--confirm-write</code>.")
-    elif outcome is None:
-        headline = "Run the --renew dry run (CLI)"
-        step = "Run <code>" + escape(cli + " --renew") + "</code>. It reads the Edit form and saves nothing."
-    elif outcome["leonardo_write"] == "attempted_unverified":
-        headline = "Verify the Dev tenant in Leonardo before any retry"
-        step = "A save was attempted but not confirmed. Check the tenant in Leonardo Development; do not re-run blindly."
-    elif result == "renewal_dry_run_planned":
-        headline = "Apply the renewal (CLI)"
-        step = ("The dry run planned the change. Apply it with <code>" + escape(cli + " --renew --confirm-write")
-                + "</code> against the Dev mirror.")
-    elif outcome["leonardo_write"] == "verified" or result == "renewal_already_current":
-        headline = "Renewal is current in Leonardo Development"
-        step = ("The last <code>--renew</code> run is recorded below. Salesforce updates stay manual and production writes "
-                "need separate approval.")
-    else:
-        headline = "Re-run the --renew dry run (CLI)"
-        step = "Run <code>" + escape(cli + " --renew") + "</code> again."
+RENEWAL_RUN_SUCCESS = frozenset({"renewal_edit_verified", "renewal_already_current"})
+RENEWAL_CLI_HINT_TEXT = "Diagnostic CLI (not needed for a normal renewal): "
+
+
+def renewal_supported(case: tuple[str, str, bool, bool] | None) -> bool:
+    """Only Cases 4-6 renew from the dashboard; single-product renewals (Q10) stay out of scope."""
+    return case is not None and case[0] in RENEWAL_ENGINES
+
+
+def _renewal_plan_summary(ctx: SimpleNamespace) -> str:
+    """The plan the operator attests to (static labels plus dates; no domain values)."""
     term = _renewal_term(ctx)
-    summary = [("Term", (str(term["start"]) + " → " + str(term["end"])) if term else "—"),
-               ("Expiry", _renewal_old_expiry(ctx) + " → " + (str(term["end"]) if term else "—")),
-               ("Apply from", ("now" if term["applicable_now"] else str(term["apply_from"])) if term else "—"),
+    old = _renewal_old_expiry(ctx)
+    if ctx.mirror:
+        mirror = "Exists (verified); it is renewed in place"
+        old = "read from the tenant" if old == "—" else old
+    else:
+        mirror = "Will be created from the production clone (the production tenant is only read)"
+        old = "read from the mirror"
+    items = [("Dev mirror", mirror),
+             ("Expiry (Q1)", old + " \u2192 " + (str(term["end"]) if term else "\u2014") + " (DealHub term end)"),
+             ("Start date (Q2)", "Unchanged"),
+             ("Number of domains", "Kept; if the Salesforce domains differ from the tenant's, the run stops (domains check)"),
+             ("Added subdomains (Q3)", "Each one passes the production duplicate gate before the save"),
+             ("Environment", "Leonardo Development only; production BackOffice is never touched"),
+             ("Salesforce", "Not changed; the Dev mirror is a separate tenant, so Salesforce IDs are not required to be empty")]
+    return "<ul class='plan-summary'>" + "".join("<li><b>" + escape(k) + ":</b> " + escape(v) + "</li>" for k, v in items) + "</ul>"
+
+
+def _renewal_start_form(ctx: SimpleNamespace) -> str:
+    """Start renewal: POST, revision-bound hidden inputs, one-time nonce, two attestations (modelled on Start onboarding)."""
+    reference, row = ctx.reference, ctx.row
+    revision = row.get("LastModifiedDate")
+    nonce = renewal_start_ack_nonce(reference, row)
+    if not isinstance(revision, str) or not revision or nonce is None:
+        return ""
+    return ("<form class='start-form' method='post' action='/attended/start-renewal'>"
+            "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
+            "<input type='hidden' name='source_revision' value='" + escape(revision) + "'>"
+            "<input type='hidden' name='nonce' value='" + escape(nonce) + "'>"
+            + _renewal_plan_summary(ctx)
+            + "<div class='confirm'><label><input type='checkbox' name='plan_reviewed' value='1' required> "
+            "I reviewed this renewal plan for this source revision</label>"
+            "<label><input type='checkbox' name='attended_renewal_authorized' value='1' required> "
+            "I authorize one Leonardo Development run for this source revision (it may create the Dev mirror and save the renewal)</label></div>"
+            "<button type='submit'>Start renewal</button></form>")
+
+
+def _renewal_do_now(ctx: SimpleNamespace) -> tuple[str, str, str]:
+    """(headline, body, chip) of a renewal: a Start renewal form like Start onboarding, or the run's state."""
+    reference, outcome, row = ctx.reference, ctx.outcome, ctx.row
+    ref = escape(reference)
+    result = str(outcome["result"]) if outcome else ""
+    blockers = _renewal_blockers(ctx)
+    term = _renewal_term(ctx)
+    summary = [("Term", (str(term["start"]) + " \u2192 " + str(term["end"])) if term else "\u2014"),
+               ("Expiry", _renewal_old_expiry(ctx) + " \u2192 " + (str(term["end"]) if term else "\u2014")),
+               ("Apply from", ("now" if term["applicable_now"] else str(term["apply_from"])) if term else "\u2014"),
                ("Blockers", str(len(blockers)) if blockers else "None"),
                ("Domain gate (Q3)", _renewal_gate_text(ctx))]
-    body = ("<p class='note'>" + escape(RENEWAL_MANUAL_NOTE) + "</p><p class='clistep'>"
-            + step + "</p>"
-            + ("<ul class='blockers'>" + "".join("<li><b>Blocked:</b> " + escape(item) + "</li>" for item in blockers) + "</ul>"
-               if blockers else "")
-            + "<dl class='kv sum5'>" + "".join("<div><dt>" + escape(k) + "</dt><dd>" + escape(v) + "</dd></div>" for k, v in summary)
-            + "</dl>")
-    return headline, body, "<span class='chip chip-neutral'>CLI only</span>"
+    summary_html = ("<dl class='kv sum5'>" + "".join("<div><dt>" + escape(k) + "</dt><dd>" + escape(v) + "</dd></div>"
+                                                   for k, v in summary) + "</dl>")
+    notes = "".join("<p class='note'>" + escape(item) + "</p>" for item in _renewal_outcome_notes(ctx))
+
+    def done(headline: str, body: str, chip: str) -> tuple[str, str, str]:
+        return headline, body + summary_html, chip
+
+    if not renewal_supported(ctx.case):
+        return ("No automated route for this renewal",
+                "<p class='note'>Only Cases 4-6 (Surface + Credential Exposure renewals) run from the dashboard; "
+                "single-product renewals are out of scope.</p>", "<span class='chip chip-neutral'>Manual</span>")
+    if ctx.renewal_state_error:
+        return ("Runner state unavailable",
+                "<p class='note'>The local runner state could not be read. Nothing can start; inspect the state file.</p>",
+                "<span class='chip chip-bad'>Blocked</span>")
+    record = ctx.renewal_record
+    if record is not None:
+        same = record.get("source_revision") == row.get("LastModifiedDate")
+        if not record.get("result"):
+            note = _running_note(ref, record) if same else _START_IN_PROGRESS_NOTE + _progress_button(ref)
+            return done("Renewal is running", note, "<span class='chip chip-warn'>Running</span>")
+        if renewal_uncertain(record):
+            return done("Verify the Dev tenant in Leonardo", _renewal_uncertain_banner(ref, record),
+                        "<span class='chip chip-warn'>Uncertain</span>")
+        if same:
+            kind, message = runner_result_message(record["result"])
+            banner = _outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
+            if record["result"] in RENEWAL_RUN_SUCCESS:
+                return done("Renewal is current in Leonardo Development",
+                            banner + "<p class='note'>Salesforce updates stay manual; production writes need separate approval.</p>",
+                            "<span class='chip chip-ok'>Renewed (Dev)</span>")
+            return done("The last renewal run stopped", banner + _reset_form(ref, record, "no Dev change is pending verification"),
+                        "<span class='chip chip-bad'>Stopped</span>")
+    if blockers:
+        return done("Resolve the blockers, then start",
+                    "<ul class='blockers'>" + "".join("<li><b>Blocked:</b> " + escape(item) + "</li>" for item in blockers)
+                    + "</ul>" + notes, "<span class='chip chip-bad'>Blocked</span>")
+    if outcome is not None and outcome["leonardo_write"] == "attempted_unverified":
+        return done("Verify the Dev tenant in Leonardo before any retry",
+                    "<p class='note'>A save was attempted but not confirmed. Check the tenant in Leonardo Development; "
+                    "do not re-run blindly.</p>", "<span class='chip chip-warn'>Uncertain</span>")
+    if outcome is not None and (outcome["leonardo_write"] == "verified" or result == "renewal_already_current"):
+        return done("Renewal is current in Leonardo Development",
+                    "<p class='note'>The last renewal run is recorded in Run history. Salesforce updates stay manual and "
+                    "production writes need separate approval.</p>", "<span class='chip chip-ok'>Renewed (Dev)</span>")
+    old_note = ("" if record is None else "<p class='note'>Previous run for a different source revision: <code>"
+                + escape(record.get("result", "no result recorded")) + "</code></p>")
+    form = _renewal_start_form(ctx)
+    return done("Start renewal",
+                "<p class='lede'>Salesforce approval is validated. One run creates the Dev mirror if needed, plans the renewal, "
+                "applies it, and turns SpyCloud OFF.</p>" + old_note + notes + form,
+                "<span class='chip chip-info'>Ready</span>")
 
 
 def _stage_steps(ctx: SimpleNamespace) -> list[str]:
@@ -3960,29 +4109,50 @@ def _duplicate_fact(ctx: SimpleNamespace) -> str:
     return "DEV: " + dev + " · prod clone: " + prod
 
 
+ID_LABELS = {"surface_account_id": "Account ID (Surface Account ID)", "account_uuid": "Account UUID"}
+
+
+def _tenant_ids_block(ctx: SimpleNamespace) -> str:
+    """The Leonardo Development IDs the route needs, FULL and copyable, from the local readback (never Salesforce).
+
+    Credential Exposure: Account UUID. Surface: Account ID. Surface + CE (Case 3) and renewals (Cases 4-6): both. A value
+    missing from the readback says "Not captured". Routes without a mapping show nothing.
+    """
+    mapping = SALESFORCE_ID_MAPPING.get(ctx.id_route or "")
+    if not mapping:
+        return ""
+    readback = ctx.readback
+    rows = ""
+    for key, _field, _label in mapping:
+        value = (readback or {}).get(key) if isinstance(readback, dict) else None
+        shown = ("<code style='user-select:all'>" + escape(value) + "</code>" if isinstance(value, str) and value
+                 else "<span class='note'>Not captured</span>")
+        rows += "<div><dt>" + escape(ID_LABELS[key]) + "</dt><dd>" + shown + "</dd></div>"
+    chips = "<span class='chip chip-info'>Leonardo Development</span>" + (" " + DEV_MIRROR_CHIP if ctx.mirror else "")
+    return ("<section class='keyfacts idbar' aria-label='Leonardo Development IDs'><dl class='kv'>" + rows
+            + "<div><dt>Environment</dt><dd>" + chips + "</dd></div></dl></section>")
+
+
 def _key_facts(ctx: SimpleNamespace) -> list[tuple[str, str]]:
     """At most KEY_FACTS_MAX facts for this route and stage, from data the page already loaded."""
     row, index, route = ctx.row, ctx.index, ctx.route
     product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
     facts = [("Product", _PRODUCT_SHORT.get(product or "", product or "—") + " · " + _TYPE_SHORT.get(onboarding_type or "", onboarding_type or "—")),
              ("Salesforce", (ctx.approval or "Approval not populated") + " · " + (row.get("Onboarding_Stage__c") or "Stage not populated"))]
-    short = (ctx.tenant_id[:8] + "…") if ctx.tenant_id else ""
     if ctx.is_renewal:
         term = _renewal_term(ctx)
         has_id = bool((row.get("Surface_Account_ID__c") or "").strip() or (row.get("Account_UUID__c") or "").strip())
         outcome = ctx.outcome
         last = ("Not run yet" if outcome is None else str(outcome["result"]) + " · write " + str(outcome["leonardo_write"]).replace("_", " "))
-        facts += [("Existing tenant", (short or "ID in Salesforce") if has_id or short else "None in Salesforce — find by name"),
+        facts += [("Existing tenant", "ID in Salesforce (production)" if has_id else "None in Salesforce \u2014 found by name"),
                   ("Expiry", _renewal_old_expiry(ctx) + " → " + (str(term["end"]) if term else "—")),
                   ("Start date", "Unchanged (Q2)"),
                   ("Apply from", ("now" if term["applicable_now"] else str(term["apply_from"])) if term else "—"),
                   ("Added domains · Q3 gate", _renewal_gate_text(ctx)),
                   ("Domains check", _renewal_domains_text(ctx)),
-                  ("Last --renew", last),
+                  ("Last renewal run", last),
                   ("Dev mirror", "Yes" if ctx.mirror else "No")]
         return facts[:KEY_FACTS_MAX]
-    if short:
-        facts.append(("Tenant", short))
     if index <= 1:
         parts = ctx.parts
         evaluation = parts.get("evaluation") if parts is not None else None
@@ -4405,6 +4575,79 @@ LEONARDO_SESSION_MESSAGES: dict[str, tuple[str, str]] = {
 }
 
 
+RENEWAL_RUN_MESSAGES: dict[str, tuple[str, str]] = {
+    "renewal_edit_verified": ("success", "The renewal was saved in Leonardo Development and read back: the new expiration and counts are on the Dev tenant. Salesforce was not changed."),
+    "renewal_already_current": ("success", "The Dev tenant already shows the new term, so nothing needed to change. Salesforce was not changed."),
+    "renewal_dry_run_planned": ("info", "The dry run planned the change but it was not applied."),
+    "renewal_domains_mismatch_manual_review": ("blocked", "The Salesforce domains differ from the domains on the tenant. Manual review is required; nothing was saved."),
+    "renewal_expiration_would_shorten": ("blocked", "The new expiration would be earlier than the tenant's current one (it may already be renewed). Manual review; nothing was saved."),
+    **{code: ("blocked", text) for code, text in RENEWAL_CLI_BLOCK_TEXT.items()
+       if code not in ("renewal_expiration_would_shorten", "renewal_domains_mismatch_manual_review")},
+    "renewal_not_approved": ("blocked", "Onboarding Approval Status is not Approved in Salesforce. Nothing was started."),
+    "renewal_route_mismatch": ("blocked", "This CO is not one of the renewal cases. Nothing was started."),
+    "renewal_route_not_supported": ("blocked", "Single-product renewals are out of scope (only Cases 4-6). Nothing was started."),
+    "renewal_ce_email_domain_invalid": ("blocked", "A renewal needs exactly one valid Credential Exposure email domain in Email Domains. Correct it in Salesforce."),
+    "renewal_source_unavailable": ("blocked", "The renewal source (Salesforce / DealHub) could not be read. Nothing was started."),
+    "renewal_not_onboarded": ("blocked", "No Dev tenant (mirror) is recorded for this CO, so there is nothing to renew. Nothing was changed."),
+    "renewal_environment_not_supported": ("blocked", "Renewals run in Leonardo Development only. Nothing was started."),
+    "renewal_form_mismatch": ("blocked", "The tenant's Edit form did not match what was expected. Nothing was saved."),
+    "renewal_form_unreadable": ("blocked", "The tenant's Edit form could not be read. Nothing was saved."),
+    "renewal_edit_unavailable": ("blocked", "The tenant's Edit action could not be opened. Nothing was saved."),
+    "renewal_row_schema_unexpected": ("blocked", "The tenant row had an unexpected layout. Nothing was saved."),
+    "renewal_start_date_changed": ("blocked", "The tenant's start date would change, which is never allowed. Nothing was saved."),
+    "renewal_confirm_unavailable": ("blocked", "The Confirm control could not be found. Nothing was saved."),
+    "renewal_confirm_disabled": ("blocked", "Confirm stayed disabled, so nothing was saved."),
+    "renewal_cancel_unavailable": ("blocked", "The Edit form could not be closed cleanly. Check the tenant in Leonardo Development."),
+    "renewal_save_no_signal": ("info", "Confirm was clicked but Leonardo gave no answer. The save may or may not have happened: verify in Leonardo."),
+    "renewal_save_id_mismatch": ("info", "Confirm was clicked and an edit of a different tenant was observed. Verify in Leonardo before any retry."),
+    "renewal_save_failed": ("info", "Leonardo answered the save with an error. Verify in Leonardo before any retry."),
+    "renewal_saved_unverified": ("info", "The save was accepted but the read-back could not confirm it. Verify in Leonardo."),
+    "renewal_readback_changed_mismatch": ("info", "The save was accepted but the tenant does not show the planned values. Verify in Leonardo."),
+    "renewal_readback_preserved_mismatch": ("info", "The save was accepted but a value that must not change differs. Verify in Leonardo."),
+    "source_revision_drift": ("blocked", "The Salesforce source changed during the run. Nothing further was done. Review the CO and start again."),
+    "mirror_already_exists": ("blocked", "A Dev mirror was already created, or its create was attempted earlier and is not verified. Check Leonardo Development."),
+    "mirror_readback_exists": ("blocked", "A Dev tenant is already recorded for this CO but it is not a verified mirror. Nothing was created."),
+    "mirror_not_renewal": ("blocked", "This CO is not a renewal. No mirror was created."),
+    "mirror_environment_not_supported": ("blocked", "Mirrors are created in Leonardo Development only."),
+    "mirror_clone_unavailable": ("blocked", "The production tenant list could not be used (missing, stale, or incomplete), so the Dev mirror could not be planned. Refresh it and start again."),
+    "mirror_co_identity_unavailable": ("blocked", "The CO's account identity could not be read for the Dev mirror. Nothing was created."),
+    "mirror_prod_tenant_not_found": ("blocked", "No live, paid production tenant with this exact name was found in the production clone. No mirror was created."),
+    "mirror_prod_tenant_ambiguous": ("blocked", "More than one production tenant matched, so the Dev mirror could not be planned. No mirror was created."),
+    "mirror_prod_license_incomplete": ("blocked", "The production tenant's licence data is incomplete. No mirror was created."),
+    "mirror_license_type_unmapped": ("blocked", "The production licence type has no Dev equivalent yet. No mirror was created."),
+    "mirror_interval_unmapped": ("blocked", "The production scanning interval has no Dev equivalent yet. No mirror was created."),
+    "mirror_lc_domains_unavailable": ("blocked", "The Leaked Credentials domains for the mirror could not be determined. No mirror was created."),
+    "mirror_duplicate_inventory_match": ("blocked", "The Dev tenant inventory already has a tenant that matches the mirror. No mirror was created."),
+    "mirror_duplicate_found": ("blocked", "Leonardo Development already has a tenant that matches the mirror. No mirror was created."),
+    "mirror_duplicate_ambiguous": ("blocked", "A similar tenant exists in Leonardo Development. No mirror was created; review it."),
+    "mirror_duplicate_schema_unavailable": ("blocked", "The tenant table could not be classified for the mirror duplicate check. No mirror was created."),
+    "mirror_confirm_no_create": ("info", "Confirm was clicked for the Dev mirror but no create was observed. A tenant may exist: verify in Leonardo."),
+    "mirror_create_unverified": ("info", "The Dev mirror may have been created but could not be read back. Verify in Leonardo."),
+    "mirror_readback_value_mismatch": ("info", "The Dev mirror was created but its read-back values were unexpected. Verify in Leonardo."),
+    "mirror_readback_write_unavailable": ("info", "The Dev mirror was created but its ids could not be recorded locally. Verify in Leonardo."),
+    "mirror_readback_id_conflict": ("info", "The Dev mirror's ids differ from ids already recorded for this CO. Verify in Leonardo."),
+    "mirror_record_write_unavailable": ("info", "The Dev mirror was created but its local record could not be written. Verify in Leonardo."),
+    "mirror_record_write_unavailable_before_create": ("blocked", "The local mirror record could not be written, so no mirror was created."),
+    "mirror_search_unavailable": ("info", "The Dev mirror may have been created but the tenant search was unavailable. Verify in Leonardo."),
+}
+RENEWAL_RUN_HEADLINES = {
+    "renewal_edit_verified": "Renewal applied (Dev)", "renewal_already_current": "Already renewed (Dev)",
+    "renewal_domains_mismatch_manual_review": "Domains differ - manual review",
+    "renewal_expiration_would_shorten": "Would shorten the licence - manual review",
+}
+
+
+def runner_result_message(result: str) -> tuple[str, str]:
+    """(kind, trusted HTML message) of any runner result, including renewal and mirror codes."""
+    if result in RUNNER_RESULT_MESSAGES:
+        return RUNNER_RESULT_MESSAGES[result]
+    if result in RENEWAL_RUN_MESSAGES:
+        return RENEWAL_RUN_MESSAGES[result]
+    if result.startswith("renewal_blocked_") and result[len("renewal_blocked_"):] in RENEWAL_BLOCKER_TEXT:
+        return "blocked", escape(RENEWAL_BLOCKER_TEXT[result[len("renewal_blocked_"):]])
+    return "blocked", "The runner finished with result code <code>" + escape(result) + "</code>."
+
+
 def page_leonardo_session_result(result: str) -> str:
     """Render the read-only Leonardo Development session check/reset outcome."""
     kind, message = LEONARDO_SESSION_MESSAGES.get(result, ("blocked", "Result code <code>" + escape(result) + "</code>."))
@@ -4647,6 +4890,8 @@ PENTERA_CSS = (
     "dl.kv.sum5{margin:10px 0 0;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}"
     "details.more details.more{box-shadow:none;margin:12px 0 0}"
     ".footline{margin:16px 0 0;color:var(--muted);font-size:12px}"
+    ".idbar{padding:10px 20px}.idbar dd code{word-break:break-all;font-size:13px}"
+    ".plan-summary{margin:0 0 12px;padding-left:18px;font-size:13px}.plan-summary li{margin:2px 0}"
     ".lede{margin:0 0 12px;color:var(--heading)}"
     ".sub-h{margin:16px 0 4px;font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}"
     "dl.compact{grid-template-columns:minmax(120px,170px) minmax(0,1fr) minmax(120px,170px) minmax(0,1fr);column-gap:12px}"
@@ -4815,7 +5060,7 @@ def _outcome_banner(kind: str, message: str, result: str, completed: str | None 
     results such as a duplicate).
     """
     icon, default_headline, modifier = OUTCOME_STYLES.get(kind, OUTCOME_STYLES["blocked"])
-    headline = headline or RUNNER_HEADLINES.get(result) or default_headline
+    headline = headline or RUNNER_HEADLINES.get(result) or RENEWAL_RUN_HEADLINES.get(result) or default_headline
     when = " · " + escape(completed) if completed else ""
     return (
         "<div class='outcome outcome-" + modifier + (" compact" if compact else "") + "' role='status' aria-label='"
@@ -4851,6 +5096,25 @@ def _uncertain_banner(ref: str, record: dict[str, str]) -> str:
             + (" · " + escape(record["completed_on"]) if record.get("completed_on") else "") + "</span></div></div>")
 
 
+def _renewal_uncertain_banner(ref: str, record: dict[str, str]) -> str:
+    """Amber banner for a renewal run that stopped after a Leonardo write that may have happened (ref is escaped)."""
+    result = escape(record.get("result", ""))
+    meta = ("<span class='meta'>Result <code>" + result + "</code>"
+            + (" · " + escape(record["completed_on"]) if record.get("completed_on") else "") + "</span>")
+    if record.get("uncertain") == "mirror_create":
+        return ("<div class='outcome outcome-info' role='status' aria-label='Dev mirror uncertain'>"
+                "<span class='outcome-icon' aria-hidden='true'>?</span><div><strong>Dev mirror uncertain - verify in Leonardo</strong>"
+                "<p>The run stopped at or after the Dev mirror's Confirm (<code>" + result + "</code>). A mirror tenant may exist. "
+                "Check Leonardo Development by hand; start and reset stay blocked until it is settled.</p>" + meta + "</div></div>")
+    return ("<div class='outcome outcome-info' role='status' aria-label='Renewal uncertain'>"
+            "<span class='outcome-icon' aria-hidden='true'>?</span><div><strong>Renewal save uncertain - verify in Leonardo</strong>"
+            "<p>The run stopped at or after the renewal's Confirm (<code>" + result + "</code>). The Dev tenant may carry the new "
+            "term. Start and reset stay blocked until a read-only check settles it: a tenant that already shows the new term is "
+            "recorded as renewed; a tenant that does not re-arms the run.</p>"
+            "<form method='post' action='/attended/verify-uncertain'><input type='hidden' name='reference' value='" + ref + "'>"
+            "<button type='submit'>Verify in Leonardo (read-only)</button></form>" + meta + "</div></div>")
+
+
 _START_IN_PROGRESS_NOTE = (
     "<p class='note'><b>A run for an earlier source revision has not reported a result.</b> The CO changed in "
     "Salesforce while it was running, so no new run can start until it finishes.</p>")
@@ -4868,12 +5132,12 @@ def _running_note(ref: str, record: dict[str, str]) -> str:
             " and has not reported a result. Do not start another.</p>" + _progress_button(ref))
 
 
-def _reset_form(ref: str, record: dict[str, str]) -> str:
+def _reset_form(ref: str, record: dict[str, str], what: str = "nothing was created") -> str:
     """Re-arm a failed run; folded away for a duplicate, where the next step is a manual review."""
     form = ("<form class='reset-form' method='post' action='/attended/reset-ce-only-runner'>"
             "<input type='hidden' name='reference' value='" + ref + "'>"
             "<label><input type='checkbox' name='reset_authorized' value='1' required> "
-            "Re-arm this failed run (nothing was created)</label>"
+            "Re-arm this failed run (" + escape(what) + ")</label>"
             "<button type='submit' class='ghost'>Reset runner record</button></form>")
     if record.get("result") in DUPLICATE_RESULTS:
         return "<details class='fold'><summary>Re-arm this run</summary>" + form + "</details>"
@@ -5212,18 +5476,27 @@ def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, referenc
     elif "result" not in record:
         started = record.get("started_on", "unknown")
         refresh = "<meta http-equiv='refresh' content='5'>"
-        body = ("<div class='card-head'><span class='pill'>Onboarding in progress</span><span class='chip chip-warn'>Running</span></div>"
-                "<p>Started at <code>" + escape(started) + "</code>. This page refreshes every 5 seconds.</p>"
-                "<p class='note'>In the automation Chrome window, complete SSO/MFA if prompted. The runner first checks Leonardo "
-                "for an existing tenant, then fills and confirms the Add Account form. It never updates Salesforce.</p>")
+        if record.get("route") in RENEWAL_ENGINES:
+            body = ("<div class='card-head'><span class='pill'>Renewal in progress</span><span class='chip chip-warn'>Running</span></div>"
+                    "<p>Started at <code>" + escape(started) + "</code>. This page refreshes every 5 seconds.</p>"
+                    "<p class='note'>In the automation Chrome window, complete SSO/MFA if prompted. The runner creates the Dev mirror "
+                    "if it is missing, plans the renewal (dry run), applies it, and turns SpyCloud OFF. Leonardo Development only; "
+                    "it never updates Salesforce.</p>")
+        else:
+            body = ("<div class='card-head'><span class='pill'>Onboarding in progress</span><span class='chip chip-warn'>Running</span></div>"
+                    "<p>Started at <code>" + escape(started) + "</code>. This page refreshes every 5 seconds.</p>"
+                    "<p class='note'>In the automation Chrome window, complete SSO/MFA if prompted. The runner first checks Leonardo "
+                    "for an existing tenant, then fills and confirms the Add Account form. It never updates Salesforce.</p>")
     else:
         result = record["result"]
         completed = record.get("completed_on", "unknown")
-        kind, message = RUNNER_RESULT_MESSAGES.get(result, ("blocked", "The runner finished with result code <code>" + escape(result) + "</code>."))
+        kind, message = runner_result_message(result)
         # A finished run returns the operator to the CO page, where the same
         # green/red outcome is shown; the link works immediately.
         refresh = "<meta http-equiv='refresh' content='" + str(RUNNER_REDIRECT_SECONDS) + ";url=/co/" + ref + "'>"
-        banner = _uncertain_banner(ref, record) if create_uncertain(record) else _outcome_banner(kind, message, result, completed)
+        banner = (_uncertain_banner(ref, record) if create_uncertain(record)
+                  else _renewal_uncertain_banner(ref, record) if renewal_uncertain(record)
+                  else _outcome_banner(kind, message, result, completed))
         body = (banner +
                 "<p class='note'>Returning to " + ref + " in " + str(RUNNER_REDIRECT_SECONDS) + " seconds. "
                 "<a href='/co/" + ref + "'>Return to " + ref + " now</a></p>")
@@ -5241,6 +5514,12 @@ START_BLOCKED_MESSAGES = {
     "run_in_progress": "A run for this CO (an earlier source revision) has not reported a result yet. No new run was started.",
     "tenant_already_verified": "A tenant was already created and verified for this CO. No new run was started.",
     "create_uncertain": "An earlier run may have created a tenant. Verify it read-only on the CO page first. No new run was started.",
+    "renewal_uncertain": "An earlier renewal run may have written to Leonardo Development. Verify it on the CO page first. No new run was started.",
+    "run_in_progress_other": "Another attended run is in progress (one run at a time). No new run was started.",
+    "renewal_acknowledgement_missing": "Both confirmations are required. No browser was launched.",
+    "renewal_nonce_invalid": "The start confirmation expired, was already used, or the CO changed. Reload the CO page and try again. No browser was launched.",
+    "renewal_not_approved": "Onboarding Approval Status is not Approved. No browser was launched.",
+    "renewal_not_supported": "This CO is not a Case 4-6 renewal. No browser was launched.",
 }
 
 
@@ -5813,7 +6092,7 @@ def page_login(state: str = "", reason: str | None = None) -> str:
 # Routes that launch the runner: "start" creates a tenant, "read" is read-only.
 SESSION_GATED_ROUTES = {
     "/attended/start-ce-only-runner": "start", "/attended/start-co0702-ce-only-runner": "start",
-    "/attended/start-surface-runner": "start",
+    "/attended/start-surface-runner": "start", "/attended/start-renewal": "start",
     "/attended/validate": "read", "/attended/scan-status-refresh": "read", "/attended/verify-uncertain": "read",
     "/attended/spycloud-check": "read",
 }
@@ -5827,7 +6106,7 @@ POST_ROUTES = frozenset({
     "/attended/rerun-comment-evaluation", "/attended/rerun-co0745-renewal-evaluation",
     "/attended/rerun-ce-only-fill-preflight", "/attended/rerun-co0702-fill-preflight",
     "/attended/start-ce-only-runner", "/attended/start-co0702-ce-only-runner", "/attended/reset-ce-only-runner",
-    "/attended/start-surface-runner", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
+    "/attended/start-surface-runner", "/attended/start-renewal", "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled",
     "/attended/mark-operator-assigned", "/attended/confirm-user-created", "/attended/unconfirm-user-created",
     "/attended/confirm-comment-update", "/attended/production-renewal-preflight",
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
@@ -6027,6 +6306,50 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page(HTTPStatus.CONFLICT, page_login("failed", reason)); return
         self.send_redirect_with_cookies("/login", [
             ATTEMPT_COOKIE + "=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + str(LOGIN_ATTEMPT_SECONDS)])
+
+    def _start_renewal(self, reference: str, form: Any, row: dict[str, str | None]) -> None:
+        """Start renewal: the same guards as Start onboarding plus a one-time nonce; Leonardo Development only."""
+        back = "<p><a href='/co/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>"
+
+        def blocked(code: str, status: HTTPStatus = HTTPStatus.CONFLICT) -> None:
+            self.send_page(status, "<!doctype html><title>Start blocked</title><p>"
+                           + START_BLOCKED_MESSAGES.get(code, "The start is blocked. No browser was launched.") + "</p>" + back)
+
+        if not source_ready_to_onboard(row):
+            blocked("renewal_not_approved"); return
+        if not renewal_supported(renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))):
+            blocked("renewal_not_supported"); return
+        if (exact_form_value(form, "plan_reviewed") != "1"
+                or exact_form_value(form, "attended_renewal_authorized") != "1"):
+            blocked("renewal_acknowledgement_missing"); return
+        acknowledged = exact_form_value(form, "source_revision")
+        if not acknowledged:
+            blocked("revision_acknowledgement_missing"); return
+        if acknowledged != row.get("LastModifiedDate"):
+            blocked("source_revision_changed"); return
+        if not consume_renewal_start_ack(reference, row, exact_form_value(form, "nonce") or ""):
+            blocked("renewal_nonce_invalid"); return
+        with _start_lock:
+            try:
+                state = load_runner_state()
+            except RunnerStateUnavailable:
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Runner state unavailable</title><p>The local runner state file could not be read. No browser was launched. Do not retry; inspect the state file.</p>")
+                return
+            record = state.get(reference)
+            if record is not None and record.get("source_revision") == acknowledged and record.get("result") \
+                    and not renewal_uncertain(record):
+                self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)  # already ran for this revision
+                return
+            blocker = start_blocker(record)
+            if blocker is not None:
+                blocked(blocker); return
+            if any(not other.get("result") for ref, other in state.items() if ref != reference):
+                blocked("run_in_progress_other"); return
+            if not self._claim_and_launch(reference, acknowledged,
+                                          lambda: start_attended_renewal_runner(reference, acknowledged),
+                                          route=renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))[0]):  # type: ignore[index]
+                return
+        self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
 
     def do_POST(self) -> None:
         # Any action may change Salesforce or local state; later pages read fresh.
@@ -6306,6 +6629,17 @@ class Handler(BaseHTTPRequestHandler):
                 record = load_runner_state().get(reference)
             except RunnerStateUnavailable:
                 record = None
+            if renewal_uncertain(record):
+                if (record or {}).get("uncertain") != "renewal_write":
+                    self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Verify by hand</title><p>The Dev mirror may exist. Check Leonardo Development manually; the dashboard cannot verify a mirror create. Nothing was started.</p>"
+                                   "<p><a href='/co/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>")
+                    return
+                # Read-only renewal dry run: it records the outcome and settles the uncertain apply.
+                if not _start_runner_mode("--co", reference, "--renew"):
+                    self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Verify unavailable</title><p>The read-only check could not be started on this desktop.</p>")
+                    return
+                self.send_redirect("/co/" + reference)
+                return
             if not create_uncertain(record):
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Nothing to verify</title><p>" + escape(reference) + " has no uncertain create. Nothing was started.</p>")
                 return
@@ -6407,6 +6741,7 @@ class Handler(BaseHTTPRequestHandler):
                     "runner_in_progress_cannot_be_reset": "An attended run is in progress and cannot be reset. Wait for it to finish.",
                     "runner_result_cannot_be_reset": "The run verified a created tenant and cannot be reset.",
                     "create_uncertain_cannot_be_reset": "The run may have created a tenant. Verify it read-only on the CO page first; nothing was changed.",
+                    "renewal_uncertain_cannot_be_reset": "The renewal run may have written to Leonardo Development. Verify it on the CO page first; nothing was changed.",
                 }.get(str(error), "The runner record could not be reset. No change was made.")
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Reset blocked</title><p>" + escape(reset_message) + "</p>")
                 return
@@ -6444,6 +6779,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Browser unavailable</title><p>The production sign-in page could not be opened. No tenant search or change was performed.</p>")
                 return
             self.send_page(HTTPStatus.OK, "<!doctype html><title>Production sign-in opened</title><p>The production BackOffice sign-in page was opened. Complete SSO/MFA manually. This Phase 1 preflight does not search, open, edit, or save a tenant.</p><p><a href='/co/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>")
+            return
+        if path == "/attended/start-renewal":
+            self._start_renewal(reference, form, row)
             return
         if not source_ready_to_onboard(row):
             self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Source not ready</title><p>This source is no longer ready for manual onboarding.</p>")

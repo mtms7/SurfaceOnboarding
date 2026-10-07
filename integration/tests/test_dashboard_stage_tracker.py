@@ -287,7 +287,8 @@ class DetailPageTrackerTests(unittest.TestCase):
         self.assertIn("Onboarding Completed<span class='sr'> — current stage</span>", page)
         self.assertIn("Salesforce still shows: Request Approved", page)
         self.assertIn("2026-10-01 → 2027-09-30", page)
-        self.assertIn("AAAAAAAA…", page)
+        self.assertIn("A" * 20, page)  # the FULL Account ID (2026-10-07), not the 8-character short form
+        self.assertNotIn("AAAAAAAA…", page)
         self.assertLess(page.index("class='tracker'"), page.index("Tenant checks"))
         self.assertIn("<details class='more'><summary><h2 class='sum-h'>Tenant checks</h2>", page)
 

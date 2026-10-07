@@ -2507,7 +2507,7 @@ class RenewalPlanCardTests(unittest.TestCase):
         with patch.object(dashboard, "renewal_subscription_rows", return_value=list(self.ROWS)):
             card = dashboard._renewal_plan_section(dict(self.ROW), _date(2026, 10, 2))
         self.assertIn("Renewal plan · Case 6 · renew Surface + CE", card)
-        self.assertIn("Plan only · applied by CLI", card)
+        self.assertIn("<span class='chip chip-neutral'>Plan</span>", card)
         self.assertIn("Prime · Weekly", card)
         self.assertIn("DealHub term end exactly: 2029-10-26", card)
         self.assertIn("from 2026-10-13", card)
@@ -2516,20 +2516,15 @@ class RenewalPlanCardTests(unittest.TestCase):
         self.assertNotIn("<form", card)
         self.assertNotIn("<button", card)
 
-    def test_renewal_detail_has_no_primary_action(self):
-        # Owner decision 2026-10-04: the renewal plan leads; sign-in and manual actions are folded ghost buttons.
-        with patch.object(dashboard, "renewal_subscription_rows", return_value=list(self.ROWS)), \
-                patch.object(dashboard, "load_runner_state", return_value={}), \
-                patch.object(dashboard, "attended_leonardo_readbacks", return_value={}), \
-                patch.object(dashboard, "manual_start_ack_nonce", return_value=None), \
-                patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce")):
-            page = page_detail("CO-0767", dict(self.ROW))
-        self.assertNotIn("<button type='submit'>", page)
-        self.assertIn(dashboard.RENEWAL_MANUAL_NOTE, page)
-        # 2026-10-07 layout: the do-now card leads with the next CLI step (text, no button); the full plan is in
-        # the Run history fold; sign-in and manual actions are in the Diagnostics fold.
-        self.assertIn("Create the Dev mirror first (CLI)", page)
-        self.assertLess(page.index(dashboard.RENEWAL_MANUAL_NOTE), page.index("Renewal plan · Case 6"))
+    def test_renewal_detail_starts_from_the_dashboard(self):
+        # Owner decision 2026-10-07 (reverses 2026-10-04): the do-now card holds the Start renewal form; sign-in and
+        # manual actions stay folded ghost buttons in Diagnostics.
+        with patch.object(dashboard, "renewal_subscription_rows", return_value=list(self.ROWS)),                 patch.object(dashboard, "load_runner_state", return_value={}),                 patch.object(dashboard, "attended_leonardo_readbacks", return_value={}),                 patch.object(dashboard, "manual_start_ack_nonce", return_value=None),                 patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce")):
+            page = page_detail("CO-0767", dict(self.ROW, LastModifiedDate="2026-10-07T08:00:00Z"))
+        self.assertIn("action='/attended/start-renewal'", page)
+        self.assertIn("<button type='submit'>Start renewal</button>", page)
+        self.assertNotIn("Create the Dev mirror first (CLI)", page)
+        self.assertLess(page.index("action='/attended/start-renewal'"), page.index("Renewal plan · Case 6"))
         folded = page.index("<details class='more'><summary><h2 class='sum-h'>Diagnostics")
         self.assertLess(folded, page.index("action='/attended/production-renewal-preflight'"))
         self.assertLess(folded, page.index("action='/attended/leonardo-session-check'"))

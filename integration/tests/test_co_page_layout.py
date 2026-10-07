@@ -9,6 +9,7 @@ import contextlib
 import re
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import tools.serve_attended_open_onboardings_dashboard as dashboard
@@ -131,7 +132,7 @@ class LayoutOrderTests(unittest.TestCase):
     def test_header_carries_route_approval_tenant_and_refresh(self):
         page = render(row_for(SURFACE), readback=READBACK, runner=VERIFIED_RUN)
         head = page[page.index("<div class='page-head'>"):page.index("class='tracker'")]
-        for text in ("CO-0702", "Acme", "Surface-only", "chip-ok'>Approved<", "Tenant AAAAAAAA…", "Read from Salesforce at",
+        for text in ("CO-0702", "Acme", "Surface-only", "chip-ok'>Approved<", "Read from Salesforce at",
                      "name='refresh' value='1'", ">Refresh<"):
             self.assertIn(text, head)
 
@@ -369,52 +370,126 @@ class DoNowTests(unittest.TestCase):
 
 
 class RenewalDoNowTests(unittest.TestCase):
+    """Owner decision 2026-10-07: renewals (Cases 4-6) start from the dashboard like Start onboarding."""
+    MIRRORED = dict(readback=READBACK, mirrors=frozenset({READBACK["surface_account_id"]}))
+    REV = "2026-10-07T08:00:00Z"
+
     def outcome(self, result, mode="dry_run", write="not_performed", **extra):
         return {"CO-0702": {"result": result, "mode": mode, "leonardo_write": write, "observed_at": NOW, "changes": 2,
                             "added_domains": extra.pop("added_domains", 0), "old_expiration": "2026-10-26",
                             "new_expiration": "2029-10-26", **extra}}
 
-    def card(self, **kwargs):
-        page = render(row_for(RENEWAL), **kwargs)
-        self.assertNotIn("<button type='submit'>", page)
-        card = do_now(page)
-        self.assertNotIn("<form", card)  # renewals are CLI only: no button, only text
-        self.assertNotIn("<button", card)
-        return card
+    def run_record(self, result=None, uncertain=None, revision=REV, **extra):
+        record = {"source_revision": revision, "route": "case_6_renew_both", "started_on": "2026-10-07T09:00:00", **extra}
+        if result:
+            record.update({"result": result, "completed_on": "2026-10-07T09:10:00"})
+        if uncertain:
+            record["uncertain"] = uncertain
+        return {"CO-0702": record}
 
-    def test_next_cli_step_follows_the_mirror_dry_run_apply_outcome_order(self):
+    def card(self, base=RENEWAL, **kwargs):
+        return do_now(render(row_for(base), **kwargs))
+
+    def test_start_form_is_modelled_on_start_onboarding(self):
         card = self.card()
-        self.assertIn("Create the Dev mirror first (CLI)", card)
-        self.assertIn("--co CO-0702 --mirror-renewal", card)
-        mirrored = dict(readback=READBACK, mirrors=frozenset({READBACK["surface_account_id"]}))
-        card = self.card(**mirrored)
-        self.assertIn("Run the --renew dry run (CLI)", card)
-        self.assertIn("--co CO-0702 --renew</code>", card)
-        card = self.card(outcomes=self.outcome("renewal_dry_run_planned"), **mirrored)
-        self.assertIn("Apply the renewal (CLI)", card)
-        self.assertIn("--renew --confirm-write", card)
-        card = self.card(outcomes=self.outcome("renewal_edit_verified", "confirm_write", "verified"), **mirrored)
+        self.assertIn("Start renewal", card)
+        self.assertIn("<form class='start-form' method='post' action='/attended/start-renewal'>", card)
+        self.assertIn("name='reference' value='CO-0702'", card)
+        self.assertIn("name='source_revision' value='" + self.REV + "'", card)
+        self.assertRegex(card, r"name='nonce' value='[A-Za-z0-9_-]{20,}'")
+        self.assertIn("name='plan_reviewed' value='1' required", card)
+        self.assertIn("name='attended_renewal_authorized' value='1' required", card)
+        self.assertEqual(card.count("<button"), 1)
+        self.assertNotIn("--mirror-renewal", card)  # the old CLI step text is gone
+        self.assertNotIn("(CLI)", card)
+
+    def test_plan_summary_names_every_decided_rule(self):
+        card = self.card()
+        for text in ("Will be created from the production clone", "read from the mirror", "2029-10-26 (DealHub term end)",
+                     "Start date (Q2):</b> Unchanged", "Number of domains:</b> Kept", "Added subdomains (Q3)",
+                     "production duplicate gate", "Leonardo Development only", "production BackOffice is never touched"):
+            self.assertIn(text, card)
+        mirrored = self.card(outcomes=self.outcome("renewal_dry_run_planned"), **self.MIRRORED)
+        self.assertIn("Exists (verified)", mirrored)
+        self.assertIn("2026-10-26 → 2029-10-26 (DealHub term end)", mirrored)
+        self.assertNotIn("Will be created", mirrored)
+
+    def test_form_for_cases_4_5_and_6_only(self):
+        case5 = {"Onboarding_Product__c": "Surface & Credential Exposure",
+                 "Onboarding_Type__c": "Renewal of Credential Exposure Module + New Surface Product"}
+        for base in (RENEWAL, CASE4, case5):
+            with self.subTest(type=base["Onboarding_Type__c"]):
+                self.assertIn("action='/attended/start-renewal'", self.card(base))
+        for product in ("Surface", "Credential Exposure"):
+            with self.subTest(single=product):
+                page = render(row_for({"Onboarding_Product__c": product, "Onboarding_Type__c": "Renewal of Existing Product"}))
+                self.assertNotIn("start-renewal", page)
+                self.assertIn("No automated route for this renewal", do_now(page))
+
+    def test_no_form_until_approved(self):
+        page = render(row_for(RENEWAL, Onboarding_Approval_Status__c="Pending"))
+        self.assertNotIn("start-renewal", page)
+        self.assertIn("Waiting for approval in Salesforce", do_now(page))
+
+    def test_running_failed_uncertain_and_done_states(self):
+        card = self.card(runner=self.run_record())
+        self.assertIn("Renewal is running", card)
+        self.assertIn("View progress", card)
+        self.assertNotIn("start-renewal", card)
+        card = self.card(runner=self.run_record("renewal_domains_mismatch_manual_review"))
+        self.assertIn("The last renewal run stopped", card)
+        self.assertIn("Salesforce domains differ from the domains on the tenant", card)
+        self.assertIn("action='/attended/reset-ce-only-runner'", card)
+        self.assertNotIn("start-renewal", card)
+        card = self.card(runner=self.run_record("renewal_save_no_signal", uncertain="renewal_write"))
+        self.assertIn("Verify the Dev tenant in Leonardo", card)
+        self.assertIn("action='/attended/verify-uncertain'", card)
+        self.assertNotIn("reset-ce-only-runner", card)
+        self.assertNotIn("start-renewal", card)
+        card = self.card(runner=self.run_record("mirror_create_unverified", uncertain="mirror_create"))
+        self.assertIn("Dev mirror uncertain", card)
+        self.assertNotIn("verify-uncertain", card)
+        card = self.card(runner=self.run_record("renewal_edit_verified"))
         self.assertIn("Renewal is current in Leonardo Development", card)
+        self.assertIn("Renewal applied (Dev)", card)
+        self.assertNotIn("start-renewal", card)
 
-    def test_blockers_are_named(self):
-        mirrored = dict(readback=READBACK, mirrors=frozenset({READBACK["surface_account_id"]}))
-        for result, text in (("renewal_expiration_would_shorten", "would shorten"),
-                             ("renewal_new_domain_in_production", "Domain gate (Q3)"),
-                             ("renewal_domains_mismatch_manual_review", "Salesforce domains differ"),
-                             ("renewal_already_current", "Already renewed")):
-            with self.subTest(result=result):
-                card = self.card(outcomes=self.outcome(result), **mirrored)
-                self.assertIn("<li><b>Blocked:</b> ", card)
-                self.assertIn(text, card)
-        card = self.card(outcomes=self.outcome("renewal_new_domain_in_production"), **mirrored)
-        self.assertIn("Resolve the blockers, then re-run the --renew dry run", card)
+    def test_a_run_of_another_revision_shows_the_form_again(self):
+        card = self.card(runner=self.run_record("renewal_edit_verified", revision="older"))
+        self.assertIn("action='/attended/start-renewal'", card)
+        self.assertIn("different source revision", card)
+        card = self.card(runner=self.run_record(revision="older"))  # still running: no second start
+        self.assertNotIn("start-renewal", card)
+        self.assertIn("has not reported a result", card)
 
-    def test_terms_that_disagree_block(self):
+    def test_plan_blockers_keep_the_form_away(self):
         rows = [dict(SUBSCRIPTIONS[0]), dict(SUBSCRIPTIONS[1], DealHub_Subscription_End_Date__c="2028-10-26")]
         card = do_now(render(row_for(RENEWAL), rows=rows))
         self.assertIn("one tenant, one licence term", card)
-        self.assertIn("Resolve the blockers, then re-run the --renew dry run", card)
+        self.assertIn("Resolve the blockers, then start", card)
         self.assertNotIn("<form", card)
+
+    def test_last_stop_reasons_are_notes_and_do_not_hide_the_form(self):
+        for result, text in (("renewal_expiration_would_shorten", "would shorten"),
+                             ("renewal_new_domain_in_production", "Domain gate (Q3)"),
+                             ("renewal_domains_mismatch_manual_review", "Salesforce domains differ")):
+            with self.subTest(result=result):
+                card = self.card(outcomes=self.outcome(result), **self.MIRRORED)
+                self.assertIn(text, card)
+                self.assertIn("action='/attended/start-renewal'", card)
+
+    def test_cli_outcomes_without_a_run_record_keep_their_meaning(self):
+        card = self.card(outcomes=self.outcome("renewal_edit_verified", "confirm_write", "verified"), **self.MIRRORED)
+        self.assertIn("Renewal is current in Leonardo Development", card)
+        self.assertNotIn("start-renewal", card)
+        card = self.card(outcomes=self.outcome("renewal_saved_unverified", "confirm_write", "attempted_unverified"), **self.MIRRORED)
+        self.assertIn("Verify the Dev tenant in Leonardo before any retry", card)
+        self.assertNotIn("start-renewal", card)
+
+    def test_diagnostics_keeps_a_one_line_cli_hint(self):
+        page = render(row_for(RENEWAL))
+        self.assertIn("--co CO-0702 --renew</code> (dry run)", fold(page, "Diagnostics"))
+        self.assertNotIn("--co CO-0702 --renew", page[:page.index("<h2 class='sum-h'>Diagnostics</h2>")])
 
     def test_five_line_summary_and_full_plan_in_a_fold(self):
         page = render(row_for(RENEWAL))
@@ -424,13 +499,89 @@ class RenewalDoNowTests(unittest.TestCase):
         self.assertEqual(card.count("<dt>"), 5)
         self.assertIn("Renewal plan · Case 6", fold(page, "Run history"))
         self.assertNotIn("Renewal plan · Case 6", page[:page.index("<h2 class='sum-h'>Run history</h2>")])
+        self.assertNotIn("applied by CLI", page)
+        self.assertNotIn("Applied only by the CLI", page)
 
-    def test_renewal_facts_include_the_cli_state(self):
+    def test_renewal_facts_include_the_run_state(self):
         page = render(row_for(RENEWAL), outcomes=self.outcome("renewal_dry_run_planned"))
         facts = key_facts(page)
         for label in ("Existing tenant", "Expiry", "Start date", "Apply from", "Added domains · Q3 gate", "Domains check",
-                      "Last --renew", "Dev mirror"):
+                      "Last renewal run", "Dev mirror"):
             self.assertIn("<dt>" + label + "</dt>", facts)
+
+
+class TenantIdsBlockTests(unittest.TestCase):
+    """Owner decision 2026-10-07: Account ID / Account UUID per product, FULL, copyable, labelled with the environment."""
+    FULL_ID, FULL_UUID = READBACK["surface_account_id"], READBACK["account_uuid"]
+
+    def block(self, base, **kwargs):
+        page = render(row_for(base), **kwargs)
+        start = page.find("<section class='keyfacts idbar'")
+        return "" if start == -1 else page[start:page.index("</section>", start)]
+
+    def code(self, value):
+        return "<code style='user-select:all'>" + value + "</code>"
+
+    def test_credential_exposure_shows_only_the_account_uuid(self):
+        run = {"CO-0702": {**VERIFIED_RUN["CO-0702"], "route": dashboard.CE_ENGINE}}
+        block = self.block(CE, readback=READBACK, runner=run, ce_evaluation=ce_evaluation())
+        self.assertIn("<dt>Account UUID</dt>", block)
+        self.assertIn(self.code(self.FULL_UUID), block)
+        self.assertNotIn("Account ID", block)
+        self.assertIn("Leonardo Development", block)
+
+    def test_surface_shows_only_the_account_id(self):
+        block = self.block(SURFACE, readback=READBACK, runner=VERIFIED_RUN)
+        self.assertIn("<dt>Account ID (Surface Account ID)</dt>", block)
+        self.assertIn(self.code(self.FULL_ID), block)
+        self.assertNotIn("Account UUID", block)
+
+    def test_case3_and_renewals_show_both_in_full(self):
+        run = {"CO-0702": {**VERIFIED_RUN["CO-0702"], "route": dashboard.CASE3_ENGINE}}
+        cases = [(CASE3, dict(readback=READBACK, runner=run,
+                              evaluation=surface_evaluation(route=dashboard.CASE3_ENGINE, core_plus=True))),
+                 (RENEWAL, dict(readback=READBACK, mirrors=frozenset({self.FULL_ID}))), (CASE4, dict(readback=READBACK))]
+        for base, kwargs in cases:
+            with self.subTest(type=base["Onboarding_Type__c"]):
+                block = self.block(base, **kwargs)
+                self.assertIn(self.code(self.FULL_ID), block)
+                self.assertIn(self.code(self.FULL_UUID), block)
+                self.assertIn("Leonardo Development", block)
+
+    def test_renewal_block_marks_the_dev_mirror(self):
+        block = self.block(RENEWAL, readback=READBACK, mirrors=frozenset({self.FULL_ID}))
+        self.assertIn("DEV mirror", block)
+
+    def test_missing_values_say_not_captured(self):
+        block = self.block(CASE3, evaluation=surface_evaluation(route=dashboard.CASE3_ENGINE, core_plus=True))
+        self.assertEqual(block.count("Not captured"), 2)
+        self.assertEqual(self.block(RENEWAL).count("Not captured"), 2)
+
+    def test_values_are_escaped_and_the_short_id_is_gone(self):
+        page = render(row_for(SURFACE), readback=READBACK, runner=VERIFIED_RUN)
+        self.assertNotIn("AAAAAAAA…", page)
+        self.assertNotIn("Tenant id (first 8 characters)", page)
+        evil = dashboard._tenant_ids_block(SimpleNamespace(
+            id_route=dashboard.SURFACE_ENGINE, readback={"surface_account_id": "<script>x</script>"}, mirror=False))
+        self.assertNotIn("<script>", evil)
+        self.assertIn("&lt;script&gt;", evil)
+
+    def test_unmapped_route_shows_nothing(self):
+        self.assertEqual(self.block({"Onboarding_Product__c": "Surface", "Onboarding_Type__c": "Something else"}), "")
+
+    def test_renewal_engines_map_both_fields_and_the_ids_fold_no_longer_says_undecided(self):
+        for engine in sorted(dashboard.RENEWAL_ENGINES):
+            self.assertEqual([key for key, _f, _l in dashboard.SALESFORCE_ID_MAPPING[engine]],
+                             ["surface_account_id", "account_uuid"])
+        page = render(row_for(RENEWAL), readback=READBACK, mirrors=frozenset({self.FULL_ID}))
+        self.assertNotIn("Mapping not decided", page)
+        self.assertIn("Salesforce IDs", page)
+        self.assertFalse(dashboard.ID_WRITEBACK_ENABLED)
+
+    def test_salesforce_write_stays_off_for_renewals(self):
+        row = {"Surface_Account_ID__c": None, "Account_UUID__c": None}
+        plan = dashboard.salesforce_id_writeback_plan(dashboard.route_for(RENEWAL), READBACK, row)
+        self.assertEqual(plan["status"], "mapping_not_decided")  # route_for stays create-only: no write path for renewals
 
 
 class KeyFactsTests(unittest.TestCase):
@@ -490,8 +641,9 @@ class KeyFactsTests(unittest.TestCase):
                             "observed_at": NOW, "expires_at": NOW}}
         page = render(row_for(SURFACE), readback=READBACK, runner=VERIFIED_RUN, scan=scan)
         facts = key_facts(page)
-        for label in ("Tenant", "Licence", "Validation", "Scan", "Operator", "User created"):
+        for label in ("Licence", "Validation", "Scan", "Operator", "User created"):
             self.assertIn("<dt>" + label + "</dt>", facts)
+        self.assertNotIn("<dt>Tenant</dt>", facts)  # the short tenant id was replaced by the full ID block (2026-10-07)
         self.assertNotIn("<dt>SpyCloud</dt>", facts)
         self.assertIn("2026-10-06 → 2027-10-05", facts)
         ce_run = {"CO-0702": {**VERIFIED_RUN["CO-0702"], "route": dashboard.CE_ENGINE}}
