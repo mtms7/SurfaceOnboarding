@@ -668,7 +668,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
             self._in_display_get(lambda: cached("CO-0002"))
         self.assertEqual(self._in_display_get(lambda: cached("CO-0002")), "CO-0002")
         self.assertEqual(len(calls), 2)
-        with patch.object(dashboard, "monotonic", return_value=dashboard.monotonic() + 121):
+        with patch.object(dashboard, "monotonic", return_value=dashboard.monotonic() + dashboard.DISPLAY_READ_TTL_SECONDS + 1):
             self._in_display_get(lambda: cached("CO-0002"))
         self.assertEqual(len(calls), 3)
         dashboard.clear_display_cache()

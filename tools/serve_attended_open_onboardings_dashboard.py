@@ -6,6 +6,7 @@ keeps data in memory only for rendering that response.
 """
 from __future__ import annotations
 
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 import contextvars
 import copy
@@ -20,6 +21,7 @@ from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -950,12 +952,12 @@ def route_for(row: dict[str, str | None]) -> str | None:
 
 
 # Display-read cache (owner decision 2026-10-01, for page speed). Each `sf` CLI
-# call costs about 4 s, so GET pages reuse a Salesforce read for up to two
+# call costs about 4 s, so GET pages reuse a Salesforce read for up to five
 # minutes. It applies only while a GET handler renders (_display_reads), keeps
 # results in memory only (never disk or logs), and is cleared by a Refresh or
 # any POST. Starts and the runner never use it: they re-read Salesforce and
 # re-check the source revision themselves.
-DISPLAY_READ_TTL_SECONDS = 120.0
+DISPLAY_READ_TTL_SECONDS = 300.0
 _display_reads: contextvars.ContextVar[bool] = contextvars.ContextVar("display_reads", default=False)
 _display_read_times: contextvars.ContextVar[list[float] | None] = contextvars.ContextVar("display_read_times", default=None)
 _display_cache: dict[tuple[object, ...], tuple[float, float, Future]] = {}
@@ -1589,7 +1591,40 @@ def consume_manual_start_ack(reference: str, row: dict[str, str | None], nonce: 
         return True
 
 
-def sf_json(args: list[str]) -> object:
+# Read-timing log (owner decision 2026-10-07): one entry per Salesforce read
+# with a label, duration and ok/fail only. The label is the SOQL object name or
+# the CLI command words; never query text, values, record ids, or output.
+READ_TIMING_LOG: deque[dict[str, object]] = deque(maxlen=200)
+_timing_logger = logging.getLogger("surface_dashboard.timing")
+_SOQL_OBJECT = re.compile(r"\bFROM\s+([A-Za-z][A-Za-z0-9_]*)", re.IGNORECASE)
+_REST_OBJECT = re.compile(r"/sobjects/([A-Za-z][A-Za-z0-9_]*)")
+_CLI_WORD = re.compile(r"[a-z][a-z-]{0,23}")
+
+
+def read_label(args: list[str]) -> str:
+    """A short, value-free name for one CLI read (SOQL object, REST object, or command words)."""
+    for index, arg in enumerate(args):
+        if arg == "--query" and index + 1 < len(args):
+            found = _SOQL_OBJECT.search(args[index + 1])
+            if found:
+                return found.group(1)
+    for arg in args:
+        found = _REST_OBJECT.search(arg)
+        if found:
+            return "rest:" + found.group(1)
+    words = [arg for arg in args if _CLI_WORD.fullmatch(arg)]
+    return " ".join(words[:2]) or "sf"
+
+
+def record_timing(kind: str, label: str, started: float, ok: bool) -> None:
+    millis = round((monotonic() - started) * 1000)
+    READ_TIMING_LOG.append({"kind": kind, "label": label, "ms": millis, "ok": ok})
+    _timing_logger.info("%s %s %d ms %s", kind, label, millis, "ok" if ok else "fail")
+
+
+def sf_json(args: list[str], label: str | None = None) -> object:
+    started = monotonic()
+    ok = False
     try:
         # Decode CLI output as UTF-8 (the --json contract) rather than the
         # locale code page; cp1252 cannot decode UTF-8 continuation bytes and
@@ -1597,9 +1632,13 @@ def sf_json(args: list[str]) -> object:
         done = subprocess.run([salesforce_cli_command(), *args, "--target-org", salesforce_target_org()], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=35, check=False)
         if done.returncode or done.stdout is None or len(done.stdout.encode()) > 512 * 1024:
             raise ReadUnavailable()
-        return json.loads(done.stdout)
+        result = json.loads(done.stdout)
+        ok = True
+        return result
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ReadUnavailable() from exc
+    finally:
+        record_timing("sf_read", label or read_label(args), started, ok)
 
 
 def sf_write_json(args: list[str]) -> object:
@@ -2177,24 +2216,55 @@ def detail_row(reference: str) -> dict[str, str | None]:
         raise ReadUnavailable() from None
 
 
-@_display_cached
-def renewal_subscription_rows(account_id: str) -> list[dict[str, object]]:
-    """DealHub rows for one account (fixed read-only query; display only, never stored)."""
-    if not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
-        raise ReadUnavailable()
-    response = sf_json(["data", "query", "--query",
-                        "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
-                        "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c WHERE DealHub_Account__c = '"
-                        + account_id + "' LIMIT 100", "--json"])
+DEALHUB_FIELDS = ("Product_Full_Name__c", "DealHub_Status__c", "DealHub_Subscription_Start_Date__c", "DealHub_Subscription_End_Date__c")
+
+
+def _dealhub_records(query_tail: str, label: str) -> list[dict[str, object]]:
+    response = sf_json(["data", "query", "--query", "SELECT " + ", ".join(DEALHUB_FIELDS)
+                        + " FROM DealHub_Subscription__c WHERE " + query_tail + " LIMIT 100", "--json"], label)
     try:
         records = response["result"]["records"]  # type: ignore[index]
         if response["status"] != 0 or not isinstance(records, list):  # type: ignore[index]
             raise ReadUnavailable()
-        return [{key: record.get(key) for key in ("Product_Full_Name__c", "DealHub_Status__c",
-                                                    "DealHub_Subscription_Start_Date__c", "DealHub_Subscription_End_Date__c")}
-                for record in records if isinstance(record, dict)]
+        if not all(isinstance(record, dict) for record in records):
+            raise ReadUnavailable()
+        return [{key: record.get(key) for key in DEALHUB_FIELDS} for record in records]
     except (KeyError, TypeError):
         raise ReadUnavailable() from None
+
+
+@_display_cached
+def dealhub_rows_for_co(reference: str) -> list[dict[str, object]]:
+    """DealHub rows for the account of one CO, in ONE query (semi-join on the CO name).
+
+    The CO page needs these rows for both the commercial check and the renewal
+    plan; the semi-join lets the read start together with the CO row read
+    instead of waiting for its Account__c. Display only, never stored.
+    """
+    if not REFERENCE.fullmatch(reference):
+        raise ReadUnavailable()
+    return _dealhub_records("DealHub_Account__c IN (SELECT Account__c FROM Customer_Onboarding__c WHERE Name = '"
+                            + reference + "')", "DealHub_Subscription__c")
+
+
+@_display_cached
+def _renewal_rows_by_account(account_id: str) -> list[dict[str, object]]:
+    if not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
+        raise ReadUnavailable()
+    return _dealhub_records("DealHub_Account__c = '" + account_id + "'", "DealHub_Subscription__c")
+
+
+def renewal_subscription_rows(account_id: str, reference: str | None = None) -> list[dict[str, object]]:
+    """DealHub rows for one account. With the CO ``reference`` this is the page's single shared read.
+
+    The account is still validated first, so a CO without a valid Account__c
+    shows the same "could not be read" outcome as before.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
+        raise ReadUnavailable()
+    if reference is not None:
+        return dealhub_rows_for_co(reference)
+    return _renewal_rows_by_account(account_id)
 
 
 RENEWAL_BLOCKER_TEXT = {
@@ -2215,7 +2285,7 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None)
             "<h2 id='renewal-plan-title' class='pill'>Renewal plan · " + escape(case[1]) + "</h2>"
             "<span class='chip chip-neutral'>Plan only · applied by CLI</span></div>")
     try:
-        rows = renewal_subscription_rows(row.get("Account__c") or "")
+        rows = renewal_subscription_rows(row.get("Account__c") or "", row.get("Name"))
     except ReadUnavailable:
         return head + "<p class='note'>The DealHub subscriptions could not be read. No plan is shown.</p></section>"
     plan = build_renewal_plan(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"), rows, today)
@@ -2331,18 +2401,12 @@ def surface_commercial_readiness(row: dict[str, str | None]) -> dict[str, object
     account_id = row.get("Account__c")
     if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
         return {"commercial_ready": False, "manual_review_required": True, "reason": "account_missing"}
-    response = sf_json([
-        "data", "query", "--query",
-        "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, DealHub_Subscription_End_Date__c "
-        "FROM DealHub_Subscription__c WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100",
-        "--json",
-    ])
+    reference = row.get("Name")
+    if not isinstance(reference, str) or not REFERENCE.fullmatch(reference):
+        raise ReadUnavailable()
     try:
-        records = response["result"]["records"]  # type: ignore[index]
-        if response["status"] != 0 or not isinstance(records, list):
-            raise ReadUnavailable()
         subscriptions: list[dict[str, object]] = []
-        for record in records:
+        for record in dealhub_rows_for_co(reference):
             if not isinstance(record, dict):
                 raise ReadUnavailable()
             subscriptions.append({
@@ -3466,11 +3530,55 @@ def render_dashboard(selected_queue: str = "", scan_started: bool = False, sort:
         check_state: dict[str, dict[str, str]] | None = load_check_state()
     except ValueError:
         check_state = None
-    return page_queue(rows, selected_queue, runner_state=runner_state, check_state=check_state,
+    page = page_queue(rows, selected_queue, runner_state=runner_state, check_state=check_state,
                       runner_state_unavailable=runner_state_unavailable,
                       history=history, history_failed=history_failed, read_at=display_read_at(),
                       scan_started=scan_started, start_dates=start_dates,
                       start_dates_unavailable=start_dates_unavailable, sort=sort, direction=direction)
+    warm_co_pages(rows, runner_state)
+    return page
+
+
+WARM_CO_LIMIT = 12
+
+
+def dealhub_needed(row: dict[str, str | None] | None) -> bool:
+    """Whether a CO page uses DealHub rows (commercial check or renewal plan); unknown row: yes."""
+    if row is None:
+        return True
+    product = row.get("Onboarding_Product__c")
+    return product == "Surface & Credential Exposure" or renewal_case(product, row.get("Onboarding_Type__c")) is not None
+
+
+def _display_entry_live(name: str, *args: Any) -> bool:
+    """True when a display read is cached or in flight and not expired or failed."""
+    with _display_cache_lock:
+        entry = _display_cache.get((name, *args))
+    return not (entry is None or entry[0] <= monotonic()
+                or (entry[2].done() and entry[2].exception() is not None))
+
+
+def warm_co_pages(rows: list[dict[str, str | None]], runner_state: dict[str, dict[str, str]] | None) -> int:
+    """Schedule background display reads for the COs shown in the queue; never blocks.
+
+    Most relevant first (Ready, Manual review, Needs validation, Follow-up), at
+    most WARM_CO_LIMIT COs, skipping reads that are already cached or in flight.
+    Salesforce display reads only: no Leonardo, browser, preflight, or write.
+    Only runs while a display GET is rendering (the cache applies only then).
+    Returns the number of reads scheduled.
+    """
+    if not _display_reads.get():
+        return 0
+    state = runner_state or {}
+    ranked = sorted(((_QUEUE_RANK.get(classify_queue_row(row, state.get(row.get("Name") or ""))[0], 9), row.get("Name") or "", row)
+                     for row in rows if REFERENCE.fullmatch(row.get("Name") or "")), key=lambda item: item[:2])
+    scheduled = 0
+    for _rank, reference, row in ranked[:WARM_CO_LIMIT]:
+        for fn in (detail_row, dealhub_rows_for_co) if dealhub_needed(row) else (detail_row,):
+            if not _display_entry_live(fn.__name__, reference):
+                prefetch_display_read(fn, reference)
+                scheduled += 1
+    return scheduled
 
 
 def page_salesforce_unavailable(failed: bool = True) -> str:
@@ -5223,15 +5331,18 @@ class Handler(BaseHTTPRequestHandler):
     def _display_get(self) -> None:
         _display_reads.set(True)
         _display_read_times.set([])
+        started = monotonic()
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
             if path == "/":
                 selected_queue = parse_qs(parsed.query).get("queue", [""])[0]
                 scan_started = parse_qs(parsed.query).get("scan", [""])[0] == "started"
-                self.send_page(HTTPStatus.OK, render_dashboard(
+                html = render_dashboard(
                     selected_queue, scan_started, parse_qs(parsed.query).get("sort", [""])[0],
-                    parse_qs(parsed.query).get("dir", [""])[0])); return
+                    parse_qs(parsed.query).get("dir", [""])[0])
+                record_timing("page_build", "queue", started, True)
+                self.send_page(HTTPStatus.OK, html); return
             if path == "/connection":
                 self.send_page(HTTPStatus.OK, page_salesforce_unavailable(failed=False)); return
             if path == "/history":
@@ -5276,8 +5387,15 @@ class Handler(BaseHTTPRequestHandler):
                     prefetch_display_read(evaluate_ce_only_fill_preflight, match.group(1))
                 elif queued_route in SURFACE_ROUTES:
                     prefetch_display_read(evaluate_surface_fill_preflight, match.group(1), queued_route)
+                # Start the CO row and the DealHub read together (semi-join on the
+                # CO name) so the two CLI calls overlap; both are display reads.
+                prefetch_display_read(detail_row, match.group(1))
+                if dealhub_needed(queued):
+                    prefetch_display_read(dealhub_rows_for_co, match.group(1))
                 row = detail_row(match.group(1))
-                self.send_page(HTTPStatus.OK, page_detail(match.group(1), row, notice, surface_commercial_readiness(row)))
+                html = page_detail(match.group(1), row, notice, surface_commercial_readiness(row))
+                record_timing("page_build", "co", started, True)
+                self.send_page(HTTPStatus.OK, html)
                 return
             self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
         except ReadUnavailable:
@@ -5739,4 +5857,8 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     listener_host, listener_port = listener_address()
     print(f"attended_open_onboardings_dashboard_listening_on_{listener_host}:{listener_port}")
+    _timing_handler = logging.StreamHandler(sys.stderr)
+    _timing_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _timing_logger.addHandler(_timing_handler)
+    _timing_logger.setLevel(logging.INFO)
     ThreadingHTTPServer((listener_host, listener_port), Handler).serve_forever()
