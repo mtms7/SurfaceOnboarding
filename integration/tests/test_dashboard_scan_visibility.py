@@ -170,7 +170,10 @@ class DoneWithErrorsTests(unittest.TestCase):
         self.assertEqual(parsed["execution_state"], "done")
         self.assertTrue(parsed["with_errors"])
         html = dashboard._scan_executions_html(parsed)
-        self.assertIn("Done ·", html)
+        # Owner 2026-10-07: total of all durations in the headline; each scan with its duration and finished state.
+        self.assertIn("Done · total 07:35:46 (2 scans)", html)
+        self.assertIn("<b>finished with errors</b> · 07:27:27", html)
+        self.assertIn("<b>finished</b> · 00:08:18", html)
         self.assertIn("finished with errors", html)
         self.assertNotIn("Unrecognized", html)
 

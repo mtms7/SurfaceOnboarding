@@ -748,7 +748,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
             active = dashboard._scan_status_section("CO-0650", now=now)
             hostile = dashboard._scan_status_section("CO-0651", now=now)
             malformed = dashboard._scan_status_section("CO-0652", now=now)
-        self.assertIn("Done · 02:00:00 (last finished execution)", finished)
+        self.assertIn("Done · total 02:30:05 (2 scans)", finished)  # owner 2026-10-07: total of all scans
         self.assertIn("<code>LEAKED_CREDENTIALS_DISCOVERY</code>", finished)
         self.assertIn("00:30:05", finished)
         self.assertIn("Running since 2026-10-01", active)

@@ -77,6 +77,7 @@ from tools.attended_ce_only_playwright import (
     renewal_case,
     RENEWAL_ENGINES,
     SCAN_EXEC_DONE,
+    SCAN_EXEC_RUNNING,
     SCAN_EXEC_WITH_ERRORS,
     SURFACE_ROUTE_PRODUCT,
     SURFACE_ROUTE_TYPE,
@@ -920,17 +921,31 @@ def _scan_executions_html(observation: dict[str, object]) -> str:
     if state == "running":
         headline = f"Running since {_clock(observation.get('running_since'))}"  # type: ignore[arg-type]
     elif state == "done":
-        finished = [e for e in executions if e["end"] is not None and e["duration_ms"] is not None]
-        last = max(finished, key=lambda e: e["end"], default=None)  # type: ignore[arg-type,return-value]
-        headline = ("Done · " + _hms(last["duration_ms"]) + " (last finished execution)") if last else "Done"  # type: ignore[arg-type]
+        # Owner 2026-10-07: the headline is the total of all scan durations; each scan is listed below with its
+        # own duration and whether it finished.
+        durations = [e["duration_ms"] for e in executions if isinstance(e["duration_ms"], int)]
+        count = len(executions)
+        headline = ("Done · total " + _hms(sum(durations)) + f" ({count} scan{'' if count == 1 else 's'})"
+                    if durations else "Done")
     elif state == "no_executions":
         headline = "No scan executions yet"
     else:
         headline = "Unrecognized execution status"
+
+    def finished_word(status: object) -> str:
+        if status in SCAN_EXEC_WITH_ERRORS:
+            return "finished with errors"
+        if status in SCAN_EXEC_DONE:
+            return "finished"
+        if status in SCAN_EXEC_RUNNING:
+            return "running"
+        return "unknown status " + str(status or "")
+
     items = "".join(
-        f"<li><code>{escape(str(e['campaign_type'] or 'unknown'))}</code> · {escape(str(e['status'] or 'unknown'))}"
+        f"<li><b>{escape(finished_word(e['status']))}</b> · "
+        f"{escape(_hms(e['duration_ms']) if isinstance(e['duration_ms'], int) else 'no duration yet')}"
         f" · started {escape(_clock(e['start']))}"  # type: ignore[arg-type]
-        f" · {escape(_hms(e['duration_ms']) if isinstance(e['duration_ms'], int) else 'no duration')}</li>"
+        f" · <code>{escape(str(e['campaign_type'] or 'unknown'))}</code></li>"
         for e in executions)
     warning = ("<p class='note' style='color:var(--warn)'>A scan finished with errors (DONE_WITH_ERRORS) — check the "
                "tenant in Leonardo Development.</p>" if observation.get("with_errors") else "")
