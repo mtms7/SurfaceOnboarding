@@ -4918,9 +4918,10 @@ class ScanStatusTests(unittest.TestCase):
 
         def get_by_role(self, role, name=None, exact=False):
             page = self
-            target = self._target(name)
+            target = self._target(name or "Duration Per Scan")
             # The tab renders only after ``tab_delay`` waits (live 2026-10-07: 0 tabs right after the Details click).
             target.count = lambda: (1 if role == "tab" and page.waits >= page.tab_delay else 0)
+            target.filter = lambda **kw: target
             return target
 
         def on(self, event, listener):

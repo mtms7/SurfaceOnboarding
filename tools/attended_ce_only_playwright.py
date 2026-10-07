@@ -5350,6 +5350,21 @@ def _is_scan_exec_response(response: Any) -> bool:
         return False
 
 
+def _scan_details_snapshot(page: Any) -> None:
+    """One diagnostic event when the Details panel shows no Duration tab: tab labels (as the probe records them),
+    the page path with ids masked, the number of open pages, and whether a dialog is visible. No values."""
+    try:
+        tabs = page.get_by_role("tab")
+        labels = [" ".join((tabs.nth(i).inner_text(timeout=1000) or "").split())[:40] for i in range(min(tabs.count(), 12))]
+        dialogs = page.get_by_role("dialog").count()
+        pages = len(page.context.pages)
+        path = _ID_SEGMENT.sub("/{id}", _url_path(page.url)) if _url_origin(page.url) == DEVELOPMENT_ORIGIN else "<other-origin>"
+        _log().event("scan_executions", "details_snapshot",
+                     detail=f"tabs={labels} dialogs={dialogs} pages={pages} path={path}"[:RUN_LOG_DETAIL_CHARS])
+    except Exception as exc:  # noqa: BLE001 - diagnostics only
+        _log().error("scan_executions", "details_snapshot", exc)
+
+
 def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[str, Any]:
     """Open the tenant's Details > Duration Per Scan and return the parsed executions reply.
 
@@ -5373,7 +5388,9 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[
             # Live 2026-10-07: the tab lookup ran in the same second as the Details click and found 0 tabs (the
             # panel had not rendered); wait for the reply or the tab, as the live-verified probe waits.
             step = "tab_wait"
-            tab = page.get_by_role("tab", name=SCAN_EXEC_DURATION_TEXT, exact=True)
+            # Any tab whose text contains "Duration" (case-insensitive): the accessible name may differ from the
+            # label the probe read (2026-10-07 live: no exact-name tab within 20 s).
+            tab = page.get_by_role("tab").filter(has_text=re.compile(r"duration", re.IGNORECASE))
             waited, tabs = 0, 0
             while not seen and waited < SCAN_EXEC_TIMEOUT_MS:
                 tabs = tab.count()
@@ -5382,6 +5399,8 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[
                 page.wait_for_timeout(250)
                 waited += 250
             _log().event("scan_executions", "tab_lookup", detail=f"role_tabs={tabs} waited_ms={waited} replies={len(seen)}")
+            if not seen and not tabs:
+                _scan_details_snapshot(page)
             if not seen:
                 step = "tab_click"
                 target = tab.first if tabs else page.get_by_text(SCAN_EXEC_DURATION_TEXT, exact=True).first
