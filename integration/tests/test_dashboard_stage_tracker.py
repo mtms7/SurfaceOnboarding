@@ -188,10 +188,12 @@ class StepperRenderTests(unittest.TestCase):
     def test_done_current_upcoming_with_accessible_text(self):
         html = dashboard._stage_tracker_html(self.state(2))
         self.assertIn("aria-label='Onboarding stage'", html)
-        self.assertEqual(html.count("class='st done'"), 2)
+        # Index 2 (Account Scanning) is the last proven stage: drawn done; the next stage is current.
+        self.assertEqual(html.count("class='st done'"), 3)
         self.assertEqual(html.count("class='st current' aria-current='step'"), 1)
-        self.assertEqual(html.count("class='st upcoming'"), 3)
-        self.assertIn("Account Scanning<span class='sr'> — current stage</span>", html)
+        self.assertEqual(html.count("class='st upcoming'"), 2)
+        self.assertIn("Account Scanning<span class='sr'> — done</span>", html)
+        self.assertIn("Scan Completed Successfully<span class='sr'> — current stage</span>", html)
         self.assertIn("New<span class='sr'> — done</span>", html)
         self.assertIn("Onboarding Completed<span class='sr'> — upcoming</span>", html)
         self.assertNotIn("<script", html)
@@ -254,7 +256,8 @@ class DetailPageTrackerTests(unittest.TestCase):
         page = self.render({})
         self.assertLess(page.index("class='tracker'"), page.index("<h1>CO-0702</h1>"))
         self.assertEqual(page.count("class='st current' aria-current='step'"), 1)
-        self.assertIn("Request Approved<span class='sr'> — current stage</span>", page)
+        self.assertIn("Request Approved<span class='sr'> — done</span>", page)
+        self.assertIn("Account Scanning<span class='sr'> — current stage</span>", page)
         self.assertIn("action='/attended/", page)
 
     def test_scan_done_and_users_advance_the_tracker_and_checks_are_folded(self):
@@ -263,7 +266,8 @@ class DetailPageTrackerTests(unittest.TestCase):
         page = self.render({"CO-0702": dict(self.READBACK)}, {"CO-0702": {"execution_state": "done", "state": "scan_completed"}}, tenant,
                            validation=_validation(True, "2026-10-06"))
         self.assertIn("Primary user verified in Leonardo", page)
-        self.assertIn("User Created<span class='sr'> — current stage</span>", page)
+        self.assertIn("User Created<span class='sr'> — done</span>", page)
+        self.assertIn("Onboarding Completed<span class='sr'> — current stage</span>", page)
         self.assertIn("Salesforce still shows: Request Approved", page)
         self.assertIn("2026-10-01 → 2027-09-30", page)
         self.assertIn("AAAAAAAA…", page)
@@ -275,16 +279,18 @@ class DetailPageTrackerTests(unittest.TestCase):
         tenant = {"operator_assigned": False, "primary_user": {"present": True}}
         page = self.render({"CO-0702": dict(self.READBACK)}, scan, tenant,
                            validation=_validation(True, ""))
-        self.assertIn("Scan Completed Successfully<span class='sr'> — current stage</span>", page)
+        self.assertIn("Scan Completed Successfully<span class='sr'> — done</span>", page)
+        self.assertIn("User Created<span class='sr'> — current stage</span>", page)
         self.assertIn("No operator assigned", page)
         page = self.render({"CO-0702": dict(self.READBACK)}, scan, tenant,
                            confirmations={"CO-0702": {"confirmed": True, "confirmed_on": "2026-10-06", "confirmed_by": "operator"}})
-        self.assertIn("User Created<span class='sr'> — current stage</span>", page)
+        self.assertIn("User Created<span class='sr'> — done</span>", page)
         self.assertIn("Confirmed manually on 2026-10-06", page)
 
     def test_readback_without_scan_stays_at_account_scanning(self):
         page = self.render({"CO-0702": dict(self.READBACK)})
-        self.assertIn("Account Scanning<span class='sr'> — current stage</span>", page)
+        self.assertIn("Account Scanning<span class='sr'> — done</span>", page)
+        self.assertIn("Scan Completed Successfully<span class='sr'> — current stage</span>", page)
 
 
 if __name__ == "__main__":

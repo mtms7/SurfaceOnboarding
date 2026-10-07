@@ -4801,6 +4801,11 @@ class ScanStatusTests(unittest.TestCase):
         @contextlib.contextmanager
         def page(_playwright):
             yield object()
+
+        def search(_page, _handle, term):
+            # The name search returns every row; a narrowing search by a primary domain returns that tenant only.
+            found = rows if term == "Sample Surface Co" else [r for r in rows if r.get("accountDomain") == term]
+            return runner.TenantSearchResult(found, len(found))
         with patch.dict(sys.modules, {"playwright": pkg, "playwright.sync_api": fake}), \
                 patch.object(runner, "READBACK_PATH", self.readbacks), \
                 patch.object(runner, "SCAN_STATUS_PATH", self.status_path), \
@@ -4809,7 +4814,7 @@ class ScanStatusTests(unittest.TestCase):
                 patch.object(runner, "_scan_status_tenant_names", return_value=("Sample Surface Co",)), \
                 patch.object(runner, "_attended_page", page), \
                 patch.object(runner, "_open_search", side_effect=AssertionError("read-only paths use the invisible search")), \
-                patch.object(runner, "_search_tenants", return_value=runner.TenantSearchResult(rows, len(rows))), \
+                patch.object(runner, "_search_tenants", side_effect=search), \
                 patch.object(runner, "read_scan_executions", **(executions or {"side_effect": RuntimeError(
                     "scan_status_executions_unavailable")})):
             return runner.run_scan_status("CO-0649")
@@ -4817,12 +4822,20 @@ class ScanStatusTests(unittest.TestCase):
     def test_exact_id_and_uuid_match_records_the_observation(self):
         rows = [{"id": "c" * 24, "accountUuid": "d" * 32, "lastReconScan": None},
                 {"id": self.ID, "accountUuid": self.UUID.upper(), "lastReconScan": "2026-10-01T03:00:00Z",
-                 "lastScanStatusEnum": "RUNNING"}]
+                 "lastScanStatusEnum": "RUNNING", "accountDomain": "sample.example"}]
         self.assertEqual(self._run_with_rows(rows, {"return_value": {"executions": [], "execution_state": "no_executions"}}), "scan_status_recorded")
         stored = json.loads(self.status_path.read_text(encoding="utf-8"))["CO-0649"]
         self.assertEqual((stored["state"], stored["status_enum"]), ("scan_started", "RUNNING"))
         self.assertNotIn("id", stored)
         self.assertNotIn("accountName", stored)
+
+    def test_shared_name_without_a_domain_to_narrow_by_is_ambiguous(self):
+        # Two rows share the name and the expected one has no primary domain: the Details click could reach the
+        # wrong row, so nothing is read (live 2026-10-07: "A2A" returned 4 rows).
+        rows = [{"id": "c" * 24, "accountUuid": "d" * 32},
+                {"id": self.ID, "accountUuid": self.UUID, "lastScanStatusEnum": "COMPLETED"}]
+        self.assertEqual(self._run_with_rows(rows), "scan_status_tenant_ambiguous")
+        self.assertFalse(self.status_path.exists())
 
     def test_name_match_with_a_different_id_is_not_accepted(self):
         rows = [{"id": "c" * 24, "accountUuid": self.UUID, "accountName": "Sample Surface Co"}]

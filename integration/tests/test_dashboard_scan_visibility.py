@@ -144,5 +144,19 @@ class StageFromLeonardoStatusTests(unittest.TestCase):
         self.assertEqual(self.stage(None)["stage"], "Account Scanning")
 
 
+class ScanCheckPartialTests(unittest.TestCase):
+    def test_executions_failure_after_a_saved_row_read_is_partial_not_failed(self):
+        # Live 2026-10-07 (CO-0767): row status COMPLETED saved; only the Duration Per Scan read failed.
+        line = dashboard._scan_check_line({"kind": "scan_status", "result": "scan_status_executions_unavailable",
+                                           "completed_on": "2026-10-07T12:11:00"})
+        self.assertIn("Last scan-status read: <b>partial</b>", line)
+        self.assertIn("the scan status was read and saved", line)
+        self.assertNotIn("var(--bad)", line)
+        failed = dashboard._scan_check_line({"kind": "scan_status", "result": "scan_status_tenant_ambiguous",
+                                             "completed_on": "2026-10-07T12:11:00"})
+        self.assertIn("<b>failed</b>", failed)
+        self.assertIn("could not be narrowed to one", failed)
+
+
 if __name__ == "__main__":
     unittest.main()

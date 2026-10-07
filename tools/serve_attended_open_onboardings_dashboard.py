@@ -924,7 +924,14 @@ SCAN_CHECK_TEXT = {
     "leonardo_session_expired": "the Leonardo session expired; sign in again in the automation browser",
     "playwright_runtime_unavailable": "the automation browser runtime is not available on this computer",
     "attended_ce_runner_unavailable": "the attended runner is not available on this computer",
+    "scan_status_tenant_ambiguous": "several tenants matched and they could not be narrowed to one; nothing was read",
+    "scan_status_executions_unavailable": ("the scan status was read and saved; the per-execution details (Duration Per "
+                                           "Scan) could not be opened"),
+    "scan_status_executions_id_mismatch": ("the scan status was read and saved; the per-execution details belonged to "
+                                           "another tenant and were ignored"),
 }
+# The row status was read and saved, only the optional executions read failed: "partial", not "failed".
+SCAN_CHECK_PARTIAL = frozenset({"scan_status_executions_unavailable", "scan_status_executions_id_mismatch"})
 
 
 def _read_age_text(moment: datetime, now: datetime) -> str:
@@ -966,9 +973,11 @@ def _scan_check_line(check: dict[str, str] | None) -> str:
         return ("<p class='note'>Last scan-status read: <b>started</b> · no result recorded yet (still running or it "
                 "ended without a result) · " + escape(when) + "</p>")
     ok = result == "scan_status_recorded"
+    partial = result in SCAN_CHECK_PARTIAL
     reason = SCAN_CHECK_TEXT.get(result, result)
-    style = "" if ok else " style='color:var(--bad)'"
-    return ("<p class='note'" + style + ">Last scan-status read: <b>" + ("ok" if ok else "failed") + "</b> · "
+    style = "" if ok else " style='color:var(--warn)'" if partial else " style='color:var(--bad)'"
+    word = "ok" if ok else "partial" if partial else "failed"
+    return ("<p class='note'" + style + ">Last scan-status read: <b>" + word + "</b> · "
             + escape(reason) + " · " + escape(when) + "</p>")
 
 
@@ -3218,13 +3227,17 @@ def _user_confirm_form(state: dict[str, object], reference: str) -> str:
 
 
 def _stage_tracker_html(state: dict[str, object], reference: str = "") -> str:
-    """Horizontal stepper (done / current / upcoming) with accessible text; no scripts or assets."""
+    """Horizontal stepper (done / current / upcoming) with accessible text; no scripts or assets.
+
+    ``index`` is the last stage with proof, so it is drawn as done (owner 2026-10-07: a reached stage that still
+    looked "current" read as not done); the stage after it is the current one.
+    """
     index = int(state["index"])  # type: ignore[call-overload]
     items = []
     for number, name in enumerate(ONBOARDING_STAGES):
-        if number < index or (number == index == len(ONBOARDING_STAGES) - 1 and index > 0):
+        if number <= index:
             cls, word, mark = "done", "done", "✓"
-        elif number == index:
+        elif number == index + 1:
             cls, word, mark = "current", "current stage", str(number + 1)
         else:
             cls, word, mark = "upcoming", "upcoming", str(number + 1)

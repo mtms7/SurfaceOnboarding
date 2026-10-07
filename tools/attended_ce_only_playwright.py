@@ -5444,19 +5444,18 @@ def _run_scan_status(reference: str, surface_only: bool = False) -> str:
     with sync_playwright() as playwright:
         try:
             with _attended_page(playwright) as page:
+                # _search_one_row leaves exactly the expected tenant in the table (narrowed by its own domain when
+                # other tenants share the name; live 2026-10-07: "A2A" returned 4 rows and the Details click below
+                # then could not reach the right row), so the executions read opens that tenant only.
                 tenant_name, match_row = tenant_names[0], None
                 for tenant_name in tenant_names:
-                    searched = _search_tenants(page, None, tenant_name)
-                    if searched is None:
+                    found, row = _search_one_row(page, tenant_name, readback["surface_account_id"], readback["account_uuid"])
+                    if found == "unavailable":
                         return "scan_status_schema_unavailable"
-                    matches = [row for row in searched.rows
-                               if row.get("id") == readback["surface_account_id"]
-                               and isinstance(row.get("accountUuid"), str)
-                               and row["accountUuid"].casefold() == readback["account_uuid"].casefold()]
-                    if len(matches) > 1:
-                        return "scan_status_tenant_not_found"
-                    if matches:
-                        match_row = matches[0]
+                    if found == "ambiguous":
+                        return "scan_status_tenant_ambiguous"
+                    if found == "ok":
+                        match_row = row
                         break
                 if match_row is None:
                     return "scan_status_tenant_not_found"
