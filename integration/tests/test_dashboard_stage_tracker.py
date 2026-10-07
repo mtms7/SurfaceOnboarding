@@ -207,24 +207,38 @@ class StepperRenderTests(unittest.TestCase):
     def test_ahead_of_salesforce_is_highlighted(self):
         html = dashboard._stage_tracker_html(self.state(2, sf=1, ahead=True))
         self.assertIn("Salesforce still shows: Request Approved", html)
-        self.assertIn("nothing is written to Salesforce", html)
+        # 2026-10-07 layout: one note line, only the chip; the page footer says nothing is written to Salesforce.
+        self.assertNotIn("nothing is written to Salesforce", html)
         self.assertNotIn("still shows", dashboard._stage_tracker_html(self.state(1, sf=1)))
+        self.assertNotIn("matches", dashboard._stage_tracker_html(self.state(1, sf=1)))
+        self.assertNotIn("not populated", dashboard._stage_tracker_html(self.state(1, sf=None)))
 
-    def test_missing_part_is_named(self):
+    def test_tracker_no_longer_carries_the_user_evidence_or_the_confirm_form(self):
+        # Moved to the "What to do now" card (2026-10-07); the tracker is only the stepper plus the ahead chip.
         proof = user_created_proof(False, False, None)
         html = dashboard._stage_tracker_html(self.state(3, user_proof=proof), "CO-0702")
-        self.assertIn("Primary user not verified", html)
-        self.assertIn("run Validate", html)
-        self.assertIn("No operator assigned", html)
-        self.assertIn("action='/attended/confirm-user-created'", html)
-        self.assertIn("Confirm user created", html)
+        for text in ("Primary user not verified", "No operator assigned", "<form", "Confirm user created"):
+            self.assertNotIn(text, html)
+
+    def test_missing_part_is_named(self):
+        # The same evidence text and Confirm form, now rendered by the do-now card helpers.
+        proof = user_created_proof(False, False, None)
+        state = self.state(3, user_proof=proof)
+        text = dashboard._user_evidence_text(state)
+        self.assertIn("Primary user not verified", text)
+        self.assertIn("run Validate", text)
+        self.assertIn("No operator assigned", text)
+        form = dashboard._user_confirm_form(state, "CO-0702")
+        self.assertIn("action='/attended/confirm-user-created'", form)
+        self.assertIn("Confirm user created", form)
 
     def test_manual_proof_shows_date_and_undo(self):
         proof = user_created_proof(None, False, {"confirmed": True, "confirmed_on": "2026-10-06"})
-        html = dashboard._stage_tracker_html(self.state(4, user_proof=proof), "CO-0702")
-        self.assertIn("Confirmed manually on 2026-10-06", html)
-        self.assertIn("action='/attended/unconfirm-user-created'", html)
-        self.assertNotIn("Confirm user created", html)
+        state = self.state(4, user_proof=proof)
+        self.assertIn("Confirmed manually on 2026-10-06", dashboard._user_evidence_text(state))
+        form = dashboard._user_confirm_form(state, "CO-0702")
+        self.assertIn("action='/attended/unconfirm-user-created'", form)
+        self.assertNotIn("Confirm user created", form)
 
 
 def _validation(matches, checked_on):
@@ -248,13 +262,15 @@ class DetailPageTrackerTests(unittest.TestCase):
                 patch.object(dashboard, "attended_validations", return_value=validation or {}), \
                 patch.object(dashboard, "load_user_created_confirmations", return_value=confirmations or {}), \
                 patch.object(dashboard, "load_attended_reminders", return_value={}), \
+                patch.object(dashboard, "attended_spycloud_states", return_value={}), \
                 patch.object(dashboard, "_stage_tenant", return_value=(tenant, "dev" if tenant else "", "2026-10-06T08:00")), \
                 patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce")):
             return dashboard.page_detail("CO-0702", dict(self.ROW))
 
     def test_tracker_is_first_and_forms_are_unchanged(self):
         page = self.render({})
-        self.assertLess(page.index("class='tracker'"), page.index("<h1>CO-0702</h1>"))
+        # 2026-10-07 layout: the header comes first, then the tracker.
+        self.assertLess(page.index("<h1>CO-0702</h1>"), page.index("class='tracker'"))
         self.assertEqual(page.count("class='st current' aria-current='step'"), 1)
         self.assertIn("Request Approved<span class='sr'> — done</span>", page)
         self.assertIn("Account Scanning<span class='sr'> — current stage</span>", page)
@@ -265,7 +281,8 @@ class DetailPageTrackerTests(unittest.TestCase):
                   "license": {"start_date": "2026-10-01", "expiration_date": "2027-09-30"}}
         page = self.render({"CO-0702": dict(self.READBACK)}, {"CO-0702": {"execution_state": "done", "state": "scan_completed"}}, tenant,
                            validation=_validation(True, "2026-10-06"))
-        self.assertIn("Primary user verified in Leonardo", page)
+        # The evidence text is only shown while confirming; the key fact carries the proof type.
+        self.assertIn("<dt>User created</dt><dd>Yes · automatic</dd>", page)
         self.assertIn("User Created<span class='sr'> — done</span>", page)
         self.assertIn("Onboarding Completed<span class='sr'> — current stage</span>", page)
         self.assertIn("Salesforce still shows: Request Approved", page)

@@ -32,6 +32,7 @@ import subprocess
 import sys
 from threading import Lock, Thread
 from time import monotonic
+from types import SimpleNamespace
 import webbrowser
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -1510,14 +1511,17 @@ def page_id_writeback_confirmation(evaluation: IdWritebackEvaluation, nonce: str
 
 
 def _salesforce_ids_section(route: str | None, readback: dict[str, str] | None, row: dict[str, str | None],
-                            reference: str = "", extra: str = "") -> str:
-    """Folded Salesforce IDs panel (``extra``: the local readback block); a warning opens it."""
+                            reference: str = "", extra: str = "", force_open: bool = False) -> str:
+    """Folded Salesforce IDs panel (``extra``: the local readback block); a warning opens it.
+
+    ``force_open`` opens it at the User Created stage, where the next step is the production ID update.
+    """
     plan = salesforce_id_writeback_plan(route, readback, row)
     status = plan["status"]
 
     def folded(cls: str, icon: str, icon_style: str, title: str, body: str) -> str:
         return ("<details class='more" + (" " + cls if cls else "") + "'"
-                + (" open" if cls in ("source-warn", "source-blocked") else "") + " aria-labelledby='salesforce-ids-title'>"
+                + (" open" if cls in ("source-warn", "source-blocked") or force_open else "") + " aria-labelledby='salesforce-ids-title'>"
                 f"<summary><span class='readiness-icon' aria-hidden='true'{icon_style}>{icon}</span>"
                 f"<h2 id='salesforce-ids-title' class='sum-h'>Salesforce IDs · {escape(title)}</h2></summary>"
                 "<div class='body'>" + body + extra + "</div></details>")
@@ -2351,19 +2355,32 @@ RENEWAL_BLOCKER_TEXT = {
 }
 
 
-def _renewal_plan_section(row: dict[str, str | None], today: date | None = None) -> str:
-    """Read-only renewal plan (Cases 4-6 and single-product renewals): a manual checklist, no action."""
+def _renewal_plan_data(row: dict[str, str | None], today: date | None = None) -> tuple[bool, dict[str, Any] | None]:
+    """(subscriptions_readable, plan) for a renewal CO; the plan is None when none can be built."""
+    if renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")) is None:
+        return True, None
+    try:
+        rows = renewal_subscription_rows(row.get("Account__c") or "", row.get("Name"))
+    except ReadUnavailable:
+        return False, None
+    return True, build_renewal_plan(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"), rows, today)
+
+
+def _renewal_plan_section(row: dict[str, str | None], today: date | None = None,
+                          data: tuple[bool, dict[str, Any] | None] | None = None) -> str:
+    """Read-only renewal plan (Cases 4-6 and single-product renewals): a manual checklist, no action.
+
+    ``data`` is the page's already computed ``_renewal_plan_data`` (so the page reads DealHub once).
+    """
     case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
     if case is None:
         return ""
     head = ("<section class='card' aria-labelledby='renewal-plan-title'><div class='card-head'>"
             "<h2 id='renewal-plan-title' class='pill'>Renewal plan · " + escape(case[1]) + "</h2>"
             "<span class='chip chip-neutral'>Plan only · applied by CLI</span></div>")
-    try:
-        rows = renewal_subscription_rows(row.get("Account__c") or "", row.get("Name"))
-    except ReadUnavailable:
+    readable, plan = data if data is not None else _renewal_plan_data(row, today)
+    if not readable:
         return head + "<p class='note'>The DealHub subscriptions could not be read. No plan is shown.</p></section>"
-    plan = build_renewal_plan(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"), rows, today)
     if plan is None:
         return ""
     has_id = bool((row.get("Surface_Account_ID__c") or "").strip() or (row.get("Account_UUID__c") or "").strip())
@@ -3197,7 +3214,8 @@ def _stage_state(reference: str, row: dict[str, str | None], readback: dict[str,
                                      tenant_created=tenant_created, scan_done=scan_done,
                                      user_created=proof["created"])  # type: ignore[arg-type]
     return {**result, "evidence": evidence, "user_proof": proof, "environment": environment, "captured_at": captured,
-            "tenant": tenant, "scan_done": scan_done, "tenant_created": tenant_created}
+            "tenant": tenant, "scan_done": scan_done, "tenant_created": tenant_created, "operator": operator,
+            "validation": validation, "scan": scan, "record": record}
 
 
 def _user_evidence_text(state: dict[str, object]) -> str:
@@ -3245,47 +3263,14 @@ def _stage_tracker_html(state: dict[str, object], reference: str = "") -> str:
                      "<span class='dot' aria-hidden='true'>" + mark + "</span><span class='lbl'>" + escape(name)
                      + "<span class='sr'> — " + word + "</span></span></li>")
     sf_index = state.get("salesforce_index")
-    if state.get("ahead"):
-        sf_note = ("<span class='chip chip-warn'>Salesforce still shows: " + escape(ONBOARDING_STAGES[int(sf_index)])  # type: ignore[call-overload]
-                   + "</span> <span class='note'>The tracker is derived on this dashboard; nothing is written to Salesforce.</span>")
-    elif sf_index is None:
-        sf_note = "<span class='note'>Salesforce stage: not populated or not recognized.</span>"
-    else:
-        sf_note = "<span class='note'>Salesforce stage: " + escape(ONBOARDING_STAGES[int(sf_index)]) + " (matches).</span>"  # type: ignore[call-overload]
+    # Owner 2026-10-07: one note line, only when the derived stage is ahead of Salesforce. The user-evidence text
+    # and the Confirm user created form moved to the "What to do now" card.
+    note = ""
+    if state.get("ahead") and sf_index is not None:
+        note = ("<p class='tracker-note'><span class='chip chip-warn'>Salesforce still shows: "
+                + escape(ONBOARDING_STAGES[int(sf_index)]) + "</span></p>")  # type: ignore[call-overload]
     return ("<nav class='tracker' aria-label='Onboarding stage'><ol class='stages'>" + "".join(items) + "</ol>"
-            "<p class='tracker-note'>" + sf_note + "</p>"
-            "<p class='tracker-note note'>" + escape(_STAGE_HINT[index]) + " " + escape(_user_evidence_text(state)) + "</p>"
-            + (_user_confirm_form(state, reference) if reference else "") + "</nav>")
-
-
-def _detail_summary(row: dict[str, str | None], extra: tuple[tuple[str, str], ...] = ()) -> str:
-    """One line of key CO facts under the header (the full record is folded below)."""
-    product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
-    items = (
-        ("Product", _PRODUCT_SHORT.get(product or "", product or "—") + " · "
-         + _TYPE_SHORT.get(onboarding_type or "", onboarding_type or "—")),
-        ("Salesforce", (row.get("Onboarding_Approval_Status__c") or "Approval not populated") + " · "
-         + (row.get("Onboarding_Stage__c") or "Stage not populated")),
-        ("Main domain", row.get("Main_Domain__c") or "Not populated"),
-        ("Alternate domains", _domain_count(row.get("Alternate_Domains__c"))),
-        ("Email domains", _domain_count(row.get("Email_Domains__c"))),
-    )
-    return "<div class='summary'>" + "".join(
-        "<span>" + escape(label) + "<b>" + escape(value) + "</b></span>" for label, value in items + extra) + "</div>"
-
-
-def _stage_facts(state: dict[str, object], readback: dict[str, str] | None,
-                 row: dict[str, str | None]) -> tuple[tuple[str, str], ...]:
-    """Licence dates and a short tenant id for the key-facts line (from local evidence only)."""
-    facts: list[tuple[str, str]] = []
-    tenant = state.get("tenant")
-    lic = tenant.get("license") if isinstance(tenant, dict) else None
-    if isinstance(lic, dict) and (lic.get("start_date") or lic.get("expiration_date")):
-        facts.append(("Licence", _inventory_date(lic.get("start_date")) + " → " + _inventory_date(lic.get("expiration_date"))))
-    tenant_id = (readback or {}).get("surface_account_id") or (row.get("Surface_Account_ID__c") or "").strip()
-    if tenant_id:
-        facts.append(("Tenant id", tenant_id[:8] + "…"))
-    return tuple(facts)
+            + note + "</nav>")
 
 
 _DOMAIN_NOTE_TEXT = {
@@ -3318,19 +3303,21 @@ PAGE_CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; f
             "frame-ancestors 'none'")
 
 
-def _domains_card(row: dict[str, str | None]) -> str:
-    """Read-only 'Domains for the tenant' card: exactly what the tenant form will receive.
-
-    Built from the Salesforce row already loaded (no extra read). Cleanups are
-    shown with the clean value to paste back into Salesforce; rejected entries
-    block the run until Salesforce is corrected. Nothing is written anywhere.
-    """
-    info = format_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
-    chip = "<span class='chip chip-ok'>Ready</span>" if info["result"] == "ok" else "<span class='chip chip-bad'>Blocked</span>"
+def _domain_lists(info: dict[str, object]) -> str:
+    """The domain lists exactly as the tenant form will receive them (read-only)."""
     shown = (("Main domain", info["main"] or "Not valid"),
              ("Alternate Domains", info["alternate_domains"] or "None"),
              ("SubDomains", info["subdomains"] or "None"))
-    body = "<dl>" + "".join("<dt>" + escape(label) + "</dt><dd>" + escape(value) + "</dd>" for label, value in shown) + "</dl>"
+    return "<dl>" + "".join("<dt>" + escape(label) + "</dt><dd>" + escape(str(value)) + "</dd>" for label, value in shown) + "</dl>"
+
+
+def _domains_banners(info: dict[str, object]) -> tuple[str, str]:
+    """(banners, script tag) of the domains preview: main-domain error, rejected entries, cleaned value with Copy.
+
+    The CO page shows these outside any fold (a blocker must never be hidden); the Copy button needs the one
+    served script, whose tag is returned separately.
+    """
+    body = ""
     if info["main_error"]:
         body += ("<div class='banner banner-bad'><b>Main_Domain__c is not a single registrable domain.</b> Nothing can run "
                  "until it is corrected in Salesforce.</div>")
@@ -3349,17 +3336,31 @@ def _domains_card(row: dict[str, str | None]) -> str:
                      "<button type='button' id='copy-domains' class='ghost'>Copy</button>")
             script = "<script src='" + COPY_SCRIPT_PATH + "'></script>"
         body += "</div>"
+    return body, script
+
+
+def _domains_card(row: dict[str, str | None]) -> str:
+    """Read-only 'Domains for the tenant' card: exactly what the tenant form will receive.
+
+    Built from the Salesforce row already loaded (no extra read). Cleanups are
+    shown with the clean value to paste back into Salesforce; rejected entries
+    block the run until Salesforce is corrected. Nothing is written anywhere.
+    """
+    info = format_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
+    chip = "<span class='chip chip-ok'>Ready</span>" if info["result"] == "ok" else "<span class='chip chip-bad'>Blocked</span>"
+    body, script = _domains_banners(info)
     return ("<section class='card' aria-labelledby='domains-title'><div class='card-head'><h2 id='domains-title' class='pill'>"
-            "Domains for the tenant</h2>" + chip + "</div>" + body
+            "Domains for the tenant</h2>" + chip + "</div>" + _domain_lists(info) + body
             + "<p class='note'>Read-only preview from Salesforce; nothing is written back.</p>" + script + "</section>")
 
 
 def page_detail(reference: str, row: dict[str, str | None], notification: str = "", commercial_readiness: dict[str, object] | None = None) -> str:
-    """CO detail: header + summary, one next-step card, tenant health, then folded records.
+    """CO detail (owner-approved layout 2026-10-07), top to bottom: header, stage tracker, pinned banners (never
+    inside a fold), ONE "What to do now" card, at most 10 key facts, then folds (Tenant checks, Salesforce record,
+    Run history, Diagnostics) and one footer line.
 
-    Renewal COs (owner decision 2026-10-04) have no primary action: the renewal
-    plan leads, and the production sign-in and Leonardo Development manual
-    actions are folded away as ghost buttons.
+    Renewal COs (owner decision 2026-10-04) have no primary action: the card shows the next CLI step as text, and
+    the production sign-in and Leonardo Development manual actions live in Diagnostics.
     """
     rows = "".join(f"<dt>{escape(label)}</dt><dd>{escape(row.get(field) or 'Not populated')}</dd>" for label, field in DETAIL_DISPLAY_FIELDS)
     comment_validation = extract_dealhub_dates(row.get("Onboarding_Comments__c"))
@@ -3427,160 +3428,610 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                 "<button type='button' disabled aria-disabled='true'>Evaluation unavailable</button></section>"
             )
     source_ready = source_ready_to_onboard(row)
+    approval = row.get("Onboarding_Approval_Status__c")
     commercial_ready = bool(commercial_readiness and commercial_readiness.get("commercial_ready"))
     commercial_manual_review = bool(commercial_readiness and commercial_readiness.get("manual_review_required"))
-    if source_ready:
-        comment_summary = (
-            "The onboarding-comment subscription period is also validated."
-            if comment_validation["ready_for_cse_review"]
-            else "The onboarding-comment subscription period needs separate review before execution."
-        )
-        ce_automated = not is_case4 and ce_only_eligible(row) and not is_renewal
-        # Surface-only (Case 1): exact Product "Surface" + Type "New Product
-        # Onboarding" only; every other CO keeps its existing behaviour.
-        surface_automated = not is_case4 and not is_renewal and route_for(row) in SURFACE_ROUTES
-        # The "not enabled" explanation only applies to routes without an
-        # automated onboarding; it is contradictory on a CE-only/Surface CO.
-        not_enabled = ("" if ce_automated or surface_automated else
-                       "<details><summary>Why Leonardo creation is not enabled yet</summary><ul>"
-                       "<li>Approved route mapping and scope-threshold evaluation</li>"
-                       "<li>Leonardo Development authentication, authority, and duplicate checks</li>"
-                       "<li>Idempotency binding, named human approval, and read-after-write plan</li>"
-                       "</ul></details>")
-        readiness = (
-            "<section class='readiness source-ready' aria-labelledby='readiness-title'><div class='readiness-heading'>"
-            "<span class='readiness-icon' aria-hidden='true'>✓</span><div><h2 id='readiness-title'>Source ready to onboard</h2>"
-            "<p>Salesforce approval is validated. " + comment_summary + "</p></div></div>"
-            + not_enabled + "</section>"
-        )
-        # The automated cards carry this sentence themselves (no separate readiness card).
-        lede = ("Salesforce approval is validated. " + (comment_summary if comment_validation["ready_for_cse_review"]
-                                                         else "<b>" + comment_summary + "</b>"))
-        if is_case4:
-            manual_action = (
-                "<section class='manual-action' aria-labelledby='case4-route-title'><div><h2 id='case4-route-title'>Case 4 Leonardo workflow</h2>"
-                "<p>Source is ready to onboard, but the Case 4 route remains unmapped and cannot start Leonardo onboarding.</p></div>"
-                "<button type='button' disabled aria-disabled='true'>Case 4 route blocked</button>"
-                "<p class='manual-blocker'>Blocked independently from Salesforce source readiness: owner-approved Case 4 mapping is required.</p></section>"
-            )
-        elif (ce_automated or surface_automated) and salesforce_id_already_present(route_for(row), row) \
-                and reference not in attended_leonardo_readbacks():
-            manual_action = _SALESFORCE_ID_PRESENT_SECTION
-        elif ce_automated:
-            readiness = ""
-            manual_action = _ce_only_onboard_section(reference, lede=lede)
-        elif surface_automated:
-            readiness = ""
-            manual_action = _surface_onboard_section(reference, route_for(row) or SURFACE_ENGINE, lede=lede)
-        else:
-            nonce = manual_start_ack_nonce(reference, row)
-            # One primary action: the session check until it is recorded, then the manual start.
-            # A renewal has no primary action at all.
-            check_class = " class='ghost'" if is_renewal or nonce is not None else ""
-            session_check = (
-                "<section class='login-preflight' aria-labelledby='login-preflight-title'><div><h2 id='login-preflight-title'>Leonardo Development session check</h2>"
-                "<p>Open the exact Development tenant-management route. Your browser will show tenant management when the current session is active or redirect to SSO/MFA when it is not.</p>"
-                "<p class='login-safety'>This dashboard cannot inspect VPN state, credentials, cookies, or browser state. The resulting browser page is the attended authentication signal; it does not clear any authority, duplicate, mapping, or execution gate.</p></div>"
-                "<form method='post' action='/attended/leonardo-session-check'><input type='hidden' name='reference' value='" + escape(reference) + "'><button" + check_class + " type='submit'>Check Leonardo Development session</button></form></section>"
-            )
-            if nonce is None:
-                manual_action = (
-                    "<section class='manual-action' aria-labelledby='manual-action-title'><div><h2 id='manual-action-title'>Manual Leonardo onboarding</h2>"
-                    "<p>Available after a fresh attended Leonardo Development session check for this exact source revision.</p></div>"
-                    "<button type='button' disabled aria-disabled='true' title='Run the attended session check first'>Start manual onboarding</button>"
-                    "<p class='manual-blocker'>Blocked: session check, explicit admin-session attestation, and the remaining manual gates are required.</p></section>"
-                )
-            else:
-                manual_action = (
-                    "<section class='manual-action manual-ready' aria-labelledby='manual-action-title'><div><h2 id='manual-action-title'>Manual Leonardo onboarding</h2>"
-                    "<p>A fresh session check is recorded for this source revision. Attest that your Leonardo Development admin session remains active to open tenant management and begin the attended workflow.</p></div>"
-                    "<form method='post' action='/attended/start-manual-onboarding'><input type='hidden' name='reference' value='" + escape(reference) + "'><input type='hidden' name='nonce' value='" + escape(nonce) + "'>"
-                    "<label><input type='checkbox' name='admin_session_active' value='1' required> I attest that my Leonardo Development admin session is active.</label>"
-                    "<button" + (" class='ghost'" if is_renewal else "") + " type='submit'>Start manual onboarding</button></form>"
-                    "<p class='manual-blocker'>This opens tenant management only. It does not fill, submit, create, or authorize a tenant.</p></section>"
-                )
-            manual_action = session_check + manual_action
-    elif commercial_ready:
-        review_suffix = " — manual review required" if commercial_manual_review else ""
-        review_message = (
-            "A comment already exists and will not be overwritten automatically. Review it before any approval decision."
-            if commercial_manual_review else
-            "A current-month or earlier Surface commercial term was found. Salesforce remains Pending until an operator reviews and approves the proposed subscription dates."
-        )
-        readiness = (
-            "<section class='readiness source-ready' aria-labelledby='readiness-title'><div class='readiness-heading'>"
-            "<span class='readiness-icon' aria-hidden='true'>✓</span><div><h2 id='readiness-title'>Source ready to onboard" + review_suffix + "</h2>"
-            "<p>Commercial source validation passed. " + escape(review_message) + "</p>"
-            "<p class='login-safety'>Validated transiently: one eligible Surface baseline and explicitly named subdomain add-ons. "
-            "This is not a Salesforce approval, a Leonardo authorization, or a write.</p></div></div></section>"
-        )
-        manual_action = (
-            "<section class='manual-action'><div><h2>Approval decision pending</h2>"
-            "<p>Review the proposed DealHub dates before changing Onboarding Comments, Stage, or Approval Status.</p></div>"
-            "<button type='button' disabled aria-disabled='true'>Awaiting approval</button></section>"
-        )
-    else:
-        commercial_reason = ""
-        if commercial_readiness is not None:
-            commercial_reason = " The Product, term, Main Domain, or comments need manual review."
-        readiness = (
-            "<section class='readiness source-blocked' aria-labelledby='readiness-title'><div class='readiness-heading'>"
-            "<span class='readiness-icon' aria-hidden='true'>!</span><div><h2 id='readiness-title'>Source requirements need review</h2>"
-            "<p>Salesforce onboarding approval is required before this CO is source ready." + escape(commercial_reason) + "</p></div></div></section>"
-        )
-        manual_action = ""
+    route = route_for(row)
+    case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+    # Automated routes only: exact Product + Type; a renewal and Case 4 never start from this page.
+    ce_automated = not is_case4 and ce_only_eligible(row) and not is_renewal
+    surface_automated = not is_case4 and not is_renewal and route in SURFACE_ROUTES
     readback = attended_leonardo_readbacks().get(reference)
-    readback_html = ""
-    if readback is not None:
-        readback_html = ("<div class='sub-block' aria-labelledby='leonardo-readback-title'>"
-                         "<h3 id='leonardo-readback-title' class='sub-h'>Leonardo Development readback"
-                         + (" " + DEV_MIRROR_CHIP if readback["surface_account_id"] in dev_mirror_ids() else "") + "</h3>"
-                         "<p class='note'>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
-                         f"<dt>Environment</dt><dd><span class='chip chip-info'>{escape(ID_ENVIRONMENT_LABEL)}</span> Leonardo Development</dd>"
-                         f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
-                         f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></div>")
-    ids_html = _salesforce_ids_section(route_for(row), readback, row, reference, readback_html)
-    health = ""
-    if readback is not None:
-        tiles = _validation_section(reference, notification, mirror=readback["surface_account_id"] in dev_mirror_ids())
-        if route_for(row) != CE_ENGINE:
-            tiles += _scan_status_section(reference, notification)
-        if route_for(row) in (CE_ENGINE, CASE3_ENGINE):
-            tiles += _spycloud_section(reference, notification)
-        health = ("<details class='more'" + (" open" if notification else "") + "><summary><h2 class='sum-h'>Tenant checks</h2>"
-                  "<span class='note'>Validation · scan status" + (" · SpyCloud" if route_for(row) in (CE_ENGINE, CASE3_ENGINE) else "")
-                  + "</span></summary><div class='body'><div class='health'>" + tiles + "</div></div></details>")
-    notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
+    # The stage is computed once and reused by every part of the page.
+    stage_state = _stage_state(reference, row, readback)
+    index = int(stage_state["index"])  # type: ignore[call-overload]
+    mirror = readback is not None and readback["surface_account_id"] in dev_mirror_ids()
+    sf_id_blocked = (source_ready and (ce_automated or surface_automated) and salesforce_id_already_present(route, row)
+                     and readback is None)
+    parts: dict[str, Any] | None = None
+    if source_ready and (ce_automated or surface_automated) and not sf_id_blocked:
+        parts = _ce_only_onboard_parts(reference) if ce_automated else _surface_onboard_parts(reference, route or SURFACE_ENGINE)
+    # Diagnostics: the manual start / session check (routes without an automated onboarding), the renewal
+    # production sign-in preflight, the one-off CO-0741 / CO-0745 repair actions and the Case 4 route button.
+    manual_action = ""
+    if source_ready and is_case4:
+        manual_action = (
+            "<section class='manual-action' aria-labelledby='case4-route-title'><div><h2 id='case4-route-title'>Case 4 Leonardo workflow</h2>"
+            "<p>Source is ready to onboard, but the Case 4 route remains unmapped and cannot start Leonardo onboarding.</p></div>"
+            "<button type='button' disabled aria-disabled='true'>Case 4 route blocked</button>"
+            "<p class='manual-blocker'>Blocked independently from Salesforce source readiness: owner-approved Case 4 mapping is required.</p></section>"
+        )
+    elif source_ready and not (ce_automated or surface_automated):
+        nonce = manual_start_ack_nonce(reference, row)
+        # One primary action: the session check until it is recorded, then the manual start.
+        # A renewal has no primary action at all.
+        check_class = " class='ghost'" if is_renewal or nonce is not None else ""
+        session_check = (
+            "<section class='login-preflight' aria-labelledby='login-preflight-title'><div><h2 id='login-preflight-title'>Leonardo Development session check</h2>"
+            "<p>Open the exact Development tenant-management route. Your browser will show tenant management when the current session is active or redirect to SSO/MFA when it is not.</p>"
+            "<p class='login-safety'>This dashboard cannot inspect VPN state, credentials, cookies, or browser state. The resulting browser page is the attended authentication signal; it does not clear any authority, duplicate, mapping, or execution gate.</p></div>"
+            "<form method='post' action='/attended/leonardo-session-check'><input type='hidden' name='reference' value='" + escape(reference) + "'><button" + check_class + " type='submit'>Check Leonardo Development session</button></form></section>"
+        )
+        if nonce is None:
+            manual_action = (
+                "<section class='manual-action' aria-labelledby='manual-action-title'><div><h2 id='manual-action-title'>Manual Leonardo onboarding</h2>"
+                "<p>Available after a fresh attended Leonardo Development session check for this exact source revision.</p></div>"
+                "<button type='button' disabled aria-disabled='true' title='Run the attended session check first'>Start manual onboarding</button>"
+                "<p class='manual-blocker'>Blocked: session check, explicit admin-session attestation, and the remaining manual gates are required.</p></section>"
+            )
+        else:
+            manual_action = (
+                "<section class='manual-action manual-ready' aria-labelledby='manual-action-title'><div><h2 id='manual-action-title'>Manual Leonardo onboarding</h2>"
+                "<p>A fresh session check is recorded for this source revision. Attest that your Leonardo Development admin session remains active to open tenant management and begin the attended workflow.</p></div>"
+                "<form method='post' action='/attended/start-manual-onboarding'><input type='hidden' name='reference' value='" + escape(reference) + "'><input type='hidden' name='nonce' value='" + escape(nonce) + "'>"
+                "<label><input type='checkbox' name='admin_session_active' value='1' required> I attest that my Leonardo Development admin session is active.</label>"
+                "<button" + (" class='ghost'" if is_renewal else "") + " type='submit'>Start manual onboarding</button></form>"
+                "<p class='manual-blocker'>This opens tenant management only. It does not fill, submit, create, or authorize a tenant.</p></section>"
+            )
+        manual_action = session_check + manual_action
+    plan_data = _renewal_plan_data(row) if is_renewal else (True, None)
+    outcome = attended_renewal_outcomes().get(reference) if is_renewal else None
+    domain_info = (format_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
+                   if route in SURFACE_ROUTES or (case or (None,))[0] in RENEWAL_ENGINES else None)
+    try:
+        validation_all = attended_validations()
+    except Exception:  # noqa: BLE001 - local evidence only; absence means none
+        validation_all = {}
+    scan_obs = stage_state.get("scan") if isinstance(stage_state.get("scan"), dict) else None
+    spycloud = attended_spycloud_states().get(reference) if readback is not None and route in (CE_ENGINE, CASE3_ENGINE) else None
+    tenant_id = (readback or {}).get("surface_account_id") or (row.get("Surface_Account_ID__c") or "").strip()
+    ctx = SimpleNamespace(
+        reference=reference, row=row, route=route, case=case, approval=approval, source_ready=source_ready,
+        commercial_ready=commercial_ready, commercial_manual_review=commercial_manual_review,
+        comment_ready=bool(comment_validation["ready_for_cse_review"]), is_renewal=is_renewal, is_case4=is_case4,
+        ce_automated=ce_automated, surface_automated=surface_automated, readback=readback, stage_state=stage_state,
+        index=index, mirror=mirror, sf_id_blocked=sf_id_blocked, parts=parts, plan_data=plan_data, outcome=outcome,
+        domain_info=domain_info, validation=validation_all.get(reference), scan=scan_obs, spycloud=spycloud,
+        tenant_id=tenant_id, notification=notification)
     toast = ""
+    notifications = {"verified": ("Update verified", "CO-0741 was refreshed from Salesforce. Comments, Stage, and Approval Status are verified."), "blocked": ("Update blocked", "No verified update was completed. Reconcile the current Salesforce value before a new evaluation.")}
     if notification.startswith("id-write:") and notification[9:] in ID_WRITEBACK_RESULTS:
         kind, text = ID_WRITEBACK_RESULTS[notification[9:]]
         notifications[notification] = ("Salesforce ID written" if kind == "verified" else "Salesforce ID not written", text + ".")
     if notification in notifications:
         title, message = notifications[notification]
         toast = "<section class='toast' role='status' aria-live='polite'><strong>" + escape(title) + "</strong><span>" + escape(message) + "</span></section>"
-    if is_renewal:
-        # Owner decision 2026-10-04: no primary action on a renewal CO.
-        folded = renewal_preflight + comment_repair_action + renewal_comment_evaluation_action + manual_action
-        next_step = (case4_panel + _renewal_plan_section(row) + _renewal_outcome_section(reference)
-                     + "<p class='lede renewal-note'>" + escape(RENEWAL_MANUAL_NOTE) + "</p>" + readiness
-                     + ("<details class='more'><summary><h2 class='sum-h'>Sign-in and manual onboarding</h2>"
-                        "<span class='note'>Production sign-in · Leonardo Development session check</span></summary>"
-                        "<div class='body'>" + folded + "</div></details>" if folded else ""))
-    else:
-        next_step = (case4_panel + comment_repair_action + renewal_comment_evaluation_action
-                     + renewal_preflight + readiness + manual_action)
-    record = ("<details class='more'><summary><h2 class='sum-h'>Salesforce record</h2><span class='note'>"
-              + str(len(DETAIL_DISPLAY_FIELDS)) + " fields</span></summary><div class='body'><dl>" + rows + "</dl></div></details>")
+    pinned = _pinned_banners(ctx, case4_panel, commercial_readiness)
+    # Tenant checks fold: validation, scan status, SpyCloud and the local readback (no Environment rows).
+    health = ""
+    if readback is not None:
+        tiles = _validation_section(reference, notification, mirror=mirror)
+        if route != CE_ENGINE:
+            tiles += _scan_status_section(reference, notification)
+        if route in (CE_ENGINE, CASE3_ENGINE):
+            tiles += _spycloud_section(reference, notification)
+        readback_html = ("<div class='sub-block' aria-labelledby='leonardo-readback-title'>"
+                         "<h3 id='leonardo-readback-title' class='sub-h'>Leonardo Development readback"
+                         + (" " + DEV_MIRROR_CHIP if mirror else "") + "</h3>"
+                         "<p class='note'>Local operator evidence only; Salesforce remains unchanged.</p><dl>"
+                         f"<dt>Leonardo state</dt><dd>{escape(readback['leonardo_state'])}</dd>"
+                         f"<dt>Observed</dt><dd>{escape(readback['observed_on'])}</dd></dl></div>")
+        health = _fold("Tenant checks", "Validation · scan status" + (" · SpyCloud" if route in (CE_ENGINE, CASE3_ENGINE) else ""),
+                       "<div class='health'>" + tiles + "</div>" + readback_html,
+                       open_=bool(notification) or _tenant_checks_need_attention(ctx))
+    ids_html = _salesforce_ids_section(route, readback, row, reference, "", force_open=index == 4)
+    ids_open = "' open " in ids_html[:160]
+    domain_lists = ""
+    if domain_info is not None:
+        domain_lists = "<h3 class='sub-h'>Domains for the tenant</h3>" + _domain_lists(domain_info)
+    record_fold = _fold("Salesforce record", str(len(DETAIL_DISPLAY_FIELDS)) + " fields · domains · Salesforce IDs",
+                        "<dl>" + rows + "</dl>" + domain_lists + ids_html, open_=ids_open)
+    history_html = _run_history_html(ctx)
+    history = _fold("Run history", "Outcomes · licence entered · plan · scope", history_html) if history_html else ""
+    diagnostics_html = renewal_preflight + comment_repair_action + renewal_comment_evaluation_action + manual_action
+    if parts is not None:
+        diagnostics_html += ("" if parts["state"] != "duplicate" else str(parts["reset"])) + str(parts["meta"])
+    diagnostics = (_fold("Diagnostics", "Manual start · sign-in preflight · repair actions · source revision", diagnostics_html)
+                   if diagnostics_html else "")
     account = row.get("Account_Name__c")
-    stage_state = _stage_state(reference, row, readback)
-    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + _stage_tracker_html(stage_state, reference)
-                 + "<div class='page-head'><h1>" + escape(reference) + "</h1>"
-                 + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + _route_chip(row)
-                 + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
-                 "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
-                 "<button class='ghost' type='submit'>Refresh</button></form></div></div>"
-                 + _detail_summary(row, _stage_facts(stage_state, readback, row)) + (_domains_card(row) if route_for(row) in SURFACE_ROUTES or (renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")) or (None,))[0] in RENEWAL_ENGINES else "") + toast + next_step + health + ids_html + record)
+    approval_chip = ("<span class='chip chip-ok'>Approved</span>" if approval == "Approved"
+                     else "<span class='chip chip-warn'>" + escape(approval or "Approval not populated") + "</span>")
+    route_chip = ("<span class='chip chip-info'>" + escape(case[1]) + "</span>" if case is not None else _route_chip(row))
+    header = ("<div class='page-head'><h1>" + escape(reference) + "</h1>"
+              + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + route_chip + approval_chip
+              + ("<span class='chip chip-neutral' title='Tenant id (first 8 characters)'>Tenant " + escape(tenant_id[:8]) + "…</span>"
+                 if tenant_id else "")
+              + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
+              "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
+              "<button class='ghost' type='submit'>Refresh</button></form></div></div>")
+    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + header + _stage_tracker_html(stage_state, reference)
+                 + toast + ("<div class='pinned' role='region' aria-label='Alerts'>" + pinned + "</div>" if pinned else "")
+                 + _do_now_card(ctx) + _key_facts_grid(_key_facts(ctx)) + health + record_fold + history + diagnostics
+                 + "<p class='footline'>" + escape(DETAIL_FOOTER_NOTE) + "</p>")
     return _app_shell(reference, main_html, active="onboardings")
+
+
+DETAIL_FOOTER_NOTE = ("Read-only view from Salesforce and local Leonardo Development evidence; nothing here writes to "
+                      "Salesforce except the explicit confirmation forms.")
+KEY_FACTS_MAX = 10
+_SCAN_ATTENTION_STATES = ("scan_failed", "unrecognized")
+RENEWAL_DOMAIN_GATE_CODES = frozenset({
+    "renewal_new_domain_in_production", "renewal_target_not_in_production_clone",
+    "renewal_target_ambiguous_in_production_clone", "production_clone_unavailable", "production_clone_incomplete"})
+RENEWAL_CLI_BLOCK_TEXT = {
+    "renewal_expiration_would_shorten": "The new expiration would shorten the current licence — manual review; nothing was saved.",
+    "renewal_domains_mismatch_manual_review": RENEWAL_RESULT_TEXT["renewal_domains_mismatch_manual_review"],
+    **{code: "Domain gate (Q3): the added domains did not pass the production duplicate gate; nothing was saved."
+       for code in RENEWAL_DOMAIN_GATE_CODES},
+}
+RENEWAL_ALREADY_TEXT = "Already renewed: the Dev tenant already shows the new term; nothing to change."
+_RENEWAL_OK_RESULTS = frozenset({"renewal_dry_run_planned", "renewal_edit_verified", "renewal_already_current"})
+
+
+def _post_button(action: str, reference: str, label: str, cls: str = "ghost sm") -> str:
+    return ("<form method='post' action='" + action + "'><input type='hidden' name='reference' value='" + escape(reference)
+            + "'><button type='submit' class='" + cls + "'>" + escape(label) + "</button></form>")
+
+
+def _step(label: str, done: bool, action: str = "") -> str:
+    """One line of a to-do list (``label`` is trusted HTML); the action is an existing guarded form."""
+    return ("<li" + (" class='done'" if done else "") + "><span class='chip " + ("chip-ok'>Done" if done else "chip-warn'>To do")
+            + "</span><span class='what'>" + label + "</span>" + action + "</li>")
+
+
+def _fold(title: str, summary: str, body: str, open_: bool = False) -> str:
+    return ("<details class='more'" + (" open" if open_ else "") + "><summary><h2 class='sum-h'>" + escape(title) + "</h2>"
+            "<span class='note'>" + escape(summary) + "</span></summary><div class='body'>" + body + "</div></details>")
+
+
+def _validation_counts(result: object) -> tuple[int, int, int]:
+    """(drift, unknown, warn) check counts of one stored validation result."""
+    checks = result.get("checks") if isinstance(result, dict) else None
+    if not isinstance(checks, list):
+        return 0, 0, 0
+    return tuple(sum(1 for c in checks if c.get("status") == status) for status in ("drift", "unknown", "warn"))  # type: ignore[return-value]
+
+
+def _tenant_checks_need_attention(ctx: SimpleNamespace) -> bool:
+    """A warn / blocked state inside "Tenant checks" opens the fold (a running scan is normal and does not)."""
+    drift, unknown, warned = (0, 0, 0) if ctx.mirror else _validation_counts(ctx.validation)
+    return bool(drift or unknown or warned
+                or (ctx.scan and ctx.scan.get("state") in _SCAN_ATTENTION_STATES)
+                or (ctx.spycloud and not ctx.spycloud.get("ok")))
+
+
+def _pinned_banners(ctx: SimpleNamespace, case4_panel: str, commercial_readiness: dict[str, object] | None) -> str:
+    """Banners that must never sit inside a fold; each appears only when it applies."""
+    reference, parts, banners = ctx.reference, ctx.parts, []
+    if not ctx.source_ready:
+        if ctx.commercial_ready:
+            banners.append("<div class='banner banner-warn'><b>Approval Status is " + escape(ctx.approval or "not populated")
+                           + ", not Approved.</b> Nothing can start until Salesforce shows Approved.</div>")
+        else:
+            reason = " The Product, term, Main Domain, or comments need manual review." if commercial_readiness is not None else ""
+            banners.append(
+                "<section class='readiness source-blocked' aria-labelledby='readiness-title'><div class='readiness-heading'>"
+                "<span class='readiness-icon' aria-hidden='true'>!</span><div><h2 id='readiness-title'>Source requirements need review</h2>"
+                "<p>Salesforce onboarding approval is required before this CO is source ready." + escape(reason)
+                + "</p></div></div></section>")
+    banners.append(case4_panel)
+    if ctx.sf_id_blocked:
+        banners.append(_SALESFORCE_ID_PRESENT_SECTION)
+    if parts is not None or ctx.sf_id_blocked:
+        banners.append(_production_marker_for(reference))
+    if parts is not None:
+        if parts["state"] == "unavailable":
+            banners.append(str(parts["unavailable"]))
+        if parts["state"] in ("duplicate", "uncertain"):
+            banners.append(str(parts["banner"]))
+        record = parts.get("record")
+        if (record is not None and not parts.get("same_revision") and parts["state"] not in ("onboarded", "running", "uncertain")):
+            banners.append("<div class='banner banner-warn'><b>The CO changed in Salesforce since the last attended run</b> (result <code>"
+                           + escape(record.get("result", "none recorded")) + "</code>). A new Start re-reads it; the scope is reviewed again.</div>")
+    if ctx.domain_info is not None:
+        domain_banners, script = _domains_banners(ctx.domain_info)
+        banners.append(domain_banners + script)
+    last = salesforce_id_writebacks().get(reference)
+    if last is not None and last.get("result") == "write_uncertain":
+        banners.append("<div class='banner banner-warn'><b>Salesforce ID write-back uncertain.</b> "
+                       + escape(ID_WRITEBACK_RESULTS["write_uncertain"][1]) + ".</div>")
+    drift = 0 if ctx.mirror else _validation_counts(ctx.validation)[0]
+    if drift:
+        banners.append("<div class='banner banner-bad'><b>Validation found " + str(drift) + " difference(s)</b> between the tenant and "
+                       "the onboarding plan. See Tenant checks below.</div>")
+    if ctx.scan and ctx.scan.get("state") in _SCAN_ATTENTION_STATES:
+        _cls, title, message = SCAN_STATES[str(ctx.scan["state"])]
+        banners.append("<div class='banner banner-bad'><b>" + escape(title) + ".</b> " + escape(message) + "</div>")
+    if ctx.spycloud and not ctx.spycloud.get("ok"):
+        banners.append("<div class='banner banner-warn'><b>SpyCloud is still ON.</b> The owner requires it OFF on Credential "
+                       "Exposure tenants: run <code>--co " + escape(reference) + " --spycloud-off --confirm-write</code>.</div>")
+    if ctx.outcome and ctx.outcome["leonardo_write"] == "attempted_unverified":
+        banners.append("<div class='banner banner-warn'><b>The last renewal save is unverified.</b> A write was attempted but "
+                       "not confirmed by the read-back. Check the tenant in Leonardo Development before any retry.</div>")
+    return "".join(banners)
+
+
+def _renewal_blockers(ctx: SimpleNamespace) -> list[str]:
+    """Plain-text blockers of a renewal CO: plan blockers plus the last --renew refusal (Q3 gate, domains, shorten)."""
+    readable, plan = ctx.plan_data
+    blockers: list[str] = []
+    if not readable:
+        blockers.append("The DealHub subscriptions could not be read; no plan can be built.")
+    elif plan is None:
+        blockers.append("No renewal plan could be built from DealHub.")
+    else:
+        blockers += [RENEWAL_BLOCKER_TEXT.get(code, code) for code in plan["blockers"]]
+    result = str(ctx.outcome["result"]) if ctx.outcome else ""
+    if result in RENEWAL_CLI_BLOCK_TEXT:
+        blockers.append(RENEWAL_CLI_BLOCK_TEXT[result])
+    elif result == "renewal_already_current":
+        blockers.append(RENEWAL_ALREADY_TEXT)
+    elif result and result not in _RENEWAL_OK_RESULTS:
+        blockers.append("The last --renew run stopped with " + result + ".")
+    return blockers
+
+
+def _renewal_term(ctx: SimpleNamespace) -> dict[str, Any] | None:
+    plan = ctx.plan_data[1]
+    return (plan["surface_term"] or plan["ce_term"]) if plan else None
+
+
+def _renewal_old_expiry(ctx: SimpleNamespace) -> str:
+    outcome = ctx.outcome
+    if outcome and outcome.get("old_expiration"):
+        return str(outcome["old_expiration"])
+    tenant = ctx.stage_state.get("tenant")
+    lic = tenant.get("license") if isinstance(tenant, dict) else None
+    return _inventory_date(lic.get("expiration_date")) if isinstance(lic, dict) and lic.get("expiration_date") else "—"
+
+
+def _renewal_gate_text(ctx: SimpleNamespace) -> str:
+    outcome = ctx.outcome
+    if outcome is None:
+        return "Not checked yet (the --renew dry run checks it)"
+    result = str(outcome["result"])
+    if result in RENEWAL_DOMAIN_GATE_CODES:
+        return "Blocked (" + result + ")"
+    added = outcome.get("added_domains")
+    if added:
+        return str(added) + " added domain(s); gate passed"
+    return "No added domains" if added == 0 else "Not recorded"
+
+
+def _renewal_domains_text(ctx: SimpleNamespace) -> str:
+    result = str(ctx.outcome["result"]) if ctx.outcome else ""
+    if result == "renewal_domains_mismatch_manual_review":
+        return "Mismatch — manual review"
+    return "Not checked yet" if not ctx.outcome else "Matches the tenant"
+
+
+def _renewal_do_now(ctx: SimpleNamespace) -> tuple[str, str, str]:
+    """(headline, body, chip) of a renewal: no button, the next CLI step as text (docs/38)."""
+    reference, outcome, blockers = ctx.reference, ctx.outcome, _renewal_blockers(ctx)
+    result = str(outcome["result"]) if outcome else ""
+    cli = "tools\\attended_ce_only_playwright.py --co " + reference
+    already = RENEWAL_ALREADY_TEXT in blockers
+    if [item for item in blockers if item != RENEWAL_ALREADY_TEXT]:
+        headline = "Resolve the blockers, then re-run the --renew dry run"
+        step = "After the blockers are cleared, re-run <code>" + escape(cli + " --renew") + "</code> (dry run)."
+    elif not ctx.mirror and not already:
+        headline = "Create the Dev mirror first (CLI)"
+        step = ("No verified Development mirror of this tenant exists yet. Run <code>" + escape(cli + " --mirror-renewal")
+                + "</code> (dry run), then the same command with <code>--confirm-write</code>.")
+    elif outcome is None:
+        headline = "Run the --renew dry run (CLI)"
+        step = "Run <code>" + escape(cli + " --renew") + "</code>. It reads the Edit form and saves nothing."
+    elif outcome["leonardo_write"] == "attempted_unverified":
+        headline = "Verify the Dev tenant in Leonardo before any retry"
+        step = "A save was attempted but not confirmed. Check the tenant in Leonardo Development; do not re-run blindly."
+    elif result == "renewal_dry_run_planned":
+        headline = "Apply the renewal (CLI)"
+        step = ("The dry run planned the change. Apply it with <code>" + escape(cli + " --renew --confirm-write")
+                + "</code> against the Dev mirror.")
+    elif outcome["leonardo_write"] == "verified" or result == "renewal_already_current":
+        headline = "Renewal is current in Leonardo Development"
+        step = ("The last <code>--renew</code> run is recorded below. Salesforce updates stay manual and production writes "
+                "need separate approval.")
+    else:
+        headline = "Re-run the --renew dry run (CLI)"
+        step = "Run <code>" + escape(cli + " --renew") + "</code> again."
+    term = _renewal_term(ctx)
+    summary = [("Term", (str(term["start"]) + " → " + str(term["end"])) if term else "—"),
+               ("Expiry", _renewal_old_expiry(ctx) + " → " + (str(term["end"]) if term else "—")),
+               ("Apply from", ("now" if term["applicable_now"] else str(term["apply_from"])) if term else "—"),
+               ("Blockers", str(len(blockers)) if blockers else "None"),
+               ("Domain gate (Q3)", _renewal_gate_text(ctx))]
+    body = ("<p class='note'>" + escape(RENEWAL_MANUAL_NOTE) + "</p><p class='clistep'>"
+            + step + "</p>"
+            + ("<ul class='blockers'>" + "".join("<li><b>Blocked:</b> " + escape(item) + "</li>" for item in blockers) + "</ul>"
+               if blockers else "")
+            + "<dl class='kv sum5'>" + "".join("<div><dt>" + escape(k) + "</dt><dd>" + escape(v) + "</dd></div>" for k, v in summary)
+            + "</dl>")
+    return headline, body, "<span class='chip chip-neutral'>CLI only</span>"
+
+
+def _stage_steps(ctx: SimpleNamespace) -> list[str]:
+    """Open to-do lines after the tenant exists, in order; every button is an existing guarded form."""
+    reference, route, index, parts = ctx.reference, ctx.route, ctx.index, ctx.parts
+    steps: list[str] = []
+    validation = ctx.stage_state.get("validation")
+    drift = _validation_counts(validation)[0]
+    if not ctx.mirror and index <= 3:
+        if not validation:
+            steps.append(_step("Verify the tenant: compare it with the onboarding plan (read-only).", False,
+                               _post_button("/attended/validate", reference, "Validate in Surface")))
+        elif drift:
+            steps.append(_step("Review the " + str(drift) + " difference(s) in Tenant checks below.", False))
+    if route in (CE_ENGINE, CASE3_ENGINE) and ctx.readback is not None:
+        state = ctx.spycloud
+        if state is None:
+            steps.append(_step("Turn SpyCloud OFF (owner rule). Check it first (read-only); the save is a CLI write: <code>--co "
+                               + escape(reference) + " --spycloud-off --confirm-write</code>.", False,
+                               _post_button("/attended/spycloud-check", reference, "Check SpyCloud (read-only)")))
+        elif not state.get("ok"):
+            steps.append(_step("SpyCloud is still ON. Turn it OFF with the CLI: <code>--co " + escape(reference)
+                               + " --spycloud-off --confirm-write</code>.", False))
+    open_items, done_items, error = (_reminder_items(reference, route, parts["record"], parts["evaluation"].core_plus_present)
+                                     if parts is not None and "evaluation" in parts and route in SURFACE_ROUTES
+                                     else ([], [], ""))
+    by_kind = {kind: (text, action, button) for kind, text, action, button in open_items}
+    # Order: scan settings off, then operator (once the scan finished), then Credential Exposure enabled.
+    for kind in ("scan_settings_off", "operator_assigned", "ce_enabled"):
+        if kind in by_kind and not (kind == "operator_assigned" and index < 3):
+            text, action, button = by_kind[kind]
+            steps.append(_step(escape(text), False, _post_button(action, reference, button)))
+    if route == CE_ENGINE and not ctx.stage_state.get("operator"):
+        steps.append(_step("Assign the Operator Account (TA/CSM from Salesforce) in Leonardo Development.", False))
+    return steps
+
+
+def _do_now_card(ctx: SimpleNamespace) -> str:
+    """ONE card: the single next action and its blockers, by the stage proven from local evidence."""
+    reference, parts, index = ctx.reference, ctx.parts, ctx.index
+
+    label = ("" if ctx.route is None or ctx.is_renewal else
+             {CE_ENGINE: "Credential Exposure onboarding", SURFACE_ENGINE: "Surface onboarding",
+              CASE3_ENGINE: "Surface + Credential Exposure onboarding"}.get(ctx.route, ""))
+
+    def card(headline: str, body: str, chip: str = "") -> str:
+        return ("<section class='card nowcard' aria-labelledby='now-title'><div class='card-head'><h2 id='now-title' class='pill'>"
+                "What to do now</h2>" + chip + "</div>"
+                + ("<p class='meta-line'>" + escape(label) + "</p>" if label else "")
+                + "<p class='next'><b>" + escape(headline) + "</b></p>" + body + "</section>")
+
+    if not ctx.source_ready:
+        if ctx.commercial_ready:
+            suffix = " — manual review required" if ctx.commercial_manual_review else ""
+            message = ("A comment already exists and will not be overwritten automatically. Review it before any approval decision."
+                       if ctx.commercial_manual_review else
+                       "A current-month or earlier Surface commercial term was found. Salesforce remains Pending until an operator "
+                       "reviews and approves the proposed subscription dates.")
+            note = ("<p class='note'><b>Source ready to onboard" + suffix + ".</b> Commercial source validation passed. "
+                    + escape(message) + " This is not a Salesforce approval, a Leonardo authorization, or a write.</p>")
+        else:
+            note = "<p class='note'>Salesforce onboarding approval is required before this CO is source ready.</p>"
+        return card("Waiting for approval in Salesforce", note, "<span class='chip chip-warn'>Awaiting approval</span>")
+    if ctx.is_renewal:
+        headline, body, chip = _renewal_do_now(ctx)
+        return card(headline, body, chip)
+    if index >= 5:
+        return card("Done", "<p class='note'>Onboarding is completed in Salesforce.</p>", "<span class='chip chip-ok'>Done</span>")
+    if index == 4:
+        proof = ctx.stage_state.get("user_proof")
+        manual = isinstance(proof, dict) and proof.get("proof") == "manual"
+        body = ("<p class='note'>The operator account and the customer user exist. In production, update the Salesforce "
+                "Onboarding Stage and the Salesforce IDs — see Salesforce record → Salesforce IDs below (opened). This page "
+                "writes nothing to Salesforce.</p>")
+        if manual:
+            body += "<p class='note'>" + escape(_user_evidence_text(ctx.stage_state)) + "</p>" + _user_confirm_form(ctx.stage_state, reference)
+        steps = _stage_steps(ctx)
+        if steps:
+            body += "<ul class='todo'>" + "".join(steps) + "</ul><p class='note'>" + REMINDER_NOTE + "</p>"
+        return card("Update Salesforce stage and IDs (production only)", body, "<span class='chip chip-info'>Next</span>")
+    if index >= 2:
+        steps = _stage_steps(ctx)
+        # Case 2 has no scan stage, so its user confirmation is offered once the tenant exists.
+        confirm = ""
+        if index >= 3 or ctx.route == CE_ENGINE:
+            confirm = _step(escape(_user_evidence_text(ctx.stage_state)), False, _user_confirm_form(ctx.stage_state, reference))
+            if "<form" not in confirm:
+                confirm = ""
+        validated = bool(ctx.stage_state.get("validation")) or ctx.mirror
+        if index >= 3:
+            headline = ("Confirm the customer user" if ctx.stage_state.get("operator")
+                        else "Assign the operator, then confirm the customer user")
+        elif not validated:
+            headline = "Verify the tenant, then finish the scan settings"
+        elif steps:
+            headline = "Finish the follow-ups"
+        else:
+            headline = "Wait for the first scan to finish"
+        body = ""
+        if steps or confirm:
+            body += "<ul class='todo'>" + "".join(steps) + confirm + "</ul><p class='note'>" + REMINDER_NOTE + "</p>"
+        if index <= 2 and ctx.route != CE_ENGINE:
+            body += ("<p class='note'>The scan is running or pending. Refresh it in Tenant checks; the tracker moves on when "
+                     "Leonardo shows it finished.</p>")
+        return card(headline, body, "<span class='chip chip-info'>Tenant created</span>")
+    # The tenant does not exist yet (stage 0 or 1) and the CO is approved.
+    if ctx.sf_id_blocked:
+        return card("Blocked: this CO already has an ID in Salesforce",
+                    "<p class='note'>See the alert above. Review the existing tenant manually; nothing was sent to Leonardo or "
+                    "Salesforce.</p>", "<span class='chip chip-bad'>Blocked</span>")
+    if parts is None:
+        if ctx.is_case4:
+            return card("Case 4 route is blocked", "<p class='note'>The Case 4 route is not mapped; see the alert above.</p>",
+                        "<span class='chip chip-bad'>Blocked</span>")
+        return card("No automated route for this CO",
+                    "<p class='note'>Onboarding for this Product and Type is manual. Use Diagnostics → manual start / session "
+                    "check.</p>", "<span class='chip chip-neutral'>Manual</span>")
+    if parts["state"] == "unavailable":
+        return card("Source could not be read", "<p class='note'>See the alert above. No browser was launched.</p>",
+                    "<span class='chip chip-bad'>Blocked</span>")
+    state = parts["state"]
+    review = ("" if ctx.comment_ready else "<p class='note'><b>The onboarding-comment subscription period needs separate review "
+                                          "before execution.</b></p>")
+    if state == "uncertain":
+        return card("Verify the tenant in Leonardo", "<p class='note'>The create may have succeeded; use the Verify button in the "
+                    "alert above. Start and reset stay blocked until it settles.</p>", "<span class='chip chip-warn'>Uncertain</span>")
+    if state == "running":
+        return card("Onboarding is running", str(parts["runner_note"]), str(parts["chip"]))
+    if state == "failed":
+        return card("The last run failed", str(parts["runner_note"]) + str(parts["blockers"]) + str(parts["reset"]), str(parts["chip"]))
+    if state == "duplicate":
+        return card("Blocked: a duplicate tenant exists", "<p class='note'>See the alert above. Review the existing tenant; to "
+                    "re-arm this run after the review use Diagnostics → Re-arm this run.</p>", str(parts["chip"]))
+    if state == "onboarded":
+        return card("Verify the tenant", "<p class='note'>A verified tenant exists; the next steps appear as the readback and "
+                    "scan evidence arrive.</p>", str(parts["chip"]))
+    if state == "blocked":
+        return card("Resolve the blockers, then start", review + str(parts["runner_note"]) + str(parts["blockers"])
+                    + str(parts.get("scope_fold", "")), str(parts["chip"]))
+    return card("Start onboarding",
+                "<p class='lede'>Salesforce approval is validated.</p>" + review + str(parts["runner_note"]) + str(parts["blockers"])
+                + str(parts.get("scope_review", "")) + str(parts["start"]), str(parts["chip"]))
+
+
+def _run_history_html(ctx: SimpleNamespace) -> str:
+    """Outcomes, the licence dates entered, the renewal outcome and plan, the full scope, and finished follow-ups."""
+    parts, html = ctx.parts, ""
+    if parts is not None:
+        record = parts.get("record")
+        if parts["state"] == "onboarded":
+            html += str(parts["runner_note"])
+        elif record is not None:
+            html += _entered_license_note(record)
+        html += str(parts.get("scope_fold", ""))
+        if parts.get("followups") and ctx.index >= 2:
+            _open, done_items, _error = _reminder_items(ctx.reference, ctx.route, record, parts["evaluation"].core_plus_present)
+            html += "".join("<p class='note'>" + escape(label) + " on " + escape(when) + ".</p>" for _kind, label, when in done_items)
+    if ctx.is_renewal:
+        html += _renewal_outcome_section(ctx.reference) + _renewal_plan_section(ctx.row, data=ctx.plan_data)
+    return html
+
+
+def _licence_fact(ctx: SimpleNamespace) -> str:
+    record = ctx.parts.get("record") if ctx.parts is not None else None
+    if record and record.get("license_start_entered") and record.get("license_end_entered"):
+        return record["license_start_entered"] + " → " + record["license_end_entered"]
+    tenant = ctx.stage_state.get("tenant")
+    lic = tenant.get("license") if isinstance(tenant, dict) else None
+    if isinstance(lic, dict) and (lic.get("start_date") or lic.get("expiration_date")):
+        return _inventory_date(lic.get("start_date")) + " → " + _inventory_date(lic.get("expiration_date"))
+    return "Not recorded"
+
+
+def _validation_fact(ctx: SimpleNamespace) -> str:
+    if ctx.mirror:
+        return "Skipped (Dev mirror)"
+    result = ctx.stage_state.get("validation")
+    if not result:
+        return "Not validated"
+    drift, unknown, warned = _validation_counts(result)
+    verdict = (str(drift) + " difference(s)" if drift else str(unknown) + " unconfirmed" if unknown
+               else str(warned) + " warning(s)" if warned else "Everything matches")
+    observed = result.get("observed_at")
+    return verdict + (" · " + observed.strftime("%Y-%m-%d") if isinstance(observed, datetime) else "")
+
+
+def _duplicate_fact(ctx: SimpleNamespace) -> str:
+    try:
+        check = load_check_state().get(ctx.reference)
+    except (ValueError, OSError):
+        check = None
+    dev = "not run"
+    if ctx.parts is not None and ctx.parts["state"] == "duplicate":
+        dev = "duplicate found"
+    if isinstance(check, dict) and check.get("kind") == "duplicate_check" and check.get("result"):
+        dev = str(check["result"]).replace("_", " ")
+    prod = "not checked"
+    if isinstance(check, dict) and check.get("kind") == "production_duplicate" and check.get("result"):
+        prod = str(check["result"]).replace("_", " ")
+    return "DEV: " + dev + " · prod clone: " + prod
+
+
+def _key_facts(ctx: SimpleNamespace) -> list[tuple[str, str]]:
+    """At most KEY_FACTS_MAX facts for this route and stage, from data the page already loaded."""
+    row, index, route = ctx.row, ctx.index, ctx.route
+    product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
+    facts = [("Product", _PRODUCT_SHORT.get(product or "", product or "—") + " · " + _TYPE_SHORT.get(onboarding_type or "", onboarding_type or "—")),
+             ("Salesforce", (ctx.approval or "Approval not populated") + " · " + (row.get("Onboarding_Stage__c") or "Stage not populated"))]
+    short = (ctx.tenant_id[:8] + "…") if ctx.tenant_id else ""
+    if ctx.is_renewal:
+        term = _renewal_term(ctx)
+        has_id = bool((row.get("Surface_Account_ID__c") or "").strip() or (row.get("Account_UUID__c") or "").strip())
+        outcome = ctx.outcome
+        last = ("Not run yet" if outcome is None else str(outcome["result"]) + " · write " + str(outcome["leonardo_write"]).replace("_", " "))
+        facts += [("Existing tenant", (short or "ID in Salesforce") if has_id or short else "None in Salesforce — find by name"),
+                  ("Expiry", _renewal_old_expiry(ctx) + " → " + (str(term["end"]) if term else "—")),
+                  ("Start date", "Unchanged (Q2)"),
+                  ("Apply from", ("now" if term["applicable_now"] else str(term["apply_from"])) if term else "—"),
+                  ("Added domains · Q3 gate", _renewal_gate_text(ctx)),
+                  ("Domains check", _renewal_domains_text(ctx)),
+                  ("Last --renew", last),
+                  ("Dev mirror", "Yes" if ctx.mirror else "No")]
+        return facts[:KEY_FACTS_MAX]
+    if short:
+        facts.append(("Tenant", short))
+    if index <= 1:
+        parts = ctx.parts
+        evaluation = parts.get("evaluation") if parts is not None else None
+        scope = getattr(evaluation, "scope", None) if evaluation is not None else None
+        main = (ctx.domain_info["main"] if ctx.domain_info is not None else None) or row.get("Main_Domain__c") or "Not populated"
+        facts.append(("Main domain", str(main)))
+        if route in SURFACE_ROUTES:
+            subdomains = _domain_count(str(ctx.domain_info["subdomains"] or "")).replace("—", "0") if ctx.domain_info is not None else "0"
+            facts.append(("Alternate · sub", _domain_count(row.get("Alternate_Domains__c")).replace("—", "0") + " alternate · " + subdomains + " sub"))
+            if scope:
+                facts += [("Licence plan", str(scope["license_start"]) + " → " + str(scope["license_end"])),
+                          ("Tier · interval", str(scope["tier"]).title() + " · " + str(scope["scanning_interval"]) + " · "
+                           + str(scope["licensed_subdomains"]) + " licensed")]
+            if route == CASE3_ENGINE:
+                lc = (" · LC " + str(scope["leaked_credentials_interval"])) if scope and scope.get("leaked_credentials_interval") else ""
+                facts.append(("Email domains", _domain_count(row.get("Email_Domains__c")) + lc))
+            facts.append(("Duplicate check", _duplicate_fact(ctx)))
+            if scope:
+                flags = [("large scope" if scope.get("large_scope") else ""),
+                         ("Core Plus" if scope.get("core_plus_present") else "")]
+                facts.append(("Onboarding day", ("from " + str(scope["production_onboarding_day"])) if scope.get("production_onboarding_day") else "Now (DEV)"))
+                facts.append(("Scope flags", ", ".join(flag for flag in flags if flag) or "None"))
+        else:
+            facts.append(("Email domains", _domain_count(row.get("Email_Domains__c"))))
+            facts.append(("Duplicate check", _duplicate_fact(ctx)))
+        return facts[:KEY_FACTS_MAX]
+    # The tenant exists: licence, checks, scan, SpyCloud, operator, user.
+    facts += [("Licence", _licence_fact(ctx)), ("Validation", _validation_fact(ctx))]
+    if route != CE_ENGINE:
+        scan = ctx.scan
+        facts.append(("Scan", (SCAN_STATES[str(scan["state"])][1] + " · " + scan["observed_at"].strftime("%Y-%m-%d %H:%M"))
+                      if scan else "Not read"))
+    if route in (CE_ENGINE, CASE3_ENGINE):
+        spy = ctx.spycloud
+        facts.append(("SpyCloud", "Not checked" if spy is None else ("OFF" if spy.get("ok") else "ON") + " · "
+                      + spy["observed_at"].strftime("%Y-%m-%d")))
+    operator = ctx.stage_state.get("operator")
+    evidence = ctx.stage_state.get("evidence")
+    facts.append(("Operator", "Assigned" if operator else "Not assigned" if isinstance(evidence, dict) and evidence.get("operator") is False
+                  else "Not confirmed"))
+    proof = ctx.stage_state.get("user_proof")
+    facts.append(("User created", ("Yes · " + str(proof["proof"])) if isinstance(proof, dict) and proof.get("created") else "No"))
+    return facts[:KEY_FACTS_MAX]
+
+
+def _key_facts_grid(facts: list[tuple[str, str]]) -> str:
+    return ("<section class='keyfacts' aria-label='Key facts'><dl class='kv'>"
+            + "".join("<div><dt>" + escape(label) + "</dt><dd>" + escape(value) + "</dd></div>" for label, value in facts[:KEY_FACTS_MAX])
+            + "</dl></section>")
 
 
 def render_dashboard(selected_queue: str = "", scan_started: bool = False, sort: str = "", direction: str = "") -> str:
@@ -4185,8 +4636,17 @@ PENTERA_CSS = (
     # CO detail page (2026-10-04): summary strip, one next-step card, follow-ups,
     # tenant-health tiles, and folded secondary panels. Existing tokens only.
     ".page-head .acct{color:var(--muted);font-size:15px;font-weight:600}"
-    ".summary{display:flex;flex-wrap:wrap;gap:8px 32px;margin:-8px 0 18px;color:var(--muted);font-size:12.5px}"
-    ".summary b{display:block;color:var(--text);font-size:14px;font-weight:600;overflow-wrap:anywhere}"
+    # CO detail layout (2026-10-07): pinned alerts, one "What to do now" card, key-facts grid, one footer line.
+    ".pinned{margin:0 0 14px}.pinned>.banner,.pinned>.readiness,.pinned>.manual-action,.pinned>.outcome{margin-bottom:10px}"
+    ".nowcard .next{margin:0 0 10px;font-size:15px;color:var(--heading)}.nowcard .clistep{margin:0 0 12px}"
+    ".nowcard .todo{margin:0 0 8px}.nowcard>.note{margin:0 0 8px}"
+    ".keyfacts{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 20px;margin:0 0 12px}"
+    "dl.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px 24px;margin:0}"
+    "dl.kv>div{min-width:0}dl.kv dt,dl.kv dd{border:0;padding:0;white-space:normal}"
+    "dl.kv dt{font-size:12px}dl.kv dd{font-weight:600;color:var(--text);font-size:13.5px}"
+    "dl.kv.sum5{margin:10px 0 0;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}"
+    "details.more details.more{box-shadow:none;margin:12px 0 0}"
+    ".footline{margin:16px 0 0;color:var(--muted);font-size:12px}"
     ".lede{margin:0 0 12px;color:var(--heading)}"
     ".sub-h{margin:16px 0 4px;font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}"
     "dl.compact{grid-template-columns:minmax(120px,170px) minmax(0,1fr) minmax(120px,170px) minmax(0,1fr);column-gap:12px}"
@@ -4239,7 +4699,7 @@ PENTERA_CSS = (
     ".tracker-note{margin:10px 0 0;font-size:12.5px}.tracker-note+.tracker-note{margin-top:4px}"
     "@media(max-width:760px){.stages{flex-direction:column;gap:8px}.st{flex-direction:row;text-align:left}"
     ".st::before{display:none}}"
-    "@media(max-width:760px){dl.compact,.stat dl{display:block}.health{grid-template-columns:1fr}.summary{margin-top:0}"
+    "@media(max-width:760px){dl.compact,.stat dl{display:block}.health{grid-template-columns:1fr}"
     ".todo li{flex-wrap:wrap}}"
 )
 
@@ -4435,15 +4895,30 @@ def _ce_only_onboard_section(reference: str, lede: str = "") -> str:
     and auto-confirms after a clear duplicate check. It never updates Salesforce.
     ``lede`` is trusted static HTML (the source-readiness sentence from page_detail).
     """
+    parts = _ce_only_onboard_parts(reference)
+    if "unavailable" in parts:
+        return str(parts["unavailable"])
+    return _onboard_card(
+        "Credential Exposure onboarding", str(parts["chip"]),
+        ("<p class='lede'>" + lede + "</p>" if lede else "") + str(parts["runner_note"]) + str(parts["blockers"])
+        + str(parts["start"]) + str(parts["reset"]) + str(parts["meta"]))
+
+
+def _ce_only_onboard_parts(reference: str) -> dict[str, Any]:
+    """The pieces of the CE-only onboard card (the CO page composes them; ``state`` classifies the run).
+
+    ``state`` is one of: unavailable, uncertain, running, duplicate, failed, onboarded, ready, blocked.
+    ``banner`` is the compact outcome banner of a recorded run (inside ``runner_note``).
+    """
     ref = escape(reference)
     try:
         evaluation = evaluate_ce_only_fill_preflight(reference)
     except ReadUnavailable:
-        return (
+        return {"state": "unavailable", "unavailable": (
             "<section class='readiness source-blocked' aria-labelledby='onboard-title'><div class='readiness-heading'>"
             "<span class='readiness-icon' aria-hidden='true'>!</span><div><h2 id='onboard-title'>Onboard " + ref + " (Credential Exposure)</h2>"
             "<p>The CE-only source could not be read. No browser was launched. Reconnect the attended Salesforce session and retry.</p></div></div></section>"
-        )
+        )}
     try:
         state = load_runner_state()
     except RunnerStateUnavailable:
@@ -4463,24 +4938,32 @@ def _ce_only_onboard_section(reference: str, lede: str = "") -> str:
     else:
         status_chip = "<span class='chip chip-info'>Ready</span>"
     runner_note = ""
+    banner = ""
     start_action = ""
+    state_name = "ready"
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
-        runner_note = (_outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
-                       + _entered_license_note(record) + _production_marker_for(reference))
+        banner = _outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
+        runner_note = banner + _entered_license_note(record) + _production_marker_for(reference)
+        state_name = ("onboarded" if record["result"] == "readback_verified"
+                      else "duplicate" if record["result"] in DUPLICATE_RESULTS else "failed")
     elif same_revision:
         runner_note = _running_note(ref, record)
+        state_name = "running"
     elif start_blocker(record) == "run_in_progress":
         runner_note = _START_IN_PROGRESS_NOTE + _progress_button(ref)
+        state_name = "running"
     elif start_blocker(record) == "tenant_already_verified":
-        runner_note = (_outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
-                                       "readback_verified", record.get("completed_on"), compact=True)
-                       + _entered_license_note(record))
+        banner = _outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
+                                 "readback_verified", record.get("completed_on"), compact=True)
+        runner_note = banner + _entered_license_note(record)
+        state_name = "onboarded"
     else:
         if record is not None:
             runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +
                            escape(record.get("result", "no result recorded")) + "</code></p>")
         start_action = _ce_only_start_form(evaluation)
+        state_name = "ready" if start_action else "blocked"
     blockers = ""
     if evaluation.blockers:
         blockers = ("<ul class='blockers'>" + "".join(
@@ -4488,14 +4971,16 @@ def _ce_only_onboard_section(reference: str, lede: str = "") -> str:
     reset_action = ""
     if create_uncertain(record):
         runner_note = _uncertain_banner(ref, record)
+        banner = runner_note
         start_action = ""
+        state_name = "uncertain"
     elif record is not None and record.get("result") and record["result"] != "readback_verified":
         reset_action = _reset_form(ref, record)
-    return _onboard_card(
-        "Credential Exposure onboarding", status_chip,
-        ("<p class='lede'>" + lede + "</p>" if lede else "") + runner_note + blockers + start_action + reset_action
-        + "<p class='meta-line'>Email domains <b>" + str(evaluation.email_domain_count) + "</b> · Source revision <code>"
-        + escape(evaluation.source_revision) + "</code></p>")
+    return {"state": state_name, "chip": status_chip, "runner_note": runner_note, "banner": banner,
+            "blockers": blockers, "start": start_action, "reset": reset_action, "record": record,
+            "evaluation": evaluation, "same_revision": same_revision,
+            "meta": ("<p class='meta-line'>Email domains <b>" + str(evaluation.email_domain_count) + "</b> · Source revision <code>"
+                     + escape(evaluation.source_revision) + "</code></p>")}
 
 
 SCAN_REMINDER_TEXT = ("Scan now / scanning interval are ON for this Leonardo Development tenant — "
@@ -4565,6 +5050,37 @@ def _reminder(text: str, action: str, reference: str, button: str) -> str:
             + escape(reference) + "'><button type='submit' class='ghost sm'>" + escape(button) + "</button></form></li>")
 
 
+def _reminder_items(reference: str, route: str | None, record: dict[str, str] | None,
+                    core_plus_present: bool) -> tuple[list[tuple[str, str, str, str]], list[tuple[str, str, str]], str]:
+    """Shared follow-up state: (open items, done items, read-error note).
+
+    Open items are (kind, text, POST action, button label); done items (kind, label, when). The same rules feed the
+    Surface Follow-ups card and the "What to do now" card, so the buttons and their guards stay identical.
+    """
+    try:
+        reminders = load_attended_reminders().get(reference, {})
+        error = ""
+    except ReadUnavailable:
+        reminders = {}
+        error = "<p class='note'>The local reminders file could not be read; reminders are shown until it is repaired.</p>"
+    open_items: list[tuple[str, str, str, str]] = []
+    if route == SURFACE_ENGINE and core_plus_present and not reminders.get(REMINDER_FIELDS["ce_enabled"]):
+        open_items.append(("ce_enabled", CE_REMINDER_TEXT, "/attended/mark-ce-enabled", "Mark CE enabled"))
+    verified = (record is not None and record.get("route") in SURFACE_ROUTES and record.get("result") == "readback_verified")
+    if verified and not reminders.get(REMINDER_FIELDS["scan_settings_off"]):
+        open_items.append(("scan_settings_off", SCAN_REMINDER_TEXT, "/attended/mark-scan-settings-off",
+                           "Mark scan settings turned off"))
+    if verified and not reminders.get(REMINDER_FIELDS["operator_assigned"]):
+        open_items.append(("operator_assigned", OPERATOR_REMINDER_TEXT, "/attended/mark-operator-assigned",
+                           "Mark Operator Account assigned"))
+    done_items = [(kind, label, reminders[REMINDER_FIELDS[kind]])
+                  for kind, label in (("scan_settings_off", "Scan settings marked off"),
+                                      ("ce_enabled", "Credential Exposure marked enabled"),
+                                      ("operator_assigned", "Operator Account marked assigned"))
+                  if reminders.get(REMINDER_FIELDS[kind])]
+    return open_items, done_items, error
+
+
 def _scope_summary_line(evaluation: SurfaceScopePreflight) -> str:
     scope = evaluation.scope or {}
     return escape(f"{str(scope.get('tier', '')).title()} · {scope.get('scanning_interval', '')} · "
@@ -4579,6 +5095,20 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE, lede: 
     adds the counts-only scope summary, the required revision-bound scope
     review, and the local Scan-now / Credential Exposure reminders (a
     Follow-ups list after the card). ``lede`` is trusted static HTML.
+    """
+    parts = _surface_onboard_parts(reference, route)
+    return _onboard_card(
+        "Surface + Credential Exposure onboarding" if route == CASE3_ENGINE else "Surface onboarding", str(parts["chip"]),
+        ("<p class='lede'>" + lede + "</p>" if lede else "") + str(parts["runner_note"]) + str(parts["blockers"])
+        + str(parts["scope_html"]) + str(parts["start"]) + str(parts["reset"]) + str(parts["meta"])) + str(parts["followups"])
+
+
+def _surface_onboard_parts(reference: str, route: str = SURFACE_ENGINE) -> dict[str, Any]:
+    """The pieces of the Surface / Case 3 onboard card (the CO page composes them; ``state`` classifies the run).
+
+    ``state`` is one of: uncertain, running, duplicate, failed, onboarded, ready, blocked. ``scope_review`` is the
+    counts-only scope (with its "Scope to review" heading) shown only next to the Start form; ``scope_fold`` is the
+    same scope once Start is not offered.
     """
     ref = escape(reference)
     evaluation = evaluate_surface_fill_preflight(reference, route)
@@ -4602,53 +5132,44 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE, lede: 
     else:
         status_chip = "<span class='chip chip-info'>Ready</span>"
     runner_note = ""
+    banner = ""
     start_action = ""
+    state_name = "ready"
     if same_revision and record.get("result"):
         kind, message = RUNNER_RESULT_MESSAGES.get(record["result"], ("blocked", "Result code <code>" + escape(record["result"]) + "</code>."))
-        runner_note = (_outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
-                       + _entered_license_note(record) + _production_marker_for(reference))
+        banner = _outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
+        runner_note = banner + _entered_license_note(record) + _production_marker_for(reference)
+        state_name = ("onboarded" if record["result"] == "readback_verified"
+                      else "duplicate" if record["result"] in DUPLICATE_RESULTS else "failed")
     elif same_revision:
         runner_note = _running_note(ref, record)
+        state_name = "running"
     elif record is not None and record.get("result") == "readback_verified":
         # A verified tenant exists; a later source revision never re-creates it.
-        runner_note = (_outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
-                                       "readback_verified", record.get("completed_on"), compact=True)
-                       + _entered_license_note(record))
+        banner = _outcome_banner("success", RUNNER_RESULT_MESSAGES["readback_verified"][1],
+                                 "readback_verified", record.get("completed_on"), compact=True)
+        runner_note = banner + _entered_license_note(record)
+        state_name = "onboarded"
     elif start_blocker(record) == "run_in_progress":
         runner_note = _START_IN_PROGRESS_NOTE + _progress_button(ref)
+        state_name = "running"
     else:
         if record is not None:
             runner_note = ("<p class='note'>Previous attended run for a different source revision: <code>" +
                            escape(record.get("result", "no result recorded")) + "</code></p>")
         start_action = _surface_start_form(evaluation)
+        state_name = "ready" if start_action else "blocked"
     blockers = ""
     if evaluation.blockers:
         blockers = ("<ul class='blockers'>" + "".join(
             "<li><b>Blocked:</b> " + RUNNER_RESULT_MESSAGES.get(code, ("blocked", ""))[1]
             + " <code>" + escape(code) + "</code></li>" for code in evaluation.blockers)
             + "".join("<li><b>" + escape(detail) + "</b></li>" for detail in evaluation.blocker_details) + "</ul>")
-    try:
-        reminders = load_attended_reminders().get(reference, {})
-        reminder_error = ""
-    except ReadUnavailable:
-        reminders = {}
-        reminder_error = "<p class='note'>The local reminders file could not be read; reminders are shown until it is repaired.</p>"
-    reminder_html = ""
-    if route == SURFACE_ENGINE and evaluation.core_plus_present and not reminders.get(REMINDER_FIELDS["ce_enabled"]):
-        reminder_html += _reminder(CE_REMINDER_TEXT, "/attended/mark-ce-enabled", reference, "Mark CE enabled")
-    if (record is not None and record.get("route") in SURFACE_ROUTES and record.get("result") == "readback_verified"
-            and not reminders.get(REMINDER_FIELDS["scan_settings_off"])):
-        reminder_html += _reminder(SCAN_REMINDER_TEXT, "/attended/mark-scan-settings-off", reference,
-                                   "Mark scan settings turned off")
-    if (record is not None and record.get("route") in SURFACE_ROUTES and record.get("result") == "readback_verified"
-            and not reminders.get(REMINDER_FIELDS["operator_assigned"])):
-        reminder_html += _reminder(OPERATOR_REMINDER_TEXT, "/attended/mark-operator-assigned", reference,
-                                   "Mark Operator Account assigned")
-    for kind, label in (("scan_settings_off", "Scan settings marked off"), ("ce_enabled", "Credential Exposure marked enabled"),
-                        ("operator_assigned", "Operator Account marked assigned")):
-        if reminders.get(REMINDER_FIELDS[kind]):
-            reminder_html += ("<li class='done'><span class='chip chip-ok'>Done</span><span class='what'>" + label
-                              + " on " + escape(reminders[REMINDER_FIELDS[kind]]) + ".</span></li>")
+    open_items, done_items, reminder_error = _reminder_items(reference, route, record, evaluation.core_plus_present)
+    reminder_html = "".join(_reminder(text, action, reference, button) for _kind, text, action, button in open_items)
+    for _kind, label, when in done_items:
+        reminder_html += ("<li class='done'><span class='chip chip-ok'>Done</span><span class='what'>" + label
+                          + " on " + escape(when) + ".</span></li>")
     followups = ""
     if reminder_html or reminder_error:
         followups = ("<section class='card' aria-labelledby='followups-title'><div class='card-head'>"
@@ -4657,21 +5178,27 @@ def _surface_onboard_section(reference: str, route: str = SURFACE_ENGINE, lede: 
     reset_action = ""
     if create_uncertain(record):
         runner_note = _uncertain_banner(ref, record)
+        banner = runner_note
         start_action = ""
+        state_name = "uncertain"
     elif record is not None and record.get("result") and record["result"] != "readback_verified":
         reset_action = _reset_form(ref, record)
     scope_html = _surface_scope_facts(evaluation)
+    scope_review = scope_fold = ""
     if scope_html and start_action:
-        scope_html = "<h3 class='sub-h'>Scope to review</h3>" + scope_html
+        scope_review = "<h3 class='sub-h'>Scope to review</h3>" + scope_html
+        scope_html = scope_review
     elif scope_html:
-        scope_html = ("<details class='fold'><summary>Planned scope · " + _scope_summary_line(evaluation)
+        scope_fold = ("<details class='fold'><summary>Planned scope · " + _scope_summary_line(evaluation)
                       + "</summary>" + scope_html + "</details>")
+        scope_html = scope_fold
     revision = evaluation.source_revision or "unavailable"
-    return _onboard_card(
-        "Surface + Credential Exposure onboarding" if route == CASE3_ENGINE else "Surface onboarding", status_chip,
-        ("<p class='lede'>" + lede + "</p>" if lede else "") + runner_note + blockers + scope_html + start_action
-        + reset_action + "<p class='meta-line'>Route <code>" + escape(route) + "</code> · Source revision <code>"
-        + escape(revision) + "</code></p>") + followups
+    return {"state": state_name, "chip": status_chip, "runner_note": runner_note, "banner": banner,
+            "blockers": blockers, "scope_html": scope_html, "scope_review": scope_review, "scope_fold": scope_fold,
+            "start": start_action, "reset": reset_action, "record": record, "evaluation": evaluation,
+            "same_revision": same_revision, "followups": followups,
+            "meta": ("<p class='meta-line'>Route <code>" + escape(route) + "</code> · Source revision <code>"
+                     + escape(revision) + "</code></p>")}
 
 
 def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, reference: str) -> str:

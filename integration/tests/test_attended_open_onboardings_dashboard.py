@@ -2526,8 +2526,11 @@ class RenewalPlanCardTests(unittest.TestCase):
             page = page_detail("CO-0767", dict(self.ROW))
         self.assertNotIn("<button type='submit'>", page)
         self.assertIn(dashboard.RENEWAL_MANUAL_NOTE, page)
-        self.assertLess(page.index("Renewal plan · Case 6"), page.index(dashboard.RENEWAL_MANUAL_NOTE))
-        folded = page.index("<details class='more'><summary><h2 class='sum-h'>Sign-in and manual onboarding")
+        # 2026-10-07 layout: the do-now card leads with the next CLI step (text, no button); the full plan is in
+        # the Run history fold; sign-in and manual actions are in the Diagnostics fold.
+        self.assertIn("Create the Dev mirror first (CLI)", page)
+        self.assertLess(page.index(dashboard.RENEWAL_MANUAL_NOTE), page.index("Renewal plan · Case 6"))
+        folded = page.index("<details class='more'><summary><h2 class='sum-h'>Diagnostics")
         self.assertLess(folded, page.index("action='/attended/production-renewal-preflight'"))
         self.assertLess(folded, page.index("action='/attended/leonardo-session-check'"))
         self.assertIn("<button class='ghost' type='submit'>Open production sign-in</button>", page)
