@@ -94,7 +94,7 @@ def after_row(before: dict, **overrides) -> dict:
     put(row, "accountLicense.licenseType", "PREPAID_ANNUAL_SUBSCRIPTION")
     row["scanningInterval"] = "WEEKLY"
     put(row, "accountLicense.assetsNumber", 10000)
-    put(row, "accountLicense.domainsNumber", 10)
+    # Owner 2026-10-07: a renewal never changes Number of domains (equal root-domain sets keep the current value).
     put(row, "accountLicense.subDomainsNumber", 10)
     put(row, runner.VALIDATION_TOGGLE_PATHS["leakedCredentialsAllowed"], True)
     put(row, runner.VALIDATION_TOGGLE_PATHS["phishingEnabled"], False)
@@ -221,7 +221,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(keys[:2], ["leakedCredentialsAllowed", "phishingEnabled"])
         self.assertEqual(set(keys), {
             "leakedCredentialsAllowed", "phishingEnabled", "license_end", "Scanning interval", "Number of assets",
-            "Number of domains", "Number of subdomains", "Leaked Credentials scanning interval",
+            "Number of subdomains", "Leaked Credentials scanning interval",  # no "Number of domains": 2026-10-07 rule
             "Leaked Credentials scanned domains (Comma Separated Values)"})  # Type already matches; lists add nothing
         self.assertEqual(added, {CE_DOMAIN})
 

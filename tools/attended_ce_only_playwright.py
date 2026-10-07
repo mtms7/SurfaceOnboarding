@@ -5115,11 +5115,9 @@ def run_readback(reference: str, tenant_name_override: str | None = None, route:
     with sync_playwright() as playwright:
         try:
             with _attended_page(playwright) as page:
-                search = _open_search(page)
-                if search is None:
-                    _capture_search_diagnostics(page)
-                    return "duplicate_search_schema_unavailable"
-                searched = _search_tenants(page, search, tenant_name)
+                # Owner 2026-10-07 (reverses the 2026-10-05 "declined"): read-only paths use the same invisible
+                # search as the SpyCloud and renewal paths (_search_tenants ignores its search handle).
+                searched = _search_tenants(page, None, tenant_name)
                 if searched is not None:
                     classification = _settled_tenant_rows(page, tenant_name, primary_domain)
                 else:
@@ -5341,8 +5339,38 @@ def write_scan_status(reference: str, observation: dict[str, Any], observed_at: 
     _write_json_atomic(SCAN_STATUS_PATH, state)
 
 
-def _scan_status_tenant_name(reference: str, surface_only: bool = False) -> str:
-    """Tenant name for the search, from one fixed, minimal Salesforce read (values stay in memory)."""
+def _verified_mirror_for(reference: str, readback: dict[str, Any]) -> bool:
+    """True only when this CO has a verified Dev mirror record whose tenant id equals the readback id.
+
+    The record store keeps ids only (no tenant name), so a renewal's search names come from Salesforce; the
+    id (and accountUuid, when the record carries one) must still match the readback exactly. An unreadable store,
+    a missing or unverified record, or any mismatch is False (fail closed).
+    """
+    from integration.onboarding.renewal_mirror import mirror_tenant_ids
+
+    try:
+        records = _mirror_records()
+    except ValueError:
+        return False
+    record = records.get(reference)
+    if not isinstance(record, dict) or record.get("surface_account_id") != readback.get("surface_account_id"):
+        return False
+    if record.get("surface_account_id") not in mirror_tenant_ids({reference: record}):
+        return False
+    uuid = record.get("account_uuid")
+    return uuid is None or (isinstance(uuid, str) and isinstance(readback.get("account_uuid"), str)
+                            and uuid.casefold() == readback["account_uuid"].casefold())
+
+
+def _scan_status_tenant_names(reference: str, surface_only: bool = False,
+                              readback: dict[str, Any] | None = None) -> tuple[str, ...]:
+    """Tenant name(s) to search, from one fixed, minimal Salesforce read (values stay in memory).
+
+    Surface / Case 3 / CE-only: one name. A Case 4-6 renewal CO (owner 2026-10-07) is supported ONLY when a
+    verified Dev mirror record exists for it and its tenant id equals the readback id, else
+    scan_status_renewal_mirror_missing; the mirror carries the production tenant name, which is one of the CO's
+    Surface / "- CE Only" names, so both are searched (the id + accountUuid row match stays mandatory).
+    """
     rows = _sf_records(
         "SELECT Name, Account_Name__c, Onboarding_Product__c, Onboarding_Type__c "
         "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
@@ -5354,21 +5382,43 @@ def _scan_status_tenant_name(reference: str, surface_only: bool = False) -> str:
         raise ValueError()
     product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
     if product == SURFACE_ROUTE_PRODUCT and onboarding_type == SURFACE_ROUTE_TYPE:
-        return surface_names(account_name).tenant_name
+        return (surface_names(account_name).tenant_name,)
     if product == CASE3_ROUTE_PRODUCT and onboarding_type == CASE3_ROUTE_TYPE:
-        return surface_names(account_name).tenant_name
+        return (surface_names(account_name).tenant_name,)
     if product == CE_ROUTE_PRODUCT and onboarding_type == CE_ROUTE_TYPE:
         if surface_only:
             raise SurfaceSourceError("scan_status_not_applicable")  # CE-only tenants never scan
-        return ce_only_names(account_name).tenant_name
+        return (ce_only_names(account_name).tenant_name,)
+    case = renewal_case(product, onboarding_type)
+    if case is not None and case[0] in RENEWAL_ENGINES:
+        if not _verified_mirror_for(reference, readback or {}):
+            raise SurfaceSourceError("scan_status_renewal_mirror_missing")
+        return tuple(dict.fromkeys((surface_names(account_name).tenant_name, ce_only_names(account_name).tenant_name)))
     raise SurfaceSourceError("scan_status_route_unsupported")
 
 
+def _scan_status_tenant_name(reference: str, surface_only: bool = False) -> str:
+    """The first (primary) search name of ``_scan_status_tenant_names`` (non-renewal COs have exactly one)."""
+    return _scan_status_tenant_names(reference, surface_only)[0]
+
+
 def run_scan_status(reference: str, surface_only: bool = False) -> str:
+    """Read-only scan-status sweep for one onboarded CO; every outcome is recorded as its latest scan_status check.
+
+    The result code (success or failure) is stored with a timestamp through the check-state mechanism so the
+    dashboard can show the latest one. ``scan_status_not_applicable`` (a skipped CE-only CO) is not recorded.
+    """
+    result = _run_scan_status(reference, surface_only)
+    if result != "scan_status_not_applicable":
+        _record_check(reference, "scan_status", result)
+    return result
+
+
+def _run_scan_status(reference: str, surface_only: bool = False) -> str:
     """Read-only scan-status sweep for one onboarded CO (never fills, submits, or creates).
 
     Requires a local readback (the captured Surface Account ID and Account
-    UUID). Searches Leonardo Development for the tenant name and accepts
+    UUID). Searches Leonardo Development (invisible search, owner 2026-10-07) for the tenant name and accepts
     exactly one row whose id AND accountUuid equal the captured values, then
     stores a minimal scan observation. It does not touch the create gate,
     the runner state, the readback evidence, or Salesforce.
@@ -5383,7 +5433,7 @@ def run_scan_status(reference: str, surface_only: bool = False) -> str:
             or not isinstance(readback.get("account_uuid"), str)):
         return "scan_status_not_onboarded"
     try:
-        tenant_name = _scan_status_tenant_name(reference, surface_only)
+        tenant_names = _scan_status_tenant_names(reference, surface_only, readback)
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return "playwright_runtime_unavailable"
@@ -5394,19 +5444,23 @@ def run_scan_status(reference: str, surface_only: bool = False) -> str:
     with sync_playwright() as playwright:
         try:
             with _attended_page(playwright) as page:
-                search = _open_search(page)
-                if search is None:
-                    return "duplicate_search_schema_unavailable"
-                searched = _search_tenants(page, search, tenant_name)
-                if searched is None:
-                    return "scan_status_schema_unavailable"
-                matches = [row for row in searched.rows
-                           if row.get("id") == readback["surface_account_id"]
-                           and isinstance(row.get("accountUuid"), str)
-                           and row["accountUuid"].casefold() == readback["account_uuid"].casefold()]
-                if len(matches) != 1:
+                tenant_name, match_row = tenant_names[0], None
+                for tenant_name in tenant_names:
+                    searched = _search_tenants(page, None, tenant_name)
+                    if searched is None:
+                        return "scan_status_schema_unavailable"
+                    matches = [row for row in searched.rows
+                               if row.get("id") == readback["surface_account_id"]
+                               and isinstance(row.get("accountUuid"), str)
+                               and row["accountUuid"].casefold() == readback["account_uuid"].casefold()]
+                    if len(matches) > 1:
+                        return "scan_status_tenant_not_found"
+                    if matches:
+                        match_row = matches[0]
+                        break
+                if match_row is None:
                     return "scan_status_tenant_not_found"
-                observation = scan_status_from_row(matches[0])
+                observation = scan_status_from_row(match_row)
                 # The row-based status is always kept; the executions add to it, or leave a reason code.
                 outcome = "scan_status_recorded"
                 try:
@@ -5755,10 +5809,7 @@ def run_validate(reference: str) -> str:
     with sync_playwright() as playwright:
         try:
             with _attended_page(playwright) as page:
-                search = _open_search(page)
-                if search is None:
-                    return "duplicate_search_schema_unavailable"
-                searched = _search_tenants(page, search, tenant_name)
+                searched = _search_tenants(page, None, tenant_name)  # invisible search (owner 2026-10-07)
                 if searched is None:
                     return "validation_schema_unavailable"
                 matches = _match_captured_row(searched.rows, ids)
@@ -6213,6 +6264,14 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
 # name + domain, never by production ids; Q10 only "Surface & Credential Exposure" renewals (Cases 4-6); the
 # single-product renewals (surface_renewal, ce_renewal) are refused.
 #
+# Number of domains (owner 2026-10-07; replaces "domains = licensed subdomains" for RENEWALS only, creates are
+# unchanged): the CO's root domains (Salesforce main + alternate roots) are compared, as sets, with the tenant's root
+# domains (primary domain + alternateDomains; casefolded, deduplicated). Equal sets: the tenant's current Number of
+# domains is kept (no spec, no change). Any difference stops BEFORE the Edit form opens with
+# renewal_domains_mismatch_manual_review (report: counts only; the CLI prints the domains on the terminal only).
+# A tenant domain list that cannot be read is renewal_row_schema_unexpected. Root domains are therefore never added
+# by a renewal; subdomain add-only and the Q3 production gate are unchanged.
+#
 # UNVERIFIED LIVE (nothing below has run against Leonardo yet; each failure is a fail-closed reason code):
 #   1. The Edit form shows the same label/name/data-am controls as Add Account for: the "Type", "Scanning
 #      interval" and "Leaked Credentials scanning interval" selects, "Number of assets/domains/subdomains",
@@ -6237,7 +6296,7 @@ RENEWAL_NEVER_SET = frozenset({"license_start"})  # Q2: the start date control i
 # Row paths that must be identical before and after the save (besides the toggles not in the plan).
 RENEWAL_PRESERVE_PATHS = (
     "accountName", "accountDomain", "accountType", "accountCountryCode", "enabled", "isDeleted",
-    "accountLicense.enabled", "accountLicense.startDate", "userEmailDomains", "additionalNetworks",
+    "accountLicense.enabled", "accountLicense.startDate", "accountLicense.domainsNumber", "userEmailDomains", "additionalNetworks",
     "operatorAccounts", "primaryUser.email", "primaryUser.firstName", "primaryUser.lastName",
     "primaryUser.isMfaRequired", "campaignsTimeoutInHours", "leakedCredentialsSettings.spyCloudSettings.enabled",
 )
@@ -6370,10 +6429,29 @@ def _row_domains(row: dict[str, Any]) -> set[str]:
     return {domain for domain in found if domain}
 
 
+def renewal_domains_check(source: RenewalSource, row: dict[str, Any]) -> dict[str, Any]:
+    """Owner 2026-10-07: compare the CO's root domains with the tenant's root domains as casefolded sets.
+
+    Pure. Returns {"result": "match", "count": K} | {"result": "mismatch", "only_in_salesforce": [...],
+    "only_on_tenant": [...]} (sorted; the lists hold domain VALUES and must never reach a report, log or store) |
+    {"result": "unreadable"} when the tenant's primary domain or alternateDomains is not readable.
+    """
+    primary, alternates = row.get("accountDomain"), row.get("alternateDomains")
+    if not (isinstance(primary, str) and _norm_text(primary)) or not isinstance(alternates, list):
+        return {"result": "unreadable"}
+    if not all(isinstance(item, str) for item in alternates):
+        return {"result": "unreadable"}
+    wanted = {domain for domain in map(_norm_text, (source.main_domain, *source.alternate_domains)) if domain}
+    have = {domain for domain in map(_norm_text, (primary, *alternates)) if domain}
+    if wanted == have:
+        return {"result": "match", "count": len(wanted)}
+    return {"result": "mismatch", "only_in_salesforce": sorted(wanted - have), "only_on_tenant": sorted(have - wanted)}
+
+
 def build_renewal_specs(source: RenewalSource, row: dict[str, Any]) -> tuple[list[FieldSpec], set[str], list[str]]:
     """(specs, domains the renewal ADDS to the tenant, errors) from the source and the tenant's current row.
 
-    Pure. Never plans the start date. Domain lists are add-only: the target is the tenant's current items plus the
+    Pure. Never plans the start date or Number of domains (see ``renewal_domains_check``). Domain lists are add-only: the target is the tenant's current items plus the
     CO's items that are missing (nothing is ever removed). A list or toggle the row does not report in the expected
     shape is an error (renewal_row_schema_unexpected) rather than a guess.
     """
@@ -6384,7 +6462,6 @@ def build_renewal_specs(source: RenewalSource, row: dict[str, Any]) -> tuple[lis
         FieldSpec("select", "Scanning interval", VALIDATION_SELECT_PATHS["Scanning interval"],
                   str(term["scanning_interval"])),
         FieldSpec("number", "Number of assets", VALIDATION_NUMBER_PATHS["Number of assets"], int(term["assets"])),
-        FieldSpec("number", "Number of domains", VALIDATION_NUMBER_PATHS["Number of domains"], int(term["domains"])),
         FieldSpec("number", "Number of subdomains", VALIDATION_NUMBER_PATHS["Number of subdomains"],
                   int(term["subdomains"])),
         FieldSpec("checkbox", "leakedCredentialsAllowed", VALIDATION_TOGGLE_PATHS["leakedCredentialsAllowed"], True),
@@ -6595,7 +6672,9 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     shows every changed field AND every preserved field). Reason codes: renewal_environment_not_supported,
     renewal_readback_unavailable, renewal_tenant_not_found, renewal_row_ambiguous, renewal_name_mismatch,
     renewal_domain_mismatch, renewal_tenant_deleted, renewal_row_schema_unexpected, renewal_expiration_in_past,
-    renewal_expiration_would_shorten, renewal_start_date_protected, the domain-gate codes
+    renewal_expiration_would_shorten, renewal_start_date_protected, renewal_domains_mismatch_manual_review (owner
+    2026-10-07: the CO's root domains differ from the tenant's; stops before Edit, counts in the report and the
+    domains under "manual_review" for the terminal only), the domain-gate codes
     (renewal_new_domain_in_production, renewal_target_not_in_production_clone,
     renewal_target_ambiguous_in_production_clone, production_clone_unavailable, production_clone_incomplete),
     renewal_edit_unavailable, renewal_form_unreadable, renewal_form_mismatch, renewal_field_unavailable,
@@ -6607,12 +6686,23 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     """
     report: dict[str, Any] = {"engine": source.engine, "mode": "write" if confirm_write else "dry_run",
                               "start_date": "never_changed", "changes": [], "added_domains": 0,
-                              "profile_drift": [], "gate": None}
+                              "profile_drift": [], "gate": None, "domains_check": None}
     if _url_origin(page.url) != DEVELOPMENT_ORIGIN or not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, expected_id or ""):
         return "renewal_environment_not_supported", report
     code, row = _renewal_row(page, tenant_name, source.main_domain, expected_id, expected_uuid)
     if code != "ok":
         return code, report
+    check = renewal_domains_check(source, row)
+    if check["result"] == "unreadable":
+        return "renewal_row_schema_unexpected", report
+    if check["result"] == "mismatch":
+        report["domains_check"] = {"result": "mismatch", "only_in_salesforce": len(check["only_in_salesforce"]),
+                                   "only_on_tenant": len(check["only_on_tenant"])}
+        # Terminal only: the CLI pops this before the outcome file and the plan are written (values, not counts).
+        report["manual_review"] = {"only_in_salesforce": check["only_in_salesforce"],
+                                   "only_on_tenant": check["only_on_tenant"]}
+        return "renewal_domains_mismatch_manual_review", report
+    report["domains_check"] = {"result": "match", "count": check["count"]}
     specs, added, errors = build_renewal_specs(source, row)
     if errors:
         return errors[0], report
@@ -6749,6 +6839,10 @@ def _renewal_outcomes() -> dict[str, Any]:
     return raw
 
 
+def _count_or_none(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
 def write_renewal_outcome(reference: str, result: str, confirm_write: bool, leonardo_write: str,
                           observed_at: datetime, tenant_id: str | None = None,
                           report: dict[str, Any] | None = None) -> None:
@@ -6762,6 +6856,8 @@ def write_renewal_outcome(reference: str, result: str, confirm_write: bool, leon
     added = report.get("added_domains")
     gate = report.get("gate")
     engine = report.get("engine")
+    domains = report.get("domains_check") if isinstance(report.get("domains_check"), dict) else {}
+    domains_result = domains.get("result")
     record: dict[str, Any] = {
         "result": result, "mode": RENEWAL_OUTCOME_MODES[1] if confirm_write else RENEWAL_OUTCOME_MODES[0],
         "leonardo_write": leonardo_write, "observed_at": observed_at.isoformat(timespec="seconds"),
@@ -6772,6 +6868,11 @@ def write_renewal_outcome(reference: str, result: str, confirm_write: bool, leon
         "changes": len(changes),
         "added_domains": added if type(added) is int and added >= 0 else None,
         "gate": gate if isinstance(gate, str) and RENEWAL_OUTCOME_CODE.fullmatch(gate) else None}
+    if domains_result in ("match", "mismatch"):  # counts only; present only when the domains check ran
+        record["domains_check"] = domains_result
+        if domains_result == "mismatch":
+            record["domains_only_in_salesforce"] = _count_or_none(domains.get("only_in_salesforce"))
+            record["domains_only_on_tenant"] = _count_or_none(domains.get("only_on_tenant"))
     state = _renewal_outcomes()
     state[reference] = record
     _write_json_atomic(RENEWAL_OUTCOMES_PATH, state)
@@ -7964,10 +8065,16 @@ def main() -> int:
             parser.error("--co is required with --renew")
         result, report = run_renewal(args.co, confirm_write=args.confirm_write, env_name=args.env,
                                      tenant_name_override=args.tenant_name)
+        # The domain lists of a mismatch are terminal-only: removed before anything is recorded.
+        manual_review = report.pop("manual_review", None) if isinstance(report, dict) else None
         record_renewal_outcome(args.co, result, args.confirm_write, report)
-        # Codes, dates, enums, counts and flags only; no domain values, ids, or names.
-        print(json.dumps({"result": result, "leonardo_write": renewal_write_label(result, args.confirm_write),
-                          "plan": report, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
+        # Codes, dates, enums, counts and flags only; no domain values, ids, or names (except manual_review below).
+        printed: dict[str, Any] = {"result": result, "leonardo_write": renewal_write_label(result, args.confirm_write),
+                                   "plan": report, "salesforce_writeback": "not_performed"}
+        if isinstance(manual_review, dict):
+            printed["manual_review"] = {"only_in_salesforce": list(manual_review.get("only_in_salesforce") or ()),
+                                        "only_on_tenant": list(manual_review.get("only_on_tenant") or ())}
+        print(json.dumps(printed, separators=(",", ":")))
         return 0
     if args.spycloud_off:
         if not args.co:
