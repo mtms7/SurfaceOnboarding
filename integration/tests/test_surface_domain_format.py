@@ -175,24 +175,20 @@ class DashboardCardTests(unittest.TestCase):
         self.assertNotIn("was cleaned", card)
         self.assertNotIn("<script", card)
 
-    def test_cleaned_card_offers_copy_from_the_fixed_script_file(self):
+    def test_cleaned_card_states_the_cleaned_value_as_text(self):
+        # Owner 2026-10-07: show what was modified as plain text; no input box, no Copy button, no script.
         card = dashboard._domains_card(_row("a2a.it", CO0767_SHAPE))
-        self.assertIn("The Salesforce value was cleaned", card)
+        self.assertIn("Alternate Domains cleaned", card)
         self.assertIn("entries were separated by spaces", card)
-        self.assertIn("readonly", card)
-        self.assertIn("value='a2aenergia.eu, gruppoa2a.it, unareti.it'", card)
-        self.assertIn("id='copy-domains'", card)
-        # No inline script: only the fixed file served by the dashboard itself.
-        self.assertIn("<script src='/static/copy-domains.js'></script>", card)
-        self.assertNotIn("navigator.clipboard", card)
-        self.assertIn("navigator.clipboard.writeText", dashboard._COPY_SCRIPT)
-        self.assertIn("execCommand('copy')", dashboard._COPY_SCRIPT)
+        self.assertIn(": a2aenergia.eu, gruppoa2a.it, unareti.it</div>", card)
+        for absent in ("<input", "copy-domains", "Copy</button>", "<script"):
+            self.assertNotIn(absent, card)
 
-    def test_csp_allows_only_self_scripts_and_no_inline(self):
-        self.assertIn("script-src 'self'", dashboard.PAGE_CSP)
-        self.assertIn("script-src 'self';", dashboard.PAGE_CSP)  # no 'unsafe-inline' for scripts
+    def test_csp_allows_no_script_at_all(self):
+        self.assertNotIn("script-src", dashboard.PAGE_CSP)
         self.assertNotIn("nonce", dashboard.PAGE_CSP)
         self.assertIn("default-src 'none'", dashboard.PAGE_CSP)
+        self.assertFalse(hasattr(dashboard, "COPY_SCRIPT_PATH"))
 
     def test_rejected_card_is_blocked_and_escaped(self):
         card = dashboard._domains_card(_row(MAIN, "ok.example *.<b>x</b>.example ftp://u.example/<i>"))

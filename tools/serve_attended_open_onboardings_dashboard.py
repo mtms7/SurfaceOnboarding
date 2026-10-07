@@ -3351,20 +3351,8 @@ _DOMAIN_REJECT_TEXT = {
     "public_suffix": "a public suffix, not a registrable domain", "network": "an IP or network (not supported)",
     "malformed": "not a valid domain", "whitespace": "contains whitespace",
 }
-_COPY_SCRIPT = (
-    "var b=document.getElementById('copy-domains'),i=document.getElementById('clean-domains');"
-    "if(b&&i){b.addEventListener('click',function(){var d=function(){b.textContent='Copied'};"
-    "var f=function(){i.select();try{document.execCommand('copy');d()}catch(e){}};"
-    "if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(i.value).then(d,f)}"
-    "else{f()}})}"
-)
-
-
-# The only script the dashboard serves: a fixed file from this module (never page content), so the CSP allows
-# 'self' scripts and still forbids every inline script.
-COPY_SCRIPT_PATH = "/static/copy-domains.js"
-PAGE_CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; form-action 'self'; base-uri 'none'; "
-            "frame-ancestors 'none'")
+# No page runs a script (owner 2026-10-07: the cleaned domain value is shown as text, no Copy box).
+PAGE_CSP = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
 
 
 def _domain_lists(info: dict[str, object]) -> str:
@@ -3376,10 +3364,10 @@ def _domain_lists(info: dict[str, object]) -> str:
 
 
 def _domains_banners(info: dict[str, object]) -> tuple[str, str]:
-    """(banners, script tag) of the domains preview: main-domain error, rejected entries, cleaned value with Copy.
+    """(banners, "") of the domains preview: main-domain error, rejected entries, the cleaned value as plain text.
 
-    The CO page shows these outside any fold (a blocker must never be hidden); the Copy button needs the one
-    served script, whose tag is returned separately.
+    The CO page shows these outside any fold (a blocker must never be hidden). The second value is kept for the
+    callers and is always empty (no script).
     """
     body = ""
     if info["main_error"]:
@@ -3393,12 +3381,9 @@ def _domains_banners(info: dict[str, object]) -> tuple[str, str]:
     script = ""
     if info["notes"]:
         human = "; ".join(_DOMAIN_NOTE_TEXT.get(code, code) for code in info["notes"])
-        body += "<div class='banner banner-warn'><b>The Salesforce value was cleaned</b> (" + escape(human) + ")."
+        body += "<div class='banner banner-warn'><b>Alternate Domains cleaned</b> (" + escape(human) + ")"
         if info["salesforce_clean_value"]:
-            body += (" Paste this into Alternate_Domains__c:<br><input id='clean-domains' readonly size='60' value='"
-                     + escape(info["salesforce_clean_value"], quote=True) + "'> "
-                     "<button type='button' id='copy-domains' class='ghost'>Copy</button>")
-            script = "<script src='" + COPY_SCRIPT_PATH + "'></script>"
+            body += ": " + escape(info["salesforce_clean_value"])
         body += "</div>"
     return body, script
 
@@ -6211,11 +6196,6 @@ class Handler(BaseHTTPRequestHandler):
         if operator is None:
             self.send_redirect("/login"); return
         _current_operator.set(operator)
-        if path == COPY_SCRIPT_PATH:
-            data = _COPY_SCRIPT.encode()
-            self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "text/javascript; charset=utf-8")
-            self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0")
-            self.send_header("X-Content-Type-Options", "nosniff"); self.end_headers(); self.wfile.write(data); return
         # Display reads may use the short in-memory cache; ?refresh=1 drops it.
         if parse_qs(urlsplit(self.path).query).get("refresh", [""])[0] == "1":
             clear_display_cache()

@@ -150,11 +150,10 @@ class PinnedBannerTests(unittest.TestCase):
         self.assertGreater(page.index(text), page.index("class='pinned'"))
         self.assertLess(page.index(text), page.index("id='now-title'"))  # before the card, so before every fold
 
-    def test_domain_banners_with_the_copy_button_are_pinned_outside_the_fold(self):
+    def test_domain_banners_are_pinned_outside_the_fold(self):
         page = render(row_for(SURFACE, Alternate_Domains__c="A.example B.example"))
-        self.assert_pinned(page, "The Salesforce value was cleaned")
-        self.assert_pinned(page, "id='copy-domains'")
-        self.assertIn("<script src='/static/copy-domains.js'></script>", page)
+        self.assert_pinned(page, "Alternate Domains cleaned")
+        self.assertNotIn("<script", page)
         # The domain lists themselves are inside the Salesforce record fold.
         self.assertGreater(page.index("Domains for the tenant"), page.index("<h2 class='sum-h'>Salesforce record</h2>"))
 
