@@ -5293,17 +5293,37 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[
     Raises LeonardoSessionExpired (401/403) or RuntimeError with scan_status_executions_unavailable /
     scan_status_executions_id_mismatch. Nothing is saved; the details view is closed with Escape.
     """
+    # Listen BEFORE opening Details: the app may load the executions as Details opens (2026-10-07 live: waiting only
+    # around the tab click timed out). Details is opened with the same helper the live-verified probe uses.
+    seen: list[Any] = []
+
+    def on_response(candidate: Any) -> None:
+        if _is_scan_exec_response(candidate):
+            seen.append(candidate)
+
+    page.on("response", on_response)
     try:
-        page.locator("tr, [role='row']").filter(has_text=tenant_name).first.click(timeout=FIELD_TIMEOUT_MS)
-        page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
-        page.locator(SCAN_EXEC_DETAILS_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
-        with page.expect_response(_is_scan_exec_response, timeout=SCAN_EXEC_TIMEOUT_MS) as info:
-            page.get_by_text(SCAN_EXEC_DURATION_TEXT, exact=True).first.click(timeout=FIELD_TIMEOUT_MS)
-        response = info.value
+        _open_row_action(page, tenant_name, SCAN_EXEC_DETAILS_SELECTOR)
+        if not seen:
+            tab = page.get_by_role("tab", name=SCAN_EXEC_DURATION_TEXT, exact=True)
+            target = tab.first if tab.count() else page.get_by_text(SCAN_EXEC_DURATION_TEXT, exact=True).first
+            target.click(timeout=FIELD_TIMEOUT_MS)
+        waited = 0
+        while not seen and waited < SCAN_EXEC_TIMEOUT_MS:
+            page.wait_for_timeout(250)
+            waited += 250
+        if not seen:
+            raise TimeoutError("no executions reply")
+        response = seen[-1]
+        _log().event("scan_executions", "reply", detail=f"replies={len(seen)}")
     except Exception as exc:
         _log().error("scan_executions", "response", exc)
         raise RuntimeError("scan_status_executions_unavailable") from exc
     finally:
+        try:
+            page.remove_listener("response", on_response)
+        except Exception:
+            pass
         try:
             page.keyboard.press("Escape")
         except Exception:

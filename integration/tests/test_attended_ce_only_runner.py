@@ -4890,14 +4890,24 @@ class ScanStatusTests(unittest.TestCase):
             return self._body
 
     class _Page:
-        def __init__(self, response):
-            self.response, self.clicked, self.keys = response, [], []
+        """The app's executions reply arrives on the Details click (``emit_on="details"``, live behaviour suspected
+        2026-10-07) or on the "Duration Per Scan" tab click (``emit_on="tab"``)."""
+
+        def __init__(self, response, emit_on="tab"):
+            self.response, self.emit_on, self.clicked, self.keys, self.listeners = response, emit_on, [], [], []
             self.keyboard = type("K", (), {"press": lambda _s, key: self.keys.append(key)})()
 
-        def _target(self, name):
+        def _click(self, name):
+            self.clicked.append(name)
+            trigger = runner.SCAN_EXEC_DETAILS_SELECTOR if self.emit_on == "details" else "Duration Per Scan"
+            if name == trigger and self.response is not None:
+                for listener in list(self.listeners):
+                    listener(self.response)
+
+        def _target(self, name, count=1):
             page = self
-            return type("T", (), {"first": type("F", (), {"click": lambda _s, **kw: page.clicked.append(name)})(),
-                                  "filter": lambda _s, **kw: page._target(name)})()
+            return type("T", (), {"first": type("F", (), {"click": lambda _s, **kw: page._click(name)})(),
+                                  "filter": lambda _s, **kw: page._target(name), "count": lambda _s: count})()
 
         def locator(self, selector):
             return self._target(selector)
@@ -4905,12 +4915,17 @@ class ScanStatusTests(unittest.TestCase):
         def get_by_text(self, text, exact=False):
             return self._target(text)
 
-        def expect_response(self, predicate, timeout=0):
-            response = self.response
-            if response is None:
-                raise TimeoutError()
-            assert predicate(response)
-            return type("C", (), {"__enter__": lambda _s: _s, "__exit__": lambda _s, *a: False, "value": response})()
+        def get_by_role(self, role, name=None, exact=False):
+            return self._target(name, count=1 if role == "tab" else 0)
+
+        def on(self, event, listener):
+            self.listeners.append(listener)
+
+        def remove_listener(self, event, listener):
+            self.listeners.remove(listener)
+
+        def wait_for_timeout(self, _ms):
+            pass
 
     def test_read_executions_clicks_only_details_and_checks_the_id(self):
         origin = runner.DEVELOPMENT_ORIGIN
@@ -4919,6 +4934,11 @@ class ScanStatusTests(unittest.TestCase):
         self.assertEqual(runner.read_scan_executions(page, "Sample", self.ID)["execution_state"], "done")
         self.assertEqual(page.clicked[1:], [runner.SCAN_EXEC_ROW_MENU_SELECTOR, runner.SCAN_EXEC_DETAILS_SELECTOR,
                                             "Duration Per Scan"])
+        self.assertEqual(page.listeners, [])
+        # The reply already arrived when Details opened: the tab is not clicked and the reply is still used.
+        early = self._Page(self._Response(url, 200, self.EXEC_ROWS), emit_on="details")
+        self.assertEqual(runner.read_scan_executions(early, "Sample", self.ID)["execution_state"], "done")
+        self.assertEqual(early.clicked[1:], [runner.SCAN_EXEC_ROW_MENU_SELECTOR, runner.SCAN_EXEC_DETAILS_SELECTOR])
         self.assertEqual(page.keys, ["Escape"])
         for selector in page.clicked:
             for hazard in ("Grid_Access", "Scan_Now", "Stop_Scan", "Delete"):
