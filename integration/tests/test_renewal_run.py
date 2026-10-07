@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+from datetime import date
 from pathlib import Path
 import shutil
 import tempfile
@@ -101,6 +102,42 @@ class OrchestratorTests(RunnerSandbox):
                                   ("renewal_apply", "renewal_edit_verified"), ("spycloud", "spycloud_off_verified"),
                                   ("finish", "renewal_edit_verified")])
 
+    def window_source(self, apply_from):
+        term = {"apply_from": apply_from}
+        return SimpleNamespace(source_revision=REV, engine=ENGINE, surface_term=term, ce_term=term)
+
+    def run_steps(self, env_name, source):
+        log = runner.RunLog(REF, runner.RENEWAL_RUN_MODE, route="renewal_run")
+        self.stub(mirror_verified=False, source=source)
+        return runner._renewal_run_steps(REF, REV, log, env_name), log
+
+    def test_production_before_apply_from_stops_before_the_mirror_and_any_write(self):
+        for env in ("prod", "production", "staging", ""):
+            with self.subTest(env=env):
+                self.calls.clear()
+                with contextlib.ExitStack() as stack, patch.object(runner, "_run_day", return_value=date(2026, 10, 6)):
+                    self.stack = stack
+                    outcome, log = self.run_steps(env, self.window_source("2026-10-20"))
+                self.assertEqual(outcome, ("renewal_not_yet_applicable", ""))
+                self.assertEqual(self.steps(), [])  # no mirror, no dry run, no apply, no SpyCloud
+                self.assertIn(("apply_window", "renewal_not_yet_applicable"), [(e["step"], e["outcome"]) for e in log.events])
+
+    def test_dev_is_exempt_and_production_on_or_after_apply_from_proceeds(self):
+        with patch.object(runner, "_run_day", return_value=date(2026, 10, 6)):
+            outcome, _log = self.run_steps("dev", self.window_source("2026-10-20"))
+            self.assertEqual(outcome, ("renewal_edit_verified", ""))
+            self.assertEqual(self.steps(), ["mirror", "dry", "outcome", "apply", "outcome", "spycloud"])
+            self.calls.clear()
+            with contextlib.ExitStack() as stack:
+                self.stack = stack
+                outcome, _log = self.run_steps("prod", self.window_source("2026-10-06"))
+            self.assertEqual(outcome, ("renewal_edit_verified", ""))
+
+    def test_production_with_an_unreadable_apply_from_fails_closed(self):
+        outcome, _log = self.run_steps("prod", self.source)  # the plain test source carries no terms
+        self.assertEqual(outcome, ("renewal_not_yet_applicable", ""))
+        self.assertEqual(self.steps(), [])
+
     def test_existing_verified_mirror_is_skipped(self):
         self.stub(mirror_verified=True)
         self.start_record()
@@ -138,7 +175,9 @@ class OrchestratorTests(RunnerSandbox):
         self.assertEqual(self.record()["result"], "renewal_already_current")
 
     def test_any_other_dry_run_code_stops_before_apply(self):
-        for code in ("renewal_domains_mismatch_manual_review", "renewal_expiration_would_shorten",
+        # renewal_expiration_would_shorten is no longer produced (owner 2026-10-07: an already-renewed expiry is kept);
+        # renewal_not_yet_applicable (production apply window) takes its place in this list of stop codes.
+        for code in ("renewal_domains_mismatch_manual_review", "renewal_not_yet_applicable",
                      "renewal_new_domain_in_production", "renewal_target_not_in_production_clone",
                      "renewal_target_ambiguous_in_production_clone", "production_clone_unavailable",
                      "production_clone_incomplete", "renewal_form_mismatch", "source_revision_drift"):
@@ -526,7 +565,8 @@ class ResultTextTests(unittest.TestCase):
     def test_every_renewal_and_mirror_code_has_plain_language(self):
         codes = set(runner.RENEWAL_AFTER_CONFIRM_RESULTS | runner.MIRROR_AFTER_CONFIRM_RESULTS)
         codes |= {"renewal_edit_verified", "renewal_already_current", "renewal_domains_mismatch_manual_review",
-                  "renewal_expiration_would_shorten", "renewal_new_domain_in_production", "renewal_not_onboarded",
+                  "renewal_expiration_would_shorten", "renewal_not_yet_applicable",
+                  "renewal_new_domain_in_production", "renewal_not_onboarded",
                   "renewal_not_approved", "renewal_route_not_supported", "renewal_ce_email_domain_invalid",
                   "mirror_already_exists", "mirror_readback_exists", "mirror_clone_unavailable", "mirror_prod_tenant_not_found",
                   "mirror_prod_tenant_ambiguous", "mirror_duplicate_found", "source_revision_drift"}
@@ -538,6 +578,46 @@ class ResultTextTests(unittest.TestCase):
         self.assertEqual(dashboard.runner_result_message("renewal_edit_verified")[0], "success")
         self.assertEqual(dashboard.runner_result_message("renewal_already_current")[0], "success")
         self.assertEqual(dashboard.runner_result_message("renewal_saved_unverified")[0], "info")
+
+    def test_apply_window_and_kept_expiry_texts(self):
+        self.assertEqual(dashboard.runner_result_message("renewal_not_yet_applicable")[0], "blocked")
+        self.assertIn("14 days", dashboard.runner_result_message("renewal_not_yet_applicable")[1])
+        self.assertIn("renewal_not_yet_applicable", dashboard.RENEWAL_RESULT_TEXT)
+        self.assertIn("renewal_not_yet_applicable", dashboard.RENEWAL_CLI_BLOCK_TEXT)
+        self.assertIn("renewal_not_yet_applicable", dashboard.RENEWAL_RUN_HEADLINES)
+        text = dashboard.renewal_apply_text({"applicable_now": False, "apply_from": "2026-10-02"})
+        self.assertEqual(text, "Apply from 2026-10-02 — enforced in production; the Dev mirror may be renewed early")
+        self.assertIn("enforced in production", dashboard.renewal_apply_text({"applicable_now": True, "apply_from": "x"}))
+        self.assertEqual(dashboard.renewal_apply_text(None), "—")
+        self.assertEqual(dashboard.renewal_expiry_text("2030-01-01", "2029-10-15"),
+                         "Expiry kept (already 2030-01-01, DealHub term end 2029-10-15)")
+        self.assertEqual(dashboard.renewal_expiry_text("2029-10-15", "2029-10-15"),
+                         "Expiry kept (already 2029-10-15, DealHub term end 2029-10-15)")
+        self.assertEqual(dashboard.renewal_expiry_text("2026-10-15", "2029-10-15"),
+                         "2026-10-15 → 2029-10-15 (DealHub term end)")
+        self.assertEqual(dashboard.renewal_expiry_text("read from the mirror", "2029-10-15"),
+                         "read from the mirror → 2029-10-15 (DealHub term end)")
+
+    def test_the_outcome_record_and_card_carry_the_kept_expiry_and_apply_from(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        path = directory / "outcomes.json"
+        report = {"engine": ENGINE, "changes": [], "added_domains": 0, "expiration": "kept_already_current_or_later",
+                  "expiration_current": "2030-01-01", "expiration_target": "2029-10-15", "apply_from": "2026-10-02"}
+        with patch.object(runner, "RENEWAL_OUTCOMES_PATH", path), patch.object(dashboard, "RENEWAL_OUTCOMES_PATH", path):
+            runner.write_renewal_outcome(REF, "renewal_already_current", True, "not_performed",
+                                         runner.datetime(2026, 10, 7, 9, 0), None, report)
+            stored = json.loads(path.read_text(encoding="utf-8"))[REF]
+            self.assertEqual((stored["expiration_kept_current"], stored["expiration_kept_target"], stored["apply_from"]),
+                             ("2030-01-01", "2029-10-15", "2026-10-02"))
+            card = dashboard._renewal_outcome_section(REF)
+            self.assertIn("Expiry kept (already 2030-01-01, DealHub term end 2029-10-15)", card)
+            runner.write_renewal_outcome(REF, "renewal_not_yet_applicable", True, "not_performed",
+                                         runner.datetime(2026, 10, 7, 9, 0), None, {**report, "expiration": "planned"})
+            self.assertNotIn("expiration_kept_current", json.loads(path.read_text(encoding="utf-8"))[REF])
+            card = dashboard._renewal_outcome_section(REF)
+            self.assertIn("Apply from", card)
+            self.assertIn("2026-10-02", card)
 
     def test_blocked_plan_codes_and_unknown_codes(self):
         self.assertIn("No Core Plus term", dashboard.runner_result_message("renewal_blocked_no_core_plus_term")[1])

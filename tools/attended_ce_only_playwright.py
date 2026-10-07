@@ -1232,6 +1232,27 @@ def _renewal_term(rows: list[dict[str, Any]], today: date) -> dict[str, Any]:
             "apply_from": apply_from.isoformat(), "applicable_now": apply_from <= today}
 
 
+def renewal_apply_window_blocks(env_name: Any, apply_from: Any, today: date) -> bool:
+    """Guide G8 apply window (owner 2026-10-07): enforced for production only. Pure.
+
+    "dev" never blocks (Dev mirrors may be renewed early for testing). A production environment ("prod",
+    "production") blocks while ``today < apply_from``. Any other / unknown environment blocks (fail closed), and so
+    does an unreadable ``apply_from`` for a non-dev environment. Dry runs never call this.
+    """
+    if env_name == "dev":
+        return False
+    if env_name not in ("prod", "production"):
+        return True
+    if isinstance(apply_from, str):
+        try:
+            apply_from = date.fromisoformat(apply_from)
+        except ValueError:
+            return True
+    if not isinstance(apply_from, date) or isinstance(apply_from, datetime):
+        return True
+    return today < apply_from
+
+
 def build_renewal_plan(product: Any, onboarding_type: Any, subscription_rows: list[Any],
                        today: date | None = None) -> dict[str, Any] | None:
     """Read-only renewal plan for one CO from its DealHub rows (pure; values are not stored).
@@ -6360,6 +6381,17 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
 # A tenant domain list that cannot be read is renewal_row_schema_unexpected. Root domains are therefore never added
 # by a renewal; subdomain add-only and the Q3 production gate are unchanged.
 #
+# Already-renewed tenants (owner 2026-10-07, "apply only missing parts"; replaces the former stop
+# renewal_expiration_would_shorten): when the tenant's current expiration is at or beyond the DealHub term end the
+# expiration is NOT changed (report "expiration": "kept_already_current_or_later" + current/target dates; the
+# read-after-write verifies it unchanged) and the other specs are still planned. renewal_expiration_in_past,
+# start-date protection, the domains check and the Q3 gate are unchanged; no differing spec = renewal_already_current.
+#
+# Apply window (owner 2026-10-07, Guide G8): ENFORCED FOR PRODUCTION ONLY (renewal_apply_window_blocks). A write to
+# a production environment before apply_from (term start - RENEWAL_APPLY_WINDOW_DAYS) stops BEFORE Edit with
+# renewal_not_yet_applicable; Dev mirrors may be renewed early for testing; dry runs are never blocked; an unknown
+# environment blocks (fail closed). Every renewal today targets Leonardo Development.
+#
 # UNVERIFIED LIVE (nothing below has run against Leonardo yet; each failure is a fail-closed reason code):
 #   1. The Edit form shows the same label/name/data-am controls as Add Account for: the "Type", "Scanning
 #      interval" and "Leaked Credentials scanning interval" selects, "Number of assets/domains/subdomains",
@@ -6497,6 +6529,19 @@ def renewal_fill_source(reference: str, run_day: date | None = None) -> RenewalS
         raise SurfaceSourceError("renewal_source_unavailable") from exc
 
 
+def renewal_source_apply_from(source: RenewalSource) -> date | None:
+    """The latest ``apply_from`` of the new terms (G8), or None when unreadable (blocks outside dev)."""
+    found: list[date] = []
+    for term in (getattr(source, "surface_term", None), getattr(source, "ce_term", None)):
+        if not term:
+            continue
+        try:
+            found.append(date.fromisoformat(str(term["apply_from"])))
+        except (KeyError, ValueError):
+            return None
+    return max(found) if found else None
+
+
 def renewal_expiration(source: RenewalSource) -> date:
     """Q1 (owner, 2026-10-06, revised): the new term's DealHub Subscription End Date exactly (full multi-year term).
 
@@ -6611,7 +6656,11 @@ def _spec_display(spec: FieldSpec, value: Any) -> Any:
 
 
 def plan_renewal_changes(row: dict[str, Any], specs: list[FieldSpec], today: date) -> tuple[list[dict[str, Any]], str | None]:
-    """The planned diff: only specs whose current row value differs. (changes, error code)."""
+    """The planned diff: only specs whose current row value differs. (changes, error code).
+
+    Owner 2026-10-07 ("apply only missing parts"): a tenant whose expiration is already at or beyond the target
+    keeps it (no license_end change, see ``renewal_kept_expiration``) and the other specs are still planned.
+    """
     changes: list[dict[str, Any]] = []
     for spec in specs:
         if spec.key in RENEWAL_NEVER_SET:
@@ -6620,15 +6669,31 @@ def plan_renewal_changes(row: dict[str, Any], specs: list[FieldSpec], today: dat
         if spec.kind == "date":
             if spec.target <= today:
                 return [], "renewal_expiration_in_past"
-            current = sorted(_epoch_dates(value))
-            if current and date.fromisoformat(current[0]) > spec.target:
-                return [], "renewal_expiration_would_shorten"
+            if _current_expiration(value, spec.target) is not None:
+                continue
         if _spec_equal(spec, value):
             continue
         changes.append({"spec": spec, "current": value})
     # Checkboxes first (the Leaked Credentials controls depend on theirs), then the rest in plan order.
     changes.sort(key=lambda change: change["spec"].kind != "checkbox")
     return changes, None
+
+
+def _current_expiration(value: Any, target: date) -> date | None:
+    """The tenant's current expiration when it is already at or beyond ``target``, else None (also when unreadable)."""
+    current = sorted(_epoch_dates(value))
+    if current and date.fromisoformat(current[0]) >= target:
+        return date.fromisoformat(current[0])
+    return None
+
+
+def renewal_kept_expiration(row: dict[str, Any], specs: list[FieldSpec]) -> FieldSpec | None:
+    """The license_end spec whose change is skipped because the tenant is already at/after the target, else None."""
+    for spec in specs:
+        if (spec.kind == "date" and spec.key == "license_end"
+                and _current_expiration(_row_value(row, spec.path), spec.target) is not None):
+            return spec
+    return None
 
 
 def _stable(value: Any) -> str:
@@ -6638,9 +6703,15 @@ def _stable(value: Any) -> str:
 
 
 def renewal_preserve_snapshot(row: dict[str, Any], specs: list[FieldSpec]) -> dict[str, str]:
-    """Stable fingerprints of every row path the edit must NOT change (never logged: paths only)."""
-    changing = {spec.path for spec in specs}
+    """Stable fingerprints of every row path the edit must NOT change (never logged: paths only).
+
+    A kept expiration (already at/after the target) is preserved too: the read-after-write must see it unchanged.
+    """
+    kept = renewal_kept_expiration(row, specs)
+    changing = {spec.path for spec in specs if spec is not kept}
     paths = list(RENEWAL_PRESERVE_PATHS)
+    if kept is not None:
+        paths.append(kept.path)
     paths += [path for path in VALIDATION_TOGGLE_PATHS.values() if path not in paths]
     paths += [path for path in ("alternateDomains", "subDomains", "leakedCredentialsScannedDomains") if path not in paths]
     return {path: _stable(_row_value(row, path)) for path in paths if path not in changing}
@@ -6752,7 +6823,8 @@ def _apply_spec(page: Any, spec: FieldSpec) -> str | None:
 
 
 def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id: str, *, expected_uuid: str | None = None,
-                 gate: Any = None, confirm_write: bool = False, today: date | None = None) -> tuple[str, dict[str, Any]]:
+                 gate: Any = None, confirm_write: bool = False, today: date | None = None,
+                 env_name: str = "dev") -> tuple[str, dict[str, Any]]:
     """Plan (and, only with confirm_write, apply) a renewal edit on one Leonardo Development tenant.
 
     Returns (result, report). Outcomes: renewal_dry_run_planned (Edit opened, diff computed, cancelled),
@@ -6760,7 +6832,9 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     shows every changed field AND every preserved field). Reason codes: renewal_environment_not_supported,
     renewal_readback_unavailable, renewal_tenant_not_found, renewal_row_ambiguous, renewal_name_mismatch,
     renewal_domain_mismatch, renewal_tenant_deleted, renewal_row_schema_unexpected, renewal_expiration_in_past,
-    renewal_expiration_would_shorten, renewal_start_date_protected, renewal_domains_mismatch_manual_review (owner
+    renewal_not_yet_applicable (owner 2026-10-07: the G8 apply window is enforced for PRODUCTION only; a write
+    before ``apply_from`` stops before Edit and the report carries apply_from; Dev mirrors and dry runs are never
+    blocked), renewal_start_date_protected, renewal_domains_mismatch_manual_review (owner
     2026-10-07: the CO's root domains differ from the tenant's; stops before Edit, counts in the report and the
     domains under "manual_review" for the terminal only), the domain-gate codes
     (renewal_new_domain_in_production, renewal_target_not_in_production_clone,
@@ -6771,6 +6845,10 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     renewal_save_failed, renewal_saved_unverified, renewal_readback_changed_mismatch,
     renewal_readback_preserved_mismatch. A 401/403 raises LeonardoSessionExpired. The form is cancelled (or Escape
     pressed) wherever nothing was saved. The report carries dates, enums, counts and flags only (no domain values).
+    Owner 2026-10-07 ("apply only missing parts"): when the tenant's expiration is already at or beyond the
+    DealHub term end it is NOT changed (report "expiration": "kept_already_current_or_later" with the dates; the
+    read-after-write checks it is unchanged) and the other fields are still planned; the former stop
+    ``renewal_expiration_would_shorten`` is no longer produced.
     """
     report: dict[str, Any] = {"engine": source.engine, "mode": "write" if confirm_write else "dry_run",
                               "start_date": "never_changed", "changes": [], "added_domains": 0,
@@ -6794,15 +6872,25 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     specs, added, errors = build_renewal_specs(source, row)
     if errors:
         return errors[0], report
-    changes, error = plan_renewal_changes(row, specs, today or _run_day())
+    day = today or _run_day()
+    changes, error = plan_renewal_changes(row, specs, day)
     if error:
         return error, report
+    kept = renewal_kept_expiration(row, specs)
+    if kept is not None:
+        report["expiration"] = "kept_already_current_or_later"
+        report["expiration_current"] = _spec_display(kept, _row_value(row, kept.path))
+        report["expiration_target"] = kept.target.isoformat()
     report["changes"] = [{"field": c["spec"].key, "kind": c["spec"].kind, "current": _spec_display(c["spec"], c["current"]),
                           "target": _spec_display(c["spec"], c["spec"].target)} for c in changes]
     report["added_domains"] = len(added)
     report["profile_drift"] = renewal_profile_drift(row)
     if not changes:
         return "renewal_already_current", report
+    apply_from = renewal_source_apply_from(source)
+    report["apply_from"] = apply_from.isoformat() if apply_from else None
+    if confirm_write and renewal_apply_window_blocks(env_name, apply_from, day):
+        return "renewal_not_yet_applicable", report  # before the gate and before Edit is opened
     found_gate = (gate or (lambda domains: _renewal_gate(source, domains)))(sorted(added))
     report["gate"] = found_gate["result"]
     if found_gate["blocks"]:
@@ -6961,6 +7049,11 @@ def write_renewal_outcome(reference: str, result: str, confirm_write: bool, leon
         if domains_result == "mismatch":
             record["domains_only_in_salesforce"] = _count_or_none(domains.get("only_in_salesforce"))
             record["domains_only_on_tenant"] = _count_or_none(domains.get("only_on_tenant"))
+    if report.get("expiration") == "kept_already_current_or_later":
+        record["expiration_kept_current"] = _renewal_outcome_date(report.get("expiration_current"))
+        record["expiration_kept_target"] = _renewal_outcome_date(report.get("expiration_target"))
+    if report.get("apply_from") is not None:
+        record["apply_from"] = _renewal_outcome_date(report.get("apply_from"))
     state = _renewal_outcomes()
     state[reference] = record
     _write_json_atomic(RENEWAL_OUTCOMES_PATH, state)
@@ -7015,7 +7108,7 @@ def run_renewal(reference: str, *, confirm_write: bool = False, env_name: str = 
                 with _attended_page(playwright) as page:
                     log.attach(page)
                     result, report = renew_tenant(page, source, tenant_name, ids[0], expected_uuid=ids[1],
-                                                  confirm_write=confirm_write)
+                                                  confirm_write=confirm_write, env_name=env_name)
             except LoginTimeout:
                 result = "development_login_timeout"
             except RuntimeError as error:
@@ -8038,7 +8131,7 @@ def renewal_mirror_verified(reference: str) -> bool:
                 and record.get("surface_account_id") == ids[0])
 
 
-def _renewal_run_steps(reference: str, revision: str | None, log: RunLog) -> tuple[str, str]:
+def _renewal_run_steps(reference: str, revision: str | None, log: RunLog, env_name: str = "dev") -> tuple[str, str]:
     """(result, uncertain stage or "") of one orchestrated renewal run; never raises on expected failures."""
     try:
         source = renewal_fill_source(reference)
@@ -8051,6 +8144,11 @@ def _renewal_run_steps(reference: str, revision: str | None, log: RunLog) -> tup
     log.event("source", "ok", detail=source.engine)
     if source.engine not in RENEWAL_ENGINES:
         return "renewal_route_not_supported", ""
+    # G8 apply window (owner 2026-10-07): production only; Dev mirrors may be renewed early. Nothing is opened.
+    apply_from = renewal_source_apply_from(source) if env_name != "dev" else None  # dev is exempt: never read
+    if renewal_apply_window_blocks(env_name, apply_from, _run_day()):
+        log.event("apply_window", "renewal_not_yet_applicable", detail=str(apply_from))
+        return "renewal_not_yet_applicable", ""
     # 2. Dev mirror
     if renewal_mirror_verified(reference):
         log.event("mirror", "skipped_verified_mirror")
@@ -8060,7 +8158,7 @@ def _renewal_run_steps(reference: str, revision: str | None, log: RunLog) -> tup
         if mirror != "mirror_created_verified":
             return mirror, ("mirror_create" if mirror in MIRROR_AFTER_CONFIRM_RESULTS else "")
     # 3. dry run
-    result, report = run_renewal(reference, confirm_write=False, expected_revision=source.source_revision)
+    result, report = run_renewal(reference, confirm_write=False, env_name=env_name, expected_revision=source.source_revision)
     log.event("renewal_dry_run", result)
     report = report if isinstance(report, dict) else {}
     report.pop("manual_review", None)  # domain lists never reach a record
@@ -8068,7 +8166,7 @@ def _renewal_run_steps(reference: str, revision: str | None, log: RunLog) -> tup
     if result != "renewal_dry_run_planned":  # includes renewal_already_current (finishes OK) and every stop code
         return result, ""
     # 4. apply
-    result, report = run_renewal(reference, confirm_write=True, expected_revision=source.source_revision)
+    result, report = run_renewal(reference, confirm_write=True, env_name=env_name, expected_revision=source.source_revision)
     log.event("renewal_apply", result)
     report = report if isinstance(report, dict) else {}
     report.pop("manual_review", None)
@@ -8101,7 +8199,7 @@ def run_renewal_onboarding(reference: str, revision: str | None = None, env_name
         elif not REFERENCE.fullmatch(reference):
             result = "invalid_co_reference"
         else:
-            result, uncertain = _renewal_run_steps(reference, revision, log)
+            result, uncertain = _renewal_run_steps(reference, revision, log, env_name)
     except Exception as exc:  # noqa: BLE001 - the record must never stay "Running"
         log.error("run", "crashed", exc)
         result, uncertain = "runner_crashed", ""

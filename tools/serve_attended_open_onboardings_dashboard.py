@@ -2462,7 +2462,7 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None,
     term = surface or ce
     if term:
         when = "now" if term["applicable_now"] else "from " + term["apply_from"]
-        facts += [("Apply", when + " (up to 14 days before the new term starts)"),
+        facts += [("Apply", when + " (up to 14 days before the new term starts) — " + RENEWAL_APPLY_WINDOW_NOTE),
                   ("Expiration (Q1)", f"DealHub term end exactly: {term['end']}"),
                   ("Start date (Q2)", "never changed")]
     if "terms_agree" in plan:
@@ -2480,11 +2480,32 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None,
             "A renewal is applied only by Start renewal in What to do now (Leonardo Development; Dev mirror first).</p></section>")
 
 
-RENEWAL_OUTCOME_DATES = ("old_expiration", "new_expiration")
+RENEWAL_OUTCOME_DATES = ("old_expiration", "new_expiration", "expiration_kept_current", "expiration_kept_target", "apply_from")
+RENEWAL_APPLY_WINDOW_NOTE = "enforced in production; the Dev mirror may be renewed early"
+
 RENEWAL_RESULT_TEXT = {
     "renewal_domains_mismatch_manual_review":
         "Salesforce domains differ from the tenant's domains — manual review; nothing was saved",
+    "renewal_not_yet_applicable":
+        "Production renewals are applied only from 14 days before the new term starts; nothing was saved",
 }
+
+
+def renewal_apply_text(term: Any) -> str:
+    """"Apply from <date> — enforced in production; the Dev mirror may be renewed early" (owner 2026-10-07)."""
+    if not term:
+        return "\u2014"
+    return ("now" if term["applicable_now"] else "Apply from " + str(term["apply_from"])) + " \u2014 " + RENEWAL_APPLY_WINDOW_NOTE
+
+
+def renewal_expiry_text(old: str, end: str) -> str:
+    """Plan text for the expiry: "Expiry kept (...)" when the tenant is already at/after the DealHub term end (owner 2026-10-07)."""
+    try:
+        if date.fromisoformat(old) >= date.fromisoformat(end):
+            return "Expiry kept (already " + old + ", DealHub term end " + end + ")"
+    except ValueError:
+        pass
+    return old + " \u2192 " + end + " (DealHub term end)"
 
 
 def attended_renewal_outcomes() -> dict[str, dict[str, object]]:
@@ -2531,8 +2552,13 @@ def _renewal_outcome_section(reference: str) -> str:
     facts += [("Mode", escape(str(outcome["mode"]).replace("_", " "))),
               ("Leonardo write", escape(str(outcome["leonardo_write"]).replace("_", " "))),
               ("Observed", escape(outcome["observed_at"].strftime("%Y-%m-%d %H:%M")))]  # type: ignore[union-attr]
-    if outcome["new_expiration"]:
+    if outcome.get("expiration_kept_current") and outcome.get("expiration_kept_target"):
+        facts.append(("Expiration", escape("Expiry kept (already " + str(outcome["expiration_kept_current"])
+                                           + ", DealHub term end " + str(outcome["expiration_kept_target"]) + ")")))
+    elif outcome["new_expiration"]:
         facts.append(("Expiration", escape(str(outcome["old_expiration"] or "—")) + " → " + escape(str(outcome["new_expiration"]))))
+    if outcome.get("apply_from") and str(outcome["result"]) == "renewal_not_yet_applicable":
+        facts.append(("Apply from", escape(str(outcome["apply_from"]))))
     if outcome["changes"] is not None:
         facts.append(("Planned changes", str(outcome["changes"]) + (
             " · " + str(outcome["added_domains"]) + " added domain(s)" if outcome["added_domains"] else "")))
@@ -3641,8 +3667,10 @@ RENEWAL_DOMAIN_GATE_CODES = frozenset({
     "renewal_new_domain_in_production", "renewal_target_not_in_production_clone",
     "renewal_target_ambiguous_in_production_clone", "production_clone_unavailable", "production_clone_incomplete"})
 RENEWAL_CLI_BLOCK_TEXT = {
+    # Historical only: no longer produced (owner 2026-10-07: an already-renewed expiry is kept); old stored outcomes still read.
     "renewal_expiration_would_shorten": "The new expiration would shorten the current licence — manual review; nothing was saved.",
     "renewal_domains_mismatch_manual_review": RENEWAL_RESULT_TEXT["renewal_domains_mismatch_manual_review"],
+    "renewal_not_yet_applicable": RENEWAL_RESULT_TEXT["renewal_not_yet_applicable"] + ".",
     **{code: "Domain gate (Q3): the added domains did not pass the production duplicate gate; nothing was saved."
        for code in RENEWAL_DOMAIN_GATE_CODES},
 }
@@ -3812,7 +3840,9 @@ def _renewal_plan_summary(ctx: SimpleNamespace) -> str:
         mirror = "Will be created from the production clone (the production tenant is only read)"
         old = "read from the mirror"
     items = [("Dev mirror", mirror),
-             ("Expiry (Q1)", old + " \u2192 " + (str(term["end"]) if term else "\u2014") + " (DealHub term end)"),
+             ("Expiry (Q1)", renewal_expiry_text(old, str(term["end"])) if term
+              else old + " \u2192 \u2014 (DealHub term end)"),
+             ("Apply from", renewal_apply_text(term)),
              ("Start date (Q2)", "Unchanged"),
              ("Number of domains", "Kept; if the Salesforce domains differ from the tenant's, the run stops (domains check)"),
              ("Added subdomains (Q3)", "Each one passes the production duplicate gate before the save"),
@@ -3848,8 +3878,9 @@ def _renewal_do_now(ctx: SimpleNamespace) -> tuple[str, str, str]:
     blockers = _renewal_blockers(ctx)
     term = _renewal_term(ctx)
     summary = [("Term", (str(term["start"]) + " \u2192 " + str(term["end"])) if term else "\u2014"),
-               ("Expiry", _renewal_old_expiry(ctx) + " \u2192 " + (str(term["end"]) if term else "\u2014")),
-               ("Apply from", ("now" if term["applicable_now"] else str(term["apply_from"])) if term else "\u2014"),
+               ("Expiry", renewal_expiry_text(_renewal_old_expiry(ctx), str(term["end"])) if term
+                else _renewal_old_expiry(ctx) + " \u2192 \u2014"),
+               ("Apply from", renewal_apply_text(term)),
                ("Blockers", str(len(blockers)) if blockers else "None"),
                ("Domain gate (Q3)", _renewal_gate_text(ctx))]
     summary_html = ("<dl class='kv sum5'>" + "".join("<div><dt>" + escape(k) + "</dt><dd>" + escape(v) + "</dd></div>"
@@ -4142,9 +4173,10 @@ def _key_facts(ctx: SimpleNamespace) -> list[tuple[str, str]]:
         outcome = ctx.outcome
         last = ("Not run yet" if outcome is None else str(outcome["result"]) + " · write " + str(outcome["leonardo_write"]).replace("_", " "))
         facts += [("Existing tenant", "ID in Salesforce (production)" if has_id else "None in Salesforce \u2014 found by name"),
-                  ("Expiry", _renewal_old_expiry(ctx) + " → " + (str(term["end"]) if term else "—")),
+                  ("Expiry", renewal_expiry_text(_renewal_old_expiry(ctx), str(term["end"])) if term
+                   else _renewal_old_expiry(ctx) + " → —"),
                   ("Start date", "Unchanged (Q2)"),
-                  ("Apply from", ("now" if term["applicable_now"] else str(term["apply_from"])) if term else "—"),
+                  ("Apply from", renewal_apply_text(term)),
                   ("Added domains · Q3 gate", _renewal_gate_text(ctx)),
                   ("Domains check", _renewal_domains_text(ctx)),
                   ("Last renewal run", last),
@@ -4586,7 +4618,9 @@ RENEWAL_RUN_MESSAGES: dict[str, tuple[str, str]] = {
     "renewal_domains_mismatch_manual_review": ("blocked", "The Salesforce domains differ from the domains on the tenant. Manual review is required; nothing was saved."),
     "renewal_expiration_would_shorten": ("blocked", "The new expiration would be earlier than the tenant's current one (it may already be renewed). Manual review; nothing was saved."),
     **{code: ("blocked", text) for code, text in RENEWAL_CLI_BLOCK_TEXT.items()
-       if code not in ("renewal_expiration_would_shorten", "renewal_domains_mismatch_manual_review")},
+       if code not in ("renewal_expiration_would_shorten", "renewal_domains_mismatch_manual_review",
+                       "renewal_not_yet_applicable")},
+    "renewal_not_yet_applicable": ("blocked", "A production renewal can be applied only from 14 days before the new term starts. Nothing was saved or opened."),
     "renewal_not_approved": ("blocked", "Onboarding Approval Status is not Approved in Salesforce. Nothing was started."),
     "renewal_route_mismatch": ("blocked", "This CO is not one of the renewal cases. Nothing was started."),
     "renewal_route_not_supported": ("blocked", "Single-product renewals are out of scope (only Cases 4-6). Nothing was started."),
@@ -4638,6 +4672,7 @@ RENEWAL_RUN_HEADLINES = {
     "renewal_edit_verified": "Renewal applied (Dev)", "renewal_already_current": "Already renewed (Dev)",
     "renewal_domains_mismatch_manual_review": "Domains differ - manual review",
     "renewal_expiration_would_shorten": "Would shorten the licence - manual review",
+    "renewal_not_yet_applicable": "Not yet applicable (production apply window)",
 }
 
 

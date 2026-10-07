@@ -251,8 +251,49 @@ class PlanTests(unittest.TestCase):
     def test_expiration_guards(self):
         specs, _a, _e, row = self.plan()
         self.assertEqual(runner.plan_renewal_changes(row, specs, date(2029, 10, 16))[1], "renewal_expiration_in_past")
+        # Owner 2026-10-07 ("apply only missing parts"): a later current expiry is no longer a stop (was
+        # renewal_expiration_would_shorten); it is kept and the other fields are still planned.
         later = tenant_row(accountLicense__expirationDate=ms(date(2030, 1, 1)))
-        self.assertEqual(runner.plan_renewal_changes(later, specs, TODAY)[1], "renewal_expiration_would_shorten")
+        changes, error = runner.plan_renewal_changes(later, specs, TODAY)
+        self.assertIsNone(error)
+        keys = {change["spec"].key for change in changes}
+        self.assertNotIn("license_end", keys)
+        self.assertIn("Number of assets", keys)
+
+    def test_an_expiry_at_or_beyond_the_target_is_kept_and_the_rest_is_planned(self):
+        for current in (date(2029, 10, 15), date(2030, 1, 1)):  # equal to / later than the DealHub term end
+            with self.subTest(current=current):
+                row = tenant_row(accountLicense__expirationDate=ms(current))
+                specs, _a, _e, _ = self.plan(row)
+                self.assertIsNotNone(runner.renewal_kept_expiration(row, specs))
+                changes, error = runner.plan_renewal_changes(row, specs, TODAY)
+                self.assertIsNone(error)
+                self.assertNotIn("license_end", {c["spec"].key for c in changes})
+                self.assertGreater(len(changes), 3)
+        earlier = tenant_row()  # 2026-10-15 < 2029-10-15: the expiry is changed as before
+        specs, _a, _e, _ = self.plan(earlier)
+        self.assertIsNone(runner.renewal_kept_expiration(earlier, specs))
+        self.assertIn("license_end", {c["spec"].key for c in runner.plan_renewal_changes(earlier, specs, TODAY)[0]})
+
+    def test_a_kept_expiry_with_everything_else_current_is_an_empty_diff(self):
+        row = after_row(tenant_row(), accountLicense__expirationDate=ms(date(2030, 1, 1)))
+        specs, _a, _e, _ = self.plan(row)
+        self.assertEqual(runner.plan_renewal_changes(row, specs, TODAY), ([], None))
+
+    def test_a_kept_expiry_is_verified_unchanged_by_the_readback(self):
+        before = tenant_row(accountLicense__expirationDate=ms(date(2030, 1, 1)))
+        specs, _a, _e, _ = self.plan(before)
+        changes, _ = runner.plan_renewal_changes(before, specs, TODAY)
+        snapshot = runner.renewal_preserve_snapshot(before, specs)
+        self.assertIn("accountLicense.expirationDate", snapshot)
+        good = after_row(before, accountLicense__expirationDate=ms(date(2030, 1, 1)))
+        self.assertEqual(runner.verify_renewal_row(good, changes, snapshot), ([], []))
+        moved = after_row(before)  # the save wrote the DealHub term end over the later expiry
+        self.assertEqual(runner.verify_renewal_row(moved, changes, snapshot)[1], ["accountLicense.expirationDate"])
+        # When the expiry IS changed it is a changed field, not a preserved one (as before).
+        normal = tenant_row()
+        normal_specs, _a, _e, _ = self.plan(normal)
+        self.assertNotIn("accountLicense.expirationDate", runner.renewal_preserve_snapshot(normal, normal_specs))
 
     def test_nothing_to_change_gives_an_empty_diff(self):
         row = after_row(tenant_row())
@@ -431,6 +472,36 @@ class RenewTenantTests(unittest.TestCase):
         self.assertEqual([s for s in page.selectors if "data-am" in s], [])
         self.assertEqual(self.applied, [])
 
+    def test_an_already_renewed_expiry_is_kept_in_a_dry_run_report(self):
+        self.before = tenant_row(accountLicense__expirationDate=ms(date(2030, 1, 1)))
+        (result, report), _page = self.run_edit(confirm_write=False, results=[result_of(self.before)])
+        self.assertEqual(result, "renewal_dry_run_planned")
+        self.assertEqual(report["expiration"], "kept_already_current_or_later")
+        self.assertEqual((report["expiration_current"], report["expiration_target"]), ("2030-01-01", "2029-10-15"))
+        self.assertNotIn("license_end", {change["field"] for change in report["changes"]})
+
+    def test_an_already_renewed_expiry_is_never_written_and_is_verified_unchanged(self):
+        self.before = tenant_row(accountLicense__expirationDate=ms(date(2030, 1, 1)))
+        done = after_row(self.before, accountLicense__expirationDate=ms(date(2030, 1, 1)))
+        (result, report), page = self.run_edit(confirm_write=True, results=[result_of(self.before), result_of(done)])
+        self.assertEqual(result, "renewal_edit_verified")
+        self.assertNotIn("license_end", self.applied)
+        self.assertEqual(report["expiration"], "kept_already_current_or_later")
+        self.assertEqual(report["readback"]["preserved_bad"], [])
+        self.assertEqual(page.clicked.count("Confirm"), 1)
+        # A save that moved the kept expiry is a preserved-field mismatch.
+        moved = after_row(self.before)
+        (result, report), _page = self.run_edit(confirm_write=True, results=[result_of(self.before), result_of(moved)])
+        self.assertEqual(result, "renewal_readback_preserved_mismatch")
+        self.assertEqual(report["readback"]["preserved_bad"], ["accountLicense.expirationDate"])
+
+    def test_an_already_renewed_tenant_with_nothing_else_to_change_is_already_current(self):
+        self.before = after_row(tenant_row(), accountLicense__expirationDate=ms(date(2030, 1, 1)))
+        (result, report), page = self.run_edit(confirm_write=True, results=[result_of(self.before)])
+        self.assertEqual(result, "renewal_already_current")
+        self.assertEqual(report["expiration"], "kept_already_current_or_later")
+        self.assertEqual([s for s in page.selectors if "data-am" in s], [])
+
     def test_confirm_write_applies_confirms_once_and_verifies_changed_and_preserved(self):
         (result, report), page = self.run_edit(confirm_write=True,
                                                results=[result_of(self.before), result_of(after_row(self.before))])
@@ -442,6 +513,51 @@ class RenewTenantTests(unittest.TestCase):
         self.assertEqual(report["readback"]["preserved_bad"], [])
         self.assertGreater(report["readback"]["preserved_ok"], 10)
         self.assertEqual(runner.renewal_write_label(result, True), "verified")
+
+    def windowed(self, apply_from):
+        """A source whose terms open the apply window on ``apply_from`` (TODAY is 2026-10-06)."""
+        term = {**source().surface_term, "apply_from": apply_from}
+        return source(surface_term=term, ce_term={"start": "2026-10-16", "apply_from": apply_from})
+
+    def test_dev_is_never_blocked_by_the_apply_window(self):
+        for env in ("dev",):
+            (result, report), page = self.run_edit(
+                confirm_write=True, env_name=env, src=self.windowed("2026-10-20"),
+                results=[result_of(self.before), result_of(after_row(self.before))])
+            self.assertEqual(result, "renewal_edit_verified")
+            self.assertEqual(report["apply_from"], "2026-10-20")  # reported, not enforced
+            self.assertEqual(page.clicked.count("Confirm"), 1)
+
+    def test_production_before_apply_from_stops_before_the_edit_form_opens(self):
+        gate_calls: list = []
+        for env in ("prod", "production", "staging", ""):  # unknown environments fail closed too
+            with self.subTest(env=env):
+                self.applied.clear()
+                (result, report), page = self.run_edit(
+                    confirm_write=True, env_name=env, src=self.windowed("2026-10-20"),
+                    gate=lambda domains: gate_calls.append(domains) or dict(CLEAR), results=[result_of(self.before)])
+                self.assertEqual(result, "renewal_not_yet_applicable")
+                self.assertEqual(report["apply_from"], "2026-10-20")
+                self.assertEqual([s for s in page.selectors if "data-am" in s], [])  # Edit never opened
+                self.assertEqual(page.clicked, [])
+                self.assertEqual(self.applied, [])
+                self.assertEqual(runner.renewal_write_label(result, True), "not_performed")
+        self.assertEqual(gate_calls, [])
+
+    def test_production_on_or_after_apply_from_is_not_blocked_and_dry_runs_never_are(self):
+        (result, _r), _page = self.run_edit(confirm_write=True, env_name="prod", src=self.windowed("2026-10-06"),
+                                            results=[result_of(self.before), result_of(after_row(self.before))])
+        self.assertEqual(result, "renewal_edit_verified")  # today == apply_from
+        for env in ("prod", "staging"):
+            (result, _r), page = self.run_edit(confirm_write=False, env_name=env, src=self.windowed("2026-10-20"),
+                                               results=[result_of(self.before)])
+            self.assertEqual(result, "renewal_dry_run_planned")
+            self.assertEqual(page.clicked.count("Confirm"), 0)
+
+    def test_production_with_an_unreadable_apply_from_fails_closed_but_dev_does_not(self):
+        (result, report), _page = self.run_edit(confirm_write=True, env_name="prod", results=[result_of(self.before)])
+        self.assertEqual(result, "renewal_not_yet_applicable")  # the default test source carries no apply_from
+        self.assertIsNone(report["apply_from"])
 
     def test_a_moved_start_date_after_the_save_is_a_preserved_field_mismatch(self):
         moved = after_row(self.before, accountLicense__startDate=ms(date(2026, 10, 16)))
@@ -565,6 +681,27 @@ class RenewTenantTests(unittest.TestCase):
 
 
 class HelperTests(unittest.TestCase):
+    def test_apply_window_helper_is_dev_exempt_and_fails_closed(self):
+        blocks = runner.renewal_apply_window_blocks
+        future, past, today = date(2026, 10, 20), date(2026, 10, 1), date(2026, 10, 6)
+        self.assertFalse(blocks("dev", future, today))  # Dev mirrors may be renewed early
+        self.assertFalse(blocks("dev", None, today))
+        for env in ("prod", "production"):
+            self.assertTrue(blocks(env, future, today))
+            self.assertTrue(blocks(env, future.isoformat(), today))
+            self.assertFalse(blocks(env, past, today))
+            self.assertFalse(blocks(env, today, today))  # the window opens ON apply_from
+        for env in ("", "DEV", "prod-clone", "staging", None):
+            self.assertTrue(blocks(env, past, today))  # unknown environment: always blocks
+        for bad in (None, "", "not-a-date", 5):
+            self.assertTrue(blocks("prod", bad, today))  # unreadable apply_from outside dev
+
+    def test_the_source_apply_from_is_the_latest_of_the_terms(self):
+        both = source(surface_term={**source().surface_term, "apply_from": "2026-10-02"},
+                      ce_term={"apply_from": "2026-10-09"})
+        self.assertEqual(runner.renewal_source_apply_from(both), date(2026, 10, 9))
+        self.assertIsNone(runner.renewal_source_apply_from(source()))  # no apply_from recorded
+
     def test_confirm_has_no_start_date_fallback_in_edit_mode(self):
         with patch.object(runner, "_confirm_enabled", return_value=False), \
                 patch.object(runner, "_fill_license_date", side_effect=AssertionError("must not re-pick the start")):
