@@ -5039,6 +5039,11 @@ PENTERA_CSS = (
     ".seg a.on .chip{outline:1px solid #fff}"
     ".strip{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}"
     ".prodnote{background:var(--env-prod-bg);color:var(--env-prod);border-radius:8px;padding:8px 12px;margin:0 0 14px;font-size:13px}"
+    # Sidebar search (GET /search, no script).
+    ".sidesearch{display:flex;flex-direction:column;gap:6px;margin:0 0 14px}"
+    ".sidesearch input{width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:6px;font:inherit;font-size:13px;"
+    "background:#fff;color:var(--text)}.sidesearch button{padding:6px 12px;font-size:13px}"
+    "@media(max-width:760px){.sidesearch{flex-direction:row;flex:1 1 100%;margin:0 0 8px}.sidesearch input{flex:1}}"
     "@media(max-width:760px){.navgroup{flex-direction:row;flex-wrap:wrap;align-items:center;margin:0 8px 0 0}"
     ".navhead{display:none}.envrow{margin:-8px 0 6px}}"
 )
@@ -5056,6 +5061,11 @@ NAV_GROUPS = (
 ENV_BY_ACTIVE = {"onboardings": "dev", "dev_onboarded": "dev", "history": "dev", "inventory": "dev",
                  "prod": "prod", "prod_matches": "prod", "prod_tenants": "prod"}
 ENV_PILLS = {"dev": "DEV · Leonardo", "prod": "PRODUCTION · read-only", "tools": "TOOLS"}
+
+
+SEARCH_FORM = ("<form class='sidesearch' method='get' action='/search' role='search'><input type='text' name='q' maxlength='80' "
+               "placeholder='Search CO or account' aria-label='Search CO or account' autocomplete='off'>"
+               "<button class='ghost' type='submit'>Search</button></form>")
 
 
 def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", wide: bool = False,
@@ -5076,7 +5086,7 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
         "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body>"
         "<div class='envbar " + env + "' aria-hidden='true'></div><div class='shell'>"
         "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
-        + groups + _session_chip() + _operator_block() +
+        + SEARCH_FORM + groups + _session_chip() + _operator_block() +
         "<div class='side-foot'>Attended · localhost only</div></aside>"
         "<main" + (" class='wide'" if wide else "") + "><div class='envrow'><span class='envpill " + env + "'>"
         + escape(ENV_PILLS[env]) + "</span></div>" + main_html + "</main></div></body></html>"
@@ -6297,6 +6307,125 @@ def render_dev_onboarded() -> str:
     return _app_shell("Onboarded on Dev", page, active="dev_onboarded", wide=True)
 
 
+# ---- Search (owner request 2026-10-07): GET only, read-only, local data plus the cached queue read ---------------
+SEARCH_MAX_LENGTH = 80
+SEARCH_MAX_ROWS = 50
+SEARCH_REFERENCE = re.compile(r"(?:co)?[\s-]*([0-9]{1,10})", re.IGNORECASE)
+
+
+def search_reference(text: str) -> str | None:
+    """Canonical CO reference (CO-0767) for CO-0767, co-0767, "co 767", 767; None for any other text."""
+    found = SEARCH_REFERENCE.fullmatch(text)
+    if found is None:
+        return None
+    reference = "CO-" + found.group(1).zfill(4)
+    return reference if REFERENCE.fullmatch(reference) else None
+
+
+def search_query_problem(raw: str) -> bool:
+    return len(raw) > SEARCH_MAX_LENGTH or any(ord(char) < 32 or ord(char) == 127 for char in raw)
+
+
+def _search_inventory_names(readbacks: dict[str, dict[str, str]]) -> dict[str, tuple[str, str]]:
+    """CO -> (tenant name, main domain) from the local Dev inventory snapshot; empty when it is missing or stale."""
+    if not readbacks:
+        return {}
+    try:
+        payload = inventory.load_latest(inventory_root(), "dev", max_age=INVENTORY_DISPLAY_MAX_AGE, now=datetime.now(timezone.utc))
+        by_ref = inventory.match_readbacks(payload, readbacks)["by_reference"]
+        tenants = {t.get("id"): t for t in payload.get("tenants") or () if isinstance(t, dict)}
+    except (inventory.InventoryError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        return {}
+    found: dict[str, tuple[str, str]] = {}
+    for ref, tenant_id in by_ref.items():
+        tenant = tenants.get(tenant_id) if tenant_id not in (None, "conflict") else None
+        if tenant:
+            found[ref] = (str(tenant.get("account_name") or ""), str(tenant.get("account_domain") or ""))
+    return found
+
+
+def search_matches(needle: str) -> tuple[list[dict[str, Any]], str]:
+    """(matching COs, note). No Salesforce read beyond the cached open-queue read; never raises."""
+    needle = needle.casefold()
+    note = ""
+    try:
+        rows = {row["Name"]: row for row in queue_source_rows() if row.get("Name")}
+    except ReadUnavailable:
+        rows, note = {}, "The open queue could not be read from Salesforce; showing local matches only."
+    try:
+        state, readbacks, outcomes, mirrors = _evidence_inputs()
+    except Exception:  # noqa: BLE001 - local evidence only; a bad file never breaks the search
+        state, readbacks, outcomes, mirrors = {}, {}, {}, frozenset()
+        note = (note + " " if note else "") + "Local run records could not be read."
+    names = _search_inventory_names(readbacks)
+    found: list[dict[str, Any]] = []
+    for ref in sorted(set(rows) | set(state) | set(readbacks) | set(outcomes)):
+        row, record = rows.get(ref), state.get(ref)
+        tenant, domain = names.get(ref, ("", ""))
+        domain = domain or (row or {}).get("Main_Domain__c") or ""
+        fields = [ref, (row or {}).get("Account__r.Name") or "", tenant, domain]
+        if not any(needle in str(field).casefold() for field in fields):
+            continue
+        where = []
+        if row is not None:
+            where.append("Open queue")
+        try:
+            if dev_status(_evidence_for(ref, state, readbacks, outcomes, mirrors)) == "onboarded":
+                where.append("Onboarded on Dev")
+        except Exception:  # noqa: BLE001
+            pass
+        if not where:
+            where.append("Local run records")
+        if row is not None:
+            progress = " · ".join(part for part in (row.get("Onboarding_Approval_Status__c"), row.get("Onboarding_Stage__c")) if part) or "—"
+        else:
+            progress = "—"
+        found.append({"ref": ref, "account": (row or {}).get("Account__r.Name") or tenant or "—", "row": row, "record": record,
+                      "where": where, "progress": progress, "domain": domain})
+    return found, note
+
+
+def render_search(raw: str) -> str:
+    """Results page for /search. Every value is escaped; the query is echoed escaped."""
+    if search_query_problem(raw):
+        body = ("<div class='page-head'><h1>Search</h1></div><section class='card'><p>Search text too long or invalid.</p>"
+                "<p class='note'>Use up to " + str(SEARCH_MAX_LENGTH) + " characters, without control characters.</p></section>")
+        return _app_shell("Search", body, active="search")
+    needle = " ".join(raw.split())
+    title = "Search: " + needle
+    if not needle:
+        body = ("<div class='page-head'><h1>Search</h1></div><section class='card'><p class='empty'>Enter a CO number "
+                "(CO-0767 or 767), an account name or a domain.</p></section>")
+        return _app_shell("Search", body, active="search")
+    found, note = search_matches(needle)
+    shown = found[:SEARCH_MAX_ROWS]
+    rows_html = "".join(
+        "<tr><td class='stick'>" + _co_link(item["ref"]) + "</td><td>" + escape(item["account"])
+        + ("<span class='sub'>" + escape(item["domain"]) + "</span>" if item["domain"] else "")
+        + "</td><td>" + _route_label(item["ref"], item["row"], item["record"]) + "</td><td>"
+        + escape(", ".join(item["where"])) + "</td><td>" + escape(item["progress"]) + "</td></tr>" for item in shown)
+    table = ("<div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col' class='stick'>CO</th><th scope='col'>Account</th>"
+             "<th scope='col'>Route / Case</th><th scope='col'>Where</th><th scope='col'>Approval / Stage</th></tr></thead><tbody>"
+             + rows_html + "</tbody></table></div>" if shown else "<p class='empty'>No CO matches.</p>")
+    more = ("<p class='note'>Showing the first " + str(SEARCH_MAX_ROWS) + " of " + str(len(found)) + " matches; narrow the search.</p>"
+            if len(found) > SEARCH_MAX_ROWS else "")
+    body = ("<div class='page-head'><h1>" + escape(title) + "</h1></div>"
+            "<p class='note'>Matches the CO number, account name and tenant name or domain in the open queue, the local run "
+            "records and the Dev tenant snapshot. Read-only.</p>"
+            + ("<p class='note'>" + escape(note) + "</p>" if note else "")
+            + "<section class='card tbl-card'>" + table + more + "</section>")
+    return _app_shell(title, body, active="search")
+
+
+def search_response(raw: str) -> tuple[str | None, str]:
+    """(redirect target, page): a valid CO reference redirects to its page; anything else renders results."""
+    if not search_query_problem(raw):
+        reference = search_reference(" ".join(raw.split()))
+        if reference is not None:
+            return "/co/" + reference, ""
+    return None, render_search(raw)
+
+
 def _env_segment(reference: str, current: str, dev_chip: str, prod_chip: str) -> str:
     """[ Dev ][ Production ] as plain links (no script); each label carries its status chip."""
     def link(env: str, label: str, chip: str) -> str:
@@ -6758,6 +6887,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_redirect("/prod/tenants" + ("?" + urlencode(kept) if kept else "")); return
             if path == "/dev/onboarded":
                 self.send_page(HTTPStatus.OK, render_dev_onboarded()); return
+            if path == "/search":
+                target, page = search_response(params.get("q", [""])[0])
+                if target:
+                    self.send_redirect(target)
+                else:
+                    self.send_page(HTTPStatus.OK, page)
+                return
             if path == "/prod":
                 self.send_page(HTTPStatus.OK, render_prod_readiness(params.get("filter", [""])[0],
                                                                     params.get("all", [""])[0] == "1")); return

@@ -125,8 +125,14 @@ def get(path):
     return request
 
 
+def without_search(page):
+    """The page without the shell's sidebar search form, so button/post assertions cover the page content only."""
+    return re.sub(r"<form class='sidesearch'.*?</form>", "", page, flags=re.S)
+
+
 def forms(page):
-    return re.findall(r"<form[^>]*>", page, flags=re.I)
+    # The sidebar search form (GET /search, owner request 2026-10-07) is in every shell; any other form still fails.
+    return [f for f in re.findall(r"<form[^>]*>", page, flags=re.I) if "action='/search'" not in f]
 
 
 class NavigationTests(unittest.TestCase):
@@ -451,7 +457,7 @@ class ProductionReadinessTests(unittest.TestCase):
         for page in (self.page(), self.page(all_open=True), self.page("differs")):
             self.assertEqual(forms(page), [])
             self.assertNotIn("<script", page.lower())
-            self.assertNotIn("<button", page)
+            self.assertNotIn("<button", without_search(page))
             self.assertNotIn("method='post'", page.lower())
             self.assertNotIn("/attended/", page)
 
@@ -502,7 +508,7 @@ class ProductionCoViewTests(unittest.TestCase):
         for match in (self.real_match(), canned("not_in_production"), canned("clone_unavailable", reason="inventory_snapshot_missing")):
             page = self.view(match)
             self.assertEqual(forms(page), [])
-            self.assertNotIn("<button", page)
+            self.assertNotIn("<button", without_search(page))
             self.assertNotIn("<script", page.lower())
             self.assertNotIn("method='post'", page.lower())
 
