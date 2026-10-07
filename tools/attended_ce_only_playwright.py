@@ -818,7 +818,7 @@ def classify_surface_domains(main_domain: object, alternate_domains: object) -> 
 
     Main_Domain__c must be one valid registrable root (not a subdomain, not a
     public suffix, not a network). Alternate_Domains__c entries (comma,
-    semicolon, or newline separated) are split into alternate roots and
+    semicolon, or any whitespace separated) are split into alternate roots and
     subdomains; a duplicate of the main root is dropped. Networks/IPs are not
     supported in v1 (surface_networks_not_supported); wildcards and malformed
     entries fail closed (surface_domains_invalid).
@@ -840,7 +840,7 @@ def classify_surface_domains(main_domain: object, alternate_domains: object) -> 
         raise SurfaceSourceError("surface_domains_invalid")
     roots: set[str] = set()
     subdomains: set[str] = set()
-    for raw in (item.strip() for item in re.split(r"[,;\r\n]+", alternate_domains)):
+    for raw in (item.strip() for item in re.split(r"[,;\s]+", alternate_domains)):
         if not raw:
             continue
         try:
@@ -857,6 +857,123 @@ def classify_surface_domains(main_domain: object, alternate_domains: object) -> 
         else:
             raise SurfaceSourceError("surface_domains_invalid")
     return main.value, tuple(sorted(roots)), tuple(sorted(subdomains))
+
+
+SURFACE_DOMAIN_SEPARATOR = ", "  # exactly what the tenant form fill joins with (build_surface_fill / mirror fill)
+
+
+def _rejection_reason(raw: str, code: str) -> str:
+    """A short, value-free reason for an alternate entry the shared normalizer refused."""
+    if "*" in raw:
+        return "wildcard"
+    if "@" in raw:
+        return "email"
+    if "://" in raw:
+        return "url"
+    if code == "domain:public_suffix_not_registrable":
+        return "public_suffix"
+    return "malformed"
+
+
+def format_surface_domains(main_domain: object, alternate_domains: object) -> dict[str, Any]:
+    """Pure, never-raising preview of the domains the tenant form would receive.
+
+    Uses the same normalizer and splitter as classify_surface_domains, so
+    ``result`` always equals what the runner would decide. Nothing is read or
+    written outside this process.
+    """
+    from phase2_leonardo.intake import IntakeError, normalize_domain_candidate
+
+    psl = _public_suffix_list()
+    try:
+        _main, _roots, _subs = classify_surface_domains(main_domain, alternate_domains)
+        result = "ok"
+    except SurfaceSourceError as exc:
+        result = str(exc)
+    main: str | None = None
+    main_error: str | None = None
+    if isinstance(main_domain, str) and main_domain.strip():
+        try:
+            candidate = normalize_domain_candidate(main_domain, psl)
+            if candidate.kind == "root_domain":
+                main = candidate.value
+        except IntakeError:
+            pass
+    if main is None:
+        main_error = "surface_main_domain_invalid"
+    notes: list[str] = []
+
+    def note(code: str) -> None:
+        if code not in notes:
+            notes.append(code)
+
+    roots: set[str] = set()
+    subdomains: set[str] = set()
+    rejected: list[dict[str, str]] = []
+    text = alternate_domains if isinstance(alternate_domains, str) else ""
+    if not isinstance(alternate_domains, (str, type(None))):
+        rejected.append({"entry": "", "reason": "malformed"})
+    parts = re.split(r"([,;\s]+)", text)
+    for index in range(1, len(parts) - 1, 2):
+        if (parts[index - 1] and parts[index + 1] and not re.search(r"[,;]", parts[index])
+                and re.search(r"[ \t]", parts[index])):
+            note("space_separated")
+    seen: set[str] = set()
+    for raw in (item for item in parts[0::2] if item):
+        try:
+            candidate = normalize_domain_candidate(raw, psl)
+        except IntakeError as exc:
+            rejected.append({"entry": raw, "reason": _rejection_reason(raw, exc.code)})
+            continue
+        if candidate.kind == "network":
+            rejected.append({"entry": raw, "reason": "network"})
+            continue
+        if candidate.kind not in ("root_domain", "subdomain"):
+            rejected.append({"entry": raw, "reason": "malformed"})
+            continue
+        if raw != raw.lower():
+            note("lowercased")
+        if "://" in raw:
+            note("url_reduced_to_host")
+        if raw.endswith("."):
+            note("trailing_dot_removed")
+        if raw.lower().startswith("www."):
+            note("www_removed")
+        if candidate.kind == "root_domain" and candidate.value == main:
+            note("main_repeated")
+            continue
+        if candidate.value in seen:
+            note("duplicate_removed")
+            continue
+        seen.add(candidate.value)
+        (roots if candidate.kind == "root_domain" else subdomains).add(candidate.value)
+    accepted = sorted((*roots, *subdomains))
+    return {
+        "main": main,
+        "main_error": main_error,
+        "alternate_domains": SURFACE_DOMAIN_SEPARATOR.join(sorted(roots)),
+        "subdomains": SURFACE_DOMAIN_SEPARATOR.join(sorted(subdomains)),
+        "rejected": rejected,
+        "notes": notes,
+        "salesforce_clean_value": SURFACE_DOMAIN_SEPARATOR.join(accepted) if accepted else None,
+        "result": result,
+    }
+
+
+def run_domains_preview(reference: str) -> dict[str, Any]:
+    """CLI: --co CO-XXXX --domains. One read-only Salesforce read; nothing persisted."""
+    if not REFERENCE.fullmatch(reference):
+        return {"result": "invalid_co_reference"}
+    try:
+        rows = _sf_records(
+            "SELECT Name, Main_Domain__c, Alternate_Domains__c "
+            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+            raise ValueError()
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return {"result": "domains_source_unavailable"}
+    row = rows[0]
+    return {"co": reference, **format_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))}
 
 
 @dataclass(frozen=True, slots=True)
@@ -7693,6 +7810,8 @@ def run_probe_tenant_details(reference: str) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Attended Leonardo Development CE-only auto-confirm runner.")
     parser.add_argument("--co", required=False, help="Customer Onboarding reference (e.g. CO-0702).")
+    parser.add_argument("--domains", action="store_true",
+                        help="With --co: read-only preview of the domains the tenant form would receive (one Salesforce read; nothing written).")
     parser.add_argument("--revision", required=False, help="Salesforce source revision acknowledged by the dashboard.")
     parser.add_argument("--check-session", action="store_true",
                         help="Read-only Leonardo Development session check (no fill, submit, or create).")
@@ -7804,6 +7923,12 @@ def main() -> int:
         return 0
     if args.open_dashboard is not None:
         print(json.dumps({"result": open_dashboard_tab(args.open_dashboard)}, separators=(",", ":")))
+        return 0
+    if args.domains:
+        if not args.co:
+            parser.error("--co is required with --domains")
+        print(json.dumps({**run_domains_preview(args.co), "salesforce_writeback": "not_performed",
+                          "leonardo_write": "not_performed"}, separators=(",", ":")))
         return 0
     if args.probe_tenant_details:
         if not args.co:
