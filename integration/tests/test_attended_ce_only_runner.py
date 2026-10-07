@@ -4893,8 +4893,9 @@ class ScanStatusTests(unittest.TestCase):
         """The app's executions reply arrives on the Details click (``emit_on="details"``, live behaviour suspected
         2026-10-07) or on the "Duration Per Scan" tab click (``emit_on="tab"``)."""
 
-        def __init__(self, response, emit_on="tab"):
+        def __init__(self, response, emit_on="tab", tab_delay=0):
             self.response, self.emit_on, self.clicked, self.keys, self.listeners = response, emit_on, [], [], []
+            self.tab_delay, self.waits = tab_delay, 0
             self.keyboard = type("K", (), {"press": lambda _s, key: self.keys.append(key)})()
 
         def _click(self, name):
@@ -4916,7 +4917,11 @@ class ScanStatusTests(unittest.TestCase):
             return self._target(text)
 
         def get_by_role(self, role, name=None, exact=False):
-            return self._target(name, count=1 if role == "tab" else 0)
+            page = self
+            target = self._target(name)
+            # The tab renders only after ``tab_delay`` waits (live 2026-10-07: 0 tabs right after the Details click).
+            target.count = lambda: (1 if role == "tab" and page.waits >= page.tab_delay else 0)
+            return target
 
         def on(self, event, listener):
             self.listeners.append(listener)
@@ -4925,7 +4930,7 @@ class ScanStatusTests(unittest.TestCase):
             self.listeners.remove(listener)
 
         def wait_for_timeout(self, _ms):
-            pass
+            self.waits += 1
 
     def test_read_executions_clicks_only_details_and_checks_the_id(self):
         origin = runner.DEVELOPMENT_ORIGIN
@@ -4939,6 +4944,11 @@ class ScanStatusTests(unittest.TestCase):
         early = self._Page(self._Response(url, 200, self.EXEC_ROWS), emit_on="details")
         self.assertEqual(runner.read_scan_executions(early, "Sample", self.ID)["execution_state"], "done")
         self.assertEqual(early.clicked[1:], [runner.SCAN_EXEC_ROW_MENU_SELECTOR, runner.SCAN_EXEC_DETAILS_SELECTOR])
+        # The Details panel renders late: wait for the tab, then click it by role.
+        late = self._Page(self._Response(url, 200, self.EXEC_ROWS), tab_delay=6)
+        self.assertEqual(runner.read_scan_executions(late, "Sample", self.ID)["execution_state"], "done")
+        self.assertGreaterEqual(late.waits, 6)
+        self.assertEqual(late.clicked[-1], "Duration Per Scan")
         self.assertEqual(page.keys, ["Escape"])
         for selector in page.clicked:
             for hazard in ("Grid_Access", "Scan_Now", "Stop_Scan", "Delete"):
