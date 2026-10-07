@@ -2454,7 +2454,9 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None,
                   ("Tier / interval", f"{str(surface['tier']).title()} · {surface['scanning_interval']}"),
                   ("Subdomains / domains / assets",
                    f"{surface['subdomains']} ({surface['baseline_subdomains']} baseline{addon}) / {surface['domains']} / {surface['assets']}"),
-                  ("Surface settings", "Revalidate the Surface profile: 90 h, Recon / brute force / Nuclei ON, discovery / dorking / AI / static IP / auth testing / multi-stack OFF; Notifications / Multiple users / API ON")]
+                  ("Surface settings", ("Case 5 applies and verifies the create-time Surface profile; Number of domains = subdomains: "
+                                        if case[0] == CASE5_ENGINE else "Revalidate the Surface profile: ")
+                   + "90 h, Recon / brute force / Nuclei ON, discovery / dorking / AI / static IP / auth testing / multi-stack OFF; Notifications / Multiple users / API ON")]
     if ce:
         extra = f" + {ce['ce_domains_addon']} from add-on rows (Q7)" if ce["ce_domains_addon"] else ""
         facts += [("New Core Plus term", f"{ce['products'][0]} · {ce['status']} · {ce['start']} → {ce['end']}"),
@@ -2478,6 +2480,15 @@ def _renewal_plan_section(row: dict[str, str | None], today: date | None = None,
             "nothing. Rules: Q1 expiration = DealHub term end; Q2 start never changes; Q3 Approved = human-validated, and added "
             "domains must pass the production duplicate gate; Q10 routing by product + type (Case 6 = Surface + CE renewal). "
             "A renewal is applied only by Start renewal in What to do now (Leonardo Development; Dev mirror first).</p></section>")
+
+
+# Owner 2026-10-07: after a verified renewal (Cases 4-6) the operator checks the Operator Account by hand; nothing is automatic.
+RENEWAL_OPERATOR_CHECK_TEXT = "Check the Operator Account (did the customer's TA change?)"
+CASE5_ENGINE = "case_5_renew_ce_new_surface"
+
+
+def _renewal_operator_check() -> str:
+    return "<ul class='todo'>" + _step(escape(RENEWAL_OPERATOR_CHECK_TEXT), False) + "</ul>"
 
 
 RENEWAL_OUTCOME_DATES = ("old_expiration", "new_expiration", "expiration_kept_current", "expiration_kept_target", "apply_from")
@@ -3839,12 +3850,19 @@ def _renewal_plan_summary(ctx: SimpleNamespace) -> str:
     else:
         mirror = "Will be created from the production clone (the production tenant is only read)"
         old = "read from the mirror"
+    case5 = ctx.case is not None and ctx.case[0] == CASE5_ENGINE
+    if case5:
+        count = str(term["subdomains"]) if term and term.get("subdomains") is not None else "licensed subdomains"
+        domains_item = ("Surface added", "profile applied, domains = subdomains (" + count + "); a tenant domain missing from "
+                        "Salesforce stops the run (domains check)")
+    else:
+        domains_item = ("Number of domains", "Kept; if the Salesforce domains differ from the tenant's, the run stops (domains check)")
     items = [("Dev mirror", mirror),
              ("Expiry (Q1)", renewal_expiry_text(old, str(term["end"])) if term
               else old + " \u2192 \u2014 (DealHub term end)"),
              ("Apply from", renewal_apply_text(term)),
              ("Start date (Q2)", "Unchanged"),
-             ("Number of domains", "Kept; if the Salesforce domains differ from the tenant's, the run stops (domains check)"),
+             domains_item,
              ("Added subdomains (Q3)", "Each one passes the production duplicate gate before the save"),
              ("Environment", "Leonardo Development only; production BackOffice is never touched"),
              ("Salesforce", "Not changed; the Dev mirror is a separate tenant, so Salesforce IDs are not required to be empty")]
@@ -3912,7 +3930,8 @@ def _renewal_do_now(ctx: SimpleNamespace) -> tuple[str, str, str]:
             banner = _outcome_banner(kind, message, record["result"], record.get("completed_on"), compact=True)
             if record["result"] in RENEWAL_RUN_SUCCESS:
                 return done("Renewal is current in Leonardo Development",
-                            banner + "<p class='note'>Salesforce updates stay manual; production writes need separate approval.</p>",
+                            banner + "<p class='note'>Salesforce updates stay manual; production writes need separate approval.</p>"
+                            + _renewal_operator_check(),
                             "<span class='chip chip-ok'>Renewed (Dev)</span>")
             return done("The last renewal run stopped", banner + _reset_form(ref, record, "no Dev change is pending verification"),
                         "<span class='chip chip-bad'>Stopped</span>")
@@ -3927,7 +3946,8 @@ def _renewal_do_now(ctx: SimpleNamespace) -> tuple[str, str, str]:
     if outcome is not None and (outcome["leonardo_write"] == "verified" or result == "renewal_already_current"):
         return done("Renewal is current in Leonardo Development",
                     "<p class='note'>The last renewal run is recorded in Run history. Salesforce updates stay manual and "
-                    "production writes need separate approval.</p>", "<span class='chip chip-ok'>Renewed (Dev)</span>")
+                    "production writes need separate approval.</p>" + _renewal_operator_check(),
+                    "<span class='chip chip-ok'>Renewed (Dev)</span>")
     old_note = ("" if record is None else "<p class='note'>Previous run for a different source revision: <code>"
                 + escape(record.get("result", "no result recorded")) + "</code></p>")
     form = _renewal_start_form(ctx)

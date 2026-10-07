@@ -673,6 +673,7 @@ def onboarding_allowed_now(subscription_start: date, run_day: date, *, environme
         return True
     return run_day >= earliest_onboarding_day(subscription_start)
 SURFACE_LICENSE_ASSETS = "10000"
+RENEWAL_CASE5_ENGINE = "case_5_renew_ce_new_surface"
 SURFACE_MAX_SCAN_DURATION_LABEL = "Maximum scan Duration (hours)"
 SURFACE_MAX_SCAN_DURATION_HOURS = "90"
 ALTERNATE_DOMAINS_LABEL = "Alternate Domains (Comma Separated Values)"
@@ -6276,7 +6277,8 @@ def spycloud_write_label(result: str, confirm_write: bool) -> str:
     return "not_performed"
 
 
-SPYCLOUD_MIRROR_ROUTES = frozenset({"case_4_renew_surface_new_ce", "case_6_renew_both"})
+# Case 5 (owner 2026-10-07) edits an existing CE tenant that carries Leaked Credentials, so SpyCloud must be OFF there too.
+SPYCLOUD_MIRROR_ROUTES = frozenset({"case_4_renew_surface_new_ce", RENEWAL_CASE5_ENGINE, "case_6_renew_both"})
 
 
 def _spycloud_mirror_target(reference: str) -> tuple[str, str] | None:
@@ -6408,7 +6410,35 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
 #   6. A saved edit does not rewrite the preserved fields (start date, SpyCloud, toggles) on the server side.
 #   7. Licence type "Prepaid annual subscription" for every renewal case (Case 6 "per Salesforce" has no source
 #      field yet) and the production tenant name = the Surface name or the "- CE Only" name (gate target match).
+#
+# CASE 5 (owner decisions 2026-10-07 + Guru guide G12, T1-T7; Surface is ADDED to an existing CE tenant, edited in place
+# like production practice, CO-0462). Only for engine case_5_renew_ce_new_surface (Cases 4 and 6 are unchanged):
+#   * expiration = DealHub term end exactly (kept when already at/after it); start never changed; licence type
+#     Prepaid annual subscription; Number of assets = 10,000 (owner: keep 10,000, not 50,000); Number of subdomains =
+#     licensed subdomains (Surface Go/Prime baseline + same-term add-ons); Number of domains = licensed subdomains.
+#   * Domains check (replaces the Cases 4/6 equal-sets rule for Case 5): the CE tenant carries the primary domain and
+#     Surface adds alternates. Every tenant root domain (primary + alternateDomains) must be in Salesforce's root
+#     domains, else renewal_domains_mismatch_manual_review (fail closed). Roots Salesforce has and the tenant lacks are
+#     ADDED to Alternate Domains (add-only) and go through the Q3 production duplicate gate like subdomains.
+#   * Scanning interval from the tier (Prime weekly, Go monthly). Scan now is never set and never required: a schedule
+#     removes the control on create (Case 1); if the Edit form shows it, it is left untouched.
+#   * Create-time Surface profile APPLIED and VERIFIED (Cases 4/6 stay report-only profile_drift): Maximum scan
+#     duration 90 h; SURFACE_ADVANCED_TOGGLES (Recon ON, brute force ON, Nuclei ON, automated discovery / dorking / AI /
+#     static IP / authenticated testing / multiple attack stacks OFF); Notifications, Multiple users, API ON; Phishing
+#     OFF; Provisioning ON; Subdomains (subDomainsNumberAllowed) ON. Every control missing from the form fails closed
+#     with renewal_field_unavailable; the read-after-write compares every profile control, not only the changed ones.
+#   * Leaked Credentials kept per entitlement (ON, Weekly, scanned domains = the CE email domain); SpyCloud OFF follows
+#     as the orchestrator's existing step; the Operator Account is a reminder only (dashboard), never automatic.
+# UNVERIFIED LIVE for Case 5 (Edit form, nothing has run against Leonardo): (a) the "Advanced options" expander and the
+#   nine advanced toggles + "Maximum scan Duration (hours)" exist in Edit with the Add Account names/labels;
+#   (b) Notifications / Multiple users / API access / Provisioning / subDomainsNumberAllowed checkboxes exist in Edit;
+#   (c) the search row reports campaignsTimeoutInHours (CO-0649's row had null) and the advanced toggle paths and
+#   accountLicense.subDomainsNumberAllowed (path is a guess); a control whose row value is None is form-verified only
+#   (read in the form, set if needed, re-read before Confirm); (d) the Number of domains control is editable in Edit.
 RENEWAL_ENGINES = frozenset({"case_4_renew_surface_new_ce", "case_5_renew_ce_new_surface", "case_6_renew_both"})
+RENEWAL_SCAN_DURATION_PATH = "campaignsTimeoutInHours"
+RENEWAL_SUBDOMAINS_ALLOWED_PATH = "accountLicense.subDomainsNumberAllowed"  # UNVERIFIED LIVE path
+RENEWAL_ADVANCED_KEYS = frozenset(ADVANCED_TOGGLES_OFF)
 RENEWAL_LICENSE_TYPE = "Prepaid annual subscription"
 RENEWAL_LC_INTERVAL = "Weekly"
 RENEWAL_EDIT_SELECTOR = SPYCLOUD_EDIT_SELECTOR  # the only row-menu item the renewal edit clicks
@@ -6439,6 +6469,10 @@ class FieldSpec:
     path: str
     target: Any
     requires: str | None = None
+    # Case 5 create-time Surface profile control (owner 2026-10-07). When the tenant search row does not report its
+    # path (value None) the control is "form-verified": read and, if needed, set in the Edit form, re-read before
+    # Confirm, and compared with the row only when the row reports it.
+    profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -6576,9 +6610,31 @@ def renewal_domains_check(source: RenewalSource, row: dict[str, Any]) -> dict[st
         return {"result": "unreadable"}
     wanted = {domain for domain in map(_norm_text, (source.main_domain, *source.alternate_domains)) if domain}
     have = {domain for domain in map(_norm_text, (primary, *alternates)) if domain}
+    if source.engine == RENEWAL_CASE5_ENGINE:
+        # Case 5 (owner 2026-10-07): Surface adds roots to the CE tenant. Tenant roots must all be in Salesforce;
+        # Salesforce's extra roots are added (add-only, Q3 gate).
+        if have <= wanted:
+            return {"result": "match", "count": len(wanted), "added_roots": len(wanted - have)}
+        return {"result": "mismatch", "only_in_salesforce": sorted(wanted - have), "only_on_tenant": sorted(have - wanted)}
     if wanted == have:
         return {"result": "match", "count": len(wanted)}
     return {"result": "mismatch", "only_in_salesforce": sorted(wanted - have), "only_on_tenant": sorted(have - wanted)}
+
+
+def case5_profile_specs() -> list[FieldSpec]:
+    """The create-time Surface profile as edit specs (Case 5 only; phishingEnabled OFF is already a base spec)."""
+    wanted = {**SURFACE_ADVANCED_TOGGLES, "notificationsAllowed": True, "multipleUsersAllowed": True,
+              "apiAccessAllowed": True, "provisioningEnabled": True}
+    specs = [FieldSpec("checkbox", key, VALIDATION_TOGGLE_PATHS[key], want, profile=True) for key, want in wanted.items()]
+    specs.append(FieldSpec("checkbox", "subDomainsNumberAllowed", RENEWAL_SUBDOMAINS_ALLOWED_PATH, True, profile=True))
+    specs.append(FieldSpec("adv_number", SURFACE_MAX_SCAN_DURATION_LABEL, RENEWAL_SCAN_DURATION_PATH,
+                           int(SURFACE_MAX_SCAN_DURATION_HOURS), profile=True))
+    return specs
+
+
+def _form_only(spec: FieldSpec, row: dict[str, Any]) -> bool:
+    """A profile control the search row does not report: verified through the Edit form only."""
+    return spec.profile and _row_value(row, spec.path) is None
 
 
 def build_renewal_specs(source: RenewalSource, row: dict[str, Any]) -> tuple[list[FieldSpec], set[str], list[str]]:
@@ -6603,9 +6659,14 @@ def build_renewal_specs(source: RenewalSource, row: dict[str, Any]) -> tuple[lis
                   VALIDATION_SELECT_PATHS["Leaked Credentials scanning interval"], RENEWAL_LC_INTERVAL,
                   requires="leakedCredentialsAllowed"),
     ]
+    if source.engine == RENEWAL_CASE5_ENGINE:
+        specs.insert(5, FieldSpec("number", "Number of domains", VALIDATION_NUMBER_PATHS["Number of domains"],
+                                  int(term["subdomains"])))
+        specs.extend(case5_profile_specs())
     errors: list[str] = []
     for spec in specs:
-        if spec.kind == "checkbox" and not isinstance(_row_value(row, spec.path), bool):
+        if spec.kind == "checkbox" and not isinstance(_row_value(row, spec.path), bool) \
+                and not (spec.profile and _row_value(row, spec.path) is None):
             errors.append("renewal_row_schema_unexpected")
     wanted = (
         (ALTERNATE_DOMAINS_LABEL, "alternateDomains", source.alternate_domains, None),
@@ -6634,7 +6695,7 @@ def _spec_equal(spec: FieldSpec, value: Any) -> bool:
         return spec.target.isoformat() in _epoch_dates(value)
     if spec.kind == "select":
         return _norm_enum(spec.target) == _norm_enum(value)
-    if spec.kind == "number":
+    if spec.kind in ("number", "adv_number"):
         return isinstance(value, int) and not isinstance(value, bool) and value == spec.target
     if spec.kind == "checkbox":
         return value is spec.target
@@ -6666,6 +6727,8 @@ def plan_renewal_changes(row: dict[str, Any], specs: list[FieldSpec], today: dat
         if spec.key in RENEWAL_NEVER_SET:
             return [], "renewal_start_date_protected"
         value = _row_value(row, spec.path)
+        if _form_only(spec, row):
+            continue  # not reported by the row: read and set through the Edit form (renew_tenant)
         if spec.kind == "date":
             if spec.target <= today:
                 return [], "renewal_expiration_in_past"
@@ -6718,10 +6781,21 @@ def renewal_preserve_snapshot(row: dict[str, Any], specs: list[FieldSpec]) -> di
 
 
 def verify_renewal_row(after: dict[str, Any], changes: list[dict[str, Any]],
-                       preserved_before: dict[str, str]) -> tuple[list[str], list[str]]:
-    """(changed fields that did not take, preserved paths that moved) after the save; both empty = verified."""
-    changed_bad = [change["spec"].key for change in changes
-                   if not _spec_equal(change["spec"], _row_value(after, change["spec"].path))]
+                       preserved_before: dict[str, str], profile: Any = (),
+                       form_verified: frozenset[str] = frozenset()) -> tuple[list[str], list[str]]:
+    """(changed fields that did not take, preserved paths that moved) after the save; both empty = verified.
+
+    ``profile`` (Case 5): every profile spec is compared with the re-read row, changed or not. A control the row
+    does not report (None) passes only when its key is in ``form_verified`` (read back in the form before Confirm).
+    """
+    def took(spec: FieldSpec) -> bool:
+        value = _row_value(after, spec.path)
+        if value is None and spec.profile and spec.key in form_verified:
+            return True
+        return _spec_equal(spec, value)
+
+    changed_bad = [change["spec"].key for change in changes if not took(change["spec"])]
+    changed_bad += [spec.key for spec in profile if spec.key not in changed_bad and not took(spec)]
     preserved_bad = [path for path, before in preserved_before.items() if _stable(_row_value(after, path)) != before]
     return changed_bad, preserved_bad
 
@@ -6762,6 +6836,34 @@ def _renewal_gate(source: RenewalSource, new_domains: Any) -> dict[str, Any]:
     return gate
 
 
+def _expand_renewal_advanced(page: Any, toggle_keys: list[str]) -> bool:
+    """Open the Edit form's "Advanced options" section when the controls are not visible yet (idempotent).
+
+    UNVERIFIED LIVE (Edit form). Tries each expander once, never collapses an open section; True when the first
+    needed advanced toggle (or, with none, Maximum scan duration) is found afterwards.
+    """
+    def present() -> bool:
+        if toggle_keys:
+            return all(_locate_checkbox(page, key) is not None for key in toggle_keys)
+        return _locate_advanced_text(page, SURFACE_MAX_SCAN_DURATION_LABEL) is not None
+
+    try:
+        if present():
+            return True
+        expanders = page.get_by_text(ADVANCED_OPTIONS_TEXT, exact=True)
+        for index in range(expanders.count()):
+            expanders.nth(index).click(timeout=FIELD_TIMEOUT_MS)
+            for _poll in range(ADVANCED_EXPAND_POLLS):
+                if present():
+                    return True
+                page.wait_for_timeout(100)
+    except Exception as exc:  # noqa: BLE001
+        _log().error("renewal", "advanced_options", exc)
+        return False
+    _log().event("renewal", "advanced_controls_missing")
+    return False
+
+
 def _cancel_edit_form(page: Any) -> bool:
     """Close the Edit form without saving (shared with SpyCloud OFF)."""
     return _spycloud_cancel(page)
@@ -6778,6 +6880,9 @@ def _form_current(page: Any, spec: FieldSpec) -> Any:
             return int(text.strip()) if text is not None and text.strip().isdigit() else None
         if spec.kind == "date":
             return _license_date_value(page, spec.key)
+        if spec.kind == "adv_number":
+            text = _advanced_text_value(page, spec.key)
+            return int(text.strip()) if text is not None and text.strip().isdigit() else None
         if spec.kind == "list":
             text = _text_control_value(page, spec.key)
             return None if text is None else [item for item in (part.strip() for part in text.split(",")) if item]
@@ -6811,6 +6916,9 @@ def _apply_spec(page: Any, spec: FieldSpec) -> str | None:
         failure = _fill_select(page, spec.key, str(spec.target))
     elif spec.kind == "number":
         failure, _control = _fill_text_control(page, spec.key, str(spec.target), "renewal_text")
+    elif spec.kind == "adv_number":
+        failure = _fill_advanced_texts(page, {spec.key: str(spec.target)})
+        failure = "renewal_field_unavailable" if failure == "max_scan_duration_schema_unavailable" else failure
     elif spec.kind == "list":
         failure, _control = _fill_text_control(page, spec.key, ", ".join(spec.target), "renewal_text")
     elif spec.kind == "checkbox":
@@ -6869,6 +6977,8 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
                                    "only_on_tenant": check["only_on_tenant"]}
         return "renewal_domains_mismatch_manual_review", report
     report["domains_check"] = {"result": "match", "count": check["count"]}
+    if "added_roots" in check:
+        report["domains_check"]["added_roots"] = check["added_roots"]
     specs, added, errors = build_renewal_specs(source, row)
     if errors:
         return errors[0], report
@@ -6884,8 +6994,16 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     report["changes"] = [{"field": c["spec"].key, "kind": c["spec"].kind, "current": _spec_display(c["spec"], c["current"]),
                           "target": _spec_display(c["spec"], c["spec"].target)} for c in changes]
     report["added_domains"] = len(added)
-    report["profile_drift"] = renewal_profile_drift(row)
-    if not changes:
+    profile_specs = [spec for spec in specs if spec.profile]
+    form_only = [spec for spec in profile_specs if _form_only(spec, row)]
+    if profile_specs:  # Case 5: the create-time profile is applied (and verified), not reported
+        report["surface_added"] = True
+        report["profile"] = {"controls": len(profile_specs),
+                             "to_change": sum(1 for c in changes if c["spec"].profile),
+                             "form_verified_only": len(form_only)}
+    else:
+        report["profile_drift"] = renewal_profile_drift(row)
+    if not changes and not form_only:
         return "renewal_already_current", report
     apply_from = renewal_source_apply_from(source)
     report["apply_from"] = apply_from.isoformat() if apply_from else None
@@ -6906,9 +7024,16 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     def stop(reason: str) -> tuple[str, dict[str, Any]]:
         """Nothing was saved: close the form and report the reason (a form that stays open is reported)."""
         closed = _cancel_edit_form(page)
-        if closed or reason != "renewal_dry_run_planned":
+        if closed or reason not in ("renewal_dry_run_planned", "renewal_already_current"):
             return reason, report
         return "renewal_cancel_unavailable", report
+
+    # Case 5: the advanced toggles and Maximum scan duration live under "Advanced options" (expanded only when a
+    # planned or form-checked control needs it; idempotent). Missing controls fail closed.
+    wanted_specs = [c["spec"] for c in changes] + form_only
+    if any(spec.key in RENEWAL_ADVANCED_KEYS or spec.kind == "adv_number" for spec in wanted_specs):
+        if not _expand_renewal_advanced(page, [s.key for s in wanted_specs if s.key in RENEWAL_ADVANCED_KEYS]):
+            return stop("renewal_field_unavailable")
 
     # Cross-check the form's own prefilled values against the row (not the Leaked Credentials controls, which may
     # exist only while that checkbox is ON): a different reading means the form is not what the row says.
@@ -6917,10 +7042,24 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
             continue
         form = _form_current(page, change["spec"])
         if form is None:
-            return stop("renewal_form_unreadable")
+            return stop("renewal_field_unavailable" if change["spec"].profile else "renewal_form_unreadable")
         if not _form_matches_row(change["spec"], form, change["current"]):
             _log().event("renewal", "form_row_mismatch", change["spec"].key)
             return stop("renewal_form_mismatch")
+    # Profile controls the row does not report: the form is the only reading. Present, else fail closed.
+    for spec in form_only:
+        form = _form_current(page, spec)
+        if form is None:
+            return stop("renewal_field_unavailable")
+        if not _spec_equal(spec, form):
+            changes.append({"spec": spec, "current": form})
+            report["changes"].append({"field": spec.key, "kind": spec.kind, "current": _spec_display(spec, form),
+                                      "target": _spec_display(spec, spec.target)})
+    if form_only:
+        changes.sort(key=lambda change: change["spec"].kind != "checkbox")
+        report["profile"]["to_change"] = sum(1 for c in changes if c["spec"].profile)
+    if not changes:
+        return stop("renewal_already_current")
     start_before = _license_date_value(page, "license_start")
     if not confirm_write:
         return stop("renewal_dry_run_planned")
@@ -6931,6 +7070,10 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
             return stop(failure)
     if start_before is not None and _license_date_value(page, "license_start") != start_before:
         return stop("renewal_start_date_changed")
+    for spec in form_only:  # re-read the form-only controls: the form must hold the target before Confirm
+        if not _spec_equal(spec, _form_current(page, spec)):
+            _log().event("renewal", "form_only_not_kept", spec.key)
+            return stop("renewal_value_mismatch")
     confirm = page.get_by_role("button", name="Confirm", exact=True)
     try:
         if confirm.count() != 1:
@@ -6969,7 +7112,8 @@ def renew_tenant(page: Any, source: RenewalSource, tenant_name: str, expected_id
     if code != "ok":
         _log().event("renewal", "saved_readback", detail=code)
         return "renewal_saved_unverified", report
-    changed_bad, preserved_bad = verify_renewal_row(after, changes, preserved_before)
+    changed_bad, preserved_bad = verify_renewal_row(after, changes, preserved_before, profile_specs,
+                                                    frozenset(spec.key for spec in form_only))
     report["readback"] = {"changed_ok": len(changes) - len(changed_bad), "changed_bad": changed_bad,
                           "preserved_ok": len(preserved_before) - len(preserved_bad), "preserved_bad": preserved_bad}
     if changed_bad:
