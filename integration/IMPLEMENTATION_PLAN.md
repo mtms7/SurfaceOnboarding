@@ -1337,8 +1337,7 @@ Owner: "validate first if this was created on Production and mark it; then valid
 - Manual form `/tenants` → `/attended/production-duplicate-check` **removed**; the Tenants tab says every Start checks this list first. CLI `--production-duplicate-check` kept as a read-only diagnostic.
 - Renewals (cases 4–6) never reach `_run` (not in `ROUTES`), so they are not gated.
 - Golden: one added event `production_gate production_clone_no_match blocks=False` after `license_dates`.
-- **Operational:** if the hourly Redash task has not refreshed within 6 h (PC off / signed out), every Start stops with `production_clone_unavailable`; run `tools
-edash_inventory_collector.py --collect` first. The marker is replaced by a later check for the same CO (the check state keeps the latest check per CO).
+- **Operational:** if the hourly Redash task has not refreshed within 6 h (PC off / signed out), every Start stops with `production_clone_unavailable`; run `tools\redash_inventory_collector.py --collect` first. The marker is replaced by a later check for the same CO (the check state keeps the latest check per CO).
 
 #### Unverified until a live read (Leonardo Development)
 
@@ -1453,7 +1452,7 @@ Superseded by "End of day 2026-10-06" below.
 7. **Case 5:** choose a CO or a synthetic fixture.
 8. **Assistant (local):** read-only probe for the real tenant-table header selector (in-app search trigger currently falls back to reload); "DEV mirror" label + skip in `--validate-all`/dashboard; renewal outcome state file; delete `_to_delete/` (operator).
 
-**Run commands with the project runtime** (PowerShell): `& "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" toolsttended_ce_only_playwright.py --co CO-XXXX <flags>`. If Leonardo hangs: close the automation browser → dashboard **Prepare sessions** → re-run.
+**Run commands with the project runtime** (PowerShell): `& "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" tools\attended_ce_only_playwright.py --co CO-XXXX <flags>`. If Leonardo hangs: close the automation browser → dashboard **Prepare sessions** → re-run.
 
 
 #### Renewals run from the dashboard; Account ID / UUID on the CO page (2026-10-07, local code and tests only)
@@ -1475,3 +1474,37 @@ Superseded by "End of day 2026-10-06" below.
 - Read-after-write compares every profile control (changed or not). Controls the search row does not report (`subDomainsNumberAllowed`, possibly `campaignsTimeoutInHours`) are form-verified (read, set, re-read before Confirm). Missing Edit controls fail closed with `renewal_field_unavailable`.
 - `SPYCLOUD_MIRROR_ROUTES` now includes Case 5 (SpyCloud OFF follows the renewal). Dashboard: Case 5 plan summary "Surface added: profile applied, domains = subdomains (N)"; all renewal cases show "Check the Operator Account (did the customer's TA change?)" after a verified renewal (no automatic change).
 - UNVERIFIED LIVE (Edit form): see the comment block above `RENEWAL_ENGINES`. Tests: `integration/tests/test_case5_renewal.py` (34). Next: Case 5 dry run on a Dev mirror of a CE-only tenant, read the plan, then owner go for `--confirm-write`.
+
+#### End of day 2026-10-07 (authoritative; continue here)
+
+**Live today (Leonardo Development, operator-run):**
+- CO-0767 (Case 6, A2A Dev mirror): `--renew` dry run `renewal_dry_run_planned` (domains_check match 5; only change expiry 2026-10-25 → 2029-10-26; start unchanged; no added domains), then **Start renewal from the dashboard → `renewal_edit_verified` (15:02:35)**. First live renewal end-to-end. Applied 6 days before "apply from" 2026-10-13 (window was not enforced yet; now production-only by owner decision, Dev exempt).
+- CO-0767 `--scan-status`: row status saved (COMPLETED, tracker reaches Scan Completed) but the executions read still ends `scan_status_executions_unavailable` after two fixes (narrow to one row; listen before opening Details). Step logging added (`126e0e6`): the next run writes a `scan_status` run with details_opened / tab_lookup / tab_clicked / reply / parse events. **Re-run and read the run log first thing.**
+
+**Owner decisions 2026-10-07 (binding):**
+1. Renewals start from the dashboard (reverses 2026-10-04 CLI-only). Renewals are not blocked when Salesforce already holds IDs (production tenants have them; the Dev mirror is separate).
+2. Renewal Number of domains: Cases 4/6 keep the tenant's current value when Salesforce root domains equal the tenant's, else stop `renewal_domains_mismatch_manual_review`; **Case 5 = licensed subdomains** (matches production CO-0462).
+3. Case 5 applies the create-time Surface profile (verified after save); Cases 4/6 stay report-only. Scan now follows the schedule (as Case 1). Assets stay 10,000 (guide says ~50,000; owner kept 10,000, production CO-0462 has 10,000). Operator: reminder only after renewals ("did the TA change?").
+4. Guide G7 14-day apply window enforced for production only; Dev mirrors may be renewed early.
+5. A tenant already at/after the DealHub term end keeps its expiry; only missing parts are applied (CO-0758 Case 4).
+6. Fix 3 reversed: read-only paths (`--scan-status`, `--readback`, `--validate`) use the hidden search; create paths keep the visible Search box gate.
+7. Dashboard split into LEONARDO · DEV and PRODUCTION · BO (read-only); "Onboarded on Dev" tab; production match required fields: name, primary domain, alternate domains, licence type, licence end, SpyCloud OFF (CE routes); Salesforce account id "not checked"; trial/eval/POV-only = blocks; Readiness defaults to Dev-onboarded COs; Matches current-only.
+8. CO page: one "What to do now" card, key facts (max 10), pinned alerts, folds (Tenant checks, Salesforce record, Run history, Diagnostics incl. CO-0741/0745 actions); tracker draws reached stages done; full Account ID / UUID per product (CE UUID, Surface ID, Case 3 and renewals both); cleaned Alternate Domains shown as text (no Copy box; no page scripts).
+9. Case 5 fixture: pure CE-only "before", CO-0462 (Helly Hansen, only historical Case 5, production) as anonymised "after".
+
+**Built and merged today (local; 1394 integration tests OK, 1 skipped; both guards pass; no real `integration/attended_*.json` changes during test runs):** domain separator fix + `--co CO-XXXX --domains` preview; DEV mirror label/skip + renewal outcome file; CO-page read speed (parallel CO/DealHub read, one DealHub query, queue warming, 5-min cache, read timing log); scan-status renewal support + failures shown + COMPLETED counts; hidden search for read-only paths; renewal domains check; tracker/partial scan fixes; CO page redesign; renewal orchestrator + Start renewal; Dev/Production split; apply window; kept expiry; Case 5.
+
+**Test-safety incidents (fixed):** (a) an existing scan-status test ran a real read-only `sf` SOQL query (CO-0649) on every full run until fixed; (b) a CE create test wrote a fake CO-0702 entry into the real `attended_spycloud.json` (removed); (c) the new scan-status logging made tests write 8 fake runs into the real run log (removed; they had pushed 8 older real runs out of the 20-run log — not recoverable). `integration/tests/__init__.py` now redirects every runner/dashboard state file to a temp folder for all tests. Known flaky: a dashboard server test (WinError 10038) fails ~1 in 3 full runs; a separate task was suggested.
+
+**Case status (Leonardo Development):** 1 ✅ CO-0649 · 2 ✅ CO-0679/0728/0762 (CO-0702 manual) · 3 ✅ CO-0757 · 6 ✅ CO-0767 (dashboard renewal) · 4 🟡 built; CO-0758 expected to apply only missing parts · 5 🟡 built + synthetic tests; no open Case 5 CO in Salesforce (live test needs one).
+
+**Next steps (in order):**
+1. Operator: `--co CO-0767 --scan-status`; assistant reads the `scan_status` run events and fixes the executions read.
+2. Operator: restart the dashboard; review the new layout (Dev/Production areas, CO page). Report what to move/hide.
+3. CO-0767: confirm the primary user on the A2A Dev mirror manually → "Confirm user created".
+4. Case 4 on CO-0758: Start renewal from the dashboard (mirror → dry run shows expiry kept + CE part → apply) — owner go.
+5. Case 5: first real Case 5 CO (none open) → Start renewal; Edit-form profile controls are UNVERIFIED LIVE (fail closed `renewal_field_unavailable`).
+6. Production readiness: open `/prod`, review match results for the onboarded COs; keep the Redash clone fresh (`tools\redash_inventory_collector.py --collect`).
+7. Still open: Redash users query + v2 accounts query (Salesforce account id); scan-status decisions (CE-only skip, Done = last vs sum, unattended sign-in tab, key rotation); flaky server test; delete `_to_delete/` and old `.claude/worktrees/agent-*` folders (four from earlier sessions).
+
+**Boundaries preserved (2026-10-07):** Leonardo Development only. Live writes today (operator-run, approved): CO-0767 renewal edit on the Dev mirror. Assistant/agent live actions: read-only Salesforce SOQL (Case 5 research; plus the accidental test read above), local prod-clone snapshot reads, Guru card reads. No Salesforce write, no production BackOffice access, no Redash change, no VM change. No credential, key, MFA value, cookie, token, or raw payload was copied, logged, or persisted.
