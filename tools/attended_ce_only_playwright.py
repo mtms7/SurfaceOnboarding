@@ -7528,6 +7528,63 @@ def run_production_duplicate_check(reference: str, route: str = CE_ENGINE) -> di
     return {"result": gate["result"], "production_clone": gate}
 
 
+def _production_expectation(reference: str, product: Any = None,
+                            onboarding_type: Any = None) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """(engine, co_source, plan) for the production match, from read-only Salesforce reads (raises on any problem).
+
+    The expected licence dates come from the DealHub term itself: Production never uses the Dev run day or the dates
+    entered in Leonardo Development (``build_fill`` is given the subscription start as the "run day").
+    """
+    case = renewal_case(product, onboarding_type) if product and onboarding_type else None
+    if case is not None and case[0] in RENEWAL_ENGINES:
+        engine = case[0]
+        source = RENEWAL_ROUTES[engine].load_source(reference)
+        return engine, {"tenant_names": (source.tenant_name, source.ce_tenant_name),
+                        "domains": (source.main_domain, *source.alternate_domains, source.ce_email_domain)}, {
+            "primary_domain": source.main_domain, "alternate_domains": tuple(source.alternate_domains),
+            "license_type": RENEWAL_LICENSE_TYPE, "license_end": renewal_expiration(source), "license_start": None,
+            "spycloud_off": True}
+    pair = (product, onboarding_type)
+    engine = (SURFACE_ENGINE if pair == (SURFACE_ROUTE_PRODUCT, SURFACE_ROUTE_TYPE)
+              else CASE3_ENGINE if pair == (CASE3_ROUTE_PRODUCT, CASE3_ROUTE_TYPE)
+              else CE_ENGINE if pair == (CE_ROUTE_PRODUCT, CE_ROUTE_TYPE) else None)
+    if engine is None:
+        engine = _validation_route(reference)[0]  # one fixed read; renewals and unknown pairs fail closed
+    contract = ROUTES[engine]
+    source = contract.load_source(reference)
+    start = source.surface.subscription_start if engine == CASE3_ENGINE else source.subscription_start
+    plan = contract.build_fill(source, start)
+    primary = source.email_domain if engine == CE_ENGINE else source.main_domain
+    alternates = () if engine == CE_ENGINE else tuple(source.alternate_domains)
+    extra = (source.ce_email_domain,) if engine == CASE3_ENGINE else ()
+    return engine, {"tenant_names": (source.tenant_name,), "domains": (primary, *alternates, *extra)}, {
+        "primary_domain": primary, "alternate_domains": alternates, "license_type": plan["selects"]["Type"],
+        "license_end": plan["license_end"], "license_start": plan["license_start"],
+        "spycloud_off": engine in SPYCLOUD_ROUTES}
+
+
+def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
+    """Read-only production match of one CO (see ``integration.onboarding.production_match``).
+
+    The clone snapshot is read first (an unusable clone needs no Salesforce read); then one read-only source/plan
+    read. Any failure fails closed as ``clone_unavailable`` with a reason. No Leonardo, browser or write.
+    """
+    from integration.onboarding import production_match as match
+
+    snapshot = match.load_snapshot(inventory_root(), datetime.now(timezone.utc))
+    co_source: dict[str, Any] | None = None
+    plan: dict[str, Any] | None = None
+    engine = None
+    if not isinstance(snapshot, str) and REFERENCE.fullmatch(reference):
+        try:
+            engine, co_source, plan = _production_expectation(reference, product, onboarding_type)
+        except (RuntimeError, ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.SubprocessError):
+            co_source = plan = None
+    result = match.production_match(co_source, plan, snapshot)
+    result["route"] = engine
+    return result
+
+
 def _combine_duplicate(ui: str, api: str) -> str:
     """Combine the table and server-row classifications (worst outcome wins)."""
     for outcome in ("duplicate_schema_unavailable", "duplicate_found", "duplicate_ambiguous"):
