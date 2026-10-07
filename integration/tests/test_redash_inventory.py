@@ -655,8 +655,8 @@ class DashboardEnvironmentTests(unittest.TestCase):
         self.assertIn("no CO", page)
         self.assertNotIn("href='/co/", page)
         self.assertNotIn("/attended/inventory-refresh", page)
-        self.assertIn("href='/tenants?", sorted_page)  # sorting and filtering stay on the clone's own tab
-        self.assertIn("action='/tenants'", sorted_page)
+        self.assertIn("href='/prod/tenants?", sorted_page)  # sorting and filtering stay on the clone's own page
+        self.assertIn("action='/prod/tenants'", sorted_page)
         self.assertNotIn("/inventory?", sorted_page)
         self.assertIn("Tenants — Production (Redash clone)", page)
         self.assertNotIn("<script", page.lower())
@@ -715,7 +715,7 @@ class DashboardEnvironmentTests(unittest.TestCase):
             self.assertIn("No tenant inventory has been exported yet", page)
             self.assertIn("/attended/inventory-refresh", page)
         self.assertNotIn("prod-clone", dashboard.render_inventory())  # no environment switch: one tab, one environment
-        self.assertIn("DevOps — Leonardo Development tenants", dashboard.render_inventory())
+        self.assertIn("Tenants — Leonardo Development", dashboard.render_inventory())
 
 
 class TenantsTabTests(unittest.TestCase):
@@ -732,14 +732,16 @@ class TenantsTabTests(unittest.TestCase):
         collector.collect(FakeOpener({GET: result(list(rows) or [row(1), row(2)], retrieved)}), FAKE_KEY,
                           root=self.root, now=NOW)
 
-    def test_sidebar_has_separate_tenants_and_devops_tabs(self):
-        for active in ("tenants", "inventory"):
+    def test_sidebar_has_a_dev_tenants_page_and_a_production_tenants_page(self):
+        # Moved 2026-10-07: Leonardo Development > Tenants (/inventory) and Production > Tenants (/prod/tenants).
+        for active, own in (("prod_tenants", "/prod/tenants"), ("inventory", "/inventory")):
             shell = dashboard._app_shell("t", "", active=active)
-            self.assertIn("<a href='/tenants'" + (" class='active'" if active == "tenants" else "") + ">Tenants</a>", shell)
-            self.assertIn("<a href='/inventory'" + (" class='active'" if active == "inventory" else "") + ">DevOps</a>", shell)
+            for href in ("/prod/tenants", "/inventory"):
+                self.assertIn("<a href='" + href + "'" + (" class='active'" if href == own else "") + ">Tenants</a>", shell)
             self.assertEqual(shell.count("class='active'"), 1)
+        self.assertNotIn("DevOps", dashboard._app_shell("t", "", active="inventory"))
         self._collect()
-        self.assertIn("<a href='/tenants' class='active'>", dashboard.render_inventory(env="prod-clone"))
+        self.assertIn("<a href='/prod/tenants' class='active'>", dashboard.render_inventory(env="prod-clone"))
         self.assertIn("<a href='/inventory' class='active'>", dashboard.render_inventory(env="dev"))
 
     def test_tenants_tab_has_the_gate_note_and_no_manual_check_or_refresh_while_devops_keeps_refresh(self):
@@ -765,12 +767,15 @@ class TenantsTabTests(unittest.TestCase):
         with patch.object(dashboard, "login_required", return_value=False),                 patch.object(dashboard, "request_origin_problem", return_value=None):
             request = _Request("/inventory?env=prod-clone&q=acme&sort=scan&dir=desc&scan=COMPLETED&junk=1")
             dashboard.Handler.do_GET(request)
-            self.assertEqual(request.redirects, ["/tenants?q=acme&sort=scan&dir=desc&scan=COMPLETED"])
+            self.assertEqual(request.redirects, ["/prod/tenants?q=acme&sort=scan&dir=desc&scan=COMPLETED"])
             bare = _Request("/inventory?env=prod-clone")
             dashboard.Handler.do_GET(bare)
-            self.assertEqual(bare.redirects, ["/tenants"])
+            self.assertEqual(bare.redirects, ["/prod/tenants"])
+            old = _Request("/tenants?q=acme")  # the old Tenants URL redirects (303) to Production > Tenants
+            dashboard.Handler.do_GET(old)
+            self.assertEqual((old.redirects, old.pages), (["/prod/tenants?q=acme"], []))
             self._collect()
-            tenants = _Request("/tenants")
+            tenants = _Request("/prod/tenants")
             dashboard.Handler.do_GET(tenants)
             self.assertEqual((tenants.redirects, tenants.pages[0][0]), ([], 200))
             self.assertIn("Every onboarding Start checks this production list first", tenants.pages[0][1])

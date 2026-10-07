@@ -39,6 +39,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory
+from integration.onboarding.dev_onboarded import dev_onboarded_evidence, dev_status
 from integration.onboarding.renewal_mirror import mirror_tenant_ids
 from integration.onboarding import session_readiness as readiness
 from integration.onboarding.session_readiness import SessionState, SessionStatus
@@ -79,6 +80,7 @@ from tools.attended_ce_only_playwright import (
     SURFACE_ROUTE_TYPE,
     _chrome_executable,
     close_automation_browser,
+    production_match_for,
     load_check_state,
     load_runner_state,
     start_blocker,
@@ -2507,6 +2509,8 @@ def attended_renewal_outcomes() -> dict[str, dict[str, object]]:
                                    "observed_at": datetime.fromisoformat(value["observed_at"]),
                                    "changes": value["changes"] if type(value.get("changes")) is int else None,
                                    "added_domains": value["added_domains"] if type(value.get("added_domains")) is int else None,
+                                   "tenant_id": value["tenant_id"] if isinstance(value.get("tenant_id"), str)
+                                   and re.fullmatch(r"[A-Za-z0-9]{16,64}", value["tenant_id"]) else None,
                                    **{key: date.fromisoformat(value[key]).isoformat() if isinstance(value.get(key), str) else None
                                       for key in RENEWAL_OUTCOME_DATES}}
         except (KeyError, TypeError, ValueError):
@@ -2952,7 +2956,8 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
                history: ClosedHistory | None = None, history_failed: bool = False,
                read_at: str | None = None, today: date | None = None, scan_started: bool = False,
                start_dates: dict[str, str] | None = None, start_dates_unavailable: bool = False,
-               sort: str = "", direction: str = "", check_state: dict[str, dict[str, str]] | None = None) -> str:
+               sort: str = "", direction: str = "", check_state: dict[str, dict[str, str]] | None = None,
+               onboarded_dev: int = 0) -> str:
     """Render the open-onboardings dashboard: one filter bar (queues, history) and one sortable table.
 
     Default order is the soonest subscription start first (blank dates last),
@@ -3105,7 +3110,8 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
     if scan_started:
         banner = ("<p class='note'>A read-only scan-status sweep of every onboarded Surface tenant was started in the "
                   "automation browser. Reload in about a minute.</p>") + banner
-    return _app_shell("Onboardings", head + bar + banner + f"<section class='card tbl-card'>{table}</section>",
+    onboarded_link = f"<p class='note'><a href='/dev/onboarded'>{onboarded_dev} onboarded on Dev &rarr;</a></p>"
+    return _app_shell("Onboardings", head + bar + banner + onboarded_link + f"<section class='card tbl-card'>{table}</section>",
                       active="onboardings", wide=True)
 
 
@@ -3613,7 +3619,13 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
               + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
               "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
               "<button class='ghost' type='submit'>Refresh</button></form></div></div>")
-    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + header + _tenant_ids_block(ctx)
+    # Segmented control (owner 2026-10-07): the Production chip only peeks at the display cache (never reads Salesforce).
+    cached_match = peek_display_cache("production_match_display", reference, row.get("Onboarding_Product__c") or "",
+                                      row.get("Onboarding_Type__c") or "")
+    seg = _env_segment(reference, "dev", _dev_status_chip(dev_evidence_for(reference)),
+                       _match_chip(cached_match["status"]) if isinstance(cached_match, dict) and "status" in cached_match
+                       else "<span class='chip chip-neutral'>Not checked</span>")
+    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + header + seg + _tenant_ids_block(ctx)
                  + _stage_tracker_html(stage_state, reference)
                  + toast + ("<div class='pinned' role='region' aria-label='Alerts'>" + pinned + "</div>" if pinned else "")
                  + _do_now_card(ctx) + _key_facts_grid(_key_facts(ctx)) + health + record_fold + history + diagnostics
@@ -4199,6 +4211,12 @@ def render_dashboard(selected_queue: str = "", scan_started: bool = False, sort:
     for it.
     """
     rows = queue_rows()
+    # Owner 2026-10-07: a CO already "onboarded on Dev" (verified evidence) leaves the queue; it lives on its own page.
+    try:
+        onboarded_dev = set(dev_onboarded_refs())
+    except Exception:  # noqa: BLE001 - local evidence only; failing to read it never hides a CO
+        onboarded_dev = set()
+    rows = [row for row in rows if row.get("Name") not in onboarded_dev]
     try:
         runner_state: dict[str, dict[str, str]] | None = load_runner_state()
         runner_state_unavailable = False
@@ -4228,7 +4246,8 @@ def render_dashboard(selected_queue: str = "", scan_started: bool = False, sort:
                       runner_state_unavailable=runner_state_unavailable,
                       history=history, history_failed=history_failed, read_at=display_read_at(),
                       scan_started=scan_started, start_dates=start_dates,
-                      start_dates_unavailable=start_dates_unavailable, sort=sort, direction=direction)
+                      start_dates_unavailable=start_dates_unavailable, sort=sort, direction=direction,
+                      onboarded_dev=len(onboarded_dev))
     warm_co_pages(rows, runner_state)
     return page
 
@@ -4931,23 +4950,71 @@ PENTERA_CSS = (
     ".st::before{display:none}}"
     "@media(max-width:760px){dl.compact,.stat dl{display:block}.health{grid-template-columns:1fr}"
     ".todo li{flex-wrap:wrap}}"
+    # Two areas (2026-10-07): environment tokens, top bar, header pill, grouped sidebar, segmented control.
+    ":root{--env-dev:#1e3a8a;--env-dev-line:#6f8fdc;--env-prod:var(--warn);--env-prod-bg:var(--warn-bg)}"
+    ".envbar{position:fixed;top:0;left:0;right:0;height:3px;z-index:5;background:var(--nav-active)}"
+    ".envbar.dev{background:var(--env-dev)}.envbar.prod{background:var(--env-prod)}"
+    ".envrow{position:sticky;top:3px;z-index:4;margin:-8px 0 6px;padding:4px 0;background:var(--canvas)}"
+    ".envpill{display:inline-block;padding:3px 12px;border-radius:999px;font:800 12px/1.4 -apple-system,'Segoe UI',sans-serif;"
+    "letter-spacing:.4px;background:var(--pill);color:var(--heading)}"
+    ".envpill.dev{background:var(--env-dev);color:#fff}.envpill.prod{background:var(--env-prod-bg);color:var(--env-prod);"
+    "border:1px solid var(--env-prod)}"
+    ".navgroup{display:flex;flex-direction:column;gap:2px;margin:0 0 12px}"
+    ".navhead{font:800 11px/1.3 -apple-system,'Segoe UI',sans-serif;letter-spacing:.6px;color:#aeb6c4;margin:2px 8px 4px}"
+    ".navgroup.dev .navhead{color:#fff;background:var(--env-dev);border:1px solid var(--env-dev-line);border-radius:5px;padding:3px 8px;margin:2px 0 4px}"
+    ".navgroup.prod .navhead{color:var(--env-prod);background:var(--env-prod-bg);border-radius:5px;padding:3px 8px;margin:2px 0 4px}"
+    ".navhead .ro{font-weight:600;letter-spacing:0;margin-left:6px}"
+    ".navgroup a::before{content:'';display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:9px;vertical-align:1px;"
+    "border:2px solid #8b94a5;box-sizing:border-box}"
+    ".navgroup.dev a::before{background:var(--env-dev-line);border-color:var(--env-dev-line)}"
+    ".navgroup.prod a::before{background:transparent;border-color:var(--env-prod-bg)}"
+    ".seg{display:inline-flex;gap:8px;margin:0 0 14px}.seg a{display:inline-flex;align-items:center;gap:8px;background:#fff;"
+    "color:var(--primary);border:1px solid var(--primary);border-radius:6px;padding:6px 14px;font-weight:600}"
+    ".seg a:hover{background:#f3f7fe;text-decoration:none}.seg a.on{background:var(--primary);color:#fff}"
+    ".seg a.on .chip{outline:1px solid #fff}"
+    ".strip{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}"
+    ".prodnote{background:var(--env-prod-bg);color:var(--env-prod);border-radius:8px;padding:8px 12px;margin:0 0 14px;font-size:13px}"
+    "@media(max-width:760px){.navgroup{flex-direction:row;flex-wrap:wrap;align-items:center;margin:0 8px 0 0}"
+    ".navhead{display:none}.envrow{margin:-8px 0 6px}}"
 )
 
 
-def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", wide: bool = False) -> str:
-    """Wrap a page in the Pentera-styled shell (navy sidebar + light canvas)."""
+# Two areas (owner decision 2026-10-07): Leonardo Development (navy, solid dot) and Production through BackOffice
+# (amber from the warn palette, hollow dot, read-only). Red is never an environment colour.
+NAV_GROUPS = (
+    ("dev", "LEONARDO · DEV", "", (("/", "Onboardings", "onboardings"), ("/dev/onboarded", "Onboarded on Dev", "dev_onboarded"),
+                                    ("/history", "History", "history"), ("/inventory", "Tenants", "inventory"))),
+    ("prod", "PRODUCTION · BO", "read-only", (("/prod", "Readiness", "prod"), ("/prod/matches", "Matches", "prod_matches"),
+                                                  ("/prod/tenants", "Tenants", "prod_tenants"))),
+    ("tools", "TOOLS", "", (("/connection", "Sessions", "connection"),)),
+)
+ENV_BY_ACTIVE = {"onboardings": "dev", "dev_onboarded": "dev", "history": "dev", "inventory": "dev",
+                 "prod": "prod", "prod_matches": "prod", "prod_tenants": "prod"}
+ENV_PILLS = {"dev": "DEV · Leonardo", "prod": "PRODUCTION · read-only", "tools": "TOOLS"}
+
+
+def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", wide: bool = False,
+               env: str = "") -> str:
+    """Wrap a page in the Pentera-styled shell (navy sidebar + light canvas, environment bar and pill)."""
+    env = env if env in ("dev", "prod") else ENV_BY_ACTIVE.get(active, "tools")
+
     def nav(href: str, label: str, key: str) -> str:
         return "<a href='" + href + "'" + (" class='active'" if key == active else "") + ">" + label + "</a>"
+
+    groups = "".join(
+        "<div class='navgroup " + key + "'><div class='navhead'>" + head
+        + ("<span class='ro'>" + note + "</span>" if note else "") + "</div>"
+        + "".join(nav(*link) for link in links) + "</div>" for key, head, note, links in NAV_GROUPS)
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>" + refresh +
-        "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body><div class='shell'>"
+        "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body>"
+        "<div class='envbar " + env + "' aria-hidden='true'></div><div class='shell'>"
         "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
-        + nav("/", "Onboardings", "onboardings") + nav("/history", "History", "history")
-        + nav("/tenants", "Tenants", "tenants") + nav("/inventory", "DevOps", "inventory")
-        + nav("/connection", "Sessions", "connection") + _session_chip() + _operator_block() +
+        + groups + _session_chip() + _operator_block() +
         "<div class='side-foot'>Attended · localhost only</div></aside>"
-        "<main" + (" class='wide'" if wide else "") + ">" + main_html + "</main></div></body></html>"
+        "<main" + (" class='wide'" if wide else "") + "><div class='envrow'><span class='envpill " + env + "'>"
+        + escape(ENV_PILLS[env]) + "</span></div>" + main_html + "</main></div></body></html>"
     )
 
 
@@ -5679,7 +5746,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
                      scan: str = "", co: str = "", env: str = "dev", top: str = "") -> str:
     """Server-rendered tenant table (the CSP blocks scripts); sort and filters are query parameters.
 
-    One environment per tab: "dev" is the DevOps tab (/inventory), "prod-clone" the Tenants tab (/tenants).
+    One environment per page: "dev" is Leonardo Development > Tenants (/inventory), "prod-clone" is Production > Tenants (/prod/tenants).
     ``top`` is extra HTML shown above the table (the Tenants tab's production-gate note).
     """
     now = datetime.now(timezone.utc)
@@ -5688,9 +5755,9 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
     environment = inventory.ENVIRONMENTS[env]
     refresh_form = "" if clone else ("<form method='post' action='/attended/inventory-refresh'><button type='submit'>"
                                      "Refresh inventory</button></form>")
-    base = "/tenants" if clone else "/inventory"
-    active = "tenants" if clone else "inventory"
-    title = "Tenants — Production (Redash clone)" if clone else "DevOps — Leonardo Development tenants"
+    base = "/prod/tenants" if clone else "/inventory"
+    active = "prod_tenants" if clone else "inventory"
+    title = "Tenants — Production (Redash clone)" if clone else "Tenants — Leonardo Development"
     head = ("<div class='page-head'><h1>" + escape(title) + "</h1><span class='chip chip-info'>"
             + escape(environment.label) + "</span>" + refresh_form + "</div>")
     if clone:
@@ -5829,6 +5896,403 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
              + escape(str(payload.get("environment"))) + " folder under %LOCALAPPDATA%\\SurfaceOnboarding\\leonardo-inventory "
              "(CSV beside it).</p></section>")
     return _app_shell(title, head + top + started + summary + table + note, active=active, wide=True)
+
+
+# ---- Two areas: "Onboarded on Dev" and Production readiness (owner decision 2026-10-07) -----------------------
+# Everything below is read-only: GET pages only, no Leonardo or BackOffice session, no refresh button for the clone.
+# Dev rows (local run/readback/outcome evidence) and Production rows (the Redash clone) never share a table.
+PROD_ACTION_REFRESH = "Refresh clone: "
+MATCH_CHIPS = {"exists_matches": ("chip-ok", "Matches"), "exists_differs": ("chip-warn", "Differs"),
+               "not_in_production": ("chip-neutral", "Not in production"), "exists_other": ("chip-bad", "Other tenants only"),
+               "ambiguous": ("chip-bad", "Ambiguous"), "clone_unavailable": ("chip-warn", "Clone unavailable")}
+MATCH_FILTERS = {"matches": ("exists_matches",), "differs": ("exists_differs",), "not_in_production": ("not_in_production",),
+                 "blocked": ("exists_other", "ambiguous"), "clone_unavailable": ("clone_unavailable",)}
+MATCH_FILTER_LABELS = (("matches", "Matches"), ("differs", "Differs"), ("not_in_production", "Not in production"),
+                       ("blocked", "Blocked"), ("clone_unavailable", "Clone unavailable"))
+MATCH_STATUS_ORDER = ("exists_other", "ambiguous", "exists_differs", "clone_unavailable", "not_in_production", "exists_matches")
+FIELD_RESULT_CHIPS = {"match": ("chip-ok", "Match"), "differs": ("chip-warn", "Differs"), "unknown": ("chip-warn", "Unknown"),
+                      "info": ("chip-neutral", "Info"), "na": ("chip-neutral", "Not required"),
+                      "not_checked": ("chip-neutral", "Not checked")}
+ENGINE_LABELS = {CE_ENGINE: "CE-only", SURFACE_ENGINE: "Surface-only", CASE3_ENGINE: "Surface + CE",
+                 "case_4_renew_surface_new_ce": "Case 4 renewal", "case_5_renew_ce_new_surface": "Case 5 renewal",
+                 "case_6_renew_both": "Case 6 renewal"}
+DEV_STATUS_CHIPS = {"onboarded": ("chip-ok", "Onboarded"), "mirror": ("chip-info", "Dev mirror"),
+                    "none": ("chip-neutral", "Not onboarded")}
+BEFORE_MIGRATION = (
+    "The production match shows Matches or Not in production, with no unresolved duplicate (Other tenants only and "
+    "Ambiguous block the migration).",
+    "The production clone is fresh: collected within the last 6 hours (" + PRODUCTION_COLLECT_HINT + ").",
+    "A separate, explicit owner approval exists for any production BackOffice write; this dashboard never writes there.",
+    "The Salesforce account id is not checked yet (the Redash accounts query is pending); compare it by hand.",
+    "On the move to production, ask the owner again: Salesforce Onboarding Stage must then be updated.",
+)
+
+
+def _evidence_for(reference: str, state: dict, readbacks: dict, outcomes: dict, mirrors: frozenset[str]) -> list[dict[str, Any]]:
+    record = state.get(reference)
+    return dev_onboarded_evidence(
+        reference, record=record, readback=readbacks.get(reference), outcome=outcomes.get(reference), mirror_ids=mirrors,
+        renewal_engines=RENEWAL_ENGINES, uncertain=bool(create_uncertain(record) or renewal_uncertain(record)))
+
+
+def _evidence_inputs() -> tuple[dict, dict, dict, frozenset[str]]:
+    try:
+        state = load_runner_state()
+    except RunnerStateUnavailable:
+        state = {}
+    try:
+        readbacks = attended_leonardo_readbacks()
+    except ReadUnavailable:
+        readbacks = {}
+    return state, readbacks, attended_renewal_outcomes(), dev_mirror_ids()
+
+
+def dev_evidence_for(reference: str) -> list[dict[str, Any]]:
+    """Local, verified-only Dev evidence for one CO (see integration/onboarding/dev_onboarded.py)."""
+    return _evidence_for(reference, *_evidence_inputs())
+
+
+def dev_evidence_map() -> dict[str, list[dict[str, Any]]]:
+    """Evidence per CO that has any (a CO needs a Dev readback to appear here)."""
+    state, readbacks, outcomes, mirrors = _evidence_inputs()
+    found = {ref: _evidence_for(ref, state, readbacks, outcomes, mirrors) for ref in sorted(readbacks)}
+    return {ref: items for ref, items in found.items() if items}
+
+
+def dev_onboarded_refs(evidence: dict[str, list[dict[str, Any]]] | None = None) -> list[str]:
+    evidence = dev_evidence_map() if evidence is None else evidence
+    return [ref for ref, items in evidence.items() if dev_status(items) == "onboarded"]
+
+
+@_display_cached
+def production_match_display(reference: str, product: str = "", onboarding_type: str = "") -> dict[str, Any]:
+    """The production match of one CO as a cached display read (read-only Salesforce source + clone snapshot)."""
+    return production_match_for(reference, product or None, onboarding_type or None)
+
+
+def _unreadable_match(reason: str = "co_source_unreadable") -> dict[str, Any]:
+    return {"status": "clone_unavailable", "reason": reason, "fields": [], "differs": [], "candidates": [], "target": None,
+            "captured_at": None, "age_seconds": None, "tenants_checked": 0, "route": None}
+
+
+def _match_of(reference: str, product: str | None, onboarding_type: str | None) -> dict[str, Any]:
+    try:
+        return production_match_display(reference, product or "", onboarding_type or "")
+    except Exception:  # noqa: BLE001 - a failed read never clears a CO: it shows as unavailable
+        return _unreadable_match()
+
+
+def _match_chip(status: str) -> str:
+    css, label = MATCH_CHIPS.get(status, ("chip-neutral", status))
+    return "<span class='chip " + css + "'>" + escape(label) + "</span>"
+
+
+def _dev_status_chip(items: list[dict[str, Any]]) -> str:
+    css, label = DEV_STATUS_CHIPS[dev_status(items)]
+    return "<span class='chip " + css + "'>" + escape(label) + "</span>"
+
+
+def _prod_action(result: dict[str, Any]) -> str:
+    status, reason = result["status"], str(result.get("reason") or "")
+    if status == "exists_differs":
+        return "Review fields"
+    if status in ("exists_other", "ambiguous"):
+        return "Resolve duplicate"
+    if status == "clone_unavailable":
+        if reason.startswith("inventory_snapshot") or reason == "alternate_domains_missing":
+            return PROD_ACTION_REFRESH + "<code>" + escape(PRODUCTION_COLLECT_HINT) + "</code>"
+        return "Check CO source data"
+    return "None"
+
+
+def _prod_action_rank(result: dict[str, Any]) -> int:
+    action = _prod_action(result)
+    return 0 if action == "Resolve duplicate" else 1 if action == "Review fields" else 3 if action == "None" else 2
+
+
+def _differing_text(result: dict[str, Any]) -> str:
+    labels = {row["code"]: row for row in result.get("fields") or ()}
+    parts = [escape(labels[code]["label"]) + (" (unknown)" if labels[code]["result"] == "unknown" else "")
+             for code in result.get("differs") or () if code in labels]
+    if parts:
+        return ", ".join(parts)
+    reason = str(result.get("reason") or "")
+    return "<span class='sub'>" + escape(reason) + "</span>" if reason and result["status"] != "exists_matches" else "—"
+
+
+def _clone_info() -> dict[str, Any]:
+    """Age and trust of the production clone for display (any age is loaded; staleness is shown, not hidden)."""
+    try:
+        payload = inventory.load_latest(inventory_root(), "prod-clone", max_age=INVENTORY_DISPLAY_MAX_AGE,
+                                        now=datetime.now(timezone.utc))
+    except inventory.InventoryError as error:
+        return {"reason": error.reason}
+    age = int(payload.get("age_seconds") or 0)
+    return {"captured_at": str(payload.get("captured_at") or ""), "age_seconds": age,
+            "trusted": age <= inventory.PRODUCTION_GATE_MAX_AGE.total_seconds(),
+            "label": str(payload.get("environment_label") or "")}
+
+
+def _age_words(seconds: int) -> str:
+    hours, minutes = divmod(max(0, seconds) // 60, 60)
+    return (str(hours) + " h " + str(minutes) + " min") if hours else (str(minutes) + " min")
+
+
+def _clone_line(info: dict[str, Any]) -> str:
+    if "reason" in info:
+        return ("Production clone unusable: <code>" + escape(info["reason"]) + "</code>. Refresh it with <code>"
+                + escape(PRODUCTION_COLLECT_HINT) + "</code>.")
+    return ("Production clone captured " + escape(info["captured_at"]) + " · data age " + _age_words(info["age_seconds"])
+            + ("" if info["trusted"] else " · <strong>older than 6 h: not trusted</strong>")
+            + (" · " + escape(info["label"]) if info["label"] else ""))
+
+
+def _co_link(reference: str, env: str = "") -> str:
+    return ("<a class='co' href='/co/" + escape(reference) + ("?env=" + env if env else "") + "'>" + escape(reference) + "</a>")
+
+
+def _route_label(reference: str, row: dict[str, str | None] | None, record: dict[str, str] | None) -> str:
+    engine = (record or {}).get("route")
+    if engine is None and row is not None:
+        case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+        engine = case[0] if case is not None else route_for(row)
+    label = ENGINE_LABELS.get(engine or "", "Route unknown" if record is None and row is None else "CE-only")
+    return "<span class='chip chip-info'>" + escape(label) + "</span>"
+
+
+def _prod_scope(all_open: bool) -> tuple[list[tuple[str, dict[str, str | None] | None]], dict[str, list[dict[str, Any]]], str]:
+    """(CO, queue row or None) in scope, the Dev evidence per CO, and a note. Default: only COs onboarded on Dev."""
+    evidence = dev_evidence_map()
+    note = ""
+    try:
+        rows = queue_source_rows()
+    except ReadUnavailable:
+        rows, note = [], "The open queue could not be read from Salesforce; only COs with local Dev evidence are listed."
+    by_ref = {row["Name"]: row for row in rows if row.get("Name")}
+    onboarded = dev_onboarded_refs(evidence)
+    refs = sorted(set(by_ref) | set(onboarded)) if all_open else sorted(onboarded)
+    return [(ref, by_ref.get(ref)) for ref in refs], evidence, note
+
+
+def _prod_results(scope: list[tuple[str, dict[str, str | None] | None]]) -> list[tuple[str, dict[str, str | None] | None, dict[str, Any]]]:
+    for ref, row in scope:  # overlap the read-only source reads (shared, cached display reads)
+        prefetch_display_read(production_match_display, ref, (row or {}).get("Onboarding_Product__c") or "",
+                              (row or {}).get("Onboarding_Type__c") or "")
+    return [(ref, row, _match_of(ref, (row or {}).get("Onboarding_Product__c"), (row or {}).get("Onboarding_Type__c")))
+            for ref, row in scope]
+
+
+def _scope_toggle(base: str, all_open: bool, flt: str) -> str:
+    params = {"filter": flt, "all": "" if all_open else "1"}
+    href = base + ("?" + urlencode({k: v for k, v in params.items() if v}) if any(params.values()) else "")
+    return ("<p class='note'>" + ("Showing every open CO." if all_open else "Showing only COs onboarded on Dev.")
+            + " <a href='" + escape(href) + "'>" + ("Show only onboarded on Dev" if all_open else "Show all open COs")
+            + " &rarr;</a></p>")
+
+
+def render_prod_readiness(flt: str = "", all_open: bool = False) -> str:
+    """/prod: per-CO production match with filter counts. GET only; no form, no refresh button."""
+    flt = flt if flt in MATCH_FILTERS else ""
+    scope, evidence, note = _prod_scope(all_open)
+    results = _prod_results(scope)
+    info = _clone_info()
+
+    def count(key: str) -> int:
+        return sum(1 for _r, _w, res in results if res["status"] in MATCH_FILTERS[key])
+
+    def link(key: str) -> str:
+        query = urlencode({k: v for k, v in (("filter", key), ("all", "1" if all_open else "")) if v})
+        return "/prod" + ("?" + query if query else "")
+
+    chips = ("<a class='fchip" + (" on" if not flt else "") + "' href='" + escape(link("")) + "'>All <b>" + str(len(results))
+             + "</b></a>")
+    for key, label in MATCH_FILTER_LABELS:
+        extra = (" · clone age " + _age_words(info["age_seconds"])) if key == "clone_unavailable" and "age_seconds" in info else ""
+        chips += ("<a class='fchip" + (" on" if flt == key else "") + "' href='" + escape(link(key)) + "'>" + escape(label)
+                  + " <b>" + str(count(key)) + "</b>" + escape(extra) + "</a>")
+    shown = [item for item in results if not flt or item[2]["status"] in MATCH_FILTERS[flt]]
+    shown.sort(key=lambda item: (_prod_action_rank(item[2]), item[0]))
+    body = ""
+    for ref, row, res in shown:
+        body += ("<tr><td class='stick'>" + _co_link(ref, "prod") + "</td><td>"
+                 + escape((row or {}).get("Account__r.Name") or "—") + "</td><td>" + _route_label(ref, row, None) + "</td><td>"
+                 + _dev_status_chip(evidence.get(ref, [])) + "</td><td>" + _match_chip(res["status"]) + "</td><td>"
+                 + _differing_text(res) + "</td><td>" + _prod_action(res) + "</td></tr>")
+    head = ("<thead><tr><th scope='col' class='stick'>CO</th><th scope='col'>Account</th><th scope='col'>Route</th>"
+            "<th scope='col'>Dev status</th><th scope='col'>Production match</th><th scope='col'>Differing fields</th>"
+            "<th scope='col'>Action needed</th></tr></thead>")
+    table = ("<div class='tbl-wrap'><table class='dense'>" + head + "<tbody>" + body + "</tbody></table></div>" if body
+             else "<p class='empty'>No CO in this view" + ("" if all_open else " (only COs onboarded on Dev are listed)") + ".</p>")
+    page = ("<div class='page-head'><h1>Production readiness</h1><span class='chip chip-warn'>read-only</span></div>"
+            "<p class='prodnote'>Read-only comparison of each CO with the production clone (Redash). Nothing here writes to "
+            "production, Leonardo or Salesforce. No tenant found is never a clearance.</p>"
+            "<p class='note'>" + _clone_line(info) + "</p><nav class='strip' aria-label='Production match filters'>" + chips
+            + "</nav>" + _scope_toggle("/prod", all_open, flt) + ("<p class='note'>" + escape(note) + "</p>" if note else "")
+            + "<section class='card tbl-card'>" + table + "</section>")
+    return _app_shell("Production readiness", page, active="prod", wide=True)
+
+
+def render_prod_matches(all_open: bool = False) -> str:
+    """/prod/matches: the current match of every CO in scope (no stored history) plus the recorded Start-gate checks."""
+    scope, _evidence, note = _prod_scope(all_open)
+    results = sorted(_prod_results(scope), key=lambda item: (MATCH_STATUS_ORDER.index(item[2]["status"])
+                                                              if item[2]["status"] in MATCH_STATUS_ORDER else 9, item[0]))
+    info = _clone_info()
+    body = ""
+    for ref, row, res in results:
+        target = res.get("target") or {}
+        body += ("<tr><td>" + _match_chip(res["status"]) + "</td><td class='stick'>" + _co_link(ref, "prod") + "</td><td>"
+                 + escape((row or {}).get("Account__r.Name") or "—") + "</td><td>" + _differing_text(res) + "</td><td>"
+                 + escape(str(target.get("name") or "—")) + "</td></tr>")
+    table = ("<div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>Match</th><th scope='col' class='stick'>CO</th>"
+             "<th scope='col'>Account</th><th scope='col'>Differing fields / reason</th><th scope='col'>Production tenant</th>"
+             "</tr></thead><tbody>" + body + "</tbody></table></div>" if body
+             else "<p class='empty'>No CO in this view" + ("" if all_open else " (only COs onboarded on Dev are listed)") + ".</p>")
+    try:
+        checks = sorted(((ref, check) for ref, check in load_check_state().items() if check.get("kind") == "production_duplicate"),
+                        key=lambda item: item[1].get("completed_on") or item[1].get("started_on") or "", reverse=True)
+        checks_error = False
+    except ValueError:
+        checks, checks_error = [], True
+    gate_rows = ""
+    for ref, check in checks:
+        gate_rows += ("<tr><td>" + _co_link(ref, "prod") + "</td><td>"
+                      + (_production_chip(check) or "<span class='chip chip-neutral'>No match</span>") + " <code>"
+                      + escape(check.get("result") or "—") + "</code></td><td>"
+                      + escape((check.get("completed_on") or check.get("started_on") or "—").replace("T", " ")[:19]) + "</td></tr>")
+    gates = ("<p class='note'>The recorded production duplicate check could not be read.</p>" if checks_error
+             else ("<div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>CO</th><th scope='col'>Start-gate result"
+                   "</th><th scope='col'>When</th></tr></thead><tbody>" + gate_rows + "</tbody></table></div>" if gate_rows
+                   else "<p class='empty'>No production duplicate check has been recorded yet.</p>"))
+    page = ("<div class='page-head'><h1>Production matches</h1><span class='chip chip-warn'>read-only</span></div>"
+            "<p class='prodnote'>Current match only; nothing is stored. Sorted by status, blocked first.</p>"
+            "<p class='note'>" + _clone_line(info) + "</p>" + _scope_toggle("/prod/matches", all_open, "")
+            + ("<p class='note'>" + escape(note) + "</p>" if note else "")
+            + "<section class='card tbl-card'>" + table + "</section>"
+            "<section class='card tbl-card'><div class='card-head'><h2 class='pill'>Latest Start-gate checks</h2></div>"
+            "<p class='note'>The latest recorded production duplicate check per CO (written when a Start was stopped by it).</p>"
+            + gates + "</section>")
+    return _app_shell("Production matches", page, active="prod_matches", wide=True)
+
+
+def _ids_cell(route: str | None, readback: dict[str, str] | None) -> str:
+    mapping = SALESFORCE_ID_MAPPING.get(route or "") or (("surface_account_id", "", "Account ID"), ("account_uuid", "", "Account UUID"))
+    out = ""
+    for key, _field, _label in mapping:
+        value = (readback or {}).get(key)
+        short = "UUID" if key == "account_uuid" else "ID"
+        out += ("<span class='sub'>" + short + " <code style='user-select:all'>" + escape(value) + "</code></span>"
+                if isinstance(value, str) and value else "<span class='sub'>" + short + " not captured</span>")
+    return out
+
+
+def render_dev_onboarded() -> str:
+    """/dev/onboarded: COs with VERIFIED Dev evidence (a verified Dev mirror alone does not count). GET only."""
+    state, readbacks, outcomes, mirrors = _evidence_inputs()
+    evidence = {ref: _evidence_for(ref, state, readbacks, outcomes, mirrors) for ref in sorted(readbacks)}
+    onboarded = [ref for ref, items in evidence.items() if dev_status(items) == "onboarded"]
+    mirrors_only = sum(1 for items in evidence.values() if dev_status(items) == "mirror")
+    note = ""
+    try:
+        rows = {row["Name"]: row for row in queue_source_rows() if row.get("Name")}
+    except ReadUnavailable:
+        rows, note = {}, "The open queue could not be read from Salesforce; account names are not shown."
+    for ref in onboarded:
+        prefetch_display_read(production_match_display, ref, (rows.get(ref) or {}).get("Onboarding_Product__c") or "",
+                              (rows.get(ref) or {}).get("Onboarding_Type__c") or "")
+    body = ""
+    for ref in onboarded:
+        row, record, outcome = rows.get(ref), state.get(ref), outcomes.get(ref)
+        items = [item for item in evidence[ref] if item["counts"]]
+        dated = next((item["on"] for item in items if item.get("on")), None)
+        renewal = bool(record and record.get("route") in RENEWAL_ENGINES) or any(i["code"].startswith("renewal_") for i in items)
+        case = renewal_case((row or {}).get("Onboarding_Product__c"), (row or {}).get("Onboarding_Type__c"))
+        route = (record or {}).get("route") or (case[0] if case is not None else (CE_ENGINE if not renewal else None))
+        entered = ("— → " + str(outcome["new_expiration"]) if renewal and outcome and outcome.get("new_expiration")
+                   else (str(record["license_start_entered"]) + " → " + str(record["license_end_entered"])
+                         if record and record.get("license_start_entered") and record.get("license_end_entered") else "—"))
+        match = _match_of(ref, (row or {}).get("Onboarding_Product__c"), (row or {}).get("Onboarding_Type__c"))
+        chips = " ".join("<span class='chip chip-ok'>" + escape(item["label"]) + "</span>" for item in items)
+        body += ("<tr><td class='stick'>" + _co_link(ref) + "</td><td>" + escape((row or {}).get("Account__r.Name") or "—")
+                 + "</td><td>" + _route_label(ref, row, record) + "</td><td>" + escape(dated or "—") + "</td><td>"
+                 + _ids_cell(route, readbacks.get(ref)) + "</td><td>" + escape(entered)
+                 + "<span class='sub'>entered in Leonardo Development</span></td><td>" + chips
+                 + "</td><td><a href='/co/" + escape(ref) + "?env=prod'>" + _match_chip(match["status"]) + "</a></td></tr>")
+    head = ("<thead><tr><th scope='col' class='stick'>CO</th><th scope='col'>Account</th><th scope='col'>Route</th>"
+            "<th scope='col'>Onboarded</th><th scope='col'>Account ID / UUID</th><th scope='col'>Licence start &ndash; end</th>"
+            "<th scope='col'>Evidence</th><th scope='col'>Production</th></tr></thead>")
+    table = ("<div class='tbl-wrap'><table class='dense'>" + head + "<tbody>" + body + "</tbody></table></div>" if body
+             else "<p class='empty'>No CO has verified Dev evidence yet.</p>")
+    page = ("<div class='page-head'><h1>Onboarded on Dev</h1><span class='chip chip-info'>Leonardo Development</span></div>"
+            "<p class='note'>Only verified evidence counts: a create readback with both ids, or a verified renewal edit. "
+            "Dry runs, uncertain runs and unverified writes never count"
+            + (" · " + str(mirrors_only) + " Dev mirror(s) not counted" if mirrors_only else "") + ". The Production column "
+            "is the read-only match against the production clone.</p>" + ("<p class='note'>" + escape(note) + "</p>" if note else "")
+            + "<section class='card tbl-card'>" + table + "</section>")
+    return _app_shell("Onboarded on Dev", page, active="dev_onboarded", wide=True)
+
+
+def _env_segment(reference: str, current: str, dev_chip: str, prod_chip: str) -> str:
+    """[ Dev ][ Production ] as plain links (no script); each label carries its status chip."""
+    def link(env: str, label: str, chip: str) -> str:
+        on = env == current
+        return ("<a href='/co/" + escape(reference) + "?env=" + env + "'" + (" class='on' aria-current='page'" if on else "")
+                + ">" + label + " " + chip + "</a>")
+    return "<div class='seg' role='group' aria-label='Environment'>" + link("dev", "Dev", dev_chip) + link("prod", "Production", prod_chip) + "</div>"
+
+
+def _field_table(fields: list[dict[str, Any]]) -> str:
+    rows = ""
+    for item in fields:
+        css, label = FIELD_RESULT_CHIPS.get(item["result"], ("chip-neutral", item["result"]))
+        rows += ("<tr><td>" + escape(item["label"]) + ("" if item["required"] else "<span class='sub'>informational</span>")
+                 + "</td><td>" + escape(str(item["expected"])) + "</td><td>" + escape(str(item["production"]))
+                 + "</td><td><span class='chip " + css + "'>" + escape(label) + "</span></td></tr>")
+    return ("<div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>Field</th><th scope='col'>Salesforce / DealHub "
+            "(expected)</th><th scope='col'>Production (clone)</th><th scope='col'>Result</th></tr></thead><tbody>" + rows
+            + "</tbody></table></div>")
+
+
+def _candidates_table(candidates: list[dict[str, Any]]) -> str:
+    rows = ""
+    for item in candidates:
+        flags = " ".join(chip for cond, chip in (
+            (item.get("deleted"), "<span class='chip chip-bad'>Deleted</span>"),
+            (not item.get("enabled") and not item.get("deleted"), "<span class='chip chip-neutral'>Disabled</span>"),
+            (item.get("live_paid"), "<span class='chip chip-ok'>Live, paid</span>")) if cond)
+        rows += ("<tr><td>" + escape(str(item.get("name") or "—")) + "<span class='sub'><code>" + escape(str(item.get("id") or "—"))
+                 + "</code></span></td><td>" + escape(str(item.get("domain") or "—")) + "</td><td>"
+                 + escape(str(item.get("license_type") or "—")) + "</td><td>" + escape(_created_date(item.get("created")))
+                 + "</td><td>" + flags + "</td></tr>")
+    return ("<div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>Production tenant</th><th scope='col'>Domain</th>"
+            "<th scope='col'>Licence type</th><th scope='col'>Created</th><th scope='col'>State</th></tr></thead><tbody>" + rows
+            + "</tbody></table></div>")
+
+
+def page_detail_production(reference: str, row: dict[str, str | None], match: dict[str, Any]) -> str:
+    """The Production view of a CO page (GET only: no form, no button, no write)."""
+    account = row.get("Account_Name__c")
+    case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+    route_chip = ("<span class='chip chip-info'>" + escape(case[1]) + "</span>" if case is not None else _route_chip(row))
+    header = ("<div class='page-head'><h1>" + escape(reference) + "</h1>"
+              + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + route_chip + "</div>")
+    seg = _env_segment(reference, "prod", _dev_status_chip(dev_evidence_for(reference)), _match_chip(match["status"]))
+    reason = ("<p class='note'>" + escape(str(match.get("reason") or "")) + "</p>") if match.get("reason") else ""
+    status = ("<section class='card'><div class='card-head'><h2 class='pill'>Production match</h2>" + _match_chip(match["status"])
+              + "</div>" + reason)
+    if match["status"] in ("exists_matches", "exists_differs"):
+        status += _field_table(match["fields"])
+    if match.get("candidates"):
+        status += "<h3 class='sub-h'>Matched production tenants</h3>" + _candidates_table(match["candidates"])
+    status += "</section>"
+    source = ("<p class='note'>" + _clone_line(_clone_info()) + " · Source: Redash saved query on the cloned production "
+              "database, personal data removed. A missing match is never a clearance.</p>")
+    checklist = ("<section class='card'><div class='card-head'><h2 class='pill'>Before migration</h2></div><ul>"
+                 + "".join("<li>" + escape(text) + "</li>" for text in BEFORE_MIGRATION) + "</ul></section>")
+    main_html = ("<a class='crumb' href='/prod'>&larr; Production readiness</a>" + header + seg
+                 + "<p class='prodnote'>Production view, read-only. Nothing on this page writes to production, Leonardo or "
+                 "Salesforce.</p>" + _production_marker_for(reference) + status + source + checklist)
+    return _app_shell(reference + " production", main_html, active="prod", env="prod")
 
 
 # Dashboard login (2026-10-03, owner decision): the operator's Salesforce SSO.
@@ -6219,16 +6683,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.OK, html); return
             if path == "/connection":
                 self.send_page(HTTPStatus.OK, page_salesforce_unavailable(failed=False)); return
-            if path == "/history":
+            if path in ("/history", "/dev/history"):
                 self.send_page(HTTPStatus.OK, render_history()); return
-            if path == "/inventory" and parse_qs(parsed.query).get("env", [""])[0] == "prod-clone":
-                # The production clone moved to its own tab; keep old links and bookmarks working.
-                kept = {key: value[0] for key, value in parse_qs(parsed.query).items()
-                        if key in ("q", "sort", "dir", "scan", "co") and value and value[0]}
-                self.send_redirect("/tenants" + ("?" + urlencode(kept) if kept else "")); return
-            if path in ("/inventory", "/tenants"):
-                params = parse_qs(parsed.query)
-                clone = path == "/tenants"
+            params = parse_qs(parsed.query)
+            kept = {key: value[0] for key, value in params.items()
+                    if key in ("q", "sort", "dir", "scan", "co") and value and value[0]}
+            if (path == "/inventory" and params.get("env", [""])[0] == "prod-clone") or path == "/tenants":
+                # The production clone moved to Production > Tenants; keep old links and bookmarks working.
+                self.send_redirect("/prod/tenants" + ("?" + urlencode(kept) if kept else "")); return
+            if path == "/dev/onboarded":
+                self.send_page(HTTPStatus.OK, render_dev_onboarded()); return
+            if path == "/prod":
+                self.send_page(HTTPStatus.OK, render_prod_readiness(params.get("filter", [""])[0],
+                                                                    params.get("all", [""])[0] == "1")); return
+            if path == "/prod/matches":
+                self.send_page(HTTPStatus.OK, render_prod_matches(params.get("all", [""])[0] == "1")); return
+            if path in ("/inventory", "/prod/tenants"):
+                clone = path == "/prod/tenants"
                 self.send_page(HTTPStatus.OK, render_inventory(
                     params.get("q", [""])[0], "" if clone else params.get("refresh", [""])[0],
                     sort=params.get("sort", [""])[0], direction=params.get("dir", [""])[0],
@@ -6267,6 +6738,13 @@ class Handler(BaseHTTPRequestHandler):
                 if dealhub_needed(queued):
                     prefetch_display_read(dealhub_rows_for_co, match.group(1))
                 row = detail_row(match.group(1))
+                if parse_qs(parsed.query).get("env", [""])[0] == "prod":
+                    # Production view: read-only comparison with the production clone; no forms, no writes.
+                    html = page_detail_production(match.group(1), row, _match_of(
+                        match.group(1), row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
+                    record_timing("page_build", "co_prod", started, True)
+                    self.send_page(HTTPStatus.OK, html)
+                    return
                 html = page_detail(match.group(1), row, notice, surface_commercial_readiness(row))
                 record_timing("page_build", "co", started, True)
                 self.send_page(HTTPStatus.OK, html)
