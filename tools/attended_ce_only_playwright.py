@@ -5277,7 +5277,9 @@ SCAN_EXEC_DURATION_TEXT = "Duration Per Scan"
 SCAN_EXEC_PATH = re.compile(r"/api/v1/backoffice/account/([A-Za-z0-9_-]{1,64})/campaign/executions")
 SCAN_EXEC_TIMEOUT_MS = 20_000
 SCAN_EXEC_MAX_ROWS = 200
-SCAN_EXEC_DONE = frozenset({"DONE"})
+# Owner 2026-10-07: DONE_WITH_ERRORS (live on CO-0767, 07:27:27) is a finished scan; the dashboard adds a warning.
+SCAN_EXEC_DONE = frozenset({"DONE", "DONE_WITH_ERRORS"})
+SCAN_EXEC_WITH_ERRORS = frozenset({"DONE_WITH_ERRORS"})
 SCAN_EXEC_RUNNING = frozenset({"PENDING"})
 
 

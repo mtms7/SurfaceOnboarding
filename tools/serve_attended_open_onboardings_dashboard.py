@@ -76,6 +76,8 @@ from tools.attended_ce_only_playwright import (
     build_renewal_plan,
     renewal_case,
     RENEWAL_ENGINES,
+    SCAN_EXEC_DONE,
+    SCAN_EXEC_WITH_ERRORS,
     SURFACE_ROUTE_PRODUCT,
     SURFACE_ROUTE_TYPE,
     _chrome_executable,
@@ -888,7 +890,13 @@ def _scan_executions_from_entry(value: dict[str, object]) -> dict[str, object]:
         since = datetime.fromisoformat(since) if since is not None else None
     except (AttributeError, TypeError, ValueError):
         return {}
-    return {"executions": executions, "execution_state": state, "running_since": since}
+    statuses = [e["status"] for e in executions]
+    if state == "unrecognized" and statuses and all(s in SCAN_EXEC_DONE for s in statuses):
+        # Apply the current confirmed list, so a newly confirmed status (DONE_WITH_ERRORS, owner 2026-10-07)
+        # updates an older read without a new Leonardo read.
+        state = "done"
+    with_errors = state == "done" and any(s in SCAN_EXEC_WITH_ERRORS for s in statuses)
+    return {"executions": executions, "execution_state": state, "running_since": since, "with_errors": with_errors}
 
 
 def _clock(moment: datetime | None) -> str:
@@ -924,7 +932,9 @@ def _scan_executions_html(observation: dict[str, object]) -> str:
         f" · started {escape(_clock(e['start']))}"  # type: ignore[arg-type]
         f" · {escape(_hms(e['duration_ms']) if isinstance(e['duration_ms'], int) else 'no duration')}</li>"
         for e in executions)
-    return (f"<p><b>{escape(headline)}</b></p>" + (f"<ul class='meta-line'>{items}</ul>" if items else ""))
+    warning = ("<p class='note' style='color:var(--warn)'>A scan finished with errors (DONE_WITH_ERRORS) — check the "
+               "tenant in Leonardo Development.</p>" if observation.get("with_errors") else "")
+    return (f"<p><b>{escape(headline)}</b></p>" + warning + (f"<ul class='meta-line'>{items}</ul>" if items else ""))
 
 
 def attended_scan_statuses() -> dict[str, dict[str, object]]:

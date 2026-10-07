@@ -158,5 +158,27 @@ class ScanCheckPartialTests(unittest.TestCase):
         self.assertIn("could not be narrowed to one", failed)
 
 
+class DoneWithErrorsTests(unittest.TestCase):
+    def test_done_with_errors_counts_as_done_with_a_warning_even_for_an_older_read(self):
+        # Live 2026-10-07 (CO-0767): stored as "unrecognized" before the owner confirmed DONE_WITH_ERRORS.
+        entry = {"execution_state": "unrecognized", "executions": [
+            {"campaign_type": "RECON", "execution_type": "SCHEDULED", "status": "DONE_WITH_ERRORS",
+             "start": "2026-10-06T08:18:00+00:00", "end": "2026-10-06T15:45:27+00:00", "duration_ms": 26847470},
+            {"campaign_type": "RECON", "execution_type": "SCHEDULED", "status": "DONE",
+             "start": "2026-10-06T16:00:00+00:00", "end": "2026-10-06T16:08:18+00:00", "duration_ms": 498643}]}
+        parsed = dashboard._scan_executions_from_entry(entry)
+        self.assertEqual(parsed["execution_state"], "done")
+        self.assertTrue(parsed["with_errors"])
+        html = dashboard._scan_executions_html(parsed)
+        self.assertIn("Done ·", html)
+        self.assertIn("finished with errors", html)
+        self.assertNotIn("Unrecognized", html)
+
+    def test_an_unknown_status_stays_unrecognized(self):
+        entry = {"execution_state": "unrecognized", "executions": [
+            {"campaign_type": "RECON", "execution_type": "SCHEDULED", "status": "EXPLODED",
+             "start": None, "end": None, "duration_ms": None}]}
+        self.assertEqual(dashboard._scan_executions_from_entry(entry)["execution_state"], "unrecognized")
+
 if __name__ == "__main__":
     unittest.main()
