@@ -4804,9 +4804,11 @@ class ScanStatusTests(unittest.TestCase):
         with patch.dict(sys.modules, {"playwright": pkg, "playwright.sync_api": fake}), \
                 patch.object(runner, "READBACK_PATH", self.readbacks), \
                 patch.object(runner, "SCAN_STATUS_PATH", self.status_path), \
-                patch.object(runner, "_scan_status_tenant_name", return_value="Sample Surface Co"), \
+                patch.object(runner, "CHECK_STATE_PATH", self.status_path.with_name("checks.json")), \
+                patch.object(runner, "_sf_records", side_effect=AssertionError("no Salesforce read")), \
+                patch.object(runner, "_scan_status_tenant_names", return_value=("Sample Surface Co",)), \
                 patch.object(runner, "_attended_page", page), \
-                patch.object(runner, "_open_search", return_value=object()), \
+                patch.object(runner, "_open_search", side_effect=AssertionError("read-only paths use the invisible search")), \
                 patch.object(runner, "_search_tenants", return_value=runner.TenantSearchResult(rows, len(rows))), \
                 patch.object(runner, "read_scan_executions", **(executions or {"side_effect": RuntimeError(
                     "scan_status_executions_unavailable")})):
