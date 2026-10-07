@@ -71,6 +71,7 @@ from tools.attended_ce_only_playwright import (
     case3_term_problem,
     build_renewal_plan,
     renewal_case,
+    RENEWAL_ENGINES,
     SURFACE_ROUTE_PRODUCT,
     SURFACE_ROUTE_TYPE,
     _chrome_executable,
@@ -3158,11 +3159,11 @@ _COPY_SCRIPT = (
 )
 
 
-def _page_csp(page: str) -> str:
-    """Strict CSP; a script is allowed only through the per-response nonce the page itself carries."""
-    csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
-    found = re.search(r"<script nonce='([A-Za-z0-9_-]{8,64})'>", page)
-    return csp + "; script-src 'nonce-" + found.group(1) + "'" if found else csp
+# The only script the dashboard serves: a fixed file from this module (never page content), so the CSP allows
+# 'self' scripts and still forbids every inline script.
+COPY_SCRIPT_PATH = "/static/copy-domains.js"
+PAGE_CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; form-action 'self'; base-uri 'none'; "
+            "frame-ancestors 'none'")
 
 
 def _domains_card(row: dict[str, str | None]) -> str:
@@ -3191,11 +3192,10 @@ def _domains_card(row: dict[str, str | None]) -> str:
         human = "; ".join(_DOMAIN_NOTE_TEXT.get(code, code) for code in info["notes"])
         body += "<div class='banner banner-warn'><b>The Salesforce value was cleaned</b> (" + escape(human) + ")."
         if info["salesforce_clean_value"]:
-            nonce = token_urlsafe(16)
             body += (" Paste this into Alternate_Domains__c:<br><input id='clean-domains' readonly size='60' value='"
                      + escape(info["salesforce_clean_value"], quote=True) + "'> "
                      "<button type='button' id='copy-domains' class='ghost'>Copy</button>")
-            script = "<script nonce='" + nonce + "'>" + _COPY_SCRIPT + "</script>"
+            script = "<script src='" + COPY_SCRIPT_PATH + "'></script>"
         body += "</div>"
     return ("<section class='card' aria-labelledby='domains-title'><div class='card-head'><h2 id='domains-title' class='pill'>"
             "Domains for the tenant</h2>" + chip + "</div>" + body
@@ -3427,7 +3427,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                  + "<div class='head-meta'><span>Read from Salesforce at " + escape(display_read_at()) + "</span>"
                  "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
                  "<button class='ghost' type='submit'>Refresh</button></form></div></div>"
-                 + _detail_summary(row, _stage_facts(stage_state, readback, row)) + (_domains_card(row) if route_for(row) in SURFACE_ROUTES else "") + toast + next_step + health + ids_html + record)
+                 + _detail_summary(row, _stage_facts(stage_state, readback, row)) + (_domains_card(row) if route_for(row) in SURFACE_ROUTES or (renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")) or (None,))[0] in RENEWAL_ENGINES else "") + toast + next_step + health + ids_html + record)
     return _app_shell(reference, main_html, active="onboardings")
 
 
@@ -5158,7 +5158,7 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
     def send_page(self, status: HTTPStatus, page: str) -> None:
-        data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", REFERRER_POLICY); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", _page_csp(page)); self.end_headers(); self.wfile.write(data)
+        data = page.encode(); self.send_response(status); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0"); self.send_header("Referrer-Policy", REFERRER_POLICY); self.send_header("X-Content-Type-Options", "nosniff"); self.send_header("X-Frame-Options", "DENY"); self.send_header("Content-Security-Policy", PAGE_CSP); self.end_headers(); self.wfile.write(data)
     def _claim_and_launch(self, reference: str, revision: str, launch: Any, **start_fields: str) -> bool:
         """Record the start first (the claim), then launch; a failed launch is recorded as such."""
         try:
@@ -5209,6 +5209,11 @@ class Handler(BaseHTTPRequestHandler):
         if operator is None:
             self.send_redirect("/login"); return
         _current_operator.set(operator)
+        if path == COPY_SCRIPT_PATH:
+            data = _COPY_SCRIPT.encode()
+            self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "text/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(data))); self.send_header("Cache-Control", "no-store, max-age=0")
+            self.send_header("X-Content-Type-Options", "nosniff"); self.end_headers(); self.wfile.write(data); return
         # Display reads may use the short in-memory cache; ?refresh=1 drops it.
         if parse_qs(urlsplit(self.path).query).get("refresh", [""])[0] == "1":
             clear_display_cache()

@@ -175,19 +175,24 @@ class DashboardCardTests(unittest.TestCase):
         self.assertNotIn("was cleaned", card)
         self.assertNotIn("<script", card)
 
-    def test_cleaned_card_offers_copy_with_nonce(self):
+    def test_cleaned_card_offers_copy_from_the_fixed_script_file(self):
         card = dashboard._domains_card(_row("a2a.it", CO0767_SHAPE))
         self.assertIn("The Salesforce value was cleaned", card)
         self.assertIn("entries were separated by spaces", card)
         self.assertIn("readonly", card)
         self.assertIn("value='a2aenergia.eu, gruppoa2a.it, unareti.it'", card)
         self.assertIn("id='copy-domains'", card)
-        self.assertIn("navigator.clipboard.writeText", card)
-        self.assertIn("execCommand('copy')", card)
-        csp = dashboard._page_csp(card)
-        self.assertRegex(csp, r"script-src 'nonce-[A-Za-z0-9_-]+'")
-        self.assertEqual(dashboard._page_csp("<p>no script</p>"),
-                         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        # No inline script: only the fixed file served by the dashboard itself.
+        self.assertIn("<script src='/static/copy-domains.js'></script>", card)
+        self.assertNotIn("navigator.clipboard", card)
+        self.assertIn("navigator.clipboard.writeText", dashboard._COPY_SCRIPT)
+        self.assertIn("execCommand('copy')", dashboard._COPY_SCRIPT)
+
+    def test_csp_allows_only_self_scripts_and_no_inline(self):
+        self.assertIn("script-src 'self'", dashboard.PAGE_CSP)
+        self.assertIn("script-src 'self';", dashboard.PAGE_CSP)  # no 'unsafe-inline' for scripts
+        self.assertNotIn("nonce", dashboard.PAGE_CSP)
+        self.assertIn("default-src 'none'", dashboard.PAGE_CSP)
 
     def test_rejected_card_is_blocked_and_escaped(self):
         card = dashboard._domains_card(_row(MAIN, "ok.example *.<b>x</b>.example ftp://u.example/<i>"))
@@ -208,9 +213,14 @@ class DashboardCardTests(unittest.TestCase):
         card = dashboard._domains_card(_row("app.example.it", "a.example"))
         self.assertIn("Main_Domain__c is not a single registrable domain", card)
 
-    def test_card_is_on_the_surface_co_page_only(self):
+    def test_card_is_on_surface_and_case_4_to_6_renewal_pages_only(self):
         page = dashboard.page_detail("CO-0767", _row("a2a.it", CO0767_SHAPE))
         self.assertIn("Domains for the tenant", page)
+        renewal = _row("a2a.it", CO0767_SHAPE)
+        renewal["Onboarding_Product__c"] = "Surface & Credential Exposure"
+        renewal["Onboarding_Type__c"] = "Renewal of Existing Product"
+        with patch.object(dashboard, "renewal_subscription_rows", return_value=[]):
+            self.assertIn("Domains for the tenant", dashboard.page_detail("CO-0767", renewal))
         other = _row("a2a.it", CO0767_SHAPE)
         other["Onboarding_Product__c"] = "Credential Exposure"
         self.assertNotIn("Domains for the tenant", dashboard.page_detail("CO-0768", other))
