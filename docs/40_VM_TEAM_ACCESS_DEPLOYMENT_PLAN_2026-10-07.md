@@ -114,6 +114,15 @@ Decisions needed from the owner:
 5. **Phase 1 scope:** read-only VM with runs on the desktop (recommended), and the desktop-to-VM state sync direction.
 6. **Proxy ownership:** accept a project-run VM-local proxy, or require the corporate proxy in `REVERSE_PROXY_APPROVAL_PACKET`; plus the Redash key approach.
 
+**Owner answers (2026-10-07).** These are owner preferences for the pilot; the SecOps / Identity / Salesforce approvals in §7 are still required and are not implied by them.
+
+1. Port: **8443**.
+2. Certificate: **self-signed for now** (pilot); internal CA later.
+3. Allow-list: **the owner only for now** (milton.stevenson@pentera.io).
+4. Operators: **the owner and john.ostrander@pentera.io**. Open point: answer 3 (owner only) and answer 4 (two operators) differ — confirm whether John is on the allow-list from the start.
+5. Phase 1: **yes** — read-only VM, runs from the owner's Windows desktop.
+6. Proxy: **VM-local (project-run) for now**; the Redash key approach is still open.
+
 ## Conflicts with existing documents
 
 - `docs/35` and the deployment README describe a single-user pilot / five operators behind a corporate SecOps proxy with enterprise TLS; this plan proposes a VM-local proxy and optionally a self-signed certificate. Needs explicit SecOps acceptance.
