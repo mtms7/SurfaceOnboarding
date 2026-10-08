@@ -26,6 +26,7 @@ browser --HTTPS 8443--> nginx (VM IP) --auth_request--> oauth2-proxy (127.0.0.1:
 - **Proxy:** nginx (or Caddy) on the VM under its own non-login user, TLS terminated on the VM IP only. It strips every client-supplied identity, role, and forwarding header, then sets only the approved ones. Upstream is `127.0.0.1:8000` only. HTTP is not bound.
 - **Authentication:** OneLogin OIDC via oauth2-proxy (or equivalent), MFA per corporate policy, email allow-list or OneLogin group, deny by default.
 - **Identity to the dashboard:** the proxy passes a verified email and role. The dashboard trusts them only when the TCP peer is loopback and exactly one well-formed value is present; anything else fails closed. Header names/format are owner-approved, not guessed (REVERSE_PROXY_APPROVAL_PACKET).
+- **Built locally 2026-10-08 (not deployed):** the dashboard also requires a shared secret in `X-Surface-Proxy-Secret` (set by nginx from a root-owned file, read via `SURFACE_ONBOARDING_PROXY_SECRET_FILE`; at least 32 characters, constant-time compare, fail closed) so another local user cannot forge `X-Forwarded-Email` on loopback. The allow-list and roles can come from ONE file (`/etc/surface-onboarding/users.txt`, `SURFACE_ONBOARDING_USERS_FILE`); `integration/deployment/vm_pilot/render_allowed_emails.py` renders oauth2-proxy's list from it. See `integration/deployment/vm_pilot/README.md`.
 - **Guards kept:** `scripts/run_vm_dashboard.sh` still refuses to start without `SURFACE_ONBOARDING_RUNTIME=vm`, the approved-identity marker, and a `127.0.0.1` bind.
 - **Roles (proposed):** `viewer` = queue, CO pages, production readiness, search. `operator` additionally sees Start/confirm actions (disabled on the VM in phase 1 anyway, section 4).
 
@@ -122,6 +123,8 @@ Decisions needed from the owner:
 4. Operators: **the owner and john.ostrander@pentera.io**. Allow-list order (confirmed): the owner first; John is added as operator after the owner has checked the pilot.
 5. Phase 1: **yes** — read-only VM, runs from the owner's Windows desktop.
 6. Proxy: **VM-local (project-run) for now**; the Redash key approach is still open.
+
+*Built locally 2026-10-08:* the header-spoofing risk above now has a code-level mitigation (shared proxy secret) and the allow-list has a single source file; both still need the VM/SecOps approvals in section 7 before any use.
 
 ## Conflicts with existing documents
 

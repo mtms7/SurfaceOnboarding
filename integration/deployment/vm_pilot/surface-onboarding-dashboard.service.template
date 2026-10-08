@@ -15,16 +15,25 @@ Group=surface-onboarding
 UMask=0077
 WorkingDirectory=/opt/surface-onboarding/app
 
-# No secrets here. Values are identity/config only.
+# No secrets here. Values are identity/config only and file paths. /etc/surface-onboarding is read-only for the
+# service (ProtectSystem=strict).
 Environment=SURFACE_ONBOARDING_RUNTIME=vm
+# The application tree is read-only (ReadOnlyPaths): do not try to write .pyc files into it.
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=SURFACE_ONBOARDING_WEB_IDENTITY_APPROVED=1
 Environment=SURFACE_ONBOARDING_HOST=127.0.0.1
 Environment=SURFACE_ONBOARDING_PORT=8000
 Environment=SURFACE_ONBOARDING_PUBLIC_ORIGIN=https://172.26.37.20:8443
 Environment=SURFACE_ONBOARDING_STATE_DIR=/var/lib/surface-onboarding
-Environment=SURFACE_ONBOARDING_ALLOWED_USERS=milton.stevenson@pentera.io
-Environment=SURFACE_ONBOARDING_OPERATORS=milton.stevenson@pentera.io
-# Optional file forms (one e-mail per line) so the owner can add a teammate without editing the unit:
+# Recommended: ONE users file is the single source of truth (lines `email` or `email operator`; the oauth2-proxy list
+# is rendered from it by render_allowed_emails.py). Mode 0640 root:surface-onboarding, read-only to the service.
+Environment=SURFACE_ONBOARDING_USERS_FILE=/etc/surface-onboarding/users.txt
+# Shared secret with nginx (never in this unit or the repository): a root-owned file, 0640 root:surface-onboarding.
+# Create and rotate it as described in README.md. The dashboard refuses every request without it in VM mode.
+Environment=SURFACE_ONBOARDING_PROXY_SECRET_FILE=/etc/surface-onboarding/proxy-secret
+# Legacy allow-list forms still work and, when set, win over the users file (each list independently):
+# Environment=SURFACE_ONBOARDING_ALLOWED_USERS=milton.stevenson@pentera.io
+# Environment=SURFACE_ONBOARDING_OPERATORS=milton.stevenson@pentera.io
 # Environment=SURFACE_ONBOARDING_ALLOWED_USERS_FILE=/etc/surface-onboarding/allowed-emails.txt
 # Environment=SURFACE_ONBOARDING_OPERATORS_FILE=/etc/surface-onboarding/operators.txt
 

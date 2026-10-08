@@ -1,0 +1,14 @@
+# REVIEW ARTIFACT - not installed; needs approvals per docs/40 section 7.
+# Single users file: the ONE source of truth for who may sign in and with which role.
+# Target path (after approval): /etc/surface-onboarding/users.txt (mode 0640, owner root, group surface-onboarding).
+# Dashboard: SURFACE_ONBOARDING_USERS_FILE=/etc/surface-onboarding/users.txt
+# oauth2-proxy list: render it from this file, never edit it by hand:
+#   python3 /opt/surface-onboarding/app/integration/deployment/vm_pilot/render_allowed_emails.py \
+#       /etc/surface-onboarding/users.txt /etc/oauth2-proxy/allowed-emails.txt
+# Format, one entry per line (# starts a comment):
+#   person@example.com             viewer: read-only
+#   person@example.com operator    operator: local acknowledgements and read-only checks only (phase 1)
+# Any malformed line makes the whole file invalid and nobody is admitted (fail closed).
+# Pilot (owner answers 2026-10-07): the owner only. john.ostrander@pentera.io is deliberately NOT listed; the owner
+# adds him later, after checking the pilot.
+milton.stevenson@pentera.io operator

@@ -1,4 +1,5 @@
 # REVIEW ARTIFACT - not installed; needs approvals per docs/40 section 7.
+# LEGACY form: the recommended single source is users.txt.template (this oauth2-proxy list is then rendered from it).
 # Allow-list template, one e-mail per line. Used by oauth2-proxy (authenticated_emails_file) and, as a copy at the
 # path named in SURFACE_ONBOARDING_ALLOWED_USERS_FILE, by the dashboard. Keep both files identical.
 # Pilot (owner answers 2026-10-07): the owner only. john.ostrander@pentera.io is deliberately NOT listed; the owner

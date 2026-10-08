@@ -13,6 +13,10 @@ server {
 
     server_tokens off;
 
+    # Defines $surface_proxy_secret (one `set` line, kept outside the repository). If this file is missing nginx
+    # refuses to start, which is the intended fail-closed behaviour.
+    include /etc/nginx/surface-onboarding-proxy-secret.conf;
+
     # Pilot: self-signed certificate (generation command: see README.md). Paths are placeholders.
     ssl_certificate     /etc/nginx/surface-onboarding/tls/surface-onboarding.crt;
     ssl_certificate_key /etc/nginx/surface-onboarding/tls/surface-onboarding.key;   # mode 0640 root:nginx
@@ -62,6 +66,14 @@ server {
         proxy_set_header X-Auth-Request-User      "";
         proxy_set_header X-Auth-Request-Groups    "";
         proxy_set_header X-Surface-Role           "";
+
+        # Shared secret for the dashboard (docs/40 step 0 follow-up). Any client-supplied copy is replaced because
+        # proxy_set_header always overwrites the request header. The value is NOT in this file: it comes from
+        #   include /etc/nginx/surface-onboarding-proxy-secret.conf;     (placed in the http{} or server{} context)
+        # which holds exactly one line `set $surface_proxy_secret "<value>";` (mode 0640 root:<nginx group>, never in
+        # the repository; creation and rotation: README.md). oauth2-proxy forwards this header to the dashboard
+        # unchanged (it passes unknown request headers through).
+        proxy_set_header X-Surface-Proxy-Secret   $surface_proxy_secret;
 
         # The dashboard accepts only exactly the public host:port (SURFACE_ONBOARDING_PUBLIC_ORIGIN).
         proxy_set_header Host              $http_host;

@@ -1,0 +1,89 @@
+# REVIEW ARTIFACT - not installed; needs approvals per docs/40 section 7.
+# INTERIM nginx site for an SSH tunnel (ssh -L), used only BEFORE the OneLogin application exists (docs/41).
+# It replaces nginx-surface-onboarding.conf.template + oauth2-proxy for that interim and is deleted when the full
+# template goes live. Placeholders only: no certificate, key, client credential, or secret is in this file.
+# Install path (after approval): /etc/nginx/sites-available/surface-onboarding-tunnel.conf
+#
+# Request path:  owner laptop --ssh -L 8443:127.0.0.1:8443--> VM 127.0.0.1:8443 (this nginx) --> dashboard 127.0.0.1:8000
+#
+# LIMITS (also in README.md): there is no per-person login. This file sets ONE identity (<OWNER_EMAIL>) for every
+# request that reaches 127.0.0.1:8443, so ANY local shell user on the VM who connects to that port is treated as that
+# person. <OWNER_EMAIL> MUST be a plain VIEWER (no operator flag) in /etc/surface-onboarding/users.txt for this interim,
+# so the worst case is read-only access to the published snapshot. Never bind this site to a non-loopback address.
+
+limit_req_zone $binary_remote_addr zone=surface_onboarding_tunnel:2m rate=10r/s;
+
+server {
+    # Loopback ONLY. There is no other listen directive, no port 80 and no wildcard address.
+    listen 127.0.0.1:8443 ssl;
+    server_name localhost;
+
+    server_tokens off;
+
+    # Same include file as the full template: one line `set $surface_proxy_secret "<value>";` (root-owned, outside
+    # the repository). nginx refuses to start without it, which is the intended fail-closed behaviour.
+    include /etc/nginx/surface-onboarding-proxy-secret.conf;
+
+    # Pilot self-signed certificate (generation command: README.md). Paths are placeholders.
+    ssl_certificate     /etc/nginx/surface-onboarding/tls/surface-onboarding.crt;
+    ssl_certificate_key /etc/nginx/surface-onboarding/tls/surface-onboarding.key;   # mode 0640 root:nginx
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 10m;
+    ssl_session_tickets off;
+
+    # HSTS stays OFF (self-signed certificate on a tunnelled local port).
+
+    # Same security headers as the full template; the dashboard's own copies are hidden so each appears once.
+    proxy_hide_header X-Powered-By;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header Referrer-Policy;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "same-origin" always;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+    add_header Cache-Control "no-store" always;
+    # The dashboard's own Content-Security-Policy header passes through unchanged.
+
+    client_max_body_size 64k;
+    limit_req zone=surface_onboarding_tunnel burst=40 nodelay;
+
+    # Only the methods the dashboard uses.
+    if ($request_method !~ ^(GET|HEAD|POST)$) {
+        return 405;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+
+        # Strip every client-supplied identity / role / forwarding header first (proxy_set_header always overwrites).
+        proxy_set_header X-Forwarded-User         "";
+        proxy_set_header X-Forwarded-Groups       "";
+        proxy_set_header X-Forwarded-Preferred-Username "";
+        proxy_set_header X-Auth-Request-Email     "";
+        proxy_set_header X-Auth-Request-User      "";
+        proxy_set_header X-Auth-Request-Groups    "";
+        proxy_set_header X-Surface-Role           "";
+
+        # The one interim identity. Replace <OWNER_EMAIL> with the owner's address; it must be a VIEWER in users.txt.
+        proxy_set_header X-Forwarded-Email        "<OWNER_EMAIL>";
+
+        # Shared secret for the dashboard, from the same root-owned include file as the full template. A client-supplied
+        # copy is replaced.
+        proxy_set_header X-Surface-Proxy-Secret   $surface_proxy_secret;
+
+        # The dashboard accepts only exactly the public host:port (SURFACE_ONBOARDING_PUBLIC_ORIGIN). Through the
+        # tunnel the browser uses https://localhost:8443, so set that value in the unit while this file is in use.
+        proxy_set_header Host              $http_host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_http_version 1.1;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    120s;
+        proxy_redirect off;
+    }
+}

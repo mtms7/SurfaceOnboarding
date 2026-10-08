@@ -1,4 +1,5 @@
 # REVIEW ARTIFACT - not installed; needs approvals per docs/40 section 7.
+# LEGACY form: the recommended single source is users.txt.template (`email operator` lines).
 # Operators template (dashboard only; path in SURFACE_ONBOARDING_OPERATORS_FILE). One e-mail per line. An operator
 # must also be on the allow-list; everyone else on the allow-list is a read-only viewer.
 # Phase 1 is read-only on the VM, so operators can only use local acknowledgements and read-only checks.

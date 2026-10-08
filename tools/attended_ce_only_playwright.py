@@ -328,7 +328,13 @@ def one_email_domain(value: object) -> str | None:
     return domain if re.fullmatch(pattern, domain) else None
 
 
+class SalesforceUnavailableInVmMode(OSError, RuntimeError):
+    """The VM has no Salesforce connection (docs/41): handled like a missing CLI by every caller (fail closed)."""
+
+
 def sf_command() -> str:
+    if os.environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop").casefold() == "vm":
+        raise SalesforceUnavailableInVmMode("salesforce_cli_unavailable_in_vm_mode")
     return os.environ.get("SURFACE_SF_CLI", "sf.cmd" if os.name == "nt" else "sf")
 
 
@@ -8871,5 +8877,26 @@ def main() -> int:
     return 0
 
 
+def _autopublish_vm_snapshot() -> None:
+    """Optional desktop hook (docs/41, default OFF): after a run ends, start the snapshot publisher detached.
+
+    Only with SURFACE_VM_SNAPSHOT_AUTOPUBLISH=1. Best effort: nothing here can change the run's result or exit code
+    (every failure is swallowed), and the publisher only writes a zip into its own configured local folder.
+    """
+    if os.environ.get("SURFACE_VM_SNAPSHOT_AUTOPUBLISH") != "1":
+        return
+    try:
+        tool = Path(__file__).resolve().with_name("publish_vm_snapshot.py")
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        subprocess.Popen([sys.executable, str(tool), "--autopublish"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+    except Exception:  # noqa: BLE001 - never affects the run
+        pass
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        _exit_code = main()
+    finally:
+        _autopublish_vm_snapshot()
+    raise SystemExit(_exit_code)

@@ -24,6 +24,7 @@ skip_provider_button = true
 # Deny by default: only the e-mails listed in the allow-list file may sign in (one per line).
 # The dashboard enforces its own allow-list and roles as well (SURFACE_ONBOARDING_ALLOWED_USERS / _OPERATORS).
 email_domains = []
+# This file is RENDERED from /etc/surface-onboarding/users.txt by render_allowed_emails.py (single source of truth).
 authenticated_emails_file = "/etc/oauth2-proxy/allowed-emails.txt"
 
 # Identity passed to the dashboard: X-Forwarded-Email (the dashboard trusts it only from a loopback peer).
@@ -31,6 +32,8 @@ pass_user_headers          = true
 pass_authorization_header  = false
 pass_access_token          = false
 set_xauthrequest           = false
+# The X-Surface-Proxy-Secret header set by nginx must reach the dashboard unchanged: oauth2-proxy forwards unrelated
+# request headers to the upstream. Verify this on the VM at approval time (the dashboard refuses everything without it).
 prefer_email_to_user       = true
 
 # Session cookie: Secure, HttpOnly, aligned with the 12 h dashboard session.

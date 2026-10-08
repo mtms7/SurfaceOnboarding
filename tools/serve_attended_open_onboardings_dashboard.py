@@ -41,6 +41,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import state_paths
 from integration.onboarding import run_progress
+from integration.onboarding import users_file
+from integration.onboarding import vm_snapshot
 from integration.onboarding.state_paths import state_file
 from integration.onboarding.dev_onboarded import dev_onboarded_evidence, dev_status
 from integration.onboarding.renewal_mirror import mirror_tenant_ids
@@ -246,6 +248,10 @@ def listener_address() -> tuple[str, int]:
 
 def salesforce_cli_command() -> str:
     """Resolve the platform CLI without copying a user session between hosts."""
+    if state_paths.vm_mode():
+        # VM data source switch (docs/41): the VM has no Salesforce connection; every caller already treats OSError
+        # as "CLI unavailable" and fails closed, so no process is ever started in VM mode.
+        raise OSError("salesforce_cli_unavailable_in_vm_mode")
     configured = os.environ.get("SURFACE_SF_CLI")
     if configured:
         return configured
@@ -2130,6 +2136,8 @@ def queue_rows() -> list[dict[str, str | None]]:
 
 @_display_cached
 def queue_source_rows() -> list[dict[str, str | None]]:
+    if vm_mode():
+        return snapshot_queue_rows()
     try:
         view_id = open_onboardings_view_id()
         result = sf_json(["api", "request", "rest", f"/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/{view_id}/results", "--method", "GET"])
@@ -2380,6 +2388,8 @@ def cached_closed_history(*, now: float | None = None) -> ClosedHistory | None:
 @_display_cached
 def detail_row(reference: str) -> dict[str, str | None]:
     if not REFERENCE.fullmatch(reference): raise ReadUnavailable()
+    if vm_mode():
+        return snapshot_detail_row(reference)
     query = "SELECT " + ", ".join(DETAIL_FIELDS) + f" FROM Customer_Onboarding__c WHERE Name = '{reference}' LIMIT 2"
     response = sf_json(["data", "query", "--query", query, "--json"])
     try:
@@ -2628,6 +2638,8 @@ def surface_commercial_readiness(row: dict[str, str | None]) -> dict[str, object
         return None
     if row.get("Onboarding_Product__c") != "Surface & Credential Exposure":
         return None
+    if vm_mode():
+        return None  # DealHub rows are not part of the published snapshot (docs/41); no live read on the VM
     account_id = row.get("Account__c")
     if not isinstance(account_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account_id):
         return {"commercial_ready": False, "manual_review_required": True, "reason": "account_missing"}
@@ -3681,7 +3693,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                     "<code>--confirm-write</code>.</p>")
     diagnostics_html = cli_hint + renewal_preflight + comment_repair_action + renewal_comment_evaluation_action + manual_action
     if parts is not None:
-        diagnostics_html += ("" if parts["state"] != "duplicate" else str(parts["reset"])) + str(parts["meta"])
+        diagnostics_html += ("" if parts["state"] != "duplicate" else str(parts["reset"])) + str(parts.get("meta", ""))
     diagnostics = (_fold("Diagnostics", "Manual start · sign-in preflight · repair actions · source revision", diagnostics_html)
                    if diagnostics_html else "")
     account = row.get("Account_Name__c")
@@ -4388,7 +4400,7 @@ def page_salesforce_unavailable(failed: bool = True) -> str:
             "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce runner</h2>"
             "<span class='chip chip-warn'>RUNNER REQUIRED</span></div>"
             "<p><strong>Manual Salesforce runner is unavailable.</strong> The VM dashboard cannot launch a browser or hold a "
-            "Salesforce session. No queue data is cached or shown until the separately approved runner is ready.</p>"
+            "Salesforce session. Queue and CO data come from the snapshot the desktop last published (see the banner above).</p>"
             "<p class='note'>Complete SSO/MFA only in the approved runner. This VM and the Workato OPA "
             "do not receive or store credentials, cookies, MFA codes, or CLI output.</p></section>"
         )
@@ -5111,13 +5123,14 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>" + refresh +
-        "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body>"
+        "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + (SNAPSHOT_BANNER_CSS if vm_mode() else "") + "</style></head><body>"
         "<div class='envbar " + env + "' aria-hidden='true'></div><div class='shell'>"
         "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
-        + SEARCH_FORM + groups + _session_chip() + _operator_block() +
-        "<div class='side-foot'>Attended · localhost only</div></aside>"
+        + SEARCH_FORM + groups + ("" if vm_mode() else _session_chip()) + _operator_block() +
+        "<div class='side-foot'>" + ("Read-only copy · published from the desktop" if vm_mode() else "Attended · localhost only") + "</div></aside>"
         "<main" + (" class='wide'" if wide else "") + "><div class='envrow'><span class='envpill " + env + "'>"
-        + escape(ENV_PILLS[env]) + "</span></div>" + main_html + "</main></div></body></html>"
+        + escape(ENV_PILLS[env]) + "</span></div>" + (snapshot_banner() + vm_strip_actions(main_html) if vm_mode() else main_html)
+        + "</main></div></body></html>"
     )
 
 
@@ -5369,7 +5382,10 @@ def _ce_only_onboard_parts(reference: str) -> dict[str, Any]:
         return {"state": "unavailable", "unavailable": (
             "<section class='readiness source-blocked' aria-labelledby='onboard-title'><div class='readiness-heading'>"
             "<span class='readiness-icon' aria-hidden='true'>!</span><div><h2 id='onboard-title'>Onboard " + ref + " (Credential Exposure)</h2>"
-            "<p>The CE-only source could not be read. No browser was launched. Reconnect the attended Salesforce session and retry.</p></div></div></section>"
+            + ("<p>This VM shows published data only: onboarding runs start on the owner's desktop and the live source is not read here.</p>"
+               if vm_mode() else
+               "<p>The CE-only source could not be read. No browser was launched. Reconnect the attended Salesforce session and retry.</p>")
+            + "</div></div></section>"
         )}
     try:
         state = load_runner_state()
@@ -6599,6 +6615,14 @@ LOGIN_REASON_TEXT = {
 # the VM: every POST that launches the runner/browser or writes Salesforce stays refused for every role.
 # ---------------------------------------------------------------------------------------------------------------
 PROXY_IDENTITY_HEADER = "X-Forwarded-Email"
+# Second factor between the proxy and the dashboard: nginx adds this header (value from a root-owned file outside
+# the repository) so a local shell user who reaches 127.0.0.1 cannot forge an identity. Never logged or echoed.
+PROXY_SECRET_HEADER = "X-Surface-Proxy-Secret"
+PROXY_SECRET_ENV = "SURFACE_ONBOARDING_PROXY_SECRET"
+PROXY_SECRET_FILE_ENV = "SURFACE_ONBOARDING_PROXY_SECRET_FILE"
+PROXY_SECRET_PATTERN = re.compile(r"[\x21-\x7e]{32,256}")
+# Recommended single source of truth for the allow-list and roles (see integration/onboarding/users_file.py).
+USERS_FILE_ENV = "SURFACE_ONBOARDING_USERS_FILE"
 TRUSTED_PROXY_PEERS = frozenset({"127.0.0.1", "::1"})
 ALLOWED_USERS_ENV = "SURFACE_ONBOARDING_ALLOWED_USERS"
 ALLOWED_USERS_FILE_ENV = "SURFACE_ONBOARDING_ALLOWED_USERS_FILE"
@@ -6613,11 +6637,10 @@ PROXY_EMAIL = re.compile(r"[a-z0-9._%+'-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]
 # Leonardo, no Salesforce write) and read-only checks. Everything else (runner starts, Leonardo sessions and
 # checks, validation/scan/inventory sweeps, SpyCloud, renewal, Salesforce comment/id writes, runner reset,
 # sign-in/out) is refused for every role.
-VM_OPERATOR_POSTS = frozenset({
-    "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled", "/attended/mark-operator-assigned",
-    "/attended/confirm-user-created", "/attended/unconfirm-user-created",
-    "/attended/duplicate-precheck", "/attended/rerun-ce-only-fill-preflight", "/attended/rerun-co0702-fill-preflight",
-})
+# Owner decision 2026-10-08: the VM serves a read-only published snapshot, so NO POST is permitted for any role
+# in phase 1 (the acknowledgements and checks above would write into, or read through, the read-only snapshot).
+# Operators get their own write path only with the phase 2 design.
+VM_OPERATOR_POSTS: frozenset[str] = frozenset()
 
 
 def vm_mode() -> bool:
@@ -6627,6 +6650,104 @@ def vm_mode() -> bool:
 def cookie_attributes() -> str:
     """Attributes for every cookie this dashboard sets: ``Secure`` is added in VM mode (HTTPS only)."""
     return "; HttpOnly; SameSite=Strict" + ("; Secure" if vm_mode() else "")
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# VM data source (docs/41): in VM mode every page reads the snapshot the desktop published and the ingest tool
+# unpacked (<state dir>/snapshots/current). There is no Salesforce, Leonardo, Redash or browser call and no process
+# is started. The switch lives in four places only: salesforce_cli_command() / the runner's sf_command() (no CLI),
+# state_paths.state_file() / inventory_root() (state and inventory files come from current/), queue_source_rows()
+# and detail_row() (the two fixed Salesforce reads come from queue.json / co_details.json), and _app_shell() (banner,
+# no action forms). Desktop mode never reaches any of this.
+# ---------------------------------------------------------------------------------------------------------------
+SNAPSHOT_STALE_HOURS_ENV = "SURFACE_ONBOARDING_SNAPSHOT_STALE_HOURS"
+DEFAULT_SNAPSHOT_STALE_HOURS = 6.0
+_POST_FORM = re.compile(r"<form\b[^>]*\bmethod=['\"]post['\"][^>]*>.*?</form>", re.IGNORECASE | re.DOTALL)
+SNAPSHOT_BANNER_CSS = (
+    ".snapbanner{margin:0 0 14px;padding:9px 14px;border-radius:6px;border:1px solid #9aa7b5;background:#eef2f6;color:#1b2733;"
+    "font-size:13px}.snapbanner.stale{background:#fff3cd;border-color:#d39e00;color:#4d3800}"
+    ".snapbanner.empty{background:#fde8e8;border-color:#c0392b;color:#5a1a14}")
+
+
+def snapshot_root() -> Path | None:
+    folder = state_paths.state_dir()
+    return None if folder is None else vm_snapshot.snapshots_root(folder)
+
+
+def _snapshot_json(name: str) -> Any:
+    root = snapshot_root()
+    if root is None:
+        raise ReadUnavailable()
+    try:
+        return vm_snapshot.load_current_json(root, name)
+    except vm_snapshot.SnapshotError:
+        raise ReadUnavailable() from None
+
+
+def snapshot_queue_rows() -> list[dict[str, str | None]]:
+    """The published open queue: exactly the fixed QUEUE_FIELDS per row (same validation as the live read)."""
+    data = _snapshot_json(vm_snapshot.QUEUE_FILE)
+    try:
+        rows: list[dict[str, str | None]] = []
+        for record in data["rows"]:
+            if (not isinstance(record, dict) or not set(QUEUE_FIELDS) <= set(record)
+                    or not isinstance(record["Name"], str) or not REFERENCE.fullmatch(record["Name"])):
+                raise ReadUnavailable()
+            rows.append({field: record[field] if isinstance(record[field], str) else None for field in QUEUE_FIELDS})
+        return rows
+    except (KeyError, TypeError):
+        raise ReadUnavailable() from None
+
+
+def snapshot_detail_row(reference: str) -> dict[str, str | None]:
+    """The published display fields of one CO (exactly DETAIL_FIELDS); a CO that was not published is unavailable."""
+    data = _snapshot_json(vm_snapshot.CO_DETAILS_FILE)
+    try:
+        record = data["details"][reference]
+        if not isinstance(record, dict) or record.get("Name") != reference or not set(DETAIL_FIELDS) <= set(record):
+            raise ReadUnavailable()
+        return {field: record[field] if isinstance(record[field], str) else None for field in DETAIL_FIELDS}
+    except (KeyError, TypeError):
+        raise ReadUnavailable() from None
+
+
+def snapshot_stale_hours() -> float:
+    try:
+        value = float(os.environ.get(SNAPSHOT_STALE_HOURS_ENV, "").strip() or DEFAULT_SNAPSHOT_STALE_HOURS)
+    except ValueError:
+        return DEFAULT_SNAPSHOT_STALE_HOURS
+    return value if 0 < value < 24 * 365 else DEFAULT_SNAPSHOT_STALE_HOURS
+
+
+def snapshot_banner(now: datetime | None = None) -> str:
+    """The banner every VM page shows: when the data was published, amber when older than the threshold."""
+    root = snapshot_root()
+    manifest = None if root is None else vm_snapshot.read_current_manifest(root)
+    if manifest is None:
+        return ("<div class='snapbanner empty' role='status'><strong>No data published yet.</strong> "
+                "The desktop has not published a snapshot to this VM.</div>")
+    created = vm_snapshot.parse_created_at(manifest["created_at"])
+    age_hours = ((now or datetime.now(timezone.utc)) - created).total_seconds() / 3600
+    stale = age_hours > snapshot_stale_hours()
+    text = "Data as of " + created.strftime("%Y-%m-%d %H:%M") + " UTC (published from the desktop)"
+    if stale:
+        text += " &middot; older than " + escape(f"{snapshot_stale_hours():g}") + " h, it may be out of date"
+    return "<div class='snapbanner" + (" stale" if stale else "") + "' role='status'>" + text + "</div>"
+
+
+def vm_strip_actions(html: str) -> str:
+    """VM pages are read-only: every POST form (Start, Confirm, Prepare sessions, checks, refresh sweeps) is removed."""
+    return _POST_FORM.sub("", html)
+
+
+def page_vm_unavailable() -> str:
+    empty = snapshot_root() is None or vm_snapshot.read_current_manifest(snapshot_root()) is None  # type: ignore[arg-type]
+    title = "No data published yet" if empty else "Not in the published data"
+    detail = ("The desktop has not published a snapshot to this VM yet." if empty else
+              "This item is not part of the snapshot the desktop last published. It may be new, or the desktop has not "
+              "published since it appeared.")
+    return _app_shell(title, "<div class='page-head'><h1>" + title + "</h1></div><section class='card'><p>" + detail
+                      + "</p></section>")
 
 
 def _email_set(env_name: str, file_env_name: str) -> frozenset[str]:
@@ -6647,22 +6768,81 @@ def _email_set(env_name: str, file_env_name: str) -> frozenset[str]:
     return frozenset(item.strip().lower() for item in values if PROXY_EMAIL.fullmatch(item.strip().lower()))
 
 
-def proxy_identity(peer: str | None, header_values: list[str]) -> str | None:
-    """The proxy-asserted e-mail, or None. Only in VM mode, only from a loopback peer, only exactly one valid value."""
+def configured_proxy_secret() -> str | None:
+    """The shared secret from the file (preferred) or the variable; None when missing, unreadable, or too short.
+
+    Fail closed: when a file is named but cannot be read, the variable is NOT used as a fallback. The value is never
+    logged or returned to a client.
+    """
+    path = os.environ.get(PROXY_SECRET_FILE_ENV, "").strip()
+    if path:
+        try:
+            raw = Path(path).read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return None
+    else:
+        raw = os.environ.get(PROXY_SECRET_ENV, "")
+    value = raw.strip()
+    return value if PROXY_SECRET_PATTERN.fullmatch(value) else None
+
+
+def proxy_secret_matches(secret_values: list[str] | None) -> bool:
+    """True only for exactly one header value equal to the configured secret (constant-time comparison)."""
+    expected = configured_proxy_secret()
+    if expected is None or not secret_values or len(secret_values) != 1:
+        return False
+    return hmac.compare_digest(secret_values[0].strip().encode("utf-8"), expected.encode("utf-8"))
+
+
+def proxy_identity(peer: str | None, header_values: list[str], secret_values: list[str] | None = None) -> str | None:
+    """The proxy-asserted e-mail, or None.
+
+    Only in VM mode, only from a loopback peer, only with the shared proxy secret, only exactly one valid value.
+    """
     if not vm_mode() or peer not in TRUSTED_PROXY_PEERS or len(header_values) != 1:
+        return None
+    if not proxy_secret_matches(secret_values):
         return None
     value = header_values[0].strip().lower()
     return value if PROXY_EMAIL.fullmatch(value) else None
 
 
+def _list_configured(env_name: str, file_env_name: str) -> bool:
+    return bool(os.environ.get(env_name, "").strip() or os.environ.get(file_env_name, "").strip())
+
+
+def _users_file_roles() -> dict[str, str]:
+    """``{email: role}`` from SURFACE_ONBOARDING_USERS_FILE; empty (nobody) when unset, unreadable, or malformed."""
+    path = os.environ.get(USERS_FILE_ENV, "").strip()
+    if not path:
+        return {}
+    try:
+        return users_file.load_users_file(path)
+    except users_file.UsersFileError:
+        return {}
+
+
 def vm_role(email: str | None) -> str | None:
-    """``operator`` / ``viewer`` for an allow-listed e-mail, else None (unknown user). Operators must also be allowed."""
+    """``operator`` / ``viewer`` for an allow-listed e-mail, else None (unknown user). Operators must also be allowed.
+
+    The ALLOWED_USERS / OPERATORS variables (and their _FILE forms) win over the single users file when set,
+    each list independently; otherwise the users file is the source.
+    """
     if not email:
         return None
     email = email.strip().lower()
-    if email not in _email_set(ALLOWED_USERS_ENV, ALLOWED_USERS_FILE_ENV):
+    roles = _users_file_roles()
+    if _list_configured(ALLOWED_USERS_ENV, ALLOWED_USERS_FILE_ENV):
+        allowed = _email_set(ALLOWED_USERS_ENV, ALLOWED_USERS_FILE_ENV)
+    else:
+        allowed = frozenset(roles)
+    if email not in allowed:
         return None
-    return ROLE_OPERATOR if email in _email_set(OPERATORS_ENV, OPERATORS_FILE_ENV) else ROLE_VIEWER
+    if _list_configured(OPERATORS_ENV, OPERATORS_FILE_ENV):
+        operators = _email_set(OPERATORS_ENV, OPERATORS_FILE_ENV)
+    else:
+        operators = frozenset(item for item, role in roles.items() if role == ROLE_OPERATOR)
+    return ROLE_OPERATOR if email in operators else ROLE_VIEWER
 
 
 def configured_public_origin() -> tuple[str | None, bool]:
@@ -6974,7 +7154,8 @@ class Handler(BaseHTTPRequestHandler):
     def _vm_identity(self) -> tuple[str | None, str | None]:
         """(proxy-asserted e-mail, role) in VM mode; (None, None) when the header is absent, malformed, or untrusted."""
         email = proxy_identity(self.client_address[0] if self.client_address else None,
-                               list(self.headers.get_all(PROXY_IDENTITY_HEADER) or []))
+                               list(self.headers.get_all(PROXY_IDENTITY_HEADER) or []),
+                               list(self.headers.get_all(PROXY_SECRET_HEADER) or []))
         return email, vm_role(email)
 
     def _vm_refuse(self, status: HTTPStatus, title: str, message: str) -> None:
@@ -7172,6 +7353,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
         except ReadUnavailable:
+            if vm_mode():
+                self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_vm_unavailable()); return
             set_session_status("salesforce", SessionStatus(SessionState.EXPIRED, "salesforce_read_failed", readiness_now()))
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable())
 
