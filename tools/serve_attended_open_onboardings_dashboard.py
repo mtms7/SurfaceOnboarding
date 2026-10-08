@@ -4620,7 +4620,7 @@ RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "confirm_button_schema_unavailable": ("blocked", "The Add Account Confirm control could not be located (page-layout/selector issue). No tenant was created."),
     "confirm_button_not_enabled": ("blocked", "The Confirm control could not be clicked (disabled or not ready). No tenant was created; do not retry blindly."),
     "confirm_no_create": ("blocked", "The form was submitted but the created tenant could not be confirmed. No retry was performed. Verify manually in Leonardo Development."),
-    "ce_subscription_unavailable": ("blocked", "No Pentera Core Plus Commercial subscription was found for this account. No tenant was created. Verify the DealHub subscription."),
+    "ce_subscription_unavailable": ("blocked", "No Pentera Core Plus subscription (Commercial or Enterprise) was found for this account. No tenant was created. Verify the DealHub subscription."),
     "ce_subscription_ambiguous": ("blocked", "The subscription dates are missing or conflicting. No tenant was created. Verify the DealHub subscription."),
     "fill_value_mismatch": ("blocked", "A form control did not keep the value the runner set. No tenant was created. Diagnostics were captured; review before retrying."),
     "readback_only_verified": ("success", "The existing tenant was verified read-only. Surface Account ID, Account UUID, and observed Account Scanning state were captured locally. No tenant was created or changed."),

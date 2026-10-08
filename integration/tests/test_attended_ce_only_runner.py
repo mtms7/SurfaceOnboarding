@@ -375,6 +375,34 @@ class SelectCeSubscriptionTests(unittest.TestCase):
         rows = [self._row("Pentera Core Plus Commercial - 500 End Points", "2026-10-24", "2029-10-23")]
         self.assertEqual(select_ce_subscription(rows), (date(2026, 10, 24), date(2029, 10, 23)))
 
+    def test_country_option_label_exact_alias_and_fail_closed(self):
+        from tools.attended_ce_only_playwright import country_option_label
+        options = ["", "France", "United States of America", "United Kingdom"]
+        self.assertEqual(country_option_label(options, "france"), "France")
+        self.assertEqual(country_option_label(options, "United States"), "United States of America")  # CO-0765
+        self.assertEqual(country_option_label(options, "UK"), "United Kingdom")
+        self.assertIsNone(country_option_label(options, "Atlantis"))
+        # Two alias candidates are ambiguous: no guess.
+        self.assertIsNone(country_option_label(["United States of America", "USA"], "United States"))
+        self.assertIsNone(country_option_label([], "United States"))
+
+    def test_selects_core_plus_enterprise_row(self):
+        # CO-0765 (2026-10-08): every Core Plus tier carries CE; the Enterprise row alone must be accepted,
+        # even next to Surface Cloud and Bulk rows of the same opportunity.
+        rows = [self._row("Security Validation Advisor Ultimate", "2026-10-12", "2029-10-11"),
+                self._row("Pentera Core Plus Enterprise - 4000 End Points", "2026-10-12", "2029-10-11"),
+                self._row("Pentera Cloud Enterprise - 200 Workloads", "2026-10-12", "2029-10-11"),
+                self._row("Pentera Cloud Bulk - Additional 100 Workloads", "2026-10-12", "2029-10-11")]
+        self.assertEqual(select_ce_subscription(rows), (date(2026, 10, 12), date(2029, 10, 11)))
+
+    def test_core_plus_enterprise_bulk_and_different_terms_still_fail_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "ce_subscription_unavailable"):
+            select_ce_subscription([self._row("Pentera Core Plus Enterprise - Bulk 1000", "2026-10-12", "2029-10-11")])
+        rows = [self._row("Pentera Core Plus Commercial - 500 End Points", "2026-10-12", "2029-10-11"),
+                self._row("Pentera Core Plus Enterprise - 4000 End Points", "2026-10-12", "2028-10-11")]
+        with self.assertRaisesRegex(RuntimeError, "ce_subscription_ambiguous"):
+            select_ce_subscription(rows)
+
     def test_prefix_match_is_case_insensitive(self):
         rows = [self._row("pentera core plus commercial - 500 End Points", "2026-10-01", "2027-09-30")]
         self.assertEqual(select_ce_subscription(rows), (date(2026, 10, 1), date(2027, 9, 30)))

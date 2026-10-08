@@ -200,7 +200,7 @@ SELECT_NAMES = {
 # Bounded per-field wait so a disabled/hidden control fails fast and is logged
 # instead of hanging on Playwright's 30 s default.
 FIELD_TIMEOUT_MS = 5_000
-TOGGLE_CLICK_TIMEOUT_MS = 2_000
+TOGGLE_CLICK_TIMEOUT_MS = 6_000  # was 2 s; Leonardo Development is slow at times (CO-0765, 2026-10-08)
 CONFIRM_ENABLE_POLLS = 12  # x 250 ms
 DIAGNOSE_SETTLE_MS = 700  # per no-submit Confirm probe (--diagnose-confirm)
 # Toggles no diagnostic probe may ever switch ON (a Surface-only tenant has no CE).
@@ -422,9 +422,9 @@ def _parse_subscription_date(value: Any) -> date | None:
 def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False) -> tuple[date, date]:
     """Select the CE license subscription dates, failing closed.
 
-    Prefers "Pentera Core Plus Commercial" rows (all Pentera Core Plus
-    subscriptions include CE); "Bulk"/"Additional" rows never match the
-    prefix. Every matching row must carry parseable dates with end after
+    Uses "Pentera Core Plus ..." baseline rows of any tier (Commercial,
+    Enterprise, ...; all include CE); "Bulk"/"Additional" rows never match.
+    Every matching row must carry parseable dates with end after
     start, and all matching rows must agree on the same (start, end) pair.
 
     Review item 20 (2026-10-06): a row whose DealHub_Status__c is Expired /
@@ -440,11 +440,10 @@ def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False) -> t
         product = row.get("Product_Full_Name__c")
         if not isinstance(product, str):
             continue
-        if not product.casefold().startswith(CE_SUBSCRIPTION_PRODUCT_PREFIX.casefold()):
-            continue
-        # "Bulk"/"Additional" rows never carry the CE license, even when their
-        # product name starts with the Core Plus prefix.
-        if "bulk" in product.casefold() or "additional" in product.casefold():
+        # Owner decision 2026-10-08 (Guru "Surface License Tiers Breakdown": CE depends on Core Plus for
+        # every tier): any "Pentera Core Plus ..." baseline row (Commercial, Enterprise, ...) carries CE.
+        # "Bulk"/"Additional" rows never do (is_core_plus_baseline_row excludes them).
+        if not is_core_plus_baseline_row(product):
             continue
         if "DealHub_Status__c" in row and _row_status(row) in _INACTIVE_STATUSES:
             continue
@@ -1623,7 +1622,7 @@ def _set_checkbox(page: Any, key: str, target: bool) -> bool:
             # retry once with a forced click (the state is still re-verified).
             _log().error("fill_toggle", f"{key}:click", exc)
             control.first.click(force=True, timeout=TOGGLE_CLICK_TIMEOUT_MS)
-        for _poll in range(5):
+        for _poll in range(20):  # up to 4 s for the form to re-render; the state is still verified
             if control.first.is_checked() == target:
                 return True
             page.wait_for_timeout(200)
@@ -3922,6 +3921,10 @@ def _fill_add_account_form(page: Any, plan: dict[str, Any]) -> tuple[str | None,
         control = _locate_select(page, label)
         try:
             ok = control is not None and _selected_option_text(control.first) == option
+            if not ok and control is not None and label == "Country":
+                # Same alias rule as _fill_select ("United States" is listed as e.g. "United States of America").
+                labels = [t for t in control.first.locator("option").all_text_contents() if isinstance(t, str)]
+                ok = _selected_option_text(control.first) == country_option_label(labels, option)
         except Exception:
             ok = False
         if not ok:
@@ -4658,6 +4661,30 @@ def _diagnose_confirm(page: Any, confirm: Any, plan: dict[str, Any], lc_prefill_
     return "diagnose_confirm_blocker_unknown"
 
 
+COUNTRY_ALIASES = {
+    "united states": ("united states of america", "usa", "u.s.a.", "us", "u.s."),
+    "united states of america": ("united states", "usa", "u.s.a.", "us", "u.s."),
+    "uk": ("united kingdom", "great britain"),
+    "united kingdom": ("uk", "great britain", "united kingdom of great britain and northern ireland"),
+    "south korea": ("korea, republic of", "republic of korea", "korea (south)", "korea"),
+    "czech republic": ("czechia",),
+    "czechia": ("czech republic",),
+    "netherlands": ("the netherlands",),
+    "uae": ("united arab emirates",),
+    "united arab emirates": ("uae",),
+}
+
+
+def country_option_label(options: list[str], wanted: str) -> str | None:
+    """The one dropdown label for ``wanted``: exact (case-insensitive) first, else exactly one alias; else None."""
+    norm = {" ".join(o.split()).casefold(): " ".join(o.split()) for o in options if o and o.strip()}
+    key = " ".join(wanted.split()).casefold()
+    if key in norm:
+        return norm[key]
+    hits = {norm[a] for a in COUNTRY_ALIASES.get(key, ()) if a in norm}
+    return next(iter(hits)) if len(hits) == 1 else None
+
+
 def _fill_select(page: Any, label: str, option: str) -> str | None:
     """Select one option by its visible label; return a failure code or None."""
     log = _log()
@@ -4669,6 +4696,14 @@ def _fill_select(page: Any, label: str, option: str) -> str | None:
         if not control.first.is_enabled():
             log.event("fill_select", "disabled", label)
             return "fill_form_schema_unavailable"
+        if label == "Country":
+            # Salesforce and Leonardo can name a country differently ("United States" vs "United States of
+            # America"): exact label first, then the alias table; exactly one option or the run fails closed.
+            try:
+                labels = [t for t in control.first.locator("option").all_text_contents() if isinstance(t, str)]
+            except Exception:
+                labels = []  # options unreadable: keep the exact-label behaviour
+            option = (country_option_label(labels, option) if labels else None) or option
         control.first.select_option(label=option, timeout=FIELD_TIMEOUT_MS)
         selected = _selected_option_text(control.first)
     except Exception as exc:
