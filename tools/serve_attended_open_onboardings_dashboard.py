@@ -55,7 +55,7 @@ from tools.attended_ce_only_playwright import (
     SCAN_STATUS_COMPLETED,
     SCAN_STATUS_FAILED,
     SCAN_STATUS_PATH,
-    SPYCLOUD_OK_OUTCOMES,
+    spycloud_state_of,
     MIRROR_PATH,
     RENEWAL_OUTCOME_MODES,
     RENEWAL_OUTCOMES_PATH,
@@ -609,7 +609,7 @@ def start_attended_surface_runner(reference: str, revision: str, route: str = SU
 
 
 def start_attended_renewal_runner(reference: str, revision: str) -> bool:
-    """Launch one desktop-only orchestrated renewal run (Dev mirror if needed, dry run, apply, SpyCloud OFF).
+    """Launch one desktop-only orchestrated renewal run (Dev mirror if needed, dry run, apply; SpyCloud is not touched).
 
     Same launch shape as a create run; Leonardo Development only (the runner has no production mode).
     """
@@ -776,21 +776,25 @@ def _validation_section(reference: str, notice: str = "", now: datetime | None =
 
 def start_attended_spycloud_check(reference: str) -> bool:
     """Launch the read-only SpyCloud dry run (opens Edit, reports the checkbox, Cancel). Never passes --confirm-write:
-    the save that turns SpyCloud OFF is a Leonardo write and stays a CLI step."""
+    the save that turns SpyCloud OFF is a Leonardo write and stays a manual CLI step (SpyCloud ON is the expected default)."""
     return REFERENCE.fullmatch(reference) is not None and _start_runner_mode("--co", reference, "--spycloud-off")
 
 
 SPYCLOUD_MESSAGES = {
-    "spycloud_off_verified": "SpyCloud is OFF (saved and read back).",
-    "spycloud_already_off": "SpyCloud is already OFF; nothing was saved.",
-    "spycloud_dry_run_on": "SpyCloud is still ON (dry run; nothing was saved).",
-    "spycloud_readback_still_on": "A save was made but Leonardo still shows SpyCloud ON.",
+    "spycloud_off_verified": "SpyCloud is OFF (saved and read back). Leonardo's default is ON; this is informational only.",
+    "spycloud_already_off": "SpyCloud is OFF; nothing was saved. Leonardo's default is ON; this is informational only.",
+    "spycloud_dry_run_on": "SpyCloud is ON, Leonardo's default (dry run; nothing was saved).",
+    "spycloud_readback_still_on": "A manual save was made but Leonardo still shows SpyCloud ON (the default). Nothing else is needed.",
     "spycloud_save_id_mismatch": "Leonardo's edit reply named a different tenant. Check the tenants in Leonardo Development.",
 }
 
 
 def attended_spycloud_states() -> dict[str, dict[str, object]]:
-    """Load the per-CO SpyCloud outcomes; absence means none. Malformed entries are dropped."""
+    """Load the per-CO SpyCloud outcomes; absence means none. Malformed entries are dropped.
+
+    ``state`` (on / off / unknown) is derived from the outcome, never from the stored ``warning`` flag, so records
+    written before the 2026-10-08 decision (ON used to carry warning=True) load unchanged. ``ok`` = the flag was read.
+    """
     try:
         raw = json.loads(SPYCLOUD_STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -809,36 +813,36 @@ def attended_spycloud_states() -> dict[str, dict[str, object]]:
                 continue
             states[reference] = {"outcome": outcome, "mode": value["mode"],
                                  "observed_at": datetime.fromisoformat(value["observed_at"]),
-                                 "ok": outcome in SPYCLOUD_OK_OUTCOMES}
+                                 "state": spycloud_state_of(outcome), "ok": spycloud_state_of(outcome) != "unknown"}
         except (KeyError, TypeError, ValueError):
             continue
     return states
 
 
 def _spycloud_section(reference: str, notice: str = "") -> str:
-    """SpyCloud card for an onboarded CE / Case 3 CO (owner: SpyCloud must be OFF on LC tenants)."""
+    """SpyCloud card for an onboarded CE / Case 3 CO (owner 2026-10-08: ON is the default and expected; OFF is a note)."""
     state = attended_spycloud_states().get(reference)
     check = ("<form method='post' action='/attended/spycloud-check'><input type='hidden' name='reference' value='"
              + escape(reference) + "'><button type='submit' class='ghost sm'>Check SpyCloud (read-only)</button></form>")
     started = ("<p class='note'>A read-only SpyCloud check was started in the automation browser (it opens Edit and "
                "cancels). Reload this page in about 30 seconds.</p>" if notice == "spycloud-started" else "")
-    how = ("<p class='meta-line'>Turning it OFF is a Leonardo Development write and needs the operator's approval: run "
-           "<code>--co " + escape(reference) + " --spycloud-off --confirm-write</code>.</p>")
+    how = ("<p class='meta-line'>Nothing to do: SpyCloud stays ON. Turning it OFF by hand is a Leonardo Development write "
+           "and needs the operator's approval (<code>--co " + escape(reference) + " --spycloud-off --confirm-write</code>).</p>")
     if state is None:
         return ("<section class='stat' aria-labelledby='spycloud-title'><div class='stat-head'>"
-                "<h2 id='spycloud-title'>SpyCloud</h2></div><p>Not checked yet. The owner requires SpyCloud OFF on "
-                "Credential Exposure tenants; Leonardo creates them with it ON.</p>" + started + check + how + "</section>")
-    ok = bool(state["ok"])
+                "<h2 id='spycloud-title'>SpyCloud</h2></div><p>Not checked yet. Leonardo creates Credential "
+                "Exposure tenants with SpyCloud ON and it stays ON; the check is optional.</p>" + started + check + how + "</section>")
+    level = str(state["state"])
     outcome = str(state["outcome"])
-    message = SPYCLOUD_MESSAGES.get(outcome, "SpyCloud was not verified OFF. Reason: " + outcome + ".")
+    message = SPYCLOUD_MESSAGES.get(outcome, "SpyCloud could not be verified. Reason: " + outcome + ".")
     observed = state["observed_at"].strftime("%Y-%m-%d %H:%M")  # type: ignore[union-attr]
-    headline = "SpyCloud is OFF" if ok else "SpyCloud still ON — run SpyCloud off"
-    cls, icon = ("source-ready", "✓") if ok else ("source-warn", "!")
+    headline = {"on": "SpyCloud is ON (default)", "off": "SpyCloud is OFF (default is ON)"}.get(level, "SpyCloud not verified")
+    cls, icon = ("source-ready", "✓") if level == "on" else ("source-warn", "!")
     return ("<section class='stat " + cls + "' aria-labelledby='spycloud-title'><div class='stat-head'>"
             f"<span class='readiness-icon' aria-hidden='true'>{icon}</span>"
             f"<h2 id='spycloud-title'>{escape(headline)}</h2></div><p>{escape(message)}</p>"
             f"<dl><dt>Result</dt><dd><code>{escape(outcome)}</code></dd><dt>Observed</dt><dd>{escape(observed)} "
-            f"({escape(str(state['mode']).replace('_', ' '))})</dd></dl>" + started + check + ("" if ok else how)
+            f"({escape(str(state['mode']).replace('_', ' '))})</dd></dl>" + started + check + how
             + "<p class='meta-line'>Local record from Leonardo Development; Salesforce is not changed.</p></section>")
 
 
@@ -3745,7 +3749,7 @@ def _tenant_checks_need_attention(ctx: SimpleNamespace) -> bool:
     drift, unknown, warned = (0, 0, 0) if ctx.mirror else _validation_counts(ctx.validation)
     return bool(drift or unknown or warned
                 or (ctx.scan and ctx.scan.get("state") in _SCAN_ATTENTION_STATES)
-                or (ctx.spycloud and not ctx.spycloud.get("ok")))
+                or (ctx.spycloud and ctx.spycloud.get("state") != "on"))
 
 
 def _pinned_banners(ctx: SimpleNamespace, case4_panel: str, commercial_readiness: dict[str, object] | None) -> str:
@@ -3790,9 +3794,9 @@ def _pinned_banners(ctx: SimpleNamespace, case4_panel: str, commercial_readiness
     if ctx.scan and ctx.scan.get("state") in _SCAN_ATTENTION_STATES:
         _cls, title, message = SCAN_STATES[str(ctx.scan["state"])]
         banners.append("<div class='banner banner-bad'><b>" + escape(title) + ".</b> " + escape(message) + "</div>")
-    if ctx.spycloud and not ctx.spycloud.get("ok"):
-        banners.append("<div class='banner banner-warn'><b>SpyCloud is still ON.</b> The owner requires it OFF on Credential "
-                       "Exposure tenants: run <code>--co " + escape(reference) + " --spycloud-off --confirm-write</code>.</div>")
+    if ctx.spycloud and ctx.spycloud.get("state") == "off":  # informational: ON is the default and shows nothing
+        banners.append("<div class='banner banner-warn'><b>SpyCloud is OFF.</b> Leonardo's default is ON and the owner leaves it "
+                       "ON; this is informational only, no action is required.</div>")
     if ctx.outcome and ctx.outcome["leonardo_write"] == "attempted_unverified":
         banners.append("<div class='banner banner-warn'><b>The last renewal save is unverified.</b> A write was attempted but "
                        "not confirmed by the read-back. Check the tenant in Leonardo Development before any retry.</div>")
@@ -3980,7 +3984,7 @@ def _renewal_do_now(ctx: SimpleNamespace) -> tuple[str, str, str]:
     form = _renewal_start_form(ctx)
     return done("Start renewal",
                 "<p class='lede'>Salesforce approval is validated. One run creates the Dev mirror if needed, plans the renewal, "
-                "applies it, and turns SpyCloud OFF.</p>" + old_note + notes + form,
+                "and applies it.</p>" + old_note + notes + form,
                 "<span class='chip chip-info'>Ready</span>")
 
 
@@ -3996,15 +4000,7 @@ def _stage_steps(ctx: SimpleNamespace) -> list[str]:
                                _post_button("/attended/validate", reference, "Validate in Surface")))
         elif drift:
             steps.append(_step("Review the " + str(drift) + " difference(s) in Tenant checks below.", False))
-    if route in (CE_ENGINE, CASE3_ENGINE) and ctx.readback is not None:
-        state = ctx.spycloud
-        if state is None:
-            steps.append(_step("Turn SpyCloud OFF (owner rule). Check it first (read-only); the save is a CLI write: <code>--co "
-                               + escape(reference) + " --spycloud-off --confirm-write</code>.", False,
-                               _post_button("/attended/spycloud-check", reference, "Check SpyCloud (read-only)")))
-        elif not state.get("ok"):
-            steps.append(_step("SpyCloud is still ON. Turn it OFF with the CLI: <code>--co " + escape(reference)
-                               + " --spycloud-off --confirm-write</code>.", False))
+    # No SpyCloud step (owner 2026-10-08): ON is Leonardo's default and stays; the optional check lives in its own card.
     open_items, done_items, error = (_reminder_items(reference, route, parts["record"], parts["evaluation"].core_plus_present)
                                      if parts is not None and "evaluation" in parts and route in SURFACE_ROUTES
                                      else ([], [], ""))
@@ -4263,7 +4259,7 @@ def _key_facts(ctx: SimpleNamespace) -> list[tuple[str, str]]:
                       if scan else "Not read"))
     if route in (CE_ENGINE, CASE3_ENGINE):
         spy = ctx.spycloud
-        facts.append(("SpyCloud", "Not checked" if spy is None else ("OFF" if spy.get("ok") else "ON") + " · "
+        facts.append(("SpyCloud", "Not checked" if spy is None else {"on": "ON", "off": "OFF"}.get(str(spy.get("state")), "Unknown") + " · "
                       + spy["observed_at"].strftime("%Y-%m-%d")))
     operator = ctx.stage_state.get("operator")
     evidence = ctx.stage_state.get("evidence")
@@ -5627,7 +5623,7 @@ def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, referenc
             body = ("<div class='card-head'><span class='pill'>Renewal in progress</span><span class='chip chip-warn'>Running</span></div>"
                     "<p>Started at <code>" + escape(started) + "</code>. This page refreshes every 5 seconds.</p>"
                     "<p class='note'>In the automation Chrome window, complete SSO/MFA if prompted. The runner creates the Dev mirror "
-                    "if it is missing, plans the renewal (dry run), applies it, and turns SpyCloud OFF. Leonardo Development only; "
+                    "if it is missing, plans the renewal (dry run), and applies it. Leonardo Development only; "
                     "it never updates Salesforce.</p>")
         else:
             body = ("<div class='card-head'><span class='pill'>Onboarding in progress</span><span class='chip chip-warn'>Running</span></div>"
@@ -5938,8 +5934,8 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
         status_cell = ("<span class='chip " + _SCAN_CHIP.get(status.upper(), "chip-neutral") + "'>" + escape(status.title()) + "</span>"
                        if status else "<span class='muted'>—</span>")
         interval = str(tenant.get("scanning_interval") or "—").replace("_", " ").casefold()
-        spy = tenant.get("spycloud_enabled")  # owner: must be OFF on LC tenants; boolean only
-        spy_cell = {True: "<span class='chip chip-warn'>ON</span>", False: "<span class='chip chip-ok'>OFF</span>"}.get(
+        spy = tenant.get("spycloud_enabled")  # informational (ON is the default); boolean only
+        spy_cell = {True: "<span class='chip chip-ok'>ON</span>", False: "<span class='chip chip-warn'>OFF</span>"}.get(
             spy, "<span class='muted'>—</span>")
         rows_html += (
             "<tr><td class='stick'>" + escape(str(tenant.get("account_name") or "")) + "<span class='sub'><code>"
@@ -5985,7 +5981,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
              + header("co", "CO") + header("licence", "Licence · start → end") + header("domain", "Domain")
              + "<th scope='col' class='num'><abbr title='Assets / domains / subdomains in the licence'>Quota</abbr></th>"
              + header("scan", "Last scan (UTC)") + header("status", "Scan status") + "<th scope='col'>Interval</th>"
-             "<th scope='col'><abbr title='SpyCloud flag of the Leaked Credentials settings; the owner requires OFF on LC tenants'>SpyCloud</abbr></th>"
+             "<th scope='col'><abbr title='SpyCloud flag of the Leaked Credentials settings; ON is the default, OFF is informational'>SpyCloud</abbr></th>"
              "<th scope='col'>Account</th></tr></thead><tbody>" + rows_html
              + "</tbody></table></div><p class='note'>Last scan times are UTC. Snapshot: "
              + escape(str(payload.get("environment"))) + " folder under %LOCALAPPDATA%\\SurfaceOnboarding\\leonardo-inventory "

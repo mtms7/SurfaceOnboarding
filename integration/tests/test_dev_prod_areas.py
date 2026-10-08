@@ -518,7 +518,9 @@ class ProductionCoViewTests(unittest.TestCase):
         for header in ("Field", "Salesforce / DealHub (expected)", "Production (clone)", "Result"):
             self.assertIn(">" + header + "</th>", page)
         self.assertIn("<td>Licence end</td><td>2027-10-19</td><td>2027-10-18</td><td><span class='chip chip-warn'>Differs</span>", page)
-        self.assertIn("<td>SpyCloud OFF</td><td>OFF</td><td>ON</td>", page)
+        self.assertIn("<td>SpyCloud<span class='sub'>informational</span></td><td>ON (default)</td><td>ON</td>"
+                      "<td><span class='chip chip-neutral'>Info</span></td>", page)  # informational: never a difference
+        self.assertNotIn("SpyCloud OFF", page)
         self.assertIn("informational", page)
         self.assertIn("Not checked", page)  # Salesforce account id
         self.assertIn("Matched production tenants", page)

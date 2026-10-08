@@ -194,18 +194,19 @@ class PinnedBannerTests(unittest.TestCase):
         page = render(row_for(SURFACE), writebacks={"CO-0702": {"result": "write_uncertain"}})
         self.assert_pinned(page, "Salesforce ID write-back uncertain.")
 
-    def test_validation_drift_scan_failure_and_spycloud_on_are_pinned(self):
+    def test_validation_drift_scan_failure_and_spycloud_off_note_are_pinned(self):
         validation = {"CO-0702": {"primary_user_matches": True, "primary_user_checked_on": "2026-10-06", "plan_note": "",
                                   "checks": [{"check": "Tier", "group": "Licence", "status": "drift", "expected": "a", "found": "b"}],
                                   "observed_at": NOW, "expires_at": NOW}}
         scan = {"CO-0702": {"state": "scan_failed", "status_enum": "FAILED", "last_recon_scan": None, "duration_ms": None,
                             "observed_at": NOW, "expires_at": NOW}}
-        spycloud = {"CO-0702": {"outcome": "spycloud_dry_run_on", "mode": "dry_run", "observed_at": NOW, "ok": False}}
+        spycloud = {"CO-0702": {"outcome": "spycloud_already_off", "mode": "standalone", "observed_at": NOW,
+                                "state": "off", "ok": True}}
         page = render(row_for(CASE3), readback=READBACK, runner=VERIFIED_RUN, validation=validation, scan=scan,
                       spycloud=spycloud, evaluation=surface_evaluation(route=dashboard.CASE3_ENGINE))
         self.assert_pinned(page, "Validation found 1 difference(s)")
         self.assert_pinned(page, "Scan failed.")
-        self.assert_pinned(page, "SpyCloud is still ON.")
+        self.assert_pinned(page, "SpyCloud is OFF.")  # informational note (owner 2026-10-08); ON shows no banner
         # A warn / blocked state opens "Tenant checks".
         self.assertIn("<details class='more' open><summary><h2 class='sum-h'>Tenant checks</h2>", page)
         self.assertNotIn("<details class='more' open><summary><h2 class='sum-h'>Tenant checks</h2>",
@@ -304,15 +305,16 @@ class DoNowTests(unittest.TestCase):
         self.assertNotIn("start-surface-runner", card)
         self.assertEqual(card.count(dashboard.REMINDER_NOTE), 1)
 
-    def test_case3_and_ce_ask_for_spycloud_off(self):
+    def test_case3_and_ce_offer_the_optional_spycloud_check_but_never_ask_for_off(self):
         run = {"CO-0702": {**VERIFIED_RUN["CO-0702"], "route": dashboard.CASE3_ENGINE}}
         card = do_now(render(row_for(CASE3), readback=READBACK, runner=run,
                              evaluation=surface_evaluation(route=dashboard.CASE3_ENGINE)))
-        self.assertIn("action='/attended/spycloud-check'", card)
-        self.assertIn("--spycloud-off --confirm-write", card)
+        self.assertNotIn("action='/attended/spycloud-check'", card)  # no to-do step: ON is the default
+        self.assertNotIn("--spycloud-off", card)
+        self.assertNotIn("Turn SpyCloud OFF", card)
         ce_run = {"CO-0702": {**VERIFIED_RUN["CO-0702"], "route": dashboard.CE_ENGINE}}
         card = do_now(render(row_for(CE), readback=READBACK, runner=ce_run, ce_evaluation=ce_evaluation()))
-        self.assertIn("action='/attended/spycloud-check'", card)
+        self.assertNotIn("action='/attended/spycloud-check'", card)
         self.assertIn("Assign the Operator Account", card)  # Case 2: text only, no reminder button
         self.assertNotIn("mark-operator-assigned", card)
         self.assertIn("action='/attended/confirm-user-created'", card)  # no scan stage in Case 2
@@ -588,7 +590,8 @@ class KeyFactsTests(unittest.TestCase):
         tenant_done = {"operator_assigned": True, "primary_user": {"present": True}}
         validation = {"CO-0702": {"primary_user_matches": True, "primary_user_checked_on": "2026-10-06", "plan_note": "",
                                   "checks": [], "observed_at": NOW, "expires_at": NOW}}
-        spycloud = {"CO-0702": {"outcome": "spycloud_off_verified", "mode": "standalone", "observed_at": NOW, "ok": True}}
+        spycloud = {"CO-0702": {"outcome": "spycloud_off_verified", "mode": "standalone", "observed_at": NOW,
+                                "state": "off", "ok": True}}
         scan = {"CO-0702": {"state": "scan_completed", "status_enum": "COMPLETED", "last_recon_scan": None,
                             "duration_ms": None, "observed_at": NOW, "expires_at": NOW, "execution_state": "done", "executions": []}}
         cases = []

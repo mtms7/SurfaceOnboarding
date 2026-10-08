@@ -5133,8 +5133,8 @@ def _run(reference: str, acknowledged_revision: str, *, review_wait_seconds: flo
                     return _finish(reference, acknowledged_revision, "readback_id_conflict")
                 except (OSError, ValueError):
                     return _finish(reference, acknowledged_revision, "readback_write_unavailable")
-                # SpyCloud OFF on LC routes (off by default, see SPYCLOUD_AFTER_CREATE_ENABLED); it
-                # records its own warning and never changes this create result.
+                # No automatic SpyCloud step (owner 2026-10-08: Leonardo's default ON stays); the hook is a
+                # no-op while SPYCLOUD_AFTER_CREATE_ENABLED is False and never changes this create result.
                 _spycloud_after_create(page, reference, contract.engine, tenant_name, surface_account_id, account_uuid)
                 return _finish(reference, acknowledged_revision, "readback_verified")
         except LoginTimeout:
@@ -5849,13 +5849,14 @@ def validate_row(row: dict[str, Any], plan: dict[str, Any] | None,
             else:
                 add("Settings", "Maximum scan duration (h)", "ok" if found == want else "drift", want, found)
     if route in SPYCLOUD_ROUTES:
-        # Informational only (owner decision 2026-10-05): SpyCloud must be OFF on LC tenants; never a drift.
+        # Informational only (owner decision 2026-10-08): SpyCloud ON is Leonardo's default and the expected
+        # state; OFF is only a note (someone changed it by hand), never a drift.
         from integration.onboarding.leonardo_inventory import spycloud_enabled
         spy = spycloud_enabled(row)
         if spy is True:
-            add("Settings", "SpyCloud is ON (owner: must be OFF)", "warn")
+            add("Settings", "SpyCloud is ON (default)", "ok", True, True)
         elif spy is False:
-            add("Settings", "SpyCloud is OFF", "ok", False, False)
+            add("Settings", "SpyCloud is OFF (default is ON)", "warn")
         else:
             add("Settings", "SpyCloud state not readable", "unknown")
     if primary_user is not None:
@@ -6035,10 +6036,12 @@ def run_validate_all() -> dict[str, str]:
     return results
 
 
-# --- SpyCloud OFF on Credential Exposure tenants (owner decision 2026-10-05) ---------
-# Leonardo's Add Account hard-codes leakedCredentialsSettings.spyCloudSettings.enabled = true, but the
-# owner requires SpyCloud OFF on LC tenants (routes CE-only and Case 3; this supersedes docs/33 "leave
-# untouched"). The tenant's Edit form (row menu > Edit > both "Advanced options" sections) carries the
+# --- Manual SpyCloud tool for Credential Exposure tenants (owner decision 2026-10-08) -------
+# Leonardo's Add Account creates tenants with leakedCredentialsSettings.spyCloudSettings.enabled = true and
+# the owner wants it LEFT ON (2026-10-08; this supersedes the 2026-10-05 "OFF on LC tenants" rule). Nothing
+# in the create or renewal runs touches it any more. What stays is this standalone, write-gated tool
+# (CLI --spycloud-off, plus the read-only dashboard check) for the rare case of turning it OFF by hand.
+# The tenant's Edit form (row menu > Edit > both "Advanced options" sections) carries the
 # checkbox input[name="spyCloudEnabled"]; Confirm posts /api/v1/backoffice/account/{id}/edit.
 # This is a Leonardo WRITE: it needs an explicit confirm_write (CLI: --spycloud-off --co CO-XXXX
 # --confirm-write), Development only. Without it the run is a dry run (open Edit, report, Cancel).
@@ -6053,15 +6056,24 @@ SPYCLOUD_EDIT_PATH = re.compile(r"/api/v1/backoffice/account/([A-Za-z0-9_-]{1,64
 SPYCLOUD_EDIT_TIMEOUT_MS = 30_000
 SPYCLOUD_ROUTES = frozenset({CE_ENGINE, CASE3_ENGINE})  # Credential Exposure routes; the Surface-only route never
 SPYCLOUD_STATE_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_spycloud.json")
-SPYCLOUD_OK_OUTCOMES = frozenset({"spycloud_off_verified", "spycloud_already_off"})
+# Outcomes that verified the flag (2026-10-08): ON is the expected default, OFF is informational only.
+SPYCLOUD_ON_OUTCOMES = frozenset({"spycloud_dry_run_on"})
+SPYCLOUD_OFF_OUTCOMES = frozenset({"spycloud_off_verified", "spycloud_already_off"})
+SPYCLOUD_OK_OUTCOMES = SPYCLOUD_ON_OUTCOMES | SPYCLOUD_OFF_OUTCOMES  # the flag was read: not a failure
+
+
+def spycloud_state_of(outcome: str) -> str:
+    """Return on (expected default), off (informational) or unknown (the run did not verify the flag)."""
+    return "on" if outcome in SPYCLOUD_ON_OUTCOMES else "off" if outcome in SPYCLOUD_OFF_OUTCOMES else "unknown"
+
+
 # The only row-menu items this runner may click (Details: scan status; Edit: SpyCloud). Everything else
 # in that menu (_Access, _Scan_Now, _Stop_Scan, _Delete) is a hazard.
 ROW_ACTIONS_ALLOWED = frozenset({SCAN_EXEC_DETAILS_SELECTOR, SPYCLOUD_EDIT_SELECTOR})
-# After-create hook (CE and Case 3, after readback_verified). Enabled by the owner on 2026-10-05 after
-# the first live standalone save was verified (CO-0679: spycloud_off_verified). A SpyCloud failure never
-# undoes or alters the create result: it is recorded as a warning (run log, state file, dashboard).
-# Set False to stop SpyCloud OFF after create (the standalone --spycloud-off stays available).
-SPYCLOUD_AFTER_CREATE_ENABLED = True
+# After-create hook (CE and Case 3, after readback_verified). DISABLED by the owner on 2026-10-08: SpyCloud
+# stays ON as Leonardo creates it, so no automatic Leonardo write follows a create. (It was enabled on 2026-10-05
+# after CO-0679 verified spycloud_off_verified.) The standalone --spycloud-off stays available as a manual tool.
+SPYCLOUD_AFTER_CREATE_ENABLED = False
 
 
 def _is_spycloud_edit_response(response: Any) -> bool:
@@ -6252,7 +6264,12 @@ def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_
 
 
 def write_spycloud_state(reference: str, outcome: str, mode: str, observed_at: datetime) -> None:
-    """Store one CO's latest SpyCloud outcome (replaces the previous; atomic). mode: standalone, dry_run, after_create."""
+    """Store one CO's latest SpyCloud outcome (replaces the previous; atomic). mode: standalone, dry_run, after_create.
+
+    ``warning`` (2026-10-08) means the flag was NOT verified (a failure or unknown outcome); ON and OFF are both
+    verified states. Records written before that date (dry_run_on carried warning=True) stay loadable: readers
+    derive the state from ``outcome`` (``spycloud_state_of``), never from the stored flag.
+    """
     if not REFERENCE.fullmatch(reference) or mode not in ("standalone", "dry_run", "after_create"):
         raise ValueError("invalid_spycloud_record")
     if not re.fullmatch(r"[a-z_]{1,64}", outcome or ""):
@@ -6269,10 +6286,12 @@ def write_spycloud_state(reference: str, outcome: str, mode: str, observed_at: d
 
 
 def _record_spycloud(reference: str, outcome: str, mode: str) -> None:
-    """Best-effort state record plus a run-log warning when SpyCloud is not verified OFF."""
+    """Best-effort state record (manual tool only) plus a run-log warning when the SpyCloud flag was not verified."""
     _log().event("spycloud", outcome, detail=mode)
     if outcome not in SPYCLOUD_OK_OUTCOMES:
-        _log().event("spycloud_warning", "not_verified_off", detail="SpyCloud still ON or unknown: run SpyCloud off")
+        _log().event("spycloud_warning", "not_verified", detail="SpyCloud flag not read: re-run the SpyCloud check")
+    elif outcome in SPYCLOUD_OFF_OUTCOMES:
+        _log().event("spycloud_note", "off", detail="SpyCloud is OFF (Leonardo's default is ON); informational only")
     try:
         write_spycloud_state(reference, outcome, mode, datetime.now())
     except (OSError, ValueError):
@@ -6281,7 +6300,9 @@ def _record_spycloud(reference: str, outcome: str, mode: str) -> None:
 
 def _spycloud_after_create(page: Any, reference: str, engine: str, tenant_name: str, account_id: str,
                            account_uuid: str) -> None:
-    """After readback_verified on an LC route: SpyCloud OFF. Never raises; never alters the create result."""
+    """Disabled hook (SPYCLOUD_AFTER_CREATE_ENABLED False, owner 2026-10-08): no automatic SpyCloud write.
+
+    Kept as an explicit kill-switch seam; if ever re-enabled it never raises and never alters the create result."""
     if not SPYCLOUD_AFTER_CREATE_ENABLED or engine not in SPYCLOUD_ROUTES:
         return
     try:
@@ -6310,7 +6331,8 @@ def spycloud_write_label(result: str, confirm_write: bool) -> str:
     return "not_performed"
 
 
-# Case 5 (owner 2026-10-07) edits an existing CE tenant that carries Leaked Credentials, so SpyCloud must be OFF there too.
+# Renewal mirrors of Cases 4-6 carry Leaked Credentials too, so the manual SpyCloud tool/check may target them
+# (the renewal runs themselves never touch SpyCloud; owner 2026-10-08).
 SPYCLOUD_MIRROR_ROUTES = frozenset({"case_4_renew_surface_new_ce", RENEWAL_CASE5_ENGINE, "case_6_renew_both"})
 
 
@@ -6333,7 +6355,10 @@ def _spycloud_mirror_target(reference: str) -> tuple[str, str] | None:
 
 
 def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: str = "dev") -> str:
-    """Standalone SpyCloud OFF for one onboarded CE / Case 3 CO in Leonardo Development.
+    """Manual standalone SpyCloud OFF for one onboarded CE / Case 3 CO in Leonardo Development.
+
+    Not part of any create or renewal run (SpyCloud stays ON by default, owner 2026-10-08); a Leonardo write
+    only with ``confirm_write``.
 
     Needs the CO's local readback (its id and accountUuid). Without ``confirm_write`` it is a dry run
     (Edit opened, checkbox state reported, Cancel). Any environment other than dev is refused before
@@ -6352,7 +6377,7 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
             route, tenant_name = _validation_route(reference)
         except SurfaceSourceError as error:
             # A renewal CO onboarded as a verified Dev mirror (2026-10-06): its mirror carries Leaked Credentials
-            # when the renewal covers CE (Cases 4 and 6), so SpyCloud must be OFF there too.
+            # when the renewal covers CE (Cases 4 and 6), so the manual tool may target it too.
             mirrored = _spycloud_mirror_target(reference)
             if mirrored is None:
                 return str(error)
@@ -6460,8 +6485,8 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
 #     static IP / authenticated testing / multiple attack stacks OFF); Notifications, Multiple users, API ON; Phishing
 #     OFF; Provisioning ON; Subdomains (subDomainsNumberAllowed) ON. Every control missing from the form fails closed
 #     with renewal_field_unavailable; the read-after-write compares every profile control, not only the changed ones.
-#   * Leaked Credentials kept per entitlement (ON, Weekly, scanned domains = the CE email domain); SpyCloud OFF follows
-#     as the orchestrator's existing step; the Operator Account is a reminder only (dashboard), never automatic.
+#   * Leaked Credentials kept per entitlement (ON, Weekly, scanned domains = the CE email domain); SpyCloud is left ON
+#     (owner 2026-10-08; the orchestrator has no SpyCloud step); the Operator Account is a reminder only (dashboard), never automatic.
 # UNVERIFIED LIVE for Case 5 (Edit form, nothing has run against Leonardo): (a) the "Advanced options" expander and the
 #   nine advanced toggles + "Maximum scan Duration (hours)" exist in Edit with the Add Account names/labels;
 #   (b) Notifications / Multiple users / API access / Provisioning / subDomainsNumberAllowed checkboxes exist in Edit;
@@ -7813,7 +7838,7 @@ def _production_expectation(reference: str, product: Any = None,
                         "domains": (source.main_domain, *source.alternate_domains, source.ce_email_domain)}, {
             "primary_domain": source.main_domain, "alternate_domains": tuple(source.alternate_domains),
             "license_type": RENEWAL_LICENSE_TYPE, "license_end": renewal_expiration(source), "license_start": None,
-            "spycloud_off": True}
+            "spycloud_shown": True}
     pair = (product, onboarding_type)
     engine = (SURFACE_ENGINE if pair == (SURFACE_ROUTE_PRODUCT, SURFACE_ROUTE_TYPE)
               else CASE3_ENGINE if pair == (CASE3_ROUTE_PRODUCT, CASE3_ROUTE_TYPE)
@@ -7830,7 +7855,7 @@ def _production_expectation(reference: str, product: Any = None,
     return engine, {"tenant_names": (source.tenant_name,), "domains": (primary, *alternates, *extra)}, {
         "primary_domain": primary, "alternate_domains": alternates, "license_type": plan["selects"]["Type"],
         "license_end": plan["license_end"], "license_start": plan["license_start"],
-        "spycloud_off": engine in SPYCLOUD_ROUTES}
+        "spycloud_shown": engine in SPYCLOUD_ROUTES}
 
 
 def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
@@ -8277,7 +8302,7 @@ def _mirror_in_browser(page: Any, reference: str, plan: Any, source: MirrorSourc
                             surface_account_id, account_uuid)
     except (OSError, ValueError):
         return "mirror_record_write_unavailable"
-    if plan.leaked_credentials_allowed:  # SpyCloud OFF after create (never changes this result)
+    if plan.leaked_credentials_allowed:  # disabled hook: SpyCloud stays ON (owner 2026-10-08); never changes this result
         _spycloud_after_create(page, reference, CASE3_ENGINE, name, surface_account_id, account_uuid)
     return "mirror_created_verified"
 
@@ -8290,7 +8315,7 @@ def _mirror_in_browser(page: Any, reference: str, plan: Any, source: MirrorSourc
 #      (a "maybe created" result stops the run: the operator verifies)
 #   3. renewal dry run: renewal_already_current finishes OK; anything but renewal_dry_run_planned stops
 #   4. apply (--confirm-write equivalent): must end renewal_edit_verified
-#   5. SpyCloud on the tenant must end OFF (a failure is a warning only)
+#   5. (no SpyCloud step: owner 2026-10-08 leaves Leonardo's default ON; the manual --spycloud-off tool is separate)
 #   6. renewal outcome record
 RENEWAL_RUN_MODE = "renewal_run"
 RENEWAL_RUN_OK_RESULTS = frozenset({"renewal_edit_verified", "renewal_already_current"})
@@ -8350,15 +8375,7 @@ def _renewal_run_steps(reference: str, revision: str | None, log: RunLog, env_na
     record_renewal_outcome(reference, result, True, report)
     if result != "renewal_edit_verified":
         return result, ("renewal_write" if renewal_write_label(result, True) == "attempted_unverified" else "")
-    # 5. SpyCloud must end OFF; a failure is a visible warning only (never changes the renewal result)
-    try:
-        spy = run_spycloud_off(reference, confirm_write=True)
-    except Exception as exc:  # noqa: BLE001
-        log.error("spycloud", "after_renewal", exc)
-        spy = "spycloud_hook_error"
-    log.event("spycloud", spy)
-    if spy not in SPYCLOUD_OK_OUTCOMES and spy != "spycloud_route_not_applicable":
-        log.event("spycloud_warning", "not_verified_off", detail="SpyCloud still ON or unknown: run SpyCloud off")
+    # 5. SpyCloud is not touched (owner 2026-10-08: ON by default stays ON); no Leonardo write follows the apply.
     return result, ""
 
 
@@ -8553,11 +8570,11 @@ def main() -> int:
     parser.add_argument("--production-duplicate-check", action="store_true",
                         help="With --co (and --route): read-only duplicate check against the production clone (Redash snapshot; no Leonardo, no browser).")
     parser.add_argument("--spycloud-off", action="store_true",
-                        help="With --co: open the tenant's Edit form in Leonardo Development and report the SpyCloud checkbox (dry run: Cancel, nothing saved). Add --confirm-write to turn it OFF.")
+                        help="With --co: open the tenant's Edit form in Leonardo Development and report the SpyCloud checkbox (dry run: Cancel, nothing saved). Manual tool only: SpyCloud ON is the expected default and no run turns it OFF; add --confirm-write to turn it OFF by hand.")
     parser.add_argument("--renew", action="store_true",
                         help="With --co: renewal EDIT of a Case 4-6 CO's existing Leonardo Development (mirror) tenant. Dry run: open Edit, read current values, report the planned diff, Cancel (nothing saved). Add --confirm-write to apply it.")
     parser.add_argument("--renew-run", action="store_true",
-                        help="With --co and --revision: the orchestrated renewal run the dashboard launches (Dev mirror if needed, renewal dry run, apply, SpyCloud OFF). Leonardo Development only; the result is recorded in the runner state.")
+                        help="With --co and --revision: the orchestrated renewal run the dashboard launches (Dev mirror if needed, renewal dry run, apply; SpyCloud is not touched). Leonardo Development only; the result is recorded in the runner state.")
     parser.add_argument("--confirm-write", action="store_true",
                         help="With --spycloud-off, --renew or --mirror-renewal: explicitly approve the Leonardo Development write. Without it nothing is saved.")
     parser.add_argument("--mirror-renewal", action="store_true",

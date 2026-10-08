@@ -38,7 +38,7 @@ def snapshot(*tenants, with_alternates=True):
 
 CO = {"tenant_names": ("Acme",), "domains": ("acme.example", "alt.acme.example")}
 PLAN = {"primary_domain": "acme.example", "alternate_domains": ("alt.acme.example",), "license_type": "Prepaid annual subscription",
-        "license_end": date(2027, 10, 18), "license_start": date(2026, 10, 1), "spycloud_off": True}
+        "license_end": date(2027, 10, 18), "license_start": date(2026, 10, 1), "spycloud_shown": True}
 GOOD = dict(alternates=("alt.acme.example",))
 
 
@@ -103,7 +103,7 @@ class StateMachineTests(unittest.TestCase):
         self.assertEqual(found["target"]["id"], "id-acme")
         self.assertEqual({row["code"]: row["result"] for row in found["fields"]}, {
             "tenant_name": "match", "primary_domain": "match", "alternate_domains": "match", "license_type": "match",
-            "license_end": "match", "spycloud_off": "match", "license_start": "match", "operator_assigned": "info",
+            "license_end": "match", "spycloud": "info", "license_start": "match", "operator_assigned": "info",
             "scan_status": "info", "salesforce_account_id": "not_checked"})
 
     def test_each_required_field_that_differs_makes_exists_differs(self):
@@ -112,7 +112,6 @@ class StateMachineTests(unittest.TestCase):
             "alternate_domains": tenant(alternates=("alt.acme.example", "extra.example")),
             "license_type": tenant(kind="PREPAID_MONTHLY_SUBSCRIPTION", **GOOD),
             "license_end": tenant(end=END_MS + 86400000 * 3, **GOOD),
-            "spycloud_off": tenant(spycloud=True, **GOOD),
         }
         for code, item in cases.items():
             with self.subTest(code=code):
@@ -134,7 +133,6 @@ class StateMachineTests(unittest.TestCase):
             "primary_domain": {"account_domain": None},
             "alternate_domains": {"alternate_domains": None},
             "license_end": {"license": {"type": "PREPAID_ANNUAL_SUBSCRIPTION", "start_date": 1, "expiration_date": None}},
-            "spycloud_off": {"spycloud_enabled": None},
         }
         for code, change in unknown.items():
             with self.subTest(code=code):
@@ -167,11 +165,29 @@ class StateMachineTests(unittest.TestCase):
         account = [row for row in found["fields"] if row["code"] == "salesforce_account_id"][0]
         self.assertEqual((account["result"], account["required"]), ("not_checked", False))
 
-    def test_spycloud_is_required_off_only_on_credential_exposure_routes(self):
-        surface = match(tenant(spycloud=True, **GOOD), plan={**PLAN, "spycloud_off": False})
+    def test_spycloud_is_informational_only_and_never_decides_or_blocks_a_match(self):
+        # Owner 2026-10-08: ON is Leonardo's default; the production value is shown, never compared, never required.
+        self.assertNotIn("spycloud", pm.REQUIRED_FIELDS)
+        self.assertNotIn("spycloud_off", pm.REQUIRED_FIELDS)
+        shown = {}
+        for spy in (True, False, None):
+            found = match(tenant(spycloud=spy, **GOOD))
+            self.assertEqual((found["status"], found["differs"]), ("exists_matches", []), spy)
+            row = {r["code"]: r for r in found["fields"]}["spycloud"]
+            self.assertEqual((row["result"], row["required"], row["expected"]), ("info", False, "ON (default)"))
+            shown[spy] = row["production"]
+        self.assertEqual(shown, {True: "ON", False: "OFF", None: "—"})
+        self.assertNotIn("spycloud_off", {r["code"] for r in found["fields"]})
+        # A real difference elsewhere still decides, with the SpyCloud row never listed among the differences.
+        other = match(tenant(spycloud=False, domain="acme.example.org", **GOOD),
+                      co={**CO, "domains": ("acme.example", "alt.acme.example", "acme.example.org")})
+        self.assertEqual((other["status"], other["differs"]), ("exists_differs", ["primary_domain"]))
+
+    def test_surface_only_plans_show_spycloud_as_not_applicable(self):
+        surface = match(tenant(spycloud=True, **GOOD), plan={**PLAN, "spycloud_shown": False})
         self.assertEqual(surface["status"], "exists_matches")
-        self.assertEqual({r["code"]: r["result"] for r in surface["fields"]}["spycloud_off"], "na")
-        self.assertEqual(match(tenant(spycloud=True, **GOOD))["differs"], ["spycloud_off"])
+        row = {r["code"]: r for r in surface["fields"]}["spycloud"]
+        self.assertEqual((row["result"], row["required"]), ("na", False))
 
     def test_licence_end_accepts_epoch_ms_or_iso_text_and_a_utc_or_local_day(self):
         self.assertEqual(match(tenant(end="2027-10-18T00:00:00Z", **GOOD))["status"], "exists_matches")
@@ -263,7 +279,7 @@ class RunnerGlueTests(unittest.TestCase):
                             "leakedCredentialsSettings.spyCloudSettings": {"enabled": False}}))
         expectation = (runner.CE_ENGINE, {"tenant_names": ("Acme - CE Only",), "domains": ("mail.example",)},
                        {"primary_domain": "mail.example", "alternate_domains": (), "license_type": "Prepaid annual subscription",
-                        "license_end": date(2027, 10, 18), "license_start": date(2026, 10, 1), "spycloud_off": True})
+                        "license_end": date(2027, 10, 18), "license_start": date(2026, 10, 1), "spycloud_shown": True})
         with patch.object(runner, "_production_expectation", return_value=expectation) as read, self.clock():
             found = runner.production_match_for("CO-0801", "Credential Exposure", "New Product Onboarding")
         read.assert_called_once_with("CO-0801", "Credential Exposure", "New Product Onboarding")
@@ -286,11 +302,11 @@ class RunnerGlueTests(unittest.TestCase):
                 patch.object(runner, "_run_day", side_effect=AssertionError("the Dev run day is never used")):
             engine, source, plan = runner._production_expectation("CO-0801", "Credential Exposure", "New Product Onboarding")
         self.assertEqual(calls, [date(2026, 11, 2)])  # the DealHub subscription start, not today
-        self.assertEqual((engine, plan["license_start"], plan["license_end"], plan["spycloud_off"]),
+        self.assertEqual((engine, plan["license_start"], plan["license_end"], plan["spycloud_shown"]),
                          (runner.CE_ENGINE, date(2026, 11, 2), date(2027, 11, 1), True))
         self.assertEqual((source["tenant_names"], source["domains"]), (("Acme - CE Only",), ("mail.example",)))
 
-    def test_surface_only_does_not_require_spycloud_off_and_compares_main_and_alternate_roots(self):
+    def test_surface_only_does_not_show_spycloud_and_compares_main_and_alternate_roots(self):
         class Source:
             reference, tenant_name, main_domain = "CO-0802", "Acme", "acme.example"
             alternate_domains = ("alt.acme.example",)
@@ -303,11 +319,11 @@ class RunnerGlueTests(unittest.TestCase):
             primary_domain=lambda source: source.main_domain, redactions=lambda source: (), allow_scan_started=True)
         with patch.dict(runner.ROUTES, {runner.SURFACE_ENGINE: contract}):
             engine, source, plan = runner._production_expectation("CO-0802", "Surface", "New Product Onboarding")
-        self.assertEqual((engine, plan["spycloud_off"], plan["primary_domain"], plan["alternate_domains"]),
+        self.assertEqual((engine, plan["spycloud_shown"], plan["primary_domain"], plan["alternate_domains"]),
                          (runner.SURFACE_ENGINE, False, "acme.example", ("alt.acme.example",)))
         self.assertEqual(source["domains"], ("acme.example", "alt.acme.example"))
 
-    def test_renewals_expect_the_dealhub_term_end_exactly_both_names_and_spycloud_off(self):
+    def test_renewals_expect_the_dealhub_term_end_exactly_both_names_and_show_spycloud(self):
         class Source:
             tenant_name, ce_tenant_name, main_domain = "Acme", "Acme - CE Only", "acme.example"
             alternate_domains, ce_email_domain = ("alt.acme.example",), "mail.example"
@@ -321,7 +337,7 @@ class RunnerGlueTests(unittest.TestCase):
             engine, source, plan = runner._production_expectation("CO-0767", "Surface & Credential Exposure",
                                                                    "Renewal of Existing Product")
         self.assertEqual(engine, "case_6_renew_both")
-        self.assertEqual((plan["license_end"], plan["license_start"], plan["spycloud_off"]), (date(2029, 10, 26), None, True))
+        self.assertEqual((plan["license_end"], plan["license_start"], plan["spycloud_shown"]), (date(2029, 10, 26), None, True))
         self.assertEqual(source["tenant_names"], ("Acme", "Acme - CE Only"))
         self.assertIn("mail.example", source["domains"])
 

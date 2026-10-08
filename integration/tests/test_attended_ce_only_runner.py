@@ -3776,10 +3776,9 @@ class CeGoldenTests(unittest.TestCase):
         page = case._install_fake_playwright(case._base(), tracker)
         _use_real_production_gate(self)
         _write_prod_clone(self, accountName="Unrelated Production Tenant")
-        # The golden pins the create path itself; the after-create SpyCloud step (owner-enabled
-        # 2026-10-05) is covered by test_a_spycloud_failure_after_create_keeps_readback_verified.
-        with patch.object(runner, "_run_day", return_value=date(2026, 9, 29)), \
-                patch.object(runner, "SPYCLOUD_AFTER_CREATE_ENABLED", False):
+        # The golden pins the create path itself; the after-create SpyCloud hook is disabled (owner 2026-10-08)
+        # and covered by test_no_automatic_spycloud_write_after_create.
+        with patch.object(runner, "_run_day", return_value=date(2026, 9, 29)):
             result = case._run_scenario(page, tracker)
         self.assertEqual(result, "readback_verified")
         self.assertEqual(_events(runner.RUN_LOG_PATH), CE_GOLDEN_EVENTS)
@@ -3788,9 +3787,29 @@ class CeGoldenTests(unittest.TestCase):
         self.assertIs(runner.ROUTES[runner.CE_ENGINE], runner.CE_ROUTE)
         self.assertEqual(ce_only_names("Sample Group Ltd."), runner.CeOnlyNames("Sample Group Ltd - CE Only", "sgl"))
 
-    def test_a_spycloud_failure_after_create_keeps_readback_verified(self):
-        # The fake page has no Edit form, so the enabled after-create step fails: the create result,
-        # the golden create events, and the finish stay as they were; the failure is a visible warning.
+    def test_no_automatic_spycloud_write_after_create(self):
+        # Owner 2026-10-08: Leonardo's default (SpyCloud ON) stays. The default configuration neither opens Edit
+        # nor writes a SpyCloud event or state record; the create result and the golden events are exact.
+        case = RunEndToEndTests("test_readback_verified_happy_path")
+        self.addCleanup(case.doCleanups)
+        tracker: dict = {}
+        page = case._install_fake_playwright(case._base(), tracker)
+        state = Path(tempfile.mkdtemp()) / "attended_spycloud.json"
+        _use_real_production_gate(self)
+        _write_prod_clone(self, accountName="Unrelated Production Tenant")
+        self.assertIs(runner.SPYCLOUD_AFTER_CREATE_ENABLED, False)
+        with patch.object(runner, "_run_day", return_value=date(2026, 9, 29)), \
+                patch.object(runner, "SPYCLOUD_STATE_PATH", state), \
+                patch.object(runner, "set_spycloud_off", side_effect=AssertionError("no SpyCloud write")), \
+                patch.object(runner, "run_spycloud_off", side_effect=AssertionError("no SpyCloud write")):
+            result = case._run_scenario(page, tracker)
+        self.assertEqual(result, "readback_verified")
+        self.assertEqual(_events(runner.RUN_LOG_PATH), CE_GOLDEN_EVENTS)
+        self.assertFalse(state.exists())
+
+    def test_a_spycloud_failure_after_create_keeps_readback_verified_if_the_hook_is_re_enabled(self):
+        # Kill-switch seam only: with the hook re-enabled (it is not) the fake page has no Edit form, so the step
+        # fails; the create result, the golden create events and the finish stay as they were.
         case = RunEndToEndTests("test_readback_verified_happy_path")
         self.addCleanup(case.doCleanups)
         tracker: dict = {}
@@ -3806,7 +3825,7 @@ class CeGoldenTests(unittest.TestCase):
         events = _events(runner.RUN_LOG_PATH)
         self.assertEqual(events[:len(CE_GOLDEN_EVENTS) - 1], CE_GOLDEN_EVENTS[:-1])
         self.assertEqual(events[-1], CE_GOLDEN_EVENTS[-1])
-        self.assertIn(["spycloud_warning", "not_verified_off", "", "SpyCloud still ON or unknown: run SpyCloud off"],
+        self.assertIn(["spycloud_warning", "not_verified", "", "SpyCloud flag not read: re-run the SpyCloud check"],
                       events)
         self.assertTrue(json.loads(state.read_text(encoding="utf-8"))[next(iter(json.loads(
             state.read_text(encoding="utf-8"))))]["warning"])

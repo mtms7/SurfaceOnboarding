@@ -11,8 +11,9 @@ never writes, and a "no tenant found" is never a clearance. First hit wins:
   exists_matches     exactly one such tenant and every REQUIRED field agrees
   exists_differs     exactly one such tenant; a required field differs or is unknown (field codes listed)
 
-Required: tenant name, primary domain, alternate domains, licence type, licence end, SpyCloud OFF (CE routes only).
-Informational (never block): licence start, operator assigned, scan status, Salesforce account id ("not checked").
+Required: tenant name, primary domain, alternate domains, licence type, licence end.
+Informational (never block): SpyCloud (owner 2026-10-08: ON is Leonardo's default; the production value is only shown,
+CE routes only), licence start, operator assigned, scan status, Salesforce account id ("not checked").
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from integration.onboarding.leonardo_inventory import (
     load_latest)
 
 STATUSES = ("clone_unavailable", "not_in_production", "exists_other", "ambiguous", "exists_matches", "exists_differs")
-REQUIRED_FIELDS = ("tenant_name", "primary_domain", "alternate_domains", "license_type", "license_end", "spycloud_off")
+REQUIRED_FIELDS = ("tenant_name", "primary_domain", "alternate_domains", "license_type", "license_end")
 NOT_A_CLEARANCE = "No tenant found. This is not a clearance: the clone can lag up to a day."
 MAX_LISTED = 8
 
@@ -137,12 +138,13 @@ def compare_fields(tenant: Mapping[str, Any], plan: Mapping[str, Any], tenant_na
     end_value = lic.get("expiration_date")
     decide("license_end", "Licence end", expected_end, _tenant_dates(end_value) or None,
            expected_end or "—", _shown_date(end_value), lambda want, got: want in got)
-    if plan.get("spycloud_off"):
+    if plan.get("spycloud_shown"):
+        # Informational only (owner 2026-10-08): the production value is shown, never compared, never blocks.
         spy = tenant.get("spycloud_enabled")
-        decide("spycloud_off", "SpyCloud OFF", True, spy if isinstance(spy, bool) else None, "OFF",
-               {True: "ON", False: "OFF"}.get(spy, "—") if isinstance(spy, bool) else "—", lambda _w, got: got is False)
+        rows.append(_field("spycloud", "SpyCloud", "ON (default)",
+                           {True: "ON", False: "OFF"}.get(spy, "—") if isinstance(spy, bool) else "—", "info", False))
     else:
-        rows.append(_field("spycloud_off", "SpyCloud OFF", "not required (Surface only)", "—", "na", False))
+        rows.append(_field("spycloud", "SpyCloud", "not applicable (Surface only)", "—", "na", False))
     start_expected, start_value = _iso(plan.get("license_start")), lic.get("start_date")
     start_result = ("info" if start_expected is None or not _tenant_dates(start_value)
                     else ("match" if start_expected in _tenant_dates(start_value) else "differs"))
@@ -166,7 +168,7 @@ def _result(status: str, reason: str = "", **extra: Any) -> dict[str, Any]:
 def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any] | None,
                      snapshot: Mapping[str, Any] | str | None) -> dict[str, Any]:
     """``co_source``: {"tenant_names": (...), "domains": (...)}; ``plan``: see ``compare_fields`` (primary_domain,
-    alternate_domains, license_type, license_end, license_start, spycloud_off); ``snapshot``: the verified clone
+    alternate_domains, license_type, license_end, license_start, spycloud_shown); ``snapshot``: the verified clone
     payload, or a reason string / None when it cannot be used. Pure; never raises on bad data (fails closed)."""
     if not isinstance(snapshot, Mapping):
         return _result("clone_unavailable", snapshot if isinstance(snapshot, str) and snapshot else "inventory_snapshot_missing")

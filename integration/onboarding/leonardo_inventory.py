@@ -226,7 +226,7 @@ def _epoch_utc(value: Any) -> str | None:
 
 
 def spycloud_enabled(row: Mapping[str, Any]) -> bool | None:
-    """Owner decision 2026-10-05 (SpyCloud must be OFF on LC tenants): the ONLY thing kept from
+    """Owner decision 2026-10-08 (SpyCloud stays ON, Leonardo's default; OFF is informational): the ONLY thing kept from
     ``leakedCredentialsSettings.spyCloudSettings`` is this boolean. True/False, or None when the
     field is absent or not a boolean. Nothing else from that object (keys, ids, settings) is read.
     """

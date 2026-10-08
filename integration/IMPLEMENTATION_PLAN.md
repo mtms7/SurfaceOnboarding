@@ -1537,3 +1537,10 @@ Superseded by "End of day 2026-10-06" below.
 4. Onboarding work (from the 2026-10-07 end-of-day list): restart the dashboard and review the layout; CO-0767 "Confirm user created"; Case 4 Start renewal on CO-0758 (owner go); Case 5 on the first real Case 5 CO; review `/prod` readiness.
 
 **Boundaries preserved:** no VM, proxy, firewall, OneLogin, Salesforce write, Redash change or production access. Pushes this evening were operator-requested (`98bfc50..78dfa76`, `78dfa76..aaf9a67`). No credential, token, cookie, MFA value or raw payload was copied, logged or persisted.
+
+#### Handoff 2026-10-08 — SpyCloud is ON by default (owner decision; local code and tests only; not committed)
+
+- **Owner decision 2026-10-08 (supersedes 2026-10-05 "SpyCloud must be OFF on LC tenants"):** SpyCloud stays enabled (Leonardo's Add Account default). Applies to every onboarding case; Surface-only (Case 1) has no Leaked Credentials, so nothing to do there.
+- **Code:** no automatic OFF after create (CE, Case 3: `SPYCLOUD_AFTER_CREATE_ENABLED = False`, hook kept as a gated no-op) or after renewals (Cases 4/5/6: orchestrator step removed). Standalone `--spycloud-off [--confirm-write]` kept as a manual, write-gated tool. Validation: ON = ok, OFF = informational warn. Dashboard: no "must be OFF" banner/step; OFF shows as an amber note. Production match: SpyCloud is an informational row (`spycloud`), no longer in `REQUIRED_FIELDS`, never blocks. Stored state: `SPYCLOUD_ON_OUTCOMES` / `SPYCLOUD_OFF_OUTCOMES`; `warning` now means "not verified"; legacy records still load; `spycloud_readback_still_on` shows as "not verified".
+- **Verified:** 1458 tests OK, 1 skipped (project runtime); artifact and offline-boundary guards pass. One known flaky dashboard-server test passed on rerun.
+- **Open owner decision:** Dev tenants turned OFF earlier (CO-0757, CO-0679, CO-0728, CO-0767 mirror, CO-0762 if run) — leave as is or turn back ON (a Leonardo Development write, needs approval). Docs/README still describe the old OFF rule (docs/33 etc.) and need a sweep.

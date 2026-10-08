@@ -64,7 +64,7 @@ class MirrorPlan:
     leaked_credentials_allowed: bool
     lc_domains_count: int
     lc_domains: tuple[str, ...]  # the CO's email domains, at most ``lc_domains_count``
-    spycloud_enabled: bool | None  # production value, informational (Dev SpyCloud is turned OFF after create)
+    spycloud_enabled: bool | None  # production value, informational (Dev SpyCloud stays ON as Leonardo creates it)
     start_date: date
     end_date: date
     production_expiration: date | None

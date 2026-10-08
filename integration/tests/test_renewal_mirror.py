@@ -23,6 +23,8 @@ from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import renewal_mirror as mirror
 from integration.tests.test_leonardo_inventory import page as inventory_page, tenant_row
 
+_REAL_AFTER_CREATE_HOOK = runner._spycloud_after_create  # the mirror tests stub the hook seam; one test uses the real one
+
 TODAY = date(2026, 10, 6)
 NOW = datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc)
 ID = "a" * 24
@@ -419,7 +421,7 @@ class RunMirrorTests(unittest.TestCase):
         self.assertFalse(runner.MIRROR_PATH.exists() or runner.READBACK_PATH.exists())
         self.assertEqual(runner.mirror_write_label(result, False), "not_performed")
 
-    def test_confirm_write_creates_reads_back_records_twice_and_turns_spycloud_off(self):
+    def test_confirm_write_creates_reads_back_and_records_twice(self):
         result = runner.run_renewal_mirror("CO-0900", confirm_write=True)
         self.assertEqual(result, "mirror_created_verified")
         self.assertEqual(self.page.clicked.count("Confirm"), 1)  # clicked exactly once, never retried
@@ -428,8 +430,16 @@ class RunMirrorTests(unittest.TestCase):
         self.assertIs(mirrors["CO-0900"]["mirror_of_production"], True)
         self.assertEqual(mirrors["CO-0900"]["source_prod_id"], "TENANTID00000001")
         self.assertEqual(runner._readback_ids("CO-0900"), (ID, UUID))  # the renewal edit finds the mirror
-        self.assertEqual(self.after_create[0][1:3], ("CO-0900", runner.CASE3_ENGINE))
         self.assertEqual(runner.mirror_write_label(result, True), "verified")
+
+    def test_no_automatic_spycloud_write_after_the_mirror_is_created(self):
+        # Owner 2026-10-08: the real after-create hook is a no-op (SpyCloud stays ON); nothing writes to Leonardo.
+        self.assertIs(runner.SPYCLOUD_AFTER_CREATE_ENABLED, False)
+        with patch.object(runner, "_spycloud_after_create", _REAL_AFTER_CREATE_HOOK), \
+                patch.object(runner, "set_spycloud_off", side_effect=AssertionError("no SpyCloud write")), \
+                patch.object(runner, "run_spycloud_off", side_effect=AssertionError("no SpyCloud write")):
+            self.assertEqual(runner.run_renewal_mirror("CO-0900", confirm_write=True), "mirror_created_verified")
+        self.assertEqual(self.page.clicked.count("Confirm"), 1)  # only the create's own Confirm
 
     def test_no_spycloud_hook_when_the_mirror_has_no_leaked_credentials(self):
         self.write_clone(prod_row(license_={"leakedCredentialsAllowed": False}))

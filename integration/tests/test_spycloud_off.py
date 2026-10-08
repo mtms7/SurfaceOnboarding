@@ -1,4 +1,5 @@
-"""SpyCloud OFF on LC tenants (owner decision 2026-10-05): runner, hook, state file, dashboard, validation.
+"""Manual SpyCloud tool (owner decision 2026-10-08: SpyCloud stays ON; OFF is informational): runner, disabled hook,
+state file, dashboard, validation.
 
 No network, no browser: every page is a recording fake, every file is a temporary one.
 """
@@ -273,7 +274,7 @@ class SetSpycloudOffTests(unittest.TestCase):
                 runner._open_row_action(page, "Tango", hazard)
         self.assertEqual(page.clicked, [])
         source = inspect.getsource(runner)
-        spycloud_block = source[source.index("# --- SpyCloud OFF on Credential"):source.index("# --- Leonardo tenant inventory")]
+        spycloud_block = source[source.index("# --- Manual SpyCloud tool"):source.index("# --- Leonardo tenant inventory")]
         for hazard in HAZARDS:
             self.assertNotIn(hazard + '"', spycloud_block.replace("Delete) is a hazard", ""))
 
@@ -294,6 +295,12 @@ class StateFileTests(unittest.TestCase):
         self.assertEqual({key: value["warning"] for key, value in state.items()}, {"CO-0757": False, "CO-0679": False})
         runner.write_spycloud_state("CO-0762", "spycloud_save_failed", "after_create", now)
         self.assertTrue(json.loads(self.path.read_text(encoding="utf-8"))["CO-0762"]["warning"])
+        # warning = "flag not verified": the expected ON outcome is no warning, only a failure or unknown is
+        self.assertEqual(sorted(runner.SPYCLOUD_OK_OUTCOMES),
+                         ["spycloud_already_off", "spycloud_dry_run_on", "spycloud_off_verified"])
+        self.assertEqual([runner.spycloud_state_of(o) for o in ("spycloud_dry_run_on", "spycloud_already_off",
+                                                              "spycloud_off_verified", "spycloud_save_failed", "x")],
+                         ["on", "off", "off", "unknown", "unknown"])
         self.assertFalse(self.path.with_name(self.path.name + ".tmp").exists())
         for reference, outcome, mode in (("bad", "spycloud_x", "dry_run"), ("CO-0757", "<b>", "dry_run"),
                                          ("CO-0757", "spycloud_x", "live")):
@@ -314,12 +321,12 @@ class AfterCreateHookTests(unittest.TestCase):
     def stored(self):
         return json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else {}
 
-    def test_enabled_by_owner_decision_and_the_switch_still_turns_it_off(self):
-        self.assertIs(runner.SPYCLOUD_AFTER_CREATE_ENABLED, True)  # owner, 2026-10-05
-        with patch.object(runner, "SPYCLOUD_AFTER_CREATE_ENABLED", False), \
-                patch.object(runner, "set_spycloud_off", side_effect=AssertionError("must not run")):
-            self.hook(runner.CE_ENGINE)
-            self.hook(runner.CASE3_ENGINE)
+    def test_disabled_by_owner_decision_no_automatic_write_after_create(self):
+        self.assertIs(runner.SPYCLOUD_AFTER_CREATE_ENABLED, False)  # owner, 2026-10-08: Leonardo's default ON stays
+        with patch.object(runner, "set_spycloud_off", side_effect=AssertionError("must not run")), \
+                patch.object(runner, "run_spycloud_off", side_effect=AssertionError("must not run")):
+            for engine in (runner.CE_ENGINE, runner.CASE3_ENGINE, runner.SURFACE_ENGINE):
+                self.hook(engine)
         self.assertEqual(self.stored(), {})
 
     def test_enabled_runs_on_ce_and_case3_only_never_on_surface_only(self):
@@ -346,7 +353,17 @@ class AfterCreateHookTests(unittest.TestCase):
                 self.hook()
             self.assertEqual(self.stored()["CO-0757"]["outcome"], expected)
             self.assertTrue(self.stored()["CO-0757"]["warning"])
-            self.assertIn(("spycloud_warning", "not_verified_off"), [(e["step"], e["outcome"]) for e in log.events])
+            self.assertIn(("spycloud_warning", "not_verified"), [(e["step"], e["outcome"]) for e in log.events])
+
+    def test_off_is_an_informational_note_never_a_warning(self):
+        log = runner.RunLog("CO-0757", "create")
+        with patch.object(runner, "_log", return_value=log):
+            runner._record_spycloud("CO-0757", "spycloud_already_off", "standalone")
+            runner._record_spycloud("CO-0758", "spycloud_dry_run_on", "dry_run")
+        steps = [e["step"] for e in log.events]
+        self.assertIn("spycloud_note", steps)
+        self.assertNotIn("spycloud_warning", steps)
+        self.assertFalse(self.stored()["CO-0757"]["warning"] or self.stored()["CO-0758"]["warning"])
 
     def test_the_hook_runs_after_the_readback_is_recorded_and_cannot_change_the_result(self):
         source = inspect.getsource(runner._run)
@@ -477,9 +494,10 @@ class ValidationCheckTests(unittest.TestCase):
         for route in (runner.CE_ENGINE, runner.CASE3_ENGINE):
             on = self.spy(runner.validate_row(self.row(True), None, None, route))
             self.assertEqual([(c["check"], c["status"]) for c in on],
-                             [("SpyCloud is ON (owner: must be OFF)", "warn")])
+                             [("SpyCloud is ON (default)", "ok")])
             off = self.spy(runner.validate_row(self.row(False), None, None, route))
-            self.assertEqual([c["status"] for c in off], ["ok"])
+            self.assertEqual([(c["check"], c["status"]) for c in off],
+                             [("SpyCloud is OFF (default is ON)", "warn")])
             unknown = self.spy(runner.validate_row(self.row("yes"), None, None, route))
             self.assertEqual([c["status"] for c in unknown], ["unknown"])
         every = runner.validate_row(self.row(True), None, None, runner.CE_ENGINE)
@@ -494,7 +512,7 @@ class ValidationCheckTests(unittest.TestCase):
         with patch.object(runner, "write_validation", lambda *a, **k: stored.update(checks=a[2])), \
                 patch.object(runner, "write_scan_status"), \
                 patch.object(runner, "_salesforce_primary_user", return_value=None):
-            result = runner._record_validation("CO-0757", runner.CE_ENGINE, self.row(True), None, "", None)
+            result = runner._record_validation("CO-0757", runner.CE_ENGINE, self.row(False), None, "", None)
         self.assertEqual(result, "validation_recorded")
         self.assertIn("warn", {c["status"] for c in stored["checks"]})
 
@@ -512,24 +530,47 @@ class DashboardTests(unittest.TestCase):
     entry = {"outcome": "spycloud_save_failed", "mode": "after_create", "observed_at": "2026-10-05T12:00:00",
              "warning": True}
 
-    def test_warning_is_visible_and_names_the_next_step(self):
+    def test_an_unverified_check_is_visible_and_never_asks_for_off(self):
         self.write({"CO-0757": self.entry})
         card = dashboard._spycloud_section("CO-0757")
-        self.assertIn("SpyCloud still ON — run SpyCloud off", card)
+        self.assertIn("SpyCloud not verified", card)
         self.assertIn("spycloud_save_failed", card)
-        self.assertIn("--spycloud-off --confirm-write", card)
         self.assertIn("/attended/spycloud-check", card)
         self.assertIn("after create", card)
+        self.assertNotIn("run SpyCloud off", card)
+        self.assertNotIn("must be OFF", card)
 
-    def test_verified_off_and_not_checked_states(self):
+    def test_on_is_the_expected_state_and_off_is_informational(self):
+        self.write({"CO-0757": {**self.entry, "outcome": "spycloud_dry_run_on", "warning": False}})
+        on = dashboard._spycloud_section("CO-0757")
+        self.assertIn("SpyCloud is ON (default)", on)
+        self.assertIn("source-ready", on)
+        self.assertNotIn("still ON", on)
+        self.assertNotIn("source-warn", on)
         self.write({"CO-0757": {**self.entry, "outcome": "spycloud_off_verified", "warning": False}})
-        ok = dashboard._spycloud_section("CO-0757")
-        self.assertIn("SpyCloud is OFF", ok)
-        self.assertNotIn("still ON", ok)
-        self.assertNotIn("--confirm-write", ok)
+        off = dashboard._spycloud_section("CO-0757")
+        self.assertIn("SpyCloud is OFF (default is ON)", off)
+        self.assertIn("informational", off)
+        self.assertIn("source-warn", off)
+        self.assertNotIn("still ON", off)
         none = dashboard._spycloud_section("CO-0999")
         self.assertIn("Not checked yet", none)
         self.assertIn("Check SpyCloud (read-only)", none)
+        for card in (on, off, none):
+            self.assertNotIn("must be OFF", card)
+            self.assertNotIn("requires SpyCloud OFF", card)
+            self.assertNotIn("run SpyCloud off", card)
+
+    def test_legacy_records_load_and_derive_their_state_from_the_outcome(self):
+        # Before 2026-10-08 an ON dry run stored warning=True and "ok" meant verified OFF.
+        self.write({"CO-0757": {**self.entry, "outcome": "spycloud_dry_run_on", "mode": "dry_run", "warning": True},
+                    "CO-0758": {**self.entry, "outcome": "spycloud_already_off", "mode": "standalone", "warning": False},
+                    "CO-0759": {**self.entry, "outcome": "spycloud_save_failed", "mode": "after_create"},
+                    "CO-0760": {k: v for k, v in self.entry.items() if k != "warning"}})
+        states = dashboard.attended_spycloud_states()
+        self.assertEqual({r: (s["state"], s["ok"]) for r, s in states.items()},
+                         {"CO-0757": ("on", True), "CO-0758": ("off", True), "CO-0759": ("unknown", False),
+                          "CO-0760": ("unknown", False)})
 
     def test_output_is_escaped_and_malformed_state_is_dropped(self):
         self.write({"CO-0757": {**self.entry, "outcome": "<script>alert(1)</script>"},
@@ -592,19 +633,36 @@ class DashboardTests(unittest.TestCase):
         ce = self.co_page(dashboard.CE_ROUTE_PRODUCT, dashboard.CE_ROUTE_TYPE)
         case3 = self.co_page(dashboard.CASE3_ROUTE_PRODUCT, dashboard.CASE3_ROUTE_TYPE)
         surface = self.co_page(dashboard.SURFACE_ROUTE_PRODUCT, dashboard.SURFACE_ROUTE_TYPE)
-        self.assertIn("SpyCloud still ON", ce)
-        self.assertIn("SpyCloud still ON", case3)
+        self.assertIn("SpyCloud not verified", ce)
+        self.assertIn("SpyCloud not verified", case3)
         self.assertNotIn("spycloud-title", surface)
 
-    def test_validation_card_shows_the_spycloud_warning_without_calling_it_a_difference(self):
-        checks = [{"group": "Settings", "check": "SpyCloud is ON (owner: must be OFF)", "status": "warn"}]
+    def test_pages_show_no_off_banner_or_step_for_on_and_only_a_note_for_off(self):
+        for outcome, banner in (("spycloud_dry_run_on", False), ("spycloud_off_verified", True),
+                                ("spycloud_save_failed", False)):
+            self.write({"CO-0757": {**self.entry, "outcome": outcome, "warning": False}})
+            for product, kind in ((dashboard.CE_ROUTE_PRODUCT, dashboard.CE_ROUTE_TYPE),
+                                  (dashboard.CASE3_ROUTE_PRODUCT, dashboard.CASE3_ROUTE_TYPE)):
+                page = self.co_page(product, kind)
+                with self.subTest(outcome=outcome, product=product):
+                    self.assertEqual("<b>SpyCloud is OFF.</b>" in page, banner)
+                    for text in ("SpyCloud is still ON", "must be OFF", "requires SpyCloud OFF", "Turn SpyCloud OFF",
+                                 "run SpyCloud off", "turns SpyCloud OFF"):
+                        self.assertNotIn(text, page)
+        self.write({})
+        for product, kind in ((dashboard.CE_ROUTE_PRODUCT, dashboard.CE_ROUTE_TYPE),
+                              (dashboard.CASE3_ROUTE_PRODUCT, dashboard.CASE3_ROUTE_TYPE)):
+            self.assertNotIn("Turn SpyCloud OFF", self.co_page(product, kind))
+
+    def test_validation_card_shows_the_spycloud_note_without_calling_it_a_difference(self):
+        checks = [{"group": "Settings", "check": "SpyCloud is OFF (default is ON)", "status": "warn"}]
         entry = {"route": runner.CE_ENGINE, "checks": checks, "plan_note": "", "observed_at": "2026-10-05T12:00:00",
                  "expires_at": "2099-10-05T12:00:00"}
         validation = Path(tempfile.mkdtemp()) / "v.json"
         validation.write_text(json.dumps({"CO-0757": entry}), encoding="utf-8")
         with patch.object(dashboard, "VALIDATION_PATH", validation):
             card = dashboard._validation_section("CO-0757")
-        self.assertIn("SpyCloud is ON (owner: must be OFF)", card)
+        self.assertIn("SpyCloud is OFF (default is ON)", card)
         self.assertIn("Verified, 1 warning(s)", card)
         self.assertNotIn("difference(s) found", card)
 
@@ -631,8 +689,8 @@ class InventoryColumnTests(unittest.TestCase):
                 patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
             page = dashboard.render_inventory()
         self.assertIn("SpyCloud</abbr>", page)
-        self.assertEqual((page.count("<span class='chip chip-warn'>ON</span>"),
-                          page.count("<span class='chip chip-ok'>OFF</span>")), (1, 1))
+        self.assertEqual((page.count("<span class='chip chip-ok'>ON</span>"),
+                          page.count("<span class='chip chip-warn'>OFF</span>")), (1, 1))
         order = [page.index(f"Tenant {n}") for n in (1, 2, 3)]
         self.assertEqual(order, sorted(order))
         self.assertNotIn("<script", page.lower())

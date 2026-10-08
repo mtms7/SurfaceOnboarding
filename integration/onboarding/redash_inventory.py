@@ -47,9 +47,9 @@ UNREPORTED_COLUMNS = frozenset({"accountSubtype"})
 # Known and deliberately not stored (the Leonardo export's allow-list has no such field).
 IGNORED_COLUMNS = frozenset({"leakedCredentialsSettings.spyCloudSettings",
                              "leakedCredentialsSettings.spyCloudSettings.enabled"})
-# Owner decision 2026-10-05: only the ``enabled`` boolean is kept from the SpyCloud settings (see
-# ``leonardo_inventory.spycloud_enabled``). Query 251 returns the object column (or, flattened,
-# its ``.enabled`` column); both are read for that one boolean and nothing else is stored.
+# Owner decisions 2026-10-05 / 2026-10-08 (SpyCloud ON is the default, informational): only the ``enabled``
+# boolean is kept from the SpyCloud settings (see ``leonardo_inventory.spycloud_enabled``).
+# Query 251 returns the object column (or, flattened, its ``.enabled`` column); both are read for that one boolean and nothing else is stored.
 SPYCLOUD_OBJECT_COLUMN = "leakedCredentialsSettings.spyCloudSettings"
 SPYCLOUD_COLUMN = SPYCLOUD_OBJECT_COLUMN + ".enabled"
 KNOWN_COLUMNS = (frozenset(REQUIRED_COLUMNS) | DATE_COLUMNS | INT_COLUMNS | PASSTHROUGH_COLUMNS | LIST_COLUMNS

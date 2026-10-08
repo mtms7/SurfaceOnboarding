@@ -285,7 +285,7 @@ class Case5EditTests(Case5Harness):
         self.assertEqual(self.form["subDomainsNumberAllowed"], True)  # applied and re-read through the form
         self.assertEqual(sorted(after["alternateDomains"]), ["acme.net"])
         self.assertEqual(sorted(after["subDomains"]), ["app.acme.com"])
-        self.assertFalse(after["leakedCredentialsSettings"]["spyCloudSettings"]["enabled"])  # preserved; the OFF step follows
+        self.assertFalse(after["leakedCredentialsSettings"]["spyCloudSettings"]["enabled"])  # preserved; no SpyCloud step follows (2026-10-08)
         self.assertEqual(self.applied[0].kind, "checkbox")  # checkboxes first
 
     def test_a_row_that_reports_the_duration_and_the_subdomains_flag_is_compared_with_the_row(self):
@@ -468,14 +468,13 @@ class MirrorAndOrchestratorTests(RunnerSandbox):
         self.assertEqual(runner.renewal_domains_check(case5_source(), before)["result"], "match")
         self.assertEqual(added, {"acme.net", "app.acme.com"})
 
-    def test_spycloud_off_runs_after_a_case_5_renewal_and_the_route_is_accepted(self):
-        self.assertIn(ENGINE, runner.SPYCLOUD_MIRROR_ROUTES)
+    def test_no_spycloud_step_after_a_case_5_renewal_but_the_manual_tool_accepts_the_route(self):
+        self.assertIn(ENGINE, runner.SPYCLOUD_MIRROR_ROUTES)  # the manual --spycloud-off tool may still target it
         self.source = SimpleNamespace(source_revision=REV, engine=ENGINE)
         self.stub()
         runner.record_runner_start(REF, REV, "2026-10-07T09:00:00", route=ENGINE)
         self.assertEqual(runner.run_renewal_onboarding(REF, REV), "renewal_edit_verified")
-        self.assertEqual(self.steps(), ["dry", "outcome", "apply", "outcome", "spycloud"])
-        self.assertEqual(self.calls[-1], ("spycloud", REF, True))
+        self.assertEqual(self.steps(), ["dry", "outcome", "apply", "outcome"])  # SpyCloud stays ON (owner 2026-10-08)
 
     def test_the_spycloud_mirror_target_accepts_a_case_5_co(self):
         record = {REF: {"mirror_of_production": True, "status": "verified"}}

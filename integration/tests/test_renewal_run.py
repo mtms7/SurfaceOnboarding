@@ -1,6 +1,6 @@
 """Renewals run from the dashboard (owner decision 2026-10-07, reverses "renewals CLI-only").
 
-The orchestrated runner mode (mirror if needed, dry run, apply, SpyCloud OFF), the runner-state bookkeeping, and the
+The orchestrated runner mode (mirror if needed, dry run, apply; no SpyCloud step, owner 2026-10-08), the runner-state bookkeeping, and the
 dashboard's Start renewal route with its guards. Local only: every browser-facing function is stubbed and every state
 file is a temporary one; nothing reaches Salesforce, Leonardo, Redash, or the network.
 """
@@ -43,7 +43,7 @@ class RunnerSandbox(unittest.TestCase):
         self.source = SimpleNamespace(source_revision=REV, engine=ENGINE)
 
     def stub(self, *, mirror_verified=True, mirror="mirror_created_verified", dry=("renewal_dry_run_planned", {}),
-             apply=("renewal_edit_verified", {}), spy="spycloud_off_verified", source=None):
+             apply=("renewal_edit_verified", {}), source=None):
         calls = self.calls
         enter = self.stack.enter_context
         if isinstance(source, Exception):
@@ -63,7 +63,7 @@ class RunnerSandbox(unittest.TestCase):
 
         def run_spy(reference, **kwargs):
             calls.append(("spycloud", reference, kwargs.get("confirm_write")))
-            return spy
+            raise AssertionError("a renewal run must never touch SpyCloud")
 
         enter(patch.object(runner, "run_renewal_mirror", side_effect=run_mirror))
         enter(patch.object(runner, "run_renewal", side_effect=run_renewal))
@@ -90,7 +90,7 @@ class OrchestratorTests(RunnerSandbox):
         self.stub(mirror_verified=False)
         self.start_record()
         self.assertEqual(runner.run_renewal_onboarding(REF, REV), "renewal_edit_verified")
-        self.assertEqual(self.steps(), ["mirror", "dry", "outcome", "apply", "outcome", "spycloud"])
+        self.assertEqual(self.steps(), ["mirror", "dry", "outcome", "apply", "outcome"])
         self.assertEqual(self.calls[0], ("mirror", REF, True))
         self.assertEqual((self.calls[1][2], self.calls[3][2]), (REV, REV))  # both pass the acknowledged revision
         self.assertEqual(self.record()["result"], "renewal_edit_verified")
@@ -99,7 +99,7 @@ class OrchestratorTests(RunnerSandbox):
         self.assertEqual(run["mode"], "renewal_run")
         self.assertEqual(events, [("source", "ok"), ("mirror", "mirror_created_verified"),
                                   ("renewal_dry_run", "renewal_dry_run_planned"),
-                                  ("renewal_apply", "renewal_edit_verified"), ("spycloud", "spycloud_off_verified"),
+                                  ("renewal_apply", "renewal_edit_verified"),
                                   ("finish", "renewal_edit_verified")])
 
     def window_source(self, apply_from):
@@ -119,14 +119,14 @@ class OrchestratorTests(RunnerSandbox):
                     self.stack = stack
                     outcome, log = self.run_steps(env, self.window_source("2026-10-20"))
                 self.assertEqual(outcome, ("renewal_not_yet_applicable", ""))
-                self.assertEqual(self.steps(), [])  # no mirror, no dry run, no apply, no SpyCloud
+                self.assertEqual(self.steps(), [])  # no mirror, no dry run, no apply
                 self.assertIn(("apply_window", "renewal_not_yet_applicable"), [(e["step"], e["outcome"]) for e in log.events])
 
     def test_dev_is_exempt_and_production_on_or_after_apply_from_proceeds(self):
         with patch.object(runner, "_run_day", return_value=date(2026, 10, 6)):
             outcome, _log = self.run_steps("dev", self.window_source("2026-10-20"))
             self.assertEqual(outcome, ("renewal_edit_verified", ""))
-            self.assertEqual(self.steps(), ["mirror", "dry", "outcome", "apply", "outcome", "spycloud"])
+            self.assertEqual(self.steps(), ["mirror", "dry", "outcome", "apply", "outcome"])
             self.calls.clear()
             with contextlib.ExitStack() as stack:
                 self.stack = stack
@@ -219,19 +219,16 @@ class OrchestratorTests(RunnerSandbox):
         self.assertNotIn("uncertain", self.record())
         self.assertTrue(runner.reset_runner_record(REF))  # nothing pending: Reset re-arms it
 
-    def test_spycloud_failure_is_a_warning_only(self):
-        self.stub(spy="spycloud_row_ambiguous")
+    def test_a_renewal_never_touches_spycloud_and_the_result_is_unchanged(self):
+        # Owner 2026-10-08: Leonardo's default (ON) stays after a renewal; no automatic write, no SpyCloud log event.
+        self.stub()
         self.start_record()
         self.assertEqual(runner.run_renewal_onboarding(REF, REV), "renewal_edit_verified")
-        self.assertIn(("spycloud_warning", "not_verified_off"), self.log_events()[1])
+        self.assertNotIn("spycloud", self.steps())  # run_spycloud_off (stubbed to raise) was never called
+        events = self.log_events()[1]
+        self.assertFalse([step for step, _outcome in events if step.startswith("spycloud")])
         self.assertEqual(self.record()["result"], "renewal_edit_verified")
-
-    def test_spycloud_exception_never_changes_the_result(self):
-        self.stub()
-        with patch.object(runner, "run_spycloud_off", side_effect=RuntimeError("boom")):
-            self.start_record()
-            self.assertEqual(runner.run_renewal_onboarding(REF, REV), "renewal_edit_verified")
-        self.assertIn(("spycloud", "spycloud_hook_error"), self.log_events()[1])
+        self.assertNotIn("uncertain", self.record())
 
     def test_source_failures_stop_before_any_browser_step(self):
         self.stub(source=runner.SurfaceSourceError("renewal_not_approved"))
