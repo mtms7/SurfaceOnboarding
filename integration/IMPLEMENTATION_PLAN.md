@@ -1514,3 +1514,26 @@ Superseded by "End of day 2026-10-06" below.
 - **Owner decisions:** `DONE_WITH_ERRORS` = finished, with an amber warning on the scan card (`b3047de`; stored older reads are re-derived). Scan card headline = **total of all scan durations** (settles scan-status decision b: sum), each scan listed with its duration and finished / finished with errors / running (`610f780`). CO-0767: total 07:35:46 (07:27:27 finished with errors, 00:08:18 finished).
 - **CO search** (`ecdcb99`): sidebar search on every page; a CO number in any form (`CO-0767`, `co 767`, `767`) opens `/co/<CO>`; other text lists matches (CO, account, tenant name, domain) from the open queue, local run records and Onboarded on Dev (History holds counts only, so it is not searchable). No new Salesforce query.
 - 1418 integration tests OK, 1 skipped; both guards pass; no real state file changed during test runs. Restart the dashboard to see all of it.
+
+#### Handoff for 2026-10-08 (latest; continue here)
+
+**Since the 2026-10-07 addendum (all local unless stated):**
+- **CI fix** (`78dfa76`, pushed): GitHub Actions "Integration scaffold checks" failed on plain Python (no Playwright). `integration/tests/__init__.py` now registers a placeholder `playwright.sync_api` (sync_playwright refuses to run) only when the package is missing. Verified locally: 1418 OK with the system Python (CI-like) and the project runtime. **Run #28's result (green/red) is not yet confirmed by the operator.** `gh` CLI is not installed, so the assistant cannot read Actions.
+- **VM team-access plan** `docs/40_VM_TEAM_ACCESS_DEPLOYMENT_PLAN_2026-10-07.md` (proposal; `aaf9a67` pushed). Owner answers recorded in its §8 (`f0b0c98`, `9fe6a3e`): port **8443** (`https://172.26.37.20:8443/`, like the Pentera appliance at `https://172.26.37.12:8181/login`); **self-signed** certificate for the pilot; allow-list = **owner only** first, **john.ostrander@pentera.io added later as operator**; **phase 1** = read-only VM, runs from the owner's Windows desktop; **VM-local proxy** (nginx + oauth2-proxy + OneLogin). SecOps / OneLogin admin / Salesforce admin / Operations approvals in docs/40 §7 are still required — the owner answers do not replace them. Existing Salesforce read approval covers CO-0717 only (team dashboard needs a new fixed-query approval).
+- **Step 0 built** (merge of `90479fb`; VM mode only, desktop unchanged): trusted `X-Forwarded-Email` from a loopback peer in VM mode; allow-list/operators via `SURFACE_ONBOARDING_ALLOWED_USERS` / `SURFACE_ONBOARDING_OPERATORS` (+ `_FILE`), fail closed; viewers GET-only; operators only the local mark/confirm and read-only POSTs; every run-starting / Salesforce-writing POST refused on the VM; HTTPS origin check against `SURFACE_ONBOARDING_PUBLIC_ORIGIN`; Secure cookies; state under `SURFACE_ONBOARDING_STATE_DIR` (`/var/lib/surface-onboarding`) via `integration/onboarding/state_paths.py`; review-only artifacts in `integration/deployment/vm_pilot/` (nginx, oauth2-proxy, systemd units, allow-list/operator templates, README with self-signed cert and firewall text; stored LF). Tests: 1453 OK, 1 skipped, under both the project runtime and the CI-like system Python; guards pass; no real state file changed. Full run now takes ~140 s (new server tests).
+
+**Not pushed:** `f0b0c98`, `9fe6a3e`, the step 0 merge (operator did not push after the last output).
+
+**Must be fixed before any VM install (step 0 follow-ups):**
+1. **Local header forging:** any shell user on the VM can reach `127.0.0.1:8000` and send `X-Forwarded-Email`. Recommended: a shared secret between oauth2-proxy and the dashboard (or a Unix socket owned by the proxy group). Build this next.
+2. Review/validate the oauth2-proxy, nginx and systemd templates on Linux (syntax untested).
+3. The allow-list lives in two places (oauth2-proxy file and dashboard env/file) — keep identical or derive one from the other.
+4. Smaller: viewers still see action buttons (clicks are refused); oauth2-proxy needs outbound HTTPS to OneLogin (name it in the SecOps request); Redash collector key is Windows DPAPI (stays desktop); inventory page text still mentions `%LOCALAPPDATA%`.
+
+**Start tomorrow with (in order):**
+1. Operator: confirm Actions run #28 (✓/✗); if red, paste the failing test names. Then `git push origin main`.
+2. Assistant: step 0 follow-up 1 (shared-secret proxy → dashboard), then template review (2) and single allow-list source (3).
+3. Operator: send approval requests per docs/40 §7 steps 1–3 (VM/SecOps placement + port 8443 + firewall; OneLogin app + allow-list; self-signed certificate acceptance) and the new Salesforce read-scope request. The assistant can draft them on request.
+4. Onboarding work (from the 2026-10-07 end-of-day list): restart the dashboard and review the layout; CO-0767 "Confirm user created"; Case 4 Start renewal on CO-0758 (owner go); Case 5 on the first real Case 5 CO; review `/prod` readiness.
+
+**Boundaries preserved:** no VM, proxy, firewall, OneLogin, Salesforce write, Redash change or production access. Pushes this evening were operator-requested (`98bfc50..78dfa76`, `78dfa76..aaf9a67`). No credential, token, cookie, MFA value or raw payload was copied, logged or persisted.
