@@ -9,8 +9,31 @@ copies some runner paths at import time.
 
 import atexit
 import shutil
+import sys
 import tempfile
+import types
 from pathlib import Path
+
+# CI (plain Python, 2026-10-07) has no Playwright package. The tests never start a real browser (they patch in
+# fakes), but some patch "playwright.sync_api.sync_playwright" and the runner imports it before its pre-browser
+# gates. Without the package those tests failed only on CI. A placeholder module whose sync_playwright refuses to
+# run keeps the tests identical everywhere; where Playwright is installed nothing changes.
+try:
+    import playwright.sync_api  # noqa: F401
+except ModuleNotFoundError:
+    def _no_browser_in_tests(*_args, **_kwargs):
+        raise RuntimeError("playwright_not_installed_in_tests")
+
+    import importlib.machinery
+
+    _package = types.ModuleType("playwright")
+    _package.__spec__ = importlib.machinery.ModuleSpec("playwright", None)  # preflight uses importlib find_spec
+    _sync_api = types.ModuleType("playwright.sync_api")
+    _sync_api.__spec__ = importlib.machinery.ModuleSpec("playwright.sync_api", None)
+    _sync_api.sync_playwright = _no_browser_in_tests
+    _package.sync_api = _sync_api
+    sys.modules.setdefault("playwright", _package)
+    sys.modules.setdefault("playwright.sync_api", _sync_api)
 
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="surface_test_state_"))
 atexit.register(shutil.rmtree, _STATE_DIR, True)
