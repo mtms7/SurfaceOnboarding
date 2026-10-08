@@ -1,0 +1,77 @@
+# REVIEW ARTIFACT - not installed; needs approvals per docs/40 section 7.
+# nginx site for the VM team-access pilot (docs/40, owner answers 2026-10-07: port 8443, self-signed for now,
+# VM-local project-run proxy). Placeholders only: no certificate, key, client credential, or cookie key is in this file.
+# Install path (after approval): /etc/nginx/sites-available/surface-onboarding.conf (own non-login nginx user).
+
+# Per-client request limits (no request body of any size is expected from this dashboard).
+limit_req_zone $binary_remote_addr zone=surface_onboarding:2m rate=10r/s;
+
+server {
+    # Bound to the VM address only. Plain HTTP is NOT bound anywhere (no port 80/redirect server).
+    listen 172.26.37.20:8443 ssl;
+    server_name 172.26.37.20;      # replace with the DNS name once an internal-CA certificate exists
+
+    server_tokens off;
+
+    # Pilot: self-signed certificate (generation command: see README.md). Paths are placeholders.
+    ssl_certificate     /etc/nginx/surface-onboarding/tls/surface-onboarding.crt;
+    ssl_certificate_key /etc/nginx/surface-onboarding/tls/surface-onboarding.key;   # mode 0640 root:nginx
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 10m;
+    ssl_session_tickets off;
+
+    # HSTS intentionally OFF for the self-signed pilot: a pinned HSTS policy on an IP/self-signed certificate
+    # would lock browsers out when the certificate is replaced. Enable (max-age=31536000) only with an internal-CA
+    # certificate for a DNS name:
+    # add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # Security headers. The dashboard sends its own CSP, X-Frame-Options, X-Content-Type-Options and Referrer-Policy;
+    # they are hidden from the upstream response and set once here so each appears exactly once.
+    proxy_hide_header X-Powered-By;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header Referrer-Policy;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "same-origin" always;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+    add_header Cache-Control "no-store" always;
+    # The dashboard's own Content-Security-Policy header passes through unchanged.
+
+    client_max_body_size 64k;
+    limit_req zone=surface_onboarding burst=40 nodelay;
+
+    # Only the methods the dashboard uses.
+    if ($request_method !~ ^(GET|HEAD|POST)$) {
+        return 405;
+    }
+
+    location / {
+        # oauth2-proxy (127.0.0.1:4180) authenticates with OneLogin, then forwards to the dashboard
+        # (http://127.0.0.1:8000) with the verified e-mail in X-Forwarded-Email.
+        proxy_pass http://127.0.0.1:4180;
+
+        # Strip every client-supplied identity / role / forwarding header; oauth2-proxy sets the verified ones.
+        proxy_set_header X-Forwarded-Email        "";
+        proxy_set_header X-Forwarded-User         "";
+        proxy_set_header X-Forwarded-Groups       "";
+        proxy_set_header X-Forwarded-Preferred-Username "";
+        proxy_set_header X-Auth-Request-Email     "";
+        proxy_set_header X-Auth-Request-User      "";
+        proxy_set_header X-Auth-Request-Groups    "";
+        proxy_set_header X-Surface-Role           "";
+
+        # The dashboard accepts only exactly the public host:port (SURFACE_ONBOARDING_PUBLIC_ORIGIN).
+        proxy_set_header Host              $http_host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_http_version 1.1;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    120s;
+        proxy_redirect off;
+    }
+}

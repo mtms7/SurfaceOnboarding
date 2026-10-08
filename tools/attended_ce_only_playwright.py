@@ -64,6 +64,8 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
+
 REFERENCE = re.compile(r"CO-[0-9]{4,10}$")
 DEVELOPMENT_LOGIN = "https://leonardo.dev.app.pentera.io/login"
 TENANT_MANAGEMENT = "https://leonardo.dev.app.pentera.io/backoffice/tenantManagement"
@@ -86,15 +88,15 @@ PROFILE_REMOVE_ATTEMPTS = 5
 ANCHOR_TAB_URL = "about:blank"
 CDP_TARGET_ID = re.compile(r"[A-Za-z0-9-]{1,128}")
 CDP_BROWSER_WS_PATH = re.compile(r"/devtools/browser/[A-Za-z0-9-]{1,128}")
-RUNNER_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_runner_state.json"
+RUNNER_STATE_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_runner_state.json")
 # Latest read-only check per CO (duplicate check / readback): local evidence
 # for the dashboard only; it never gates or consumes a create run.
-CHECK_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_check_state.json"
+CHECK_STATE_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_check_state.json")
 DEV_MIRROR_SKIP_REASON = "dev_mirror_skipped"  # same code as integration.onboarding.renewal_mirror
 CHECK_KINDS = frozenset({"duplicate_check", "production_duplicate", "readback", "scan_status", "validation"})
-READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
+READBACK_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json")
 # Surface-only scan observations (plan §5: Surface-owned, short-lived, never in Salesforce).
-SCAN_STATUS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_status.json"
+SCAN_STATUS_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_scan_status.json")
 SCAN_STATUS_TTL = timedelta(hours=6)
 # lastScanStatusEnum values whose meaning has been confirmed from a live read.
 # Empty until the first live sweep is reviewed: until then a set status shows
@@ -108,9 +110,9 @@ SCAN_STATUS_ENUM_PATTERN = r"[A-Za-z][A-Za-z0-9_]{0,39}"
 # Surface validation (2026-10-02): checks of a tenant's own search row against
 # the route plan. Values are kept only for booleans, enums, numbers, and dates;
 # names, domains, and emails are reduced to ok/drift plus counts.
-VALIDATION_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_surface_validation.json"
+VALIDATION_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_surface_validation.json")
 VALIDATION_TTL = timedelta(hours=6)
-DIAGNOSTICS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_diagnostics.json"
+DIAGNOSTICS_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_diagnostics.json")
 READBACK_SOURCE = "Leonardo Development Details readback"
 READBACK_STATE = "Account Scanning"
 SURFACE_ACCOUNT_ID_PATTERN = r"[A-Za-z0-9]{16,64}"
@@ -224,7 +226,7 @@ ADVANCED_TOGGLES_OFF = (
     "staticOutboundIpEnabled", "aiEnabled", "multipleAttackStacksEnabled",
 )
 ADVANCED_EXPAND_POLLS = 20  # x 100 ms
-RUN_LOG_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_run_log.json"
+RUN_LOG_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_run_log.json")
 RUN_LOG_MAX_EVENTS = 700
 # Diagnose timeline: which run-log steps trigger a Confirm/state snapshot.
 TIMELINE_STEP_PREFIXES = ("add_account_open", "fill_", "absent_toggle", "advanced_options", "max_scan_duration",
@@ -6050,7 +6052,7 @@ SPYCLOUD_ADVANCED_TEXT = "Advanced options"
 SPYCLOUD_EDIT_PATH = re.compile(r"/api/v1/backoffice/account/([A-Za-z0-9_-]{1,64})/edit")
 SPYCLOUD_EDIT_TIMEOUT_MS = 30_000
 SPYCLOUD_ROUTES = frozenset({CE_ENGINE, CASE3_ENGINE})  # Credential Exposure routes; the Surface-only route never
-SPYCLOUD_STATE_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_spycloud.json"
+SPYCLOUD_STATE_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_spycloud.json")
 SPYCLOUD_OK_OUTCOMES = frozenset({"spycloud_off_verified", "spycloud_already_off"})
 # The only row-menu items this runner may click (Details: scan status; Edit: SpyCloud). Everything else
 # in that menu (_Access, _Scan_Now, _Stop_Scan, _Delete) is a hazard.
@@ -7165,7 +7167,7 @@ def renewal_write_label(result: str, confirm_write: bool) -> str:
 
 # Latest outcome of each --renew run per CO (dry run or confirm-write), for the dashboard's CO page. Codes, dates,
 # counts and the Dev tenant id only (the id the readback store already holds); no names, domains, emails or payloads.
-RENEWAL_OUTCOMES_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_renewal_outcomes.json"
+RENEWAL_OUTCOMES_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_renewal_outcomes.json")
 RENEWAL_OUTCOME_MODES = ("dry_run", "confirm_write")
 RENEWAL_WRITE_LABELS = ("verified", "attempted_unverified", "not_performed")
 RENEWAL_OUTCOME_CODE = re.compile(r"[a-z0-9_]{1,64}")
@@ -7943,7 +7945,7 @@ def _record_check(reference: str, kind: str, result: str, detail: str = "") -> N
 # The mirror is recorded in integration/attended_renewal_mirrors.json AND in the standard readback store so
 # the renewal edit can find it with _readback_ids. Salesforce is never written. Selectors are the ones the
 # create path already uses; the mirror flow itself has not run live.
-MIRROR_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_renewal_mirrors.json"
+MIRROR_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_renewal_mirrors.json")
 MIRROR_ENGINE = "renewal_mirror"
 # Outcomes reached after Confirm was (or may have been) clicked: the tenant may exist, unverified.
 MIRROR_AFTER_CONFIRM_RESULTS = frozenset({

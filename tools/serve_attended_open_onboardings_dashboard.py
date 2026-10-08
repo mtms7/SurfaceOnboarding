@@ -39,6 +39,8 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory
+from integration.onboarding import state_paths
+from integration.onboarding.state_paths import state_file
 from integration.onboarding.dev_onboarded import dev_onboarded_evidence, dev_status
 from integration.onboarding.renewal_mirror import mirror_tenant_ids
 from integration.onboarding import session_readiness as readiness
@@ -115,15 +117,15 @@ DETAIL_DISPLAY_FIELDS = (
     ("Onboarding Comments", "Onboarding_Comments__c"), ("Onboarding Stage", "Onboarding_Stage__c"),
     ("Surface Account ID", "Surface_Account_ID__c"), ("Account UUID", "Account_UUID__c"),
 )
-ATTENDED_LEONARDO_READBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json"
+ATTENDED_LEONARDO_READBACK_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_leonardo_readbacks.json")
 ATTENDED_CE_ONLY_RUNNER = Path(__file__).resolve().with_name("attended_ce_only_playwright.py")
 # Local operator acknowledgements for post-onboarding reminders (gitignored).
 # It never drives Leonardo or Salesforce; it only hides a reminder.
-ATTENDED_REMINDERS_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_scan_reminders.json"
+ATTENDED_REMINDERS_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_scan_reminders.json")
 REMINDER_FIELDS = {"scan_settings_off": "scan_settings_off_on", "ce_enabled": "ce_enabled_on",
                    "operator_assigned": "operator_assigned_on"}
 # Manual "User created" confirmation (gitignored): {CO: {confirmed, confirmed_on, confirmed_by}}; no names or emails.
-USER_CREATED_CONFIRMATION_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_user_created_confirmations.json"
+USER_CREATED_CONFIRMATION_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_user_created_confirmations.json")
 LEONARDO_READBACK_STATES = frozenset({"Account Scanning", "No scan started"})
 CASE4_PRODUCT = "Surface & Credential Exposure"
 CASE4_TYPE = "Renewal of Surface + New Credential Exposure Module"
@@ -1432,7 +1434,7 @@ ID_WRITEBACK_ACK_TTL_SECONDS = 10 * 60
 # This replaces pilot decision (b). The guarded write path stays tested but off.
 ID_WRITEBACK_ENABLED = False
 ID_ENVIRONMENT_LABEL = "dev"
-ID_WRITEBACK_PATH = Path(__file__).resolve().parents[1] / "integration" / "attended_salesforce_id_writebacks.json"
+ID_WRITEBACK_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_salesforce_id_writebacks.json")
 ID_VALUE_PATTERNS = {"Surface_Account_ID__c": r"[a-f0-9]{24}", "Account_UUID__c": r"[a-f0-9]{32}"}
 _id_writeback_acks: dict[str, tuple[str, str, float]] = {}
 _id_writeback_lock = Lock()
@@ -5112,6 +5114,9 @@ def _operator_block() -> str:
     operator = _current_operator.get()
     if not operator:
         return ""
+    if vm_mode():
+        return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
+                "<br><a href='" + VM_SIGN_OUT_PATH + "'>Sign out</a></div>")
     return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
             "<form method='post' action='/logout'><button class='ghost' type='submit'>Sign out</button></form></div>")
 
@@ -6539,6 +6544,95 @@ LOGIN_REASON_TEXT = {
 }
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# VM team-access mode (docs/40 step 0, owner go 2026-10-07). Everything below is active ONLY when
+# SURFACE_ONBOARDING_RUNTIME=vm; the desktop keeps its Salesforce-SSO login, loopback-only origin checks and
+# cookies exactly as before.
+#
+# Identity: oauth2-proxy (behind nginx) authenticates the person with OneLogin and passes the verified e-mail in
+# PROXY_IDENTITY_HEADER. The dashboard trusts that header only when the TCP peer is loopback (the proxy on the
+# same host) and exactly one well-formed value is present; from any other peer, or in desktop mode, it is ignored.
+# Authorization: SURFACE_ONBOARDING_ALLOWED_USERS (+ _FILE) is the allow-list; SURFACE_ONBOARDING_OPERATORS
+# (+ _FILE) is the subset that may POST. An unknown user gets 403. Phase 1 (docs/40 section 4) is read-only on
+# the VM: every POST that launches the runner/browser or writes Salesforce stays refused for every role.
+# ---------------------------------------------------------------------------------------------------------------
+PROXY_IDENTITY_HEADER = "X-Forwarded-Email"
+TRUSTED_PROXY_PEERS = frozenset({"127.0.0.1", "::1"})
+ALLOWED_USERS_ENV = "SURFACE_ONBOARDING_ALLOWED_USERS"
+ALLOWED_USERS_FILE_ENV = "SURFACE_ONBOARDING_ALLOWED_USERS_FILE"
+OPERATORS_ENV = "SURFACE_ONBOARDING_OPERATORS"
+OPERATORS_FILE_ENV = "SURFACE_ONBOARDING_OPERATORS_FILE"
+PUBLIC_ORIGIN_ENV = "SURFACE_ONBOARDING_PUBLIC_ORIGIN"
+ROLE_VIEWER = "viewer"
+ROLE_OPERATOR = "operator"
+VM_SIGN_OUT_PATH = "/oauth2/sign_out"  # served by oauth2-proxy, not by this dashboard
+PROXY_EMAIL = re.compile(r"[a-z0-9._%+'-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,24}")
+# Phase 1 (read-only VM): the only POSTs an operator may use. They are local acknowledgements (no browser, no
+# Leonardo, no Salesforce write) and read-only checks. Everything else (runner starts, Leonardo sessions and
+# checks, validation/scan/inventory sweeps, SpyCloud, renewal, Salesforce comment/id writes, runner reset,
+# sign-in/out) is refused for every role.
+VM_OPERATOR_POSTS = frozenset({
+    "/attended/mark-scan-settings-off", "/attended/mark-ce-enabled", "/attended/mark-operator-assigned",
+    "/attended/confirm-user-created", "/attended/unconfirm-user-created",
+    "/attended/duplicate-precheck", "/attended/rerun-ce-only-fill-preflight", "/attended/rerun-co0702-fill-preflight",
+})
+
+
+def vm_mode() -> bool:
+    return os.environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop").casefold() == "vm"
+
+
+def cookie_attributes() -> str:
+    """Attributes for every cookie this dashboard sets: ``Secure`` is added in VM mode (HTTPS only)."""
+    return "; HttpOnly; SameSite=Strict" + ("; Secure" if vm_mode() else "")
+
+
+def _email_set(env_name: str, file_env_name: str) -> frozenset[str]:
+    """Lower-cased e-mails from a comma/space separated variable plus an optional one-per-line file (# comments).
+
+    Fail closed: an unreadable file contributes nothing (so a missing allow-list admits nobody).
+    """
+    values = [item for item in re.split(r"[,\s]+", os.environ.get(env_name, "")) if item]
+    path = os.environ.get(file_env_name, "").strip()
+    if path:
+        try:
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    values.append(line)
+        except (OSError, UnicodeError):
+            pass
+    return frozenset(item.strip().lower() for item in values if PROXY_EMAIL.fullmatch(item.strip().lower()))
+
+
+def proxy_identity(peer: str | None, header_values: list[str]) -> str | None:
+    """The proxy-asserted e-mail, or None. Only in VM mode, only from a loopback peer, only exactly one valid value."""
+    if not vm_mode() or peer not in TRUSTED_PROXY_PEERS or len(header_values) != 1:
+        return None
+    value = header_values[0].strip().lower()
+    return value if PROXY_EMAIL.fullmatch(value) else None
+
+
+def vm_role(email: str | None) -> str | None:
+    """``operator`` / ``viewer`` for an allow-listed e-mail, else None (unknown user). Operators must also be allowed."""
+    if not email:
+        return None
+    email = email.strip().lower()
+    if email not in _email_set(ALLOWED_USERS_ENV, ALLOWED_USERS_FILE_ENV):
+        return None
+    return ROLE_OPERATOR if email in _email_set(OPERATORS_ENV, OPERATORS_FILE_ENV) else ROLE_VIEWER
+
+
+def configured_public_origin() -> tuple[str | None, bool]:
+    """(origin, valid): the one https origin the VM answers for. (None, True) when unset; (None, False) when malformed."""
+    raw = os.environ.get(PUBLIC_ORIGIN_ENV, "").strip().lower()
+    if not raw:
+        return None, True
+    if re.fullmatch(r"https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?", raw):
+        return raw, True
+    return None, False
+
+
 def login_required() -> bool:
     """Every desktop dashboard page and action needs a signed-in operator (the VM keeps its own identity gate)."""
     return os.environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop").casefold() == "desktop"
@@ -6781,7 +6875,7 @@ REFERRER_POLICY = "same-origin"
 
 
 def request_origin_problem(command: str, host: str | None, origin: str | None, fetch_site: str | None,
-                           port: int) -> str | None:
+                           port: int, referer: str | None = None) -> str | None:
     """Why a request must be refused before any handler runs, else None (review item 6, 2026-10-01).
 
     The Host header must be this dashboard's own loopback address (blocks DNS
@@ -6791,7 +6885,33 @@ def request_origin_problem(command: str, host: str | None, origin: str | None, f
     them on a cross-site form post; a local script that sends neither is not
     a cross-site page. SURFACE_ONBOARDING_ALLOWED_HOSTS adds exact host:port
     values (for example an SSH-tunnel port), comma-separated.
+
+    VM mode with SURFACE_ONBOARDING_PUBLIC_ORIGIN (docs/40 step 0): behind the HTTPS proxy the forwarded Host must
+    be exactly the public host[:port] and a POST's Origin (or, without one, Referer) exactly the public origin;
+    nothing else is accepted (a malformed setting refuses everything). Desktop and an unset origin: unchanged.
     """
+    if vm_mode():
+        public, valid = configured_public_origin()
+        if not valid:
+            return "public_origin_invalid"
+        if public is not None:
+            if (host or "").strip().lower() != public[len("https://"):]:
+                return "host_not_allowed"
+            if command == "POST":
+                def from_public(value: str) -> bool:
+                    value = value.strip().lower()
+                    return value == public or value.startswith(public + "/")
+                if origin is not None:
+                    if origin.strip().lower() != public:
+                        return "origin_not_allowed"
+                    if referer is not None and not from_public(referer):
+                        return "origin_not_allowed"
+                elif referer is not None:
+                    if not from_public(referer):
+                        return "origin_not_allowed"
+                elif fetch_site is not None and fetch_site.strip().lower() not in ("same-origin", "none"):
+                    return "cross_site_post"
+            return None
     allowed = {f"127.0.0.1:{port}", f"localhost:{port}"}
     allowed |= {item.strip().lower() for item in os.environ.get("SURFACE_ONBOARDING_ALLOWED_HOSTS", "").split(",") if item.strip()}
     if (host or "").strip().lower() not in allowed:
@@ -6807,12 +6927,44 @@ def request_origin_problem(command: str, host: str | None, origin: str | None, f
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args: object) -> None: pass
+    vm_email: str | None = None
+
+    def _vm_identity(self) -> tuple[str | None, str | None]:
+        """(proxy-asserted e-mail, role) in VM mode; (None, None) when the header is absent, malformed, or untrusted."""
+        email = proxy_identity(self.client_address[0] if self.client_address else None,
+                               list(self.headers.get_all(PROXY_IDENTITY_HEADER) or []))
+        return email, vm_role(email)
+
+    def _vm_refuse(self, status: HTTPStatus, title: str, message: str) -> None:
+        # Consume a small unread request body first so the refusal is not lost to a connection reset.
+        try:
+            unread = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            unread = 0
+        if 0 < unread <= 65536:
+            self.rfile.read(unread)
+        else:
+            self.close_connection = True
+        self.send_page(status, "<!doctype html><title>" + escape(title) + "</title><p>" + escape(message) + "</p>")
+
+    def _vm_identity_refusal(self, email: str | None) -> None:
+        if email is None:
+            self._vm_refuse(HTTPStatus.FORBIDDEN, "Sign-in required",
+                            "No verified sign-in reached the dashboard. Open it through the single sign-on address.")
+        else:
+            self._vm_refuse(HTTPStatus.FORBIDDEN, "Access not granted",
+                            "This account is not on the dashboard allow-list. Ask the owner to add it.")
+
+    def request_operator(self) -> str | None:
+        """The identity to record in audit fields: the proxy e-mail on the VM, else the desktop session operator."""
+        return self.vm_email if vm_mode() else dashboard_operator(self.headers.get("Cookie"))
     def parse_request(self) -> bool:
         """Refuse foreign Host / cross-site POST requests before any page or action runs."""
         if not super().parse_request():
             return False
         problem = request_origin_problem(self.command, self.headers.get("Host"), self.headers.get("Origin"),
-                                         self.headers.get("Sec-Fetch-Site"), self.server.server_address[1])
+                                         self.headers.get("Sec-Fetch-Site"), self.server.server_address[1],
+                                         self.headers.get("Referer"))
         if problem is not None:
             self.send_error(HTTPStatus.FORBIDDEN, "Request refused")
             return False
@@ -6853,22 +7005,33 @@ class Handler(BaseHTTPRequestHandler):
         if dashboard_operator(cookie_header):
             self.send_redirect("/"); return
         state, value = finish_dashboard_login(_cookie(cookie_header, ATTEMPT_COOKIE))
-        clear_attempt = ATTEMPT_COOKIE + "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"
+        clear_attempt = ATTEMPT_COOKIE + "=; Path=/" + cookie_attributes() + "; Max-Age=0"
         if state == "signed_in":
             self.send_redirect_with_cookies("/connection", [
-                SESSION_COOKIE + "=" + str(value) + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + str(DASHBOARD_SESSION_SECONDS),
+                SESSION_COOKIE + "=" + str(value) + "; Path=/" + cookie_attributes() + "; Max-Age=" + str(DASHBOARD_SESSION_SECONDS),
                 clear_attempt])
             return
         self.send_page(HTTPStatus.OK, page_login(state, value))
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path == "/login":
-            self._get_login(); return
-        operator = dashboard_operator(self.headers.get("Cookie")) if login_required() else ""
-        if operator is None:
-            self.send_redirect("/login"); return
-        _current_operator.set(operator)
+        if vm_mode():
+            # The Salesforce-CLI sign-in does not exist on the VM; identity comes from the proxy header.
+            email, role = self._vm_identity()
+            if email is None or role is None:
+                self._vm_identity_refusal(email); return
+            if path == "/login":
+                self._vm_refuse(HTTPStatus.SERVICE_UNAVAILABLE, "Sign-in unavailable",
+                                "Sign-in is handled by the single sign-on proxy on this VM, not by the dashboard."); return
+            self.vm_email = email
+            _current_operator.set(email)
+        else:
+            if path == "/login":
+                self._get_login(); return
+            operator = dashboard_operator(self.headers.get("Cookie")) if login_required() else ""
+            if operator is None:
+                self.send_redirect("/login"); return
+            _current_operator.set(operator)
         # Display reads may use the short in-memory cache; ?refresh=1 drops it.
         if parse_qs(urlsplit(self.path).query).get("refresh", [""])[0] == "1":
             clear_display_cache()
@@ -6979,7 +7142,7 @@ class Handler(BaseHTTPRequestHandler):
         if token is None:
             self.send_page(HTTPStatus.CONFLICT, page_login("failed", reason)); return
         self.send_redirect_with_cookies("/login", [
-            ATTEMPT_COOKIE + "=" + token + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + str(LOGIN_ATTEMPT_SECONDS)])
+            ATTEMPT_COOKIE + "=" + token + "; Path=/" + cookie_attributes() + "; Max-Age=" + str(LOGIN_ATTEMPT_SECONDS)])
 
     def _start_renewal(self, reference: str, form: Any, row: dict[str, str | None]) -> None:
         """Start renewal: the same guards as Start onboarding plus a one-time nonce; Leonardo Development only."""
@@ -7029,6 +7192,21 @@ class Handler(BaseHTTPRequestHandler):
         # Any action may change Salesforce or local state; later pages read fresh.
         clear_display_cache()
         path = urlsplit(self.path).path
+        if vm_mode():
+            email, role = self._vm_identity()
+            if email is None or role is None:
+                self._vm_identity_refusal(email); return
+            self.vm_email = email
+            if role != ROLE_OPERATOR:
+                self._vm_refuse(HTTPStatus.FORBIDDEN, "Read-only access",
+                                "Viewers cannot change anything. Nothing was started or recorded."); return
+            if path in ("/login/start", "/login/cancel"):
+                self._vm_refuse(HTTPStatus.SERVICE_UNAVAILABLE, "Sign-in unavailable",
+                                "Sign-in is handled by the single sign-on proxy on this VM, not by the dashboard."); return
+            if path not in VM_OPERATOR_POSTS:
+                self._vm_refuse(HTTPStatus.FORBIDDEN, "Not available on the VM",
+                                "The VM dashboard is read-only in phase 1: runs start from the owner's Windows desktop. "
+                                "Nothing was started or changed."); return
         if path in ("/login/start", "/login/cancel"):
             self._post_login(path); return
         if login_required() and dashboard_operator(self.headers.get("Cookie")) is None:
@@ -7042,7 +7220,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Sign-out refused</title><p>"
                                + escape(LOGIN_REASON_TEXT[problem]) + "</p><p><a href='/'>Return</a></p>")
                 return
-            self.send_redirect_with_cookies("/login", [SESSION_COOKIE + "=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"])
+            self.send_redirect_with_cookies("/login", [SESSION_COOKIE + "=; Path=/" + cookie_attributes() + "; Max-Age=0"])
             return
         if path not in POST_ROUTES:
             # Unknown routes stop here: no form parse, Salesforce read, or launch.
@@ -7394,7 +7572,7 @@ class Handler(BaseHTTPRequestHandler):
             # Local acknowledgement only: no Leonardo, browser, or Salesforce write.
             try:
                 set_user_created_confirmation(reference, path == "/attended/confirm-user-created",
-                                              dashboard_operator(self.headers.get("Cookie")))
+                                              self.request_operator())
             except (OSError, ValueError):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Confirmation unavailable</title><p>The local confirmation file could not be written. Nothing was changed in Leonardo or Salesforce.</p>")
                 return

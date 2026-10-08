@@ -18,6 +18,21 @@ if [[ "${SURFACE_ONBOARDING_HOST:-127.0.0.1}" != "127.0.0.1" ]]; then
   exit 2
 fi
 
+# Team-access mode (docs/40 step 0): identity comes from the loopback proxy, so the allow-list and the one public
+# https origin must be configured; otherwise every request would be refused anyway. Fail early and clearly.
+if [[ -z "${SURFACE_ONBOARDING_ALLOWED_USERS:-}" && -z "${SURFACE_ONBOARDING_ALLOWED_USERS_FILE:-}" ]]; then
+  echo "Refusing to start: SURFACE_ONBOARDING_ALLOWED_USERS (or _FILE) must list the allowed e-mails." >&2
+  exit 2
+fi
+
+if [[ ! "${SURFACE_ONBOARDING_PUBLIC_ORIGIN:-}" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?$ ]]; then
+  echo "Refusing to start: SURFACE_ONBOARDING_PUBLIC_ORIGIN must be an https origin such as https://host:8443." >&2
+  exit 2
+fi
+
+# Local state lives under one folder (mode 0750, owner surface-onboarding).
+export SURFACE_ONBOARDING_STATE_DIR="${SURFACE_ONBOARDING_STATE_DIR:-/var/lib/surface-onboarding}"
+
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # Ubuntu 22.04's system ``python3`` is 3.10, but this project requires

@@ -28,7 +28,9 @@ from tools.attended_ce_only_playwright import (  # noqa: E402
     _attended_page,
 )
 
-OUT_PATH = ROOT / "integration" / "attended_ce_only_table_diagnostics.json"
+from integration.onboarding.state_paths import state_file  # noqa: E402
+
+OUT_PATH = state_file(ROOT / "integration" / "attended_ce_only_table_diagnostics.json")
 
 
 def _safe(fn, default=""):

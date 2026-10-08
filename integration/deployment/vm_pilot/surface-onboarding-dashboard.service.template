@@ -1,0 +1,72 @@
+# REVIEW ARTIFACT - not installed; needs approvals per docs/40 section 7.
+# Template only. Do not install or enable before every gate in docs/40 section 7 (steps 1-4) is approved.
+# Install path (after approval): /etc/systemd/system/surface-onboarding-dashboard.service
+[Unit]
+Description=Surface onboarding dashboard (VM team-access pilot, read-only phase 1)
+After=network-online.target
+Wants=network-online.target
+# Approval marker created by VM/SecOps only after written approval (same gate as the web template).
+ConditionPathExists=/etc/surface-onboarding/approved-web-identity
+
+[Service]
+Type=exec
+User=surface-onboarding
+Group=surface-onboarding
+UMask=0077
+WorkingDirectory=/opt/surface-onboarding/app
+
+# No secrets here. Values are identity/config only.
+Environment=SURFACE_ONBOARDING_RUNTIME=vm
+Environment=SURFACE_ONBOARDING_WEB_IDENTITY_APPROVED=1
+Environment=SURFACE_ONBOARDING_HOST=127.0.0.1
+Environment=SURFACE_ONBOARDING_PORT=8000
+Environment=SURFACE_ONBOARDING_PUBLIC_ORIGIN=https://172.26.37.20:8443
+Environment=SURFACE_ONBOARDING_STATE_DIR=/var/lib/surface-onboarding
+Environment=SURFACE_ONBOARDING_ALLOWED_USERS=milton.stevenson@pentera.io
+Environment=SURFACE_ONBOARDING_OPERATORS=milton.stevenson@pentera.io
+# Optional file forms (one e-mail per line) so the owner can add a teammate without editing the unit:
+# Environment=SURFACE_ONBOARDING_ALLOWED_USERS_FILE=/etc/surface-onboarding/allowed-emails.txt
+# Environment=SURFACE_ONBOARDING_OPERATORS_FILE=/etc/surface-onboarding/operators.txt
+
+ExecStart=/opt/surface-onboarding/app/scripts/run_vm_dashboard.sh
+Restart=on-failure
+RestartSec=5
+
+# State: created 0750 owned by surface-onboarding; the only writable path.
+StateDirectory=surface-onboarding
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/surface-onboarding
+ReadOnlyPaths=/opt/surface-onboarding
+
+# Hardening (same baseline as the web template, integration/deployment/SECURITY_BASELINE.md).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Resource limits so a dashboard fault cannot starve OPA or other tenants of the VM.
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=128
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

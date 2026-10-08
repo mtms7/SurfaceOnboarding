@@ -21,6 +21,8 @@ from pathlib import Path
 import re
 from typing import Any, Mapping
 
+from . import state_paths
+
 SCHEMA_VERSION = 1
 MAX_TOTAL = 5000
 REDASH_MAX_TOTAL = 50_000  # the production clone holds ~5,400 tenants and grows
@@ -627,7 +629,8 @@ def snapshot_payload(env: InventoryEnvironment, assembled: AssembledInventory, c
 
 def default_root() -> Path:
     base = os.environ.get("LOCALAPPDATA")
-    return (Path(base) if base else Path.home() / "AppData" / "Local") / "SurfaceOnboarding" / "leonardo-inventory"
+    desktop = (Path(base) if base else Path.home() / "AppData" / "Local") / "SurfaceOnboarding" / "leonardo-inventory"
+    return state_paths.inventory_root(desktop)  # SURFACE_ONBOARDING_STATE_DIR / VM default; else the desktop folder
 
 
 def env_dir(root: Path, env_name: str) -> Path:
