@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import state_paths
+from integration.onboarding import run_progress
 from integration.onboarding.state_paths import state_file
 from integration.onboarding.dev_onboarded import dev_onboarded_evidence, dev_status
 from integration.onboarding.renewal_mirror import mirror_tenant_ids
@@ -1984,7 +1985,7 @@ def evaluate_ce_only_fill_preflight(reference: str) -> CredentialExposureFillPre
                 or co.get("Onboarding_Type__c") != CE_ROUTE_TYPE):
             blockers.append("not_a_new_credential_exposure_onboarding")
         raw_email_domains = co.get("Email_Domains__c")
-        email_domains = [item for item in re.split(r"[,;\s]+", raw_email_domains.strip()) if item] if isinstance(raw_email_domains, str) else []
+        email_domains = [item.removeprefix("@") for item in re.split(r"[,;\s]+", raw_email_domains.strip()) if item] if isinstance(raw_email_domains, str) else []
         domain = email_domains[0].casefold() if len(email_domains) == 1 else ""
         if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", domain):
             blockers.append("exactly_one_email_domain_required")
@@ -3202,7 +3203,8 @@ def ce_only_eligible(row: dict[str, str | None]) -> bool:
     raw = row.get("Email_Domains__c")
     if not isinstance(raw, str):
         return False
-    domains = [item for item in re.split(r"[,;\s]+", raw.strip()) if item]
+    # Salesforce often holds "@example.com"; one leading "@" is stripped (nothing else is normalised).
+    domains = [item.removeprefix("@") for item in re.split(r"[,;\s]+", raw.strip()) if item]
     if len(domains) != 1:
         return False
     domain = domains[0].casefold()
@@ -3702,7 +3704,9 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
                  + toast + ("<div class='pinned' role='region' aria-label='Alerts'>" + pinned + "</div>" if pinned else "")
                  + _do_now_card(ctx) + _key_facts_grid(_key_facts(ctx)) + health + record_fold + history + diagnostics
                  + "<p class='footline'>" + escape(DETAIL_FOOTER_NOTE) + "</p>")
-    return _app_shell(reference, main_html, active="onboardings")
+    # Refresh only while a run is open (CSP allows no script); a finished run ends the refresh by itself.
+    return _app_shell(reference, main_html, active="onboardings",
+                      refresh="<meta http-equiv='refresh' content='3'>" if _open_run_for(reference) else "")
 
 
 DETAIL_FOOTER_NOTE = ("Read-only view from Salesforce and local Leonardo Development evidence; nothing here writes to "
@@ -4820,6 +4824,13 @@ PENTERA_CSS = (
     ".outcome strong{font-size:15px}.outcome-success strong{color:var(--ok)}.outcome-failed strong{color:var(--bad)}"
     ".outcome-info strong{color:var(--warn)}.outcome p{margin:2px 0 4px}"
     ".outcome .meta{color:var(--muted);font-size:12px}"
+    ".runprog{margin:8px 0}.runprog-head{display:flex;justify-content:space-between;gap:12px;font-weight:600}"
+    ".runprog-bar{height:10px;margin:6px 0 8px;border-radius:5px;background:var(--line);overflow:hidden}"
+    ".runprog-fill{display:block;height:100%;background:var(--primary)}.runprog-failed .runprog-fill{background:var(--bad)}"
+    ".runprog-done .runprog-fill{background:var(--ok)}"
+    ".runprog-steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted)}"
+    ".runprog-steps .s-done{color:var(--ok)}.runprog-steps .s-active{color:var(--text);font-weight:700}"
+    ".runprog-steps .s-failed{color:var(--bad);font-weight:700}"
     "code{font:12px/1.4 Consolas,'SFMono-Regular',monospace;background:var(--pill);padding:1px 5px;border-radius:4px}"
     ".readiness h2,.login-preflight h2,.manual-action h2{margin:0 0 4px;font-size:15px;color:var(--heading)}"
     ".readiness p,.login-preflight p,.manual-action p{margin:2px 0 0;color:var(--muted)}"
@@ -5273,10 +5284,40 @@ def _progress_button(ref: str) -> str:
             + ref + "'><button type='submit'>View progress</button></form>")
 
 
+def _progress_events(ref: str, record: dict[str, str]) -> list[dict[str, str]]:
+    """Milestone events recorded since this run started (read-only; unreadable means none)."""
+    import tools.attended_ce_only_playwright as runner_module
+    try:
+        return run_progress.read_milestones(runner_module.PROGRESS_PATH, ref, record.get("started_on", ""))
+    except Exception:
+        return []
+
+
+def _progress_bar(ref: str, record: dict[str, str]) -> str:
+    """CSS-only progress bar of an open run: step labels, percent and state only (no script, no payload)."""
+    progress = run_progress.build_progress(record.get("route"), _progress_events(ref, record))
+    items = "".join("<li class='s-" + step.state + "'>" + escape(step.label)
+                    + (" (running)" if step.state == "active" else "") + "</li>" for step in progress.steps)
+    return ("<div class='runprog' aria-live='polite'><div class='runprog-head'><span>Onboarding in progress: "
+            + escape(progress.current) + "</span><span>" + str(progress.percent) + "%</span></div>"
+            "<div class='runprog-bar' role='progressbar' aria-label='Onboarding progress' aria-valuemin='0' "
+            "aria-valuemax='100' aria-valuenow='" + str(progress.percent) + "'><span class='runprog-fill' style='width:"
+            + str(progress.percent) + "%'></span></div><ol class='runprog-steps'>" + items + "</ol></div>")
+
+
 def _running_note(ref: str, record: dict[str, str]) -> str:
     started = " at " + escape(record["started_on"]) if record.get("started_on") else ""
-    return ("<p class='note'>An attended run for this source revision was started" + started +
+    return (_progress_bar(ref, record) + "<p class='note'>An attended run for this source revision was started" + started +
             " and has not reported a result. Do not start another.</p>" + _progress_button(ref))
+
+
+def _open_run_for(reference: str) -> bool:
+    """True while a run for ``reference`` has been claimed and has no result (the page then refreshes itself)."""
+    try:
+        record = load_runner_state().get(reference)
+    except (RunnerStateUnavailable, AttributeError):
+        return False
+    return record is not None and not record.get("result")
 
 
 def _reset_form(ref: str, record: dict[str, str], what: str = "nothing was created") -> str:
@@ -5623,17 +5664,18 @@ def page_ce_only_runner_status(state: dict[str, dict[str, str]] | None, referenc
     elif "result" not in record:
         started = record.get("started_on", "unknown")
         refresh = "<meta http-equiv='refresh' content='5'>"
+        bar = _progress_bar(ref, record)
         if record.get("route") in RENEWAL_ENGINES:
             body = ("<div class='card-head'><span class='pill'>Renewal in progress</span><span class='chip chip-warn'>Running</span></div>"
                     "<p>Started at <code>" + escape(started) + "</code>. This page refreshes every 5 seconds.</p>"
                     "<p class='note'>In the automation Chrome window, complete SSO/MFA if prompted. The runner creates the Dev mirror "
                     "if it is missing, plans the renewal (dry run), and applies it. Leonardo Development only; "
-                    "it never updates Salesforce.</p>")
+                    "it never updates Salesforce.</p>" + bar)
         else:
             body = ("<div class='card-head'><span class='pill'>Onboarding in progress</span><span class='chip chip-warn'>Running</span></div>"
                     "<p>Started at <code>" + escape(started) + "</code>. This page refreshes every 5 seconds.</p>"
                     "<p class='note'>In the automation Chrome window, complete SSO/MFA if prompted. The runner first checks Leonardo "
-                    "for an existing tenant, then fills and confirms the Add Account form. It never updates Salesforce.</p>")
+                    "for an existing tenant, then fills and confirms the Add Account form. It never updates Salesforce.</p>" + bar)
     else:
         result = record["result"]
         completed = record.get("completed_on", "unknown")

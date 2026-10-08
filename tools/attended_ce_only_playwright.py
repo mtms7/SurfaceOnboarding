@@ -64,6 +64,7 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from integration.onboarding import run_progress  # noqa: E402
 from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
 
 REFERENCE = re.compile(r"CO-[0-9]{4,10}$")
@@ -227,6 +228,9 @@ ADVANCED_TOGGLES_OFF = (
 )
 ADVANCED_EXPAND_POLLS = 20  # x 100 ms
 RUN_LOG_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_run_log.json")
+# Milestone steps of a run in progress (no values), read by the dashboard's progress bar; the run log above is
+# written only when a run ends.
+PROGRESS_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_progress.json")
 RUN_LOG_MAX_EVENTS = 700
 # Diagnose timeline: which run-log steps trigger a Confirm/state snapshot.
 TIMELINE_STEP_PREFIXES = ("add_account_open", "fill_", "absent_toggle", "advanced_options", "max_scan_duration",
@@ -315,7 +319,8 @@ def one_email_domain(value: object) -> str | None:
     """Return exactly one valid CE domain; no normalization expands its scope."""
     if not isinstance(value, str):
         return None
-    domains = [item.casefold() for item in re.split(r"[,;\s]+", value.strip()) if item]
+    # One leading "@" (Salesforce "@example.com") is stripped; nothing else is normalised.
+    domains = [item.removeprefix("@").casefold() for item in re.split(r"[,;\s]+", value.strip()) if item]
     if len(domains) != 1:
         return None
     domain = domains[0]
@@ -3105,6 +3110,16 @@ def _stop_chrome_process(chrome_proc: Any) -> None:
             pass
 
 
+QUIET_CHROME_FLAGS = ("--window-position=-2400,-2400", "--disable-renderer-backgrounding",
+                      "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows")
+
+
+def automation_chrome_args(executable: str, profile_dir: Path, quiet: bool = False) -> list[str]:
+    """The automation Chrome command line (pure); ``quiet`` adds the off-screen, no-throttling flags."""
+    return [executable, f"--user-data-dir={profile_dir}", "--remote-debugging-port=0",
+            "--no-first-run", "--no-default-browser-check", *(QUIET_CHROME_FLAGS if quiet else ()), ANCHOR_TAB_URL]
+
+
 def _launch_automation_chrome(executable: str, profile_dir: Path, persist: bool) -> tuple[Any, int | None]:
     """Launch the automation Chrome with an OS-chosen loopback CDP port.
 
@@ -3116,14 +3131,17 @@ def _launch_automation_chrome(executable: str, profile_dir: Path, persist: bool)
     placed in its own process group so it outlives the runner process (the
     window is reused by the next run). Returns (chrome_proc, port) where port
     is None when the endpoint was not verified in time.
+
+    Opt-in quiet mode: with the environment variable SURFACE_AUTOMATION_QUIET=1 the window opens off-screen and
+    keeps running at full speed in the background (the operator then follows the dashboard progress bar instead
+    of the browser; sign-in or MFA needs the window, so run without it for a first sign-in). Default unchanged.
     """
     kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                               "stdin": subprocess.DEVNULL}
     if persist and os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     chrome_proc = subprocess.Popen(
-        [executable, f"--user-data-dir={profile_dir}", "--remote-debugging-port=0",
-         "--no-first-run", "--no-default-browser-check", ANCHOR_TAB_URL],
+        automation_chrome_args(executable, profile_dir, os.environ.get("SURFACE_AUTOMATION_QUIET") == "1"),
         **kwargs,
     )
     deadline = monotonic() + BROWSER_LAUNCH_SECONDS
@@ -3560,6 +3578,8 @@ class RunLog:
             if detail:
                 entry["detail"] = self._clean(detail)
             self.events.append(entry)
+            if step in run_progress.MILESTONE_STEPS and self.reference != "-":
+                run_progress.record_milestone(PROGRESS_PATH, self.reference, entry)
         except Exception:
             pass
         self._timeline_snapshot(step)
@@ -8048,7 +8068,7 @@ def _domain_tokens(value: object) -> tuple[str, ...]:
 
     if not isinstance(value, str):
         return ()
-    return tuple(dict.fromkeys(d for d in map(inventory.canonical_domain, re.split(r"[,;\s]+", value)) if d))
+    return tuple(dict.fromkeys(d for d in map(inventory.canonical_domain, (t.removeprefix("@") for t in re.split(r"[,;\s]+", value))) if d))
 
 
 def mirror_source(reference: str) -> MirrorSource:

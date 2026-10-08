@@ -1377,6 +1377,10 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
     def test_ce_only_eligible_requires_exactly_one_valid_email_domain(self):
         self.assertTrue(dashboard.ce_only_eligible({"Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding", "Email_Domains__c": "example.test"}))
         self.assertTrue(dashboard.ce_only_eligible({"Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding", "Email_Domains__c": "  Example.Test  "}))
+        ce = {"Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
+        self.assertTrue(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@orlandohealth.com"}))
+        self.assertFalse(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@@orlandohealth.com"}))
+        self.assertFalse(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@one.test, @two.test"}))
         self.assertFalse(dashboard.ce_only_eligible({"Email_Domains__c": "one.test, two.test"}))
         self.assertFalse(dashboard.ce_only_eligible({"Email_Domains__c": ""}))
         self.assertFalse(dashboard.ce_only_eligible({"Email_Domains__c": None}))

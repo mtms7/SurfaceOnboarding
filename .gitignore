@@ -51,6 +51,7 @@ tmp/
 # Legacy duplicate handover export; source remains in the main project tree
 Surface_Workato_OPA_Handover_2026-08-26/
 integration/attended_ce_only_run_log.json
+integration/attended_ce_only_progress.json
 integration/attended_ce_only_check_state.json
 integration/attended_scan_reminders.json
 integration/attended_user_created_confirmations.json
@@ -63,3 +64,6 @@ integration/attended_salesforce_id_writebacks.tmp
 integration/attended_surface_validation.json
 integration/attended_renewal_mirrors.json
 integration/attended_renewal_outcomes.json
+
+# Local reset backups (demo CO records)
+integration/attended_reset_backups/

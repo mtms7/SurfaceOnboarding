@@ -17,6 +17,10 @@ Every Salesforce read is pinned to the -TargetOrg alias and must belong to
 the org Id in -ExpectedOrgId (or the first line of
 %LOCALAPPDATA%\SurfaceOnboarding\salesforce-expected-org-id.txt). The org Id
 is not a secret.
+
+Optional: set $env:SURFACE_AUTOMATION_QUIET = '1' before starting to open the
+automation Chrome off-screen without background throttling (follow the progress
+bar on the CO page; first sign-in/MFA needs the visible window). Not set by default.
 #>
 [CmdletBinding()]
 param(

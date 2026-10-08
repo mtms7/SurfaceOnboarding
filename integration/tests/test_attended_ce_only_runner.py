@@ -275,6 +275,11 @@ class OneEmailDomainTests(unittest.TestCase):
 
     def test_surrounding_separators_are_tolerated(self):
         self.assertEqual(one_email_domain("  example.test  "), "example.test")
+        # Salesforce often holds "@example.com": exactly one leading "@" is dropped, nothing else.
+        self.assertEqual(one_email_domain("@Example.Test"), "example.test")
+        self.assertIsNone(one_email_domain("@@example.test"))
+        self.assertIsNone(one_email_domain("user@example.test"))
+        self.assertIsNone(one_email_domain("@one.test, @two.test"))
         self.assertEqual(one_email_domain("example.test;"), "example.test")
 
     def test_multiple_or_missing_domains_rejected(self):

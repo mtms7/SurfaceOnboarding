@@ -41,7 +41,7 @@ atexit.register(shutil.rmtree, _STATE_DIR, True)
 import tools.attended_ce_only_playwright as _runner  # noqa: E402
 
 for _name in ("RUNNER_STATE_PATH", "CHECK_STATE_PATH", "READBACK_PATH", "SCAN_STATUS_PATH", "VALIDATION_PATH",
-              "DIAGNOSTICS_PATH", "RUN_LOG_PATH", "SPYCLOUD_STATE_PATH", "RENEWAL_OUTCOMES_PATH", "MIRROR_PATH"):
+              "DIAGNOSTICS_PATH", "RUN_LOG_PATH", "PROGRESS_PATH", "SPYCLOUD_STATE_PATH", "RENEWAL_OUTCOMES_PATH", "MIRROR_PATH"):
     setattr(_runner, _name, _STATE_DIR / getattr(_runner, _name).name)
 
 import tools.serve_attended_open_onboardings_dashboard as _dashboard  # noqa: E402

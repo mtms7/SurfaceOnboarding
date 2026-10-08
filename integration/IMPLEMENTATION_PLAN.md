@@ -1555,3 +1555,10 @@ Superseded by "End of day 2026-10-06" below.
 - `--spycloud-on --confirm-write`: **CO-0757 `spycloud_on_verified`** and **CO-0728 `spycloud_on_verified`** (first live proof of the tool's own save; both `"leonardo_write":"verified"`); CO-0767 (A2A mirror) and CO-0762 `spycloud_already_on` (no write).
 - All five Dev CE / Case 3 tenants are now ON: CO-0679, CO-0757, CO-0728, CO-0767 mirror, CO-0762. No Salesforce write, no production access. The dashboard process predates the policy change and still shows the old "must be OFF" wording until restarted (`tools\start_attended_dashboard.ps1 -Restart`).
 - Next: restart the dashboard, push (`3b21e98`, `22243fa` + this entry), then Case 4 on CO-0758 (mirror → dry run → apply; owner go at each write).
+
+#### Progress 2026-10-08 (afternoon) — email-domain "@" fix, run progress bar, quiet mode, demo reset tool (local; not run live)
+- CO-0765 (Orlando Health, CE-only) showed "No automated route": Salesforce Email Domains `@orlandohealth.com` failed the exactly-one-valid-domain gate. Now exactly one leading `@` is stripped (dashboard eligibility + preflight, runner `one_email_domain`, `_domain_tokens`); `@@x`, `user@x`, two domains still fail closed.
+- Run progress bar on the CO page (CSS-only, meta refresh 3 s while a run is open, no page scripts): `integration/onboarding/run_progress.py` maps real milestone events (new git-ignored `integration/attended_ce_only_progress.json`: step/outcome/time only) to a 10-step create list or a 4-step renewal list; capped at 95% until a result exists.
+- Opt-in `SURFACE_AUTOMATION_QUIET=1`: automation Chrome off-screen + anti-throttling flags (warm session only; not yet run live).
+- `tools/reset_demo_co.py --co CO-XXXX [--confirm-tenant-deleted]`: dry run by default; backs up then clears one CO's local records after the rehearsal tenant was DELETED in Leonardo (rename is not enough: duplicate check matches domains). Never contacts external systems.
+- 1493 tests OK, 1 skipped; both guards pass. Known gap: "No automated route" gives no reason text.
