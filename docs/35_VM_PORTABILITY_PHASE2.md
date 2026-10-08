@@ -3,6 +3,8 @@
 **Date:** 2026-09-15  
 **Status:** local source refactor only; no VM, service, proxy, Salesforce, Leonardo, Workato, or OPA action occurred.
 
+> **Superseded in parts by [docs/40](40_VM_TEAM_ACCESS_DEPLOYMENT_PLAN_2026-10-07.md)** (proposal, 2026-10-07): team access over HTTPS with SSO, VM-local proxy, roles, and phased rollout. The gates below remain in force until approvals are recorded.
+
 ## Goal
 
 Move the complete onboarding application to Ubuntu 22.04 on

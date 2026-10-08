@@ -57,3 +57,8 @@ controls before it may be enabled.
   blocked until its separate authentication and operation approvals exist.
 
 Do not copy these templates to the VM until the preceding gates are recorded.
+
+## Related documents
+
+- `../../docs/40_VM_TEAM_ACCESS_DEPLOYMENT_PLAN_2026-10-07.md` — proposal (not approved) for team HTTPS access with SSO login, roles, and a phased rollout; supersedes parts of `docs/35`.
+- `REVERSE_PROXY_APPROVAL_PACKET.md`, `SALESFORCE_READ_APPROVAL_PACKET.md`, `BROWSER_RUNNER_APPROVAL_PACKET.md`, `SECURITY_BASELINE.md`, `THREAT_MODEL.md` — approval and security references.
