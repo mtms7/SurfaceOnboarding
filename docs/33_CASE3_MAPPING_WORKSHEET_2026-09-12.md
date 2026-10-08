@@ -77,7 +77,7 @@ superseded by the owner.
 | Authenticated Testing | Disabled | Owner-attested Case 3 decision. |
 | AI | Disabled | Owner-attested Case 3 decision. |
 | Web Agent | Leave untouched. Do not set, enable, or disable it. | Owner instruction 2026-09-12; excluded until the instruction is explicitly updated. |
-| SpyCloud | ~~Leave untouched.~~ **Superseded 2026-10-05: OFF on LC tenants** (see the supersession note after this table). | Owner instruction 2026-09-12, superseded by the owner decision 2026-10-05. |
+| SpyCloud | ~~Leave untouched.~~ **Superseded 2026-10-05: OFF on LC tenants** (see the supersession note after this table). **Superseded 2026-10-08: SpyCloud is ON by default (owner decision).** | Owner instruction 2026-09-12, superseded by the owner decision 2026-10-05. |
 | Web dictionary brute force | Enabled | Owner-attested Case 3 decision. |
 | Multiple users | Enabled | Owner-attested Case 3 decision. |
 | Notifications | Enabled | Owner-attested Case 3 decision. |
@@ -94,6 +94,8 @@ Account form hard-codes it ON, so it is turned OFF afterwards through the tenant
 `spyCloudEnabled` checkbox), as a separately approved Leonardo Development write with read-after-write
 verification (`--spycloud-off --co CO-XXXX --confirm-write`; a dry run without the flag). The Web Agent
 instruction is unchanged.
+
+Superseded 2026-10-08: SpyCloud is ON by default (owner decision).
 
 The historical/guide candidate for a user created by the operator does not
 override the project's newer exact-primary-user source binding. The exact

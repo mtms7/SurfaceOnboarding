@@ -6057,8 +6057,9 @@ SPYCLOUD_EDIT_TIMEOUT_MS = 30_000
 SPYCLOUD_ROUTES = frozenset({CE_ENGINE, CASE3_ENGINE})  # Credential Exposure routes; the Surface-only route never
 SPYCLOUD_STATE_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_spycloud.json")
 # Outcomes that verified the flag (2026-10-08): ON is the expected default, OFF is informational only.
-SPYCLOUD_ON_OUTCOMES = frozenset({"spycloud_dry_run_on"})
-SPYCLOUD_OFF_OUTCOMES = frozenset({"spycloud_off_verified", "spycloud_already_off"})
+# spycloud_on_verified / spycloud_already_on = ON (manual --spycloud-on); spycloud_dry_run_off = OFF (informational).
+SPYCLOUD_ON_OUTCOMES = frozenset({"spycloud_dry_run_on", "spycloud_on_verified", "spycloud_already_on"})
+SPYCLOUD_OFF_OUTCOMES = frozenset({"spycloud_off_verified", "spycloud_already_off", "spycloud_dry_run_off"})
 SPYCLOUD_OK_OUTCOMES = SPYCLOUD_ON_OUTCOMES | SPYCLOUD_OFF_OUTCOMES  # the flag was read: not a failure
 
 
@@ -6163,6 +6164,15 @@ def _spycloud_row(page: Any, tenant_name: str, expected_id: str, expected_uuid: 
     return "ok", inventory.spycloud_enabled(row)
 
 
+# Outcome codes per target state of the one checkbox (False = --spycloud-off, True = --spycloud-on).
+_SPYCLOUD_CODES = {
+    False: {"already": "spycloud_already_off", "dry_run": "spycloud_dry_run_on", "toggle_failed": "spycloud_uncheck_failed",
+            "verified": "spycloud_off_verified", "still": "spycloud_readback_still_on"},
+    True: {"already": "spycloud_already_on", "dry_run": "spycloud_dry_run_off", "toggle_failed": "spycloud_check_failed",
+           "verified": "spycloud_on_verified", "still": "spycloud_readback_still_off"},
+}
+
+
 def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_uuid: str | None = None,
                      confirm_write: bool = False) -> str:
     """Turn SpyCloud OFF on one Leonardo Development tenant, or (without confirm_write) report it.
@@ -6177,6 +6187,28 @@ def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_
     spycloud_readback_missing, spycloud_saved_unverified (2xx save, re-read failed twice), spycloud_cancel_unavailable. A 401/403 raises LeonardoSessionExpired.
     The form is cancelled (or Escape pressed) wherever nothing was saved.
     """
+    return _set_spycloud(page, tenant_name, expected_id, expected_uuid=expected_uuid, confirm_write=confirm_write,
+                         target=False)
+
+
+def set_spycloud_on(page: Any, tenant_name: str, expected_id: str, *, expected_uuid: str | None = None,
+                    confirm_write: bool = False) -> str:
+    """Turn SpyCloud back ON on one Leonardo Development tenant, or (without confirm_write) report it.
+
+    Same steps and guards as ``set_spycloud_off`` (one implementation). Outcomes: spycloud_on_verified (saved and the
+    re-read row says true), spycloud_already_on (no save), spycloud_dry_run_off (no confirm_write: Edit opened,
+    checkbox OFF, cancelled). Failures: the codes of ``set_spycloud_off`` with spycloud_check_failed (the checkbox
+    would not tick) and spycloud_readback_still_off (the re-read row still says false) in place of the uncheck and
+    still-on codes. A 401/403 raises LeonardoSessionExpired.
+    """
+    return _set_spycloud(page, tenant_name, expected_id, expected_uuid=expected_uuid, confirm_write=confirm_write,
+                         target=True)
+
+
+def _set_spycloud(page: Any, tenant_name: str, expected_id: str, *, expected_uuid: str | None, confirm_write: bool,
+                  target: bool) -> str:
+    """Shared implementation: set the spyCloudEnabled checkbox of one tenant to ``target`` (write-gated)."""
+    codes = _SPYCLOUD_CODES[target]
     if _url_origin(page.url) != DEVELOPMENT_ORIGIN or not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, expected_id or ""):
         return "spycloud_environment_not_supported"
     found, _before = _spycloud_row(page, tenant_name, expected_id, expected_uuid)
@@ -6192,7 +6224,7 @@ def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_
     def stop(reason: str) -> str:
         """Nothing was saved: close the form and report the reason (a form that stays open is reported)."""
         closed = _spycloud_cancel(page)
-        if closed or reason not in ("spycloud_already_off", "spycloud_dry_run_on"):
+        if closed or reason not in (codes["already"], codes["dry_run"]):
             return reason
         return "spycloud_cancel_unavailable"
 
@@ -6215,13 +6247,15 @@ def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_
     except Exception as exc:
         _log().error("spycloud", "checkbox_read", exc)
         return stop("spycloud_checkbox_unreadable")
-    if checked is False:
-        return stop("spycloud_already_off")
+    if not isinstance(checked, bool):
+        return stop("spycloud_checkbox_unreadable")
+    if checked is target:
+        return stop(codes["already"])
     if not confirm_write:
-        return stop("spycloud_dry_run_on")
-    # Approved write: uncheck this one checkbox (re-read), then Confirm.
-    if not _set_checkbox(page, SPYCLOUD_CHECKBOX_NAME, False):
-        return stop("spycloud_uncheck_failed")
+        return stop(codes["dry_run"])
+    # Approved write: set this one checkbox (re-read), then Confirm.
+    if not _set_checkbox(page, SPYCLOUD_CHECKBOX_NAME, target):
+        return stop(codes["toggle_failed"])
     confirm = page.get_by_role("button", name="Confirm", exact=True)
     try:
         if confirm.count() != 1:
@@ -6250,7 +6284,7 @@ def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_
         _log().event("spycloud", "save_status", detail=str(response.status))
         _spycloud_cancel(page)
         return "spycloud_save_failed"
-    # Read-after-write: the tenant row itself must now say false. The save returned 2xx, so a failed
+    # Read-after-write: the tenant row itself must now say the target value. The save returned 2xx, so a failed
     # re-read is "saved, unverified" (one retry), never a reason code that reads as "nothing written".
     found, after = _spycloud_row(page, tenant_name, expected_id, expected_uuid)
     if found != "ok":
@@ -6258,9 +6292,9 @@ def set_spycloud_off(page: Any, tenant_name: str, expected_id: str, *, expected_
     if found != "ok":
         _log().event("spycloud", "saved_readback", detail=found)
         return "spycloud_saved_unverified"
-    if after is False:
-        return "spycloud_off_verified"
-    return "spycloud_readback_still_on" if after is True else "spycloud_readback_missing"
+    if after is target:
+        return codes["verified"]
+    return codes["still"] if after is (not target) else "spycloud_readback_missing"
 
 
 def write_spycloud_state(reference: str, outcome: str, mode: str, observed_at: datetime) -> None:
@@ -6318,13 +6352,13 @@ def _spycloud_after_create(page: Any, reference: str, engine: str, tenant_name: 
 # Outcomes reached only after Confirm was clicked: the save may have happened but is not verified.
 SPYCLOUD_AFTER_CONFIRM_RESULTS = frozenset({
     "spycloud_save_no_signal", "spycloud_save_id_mismatch", "spycloud_save_failed",
-    "spycloud_readback_still_on", "spycloud_readback_missing", "spycloud_saved_unverified",
-    "leonardo_session_expired"})
+    "spycloud_readback_still_on", "spycloud_readback_still_off", "spycloud_readback_missing",
+    "spycloud_saved_unverified", "leonardo_session_expired"})
 
 
 def spycloud_write_label(result: str, confirm_write: bool) -> str:
     """What the CLI may claim about the Leonardo write; never "attempted" for a run that stopped before Confirm."""
-    if result == "spycloud_off_verified":
+    if result in ("spycloud_off_verified", "spycloud_on_verified"):
         return "verified"
     if confirm_write and result in SPYCLOUD_AFTER_CONFIRM_RESULTS:
         return "attempted_unverified"
@@ -6357,6 +6391,8 @@ def _spycloud_mirror_target(reference: str) -> tuple[str, str] | None:
 def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: str = "dev") -> str:
     """Manual standalone SpyCloud OFF for one onboarded CE / Case 3 CO in Leonardo Development.
 
+    (``run_spycloud_on`` is the same run with the target ON; both share ``_run_spycloud``.)
+
     Not part of any create or renewal run (SpyCloud stays ON by default, owner 2026-10-08); a Leonardo write
     only with ``confirm_write``.
 
@@ -6364,6 +6400,19 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
     (Edit opened, checkbox state reported, Cancel). Any environment other than dev is refused before
     anything else. Salesforce is never written.
     """
+    return _run_spycloud(reference, confirm_write=confirm_write, env_name=env_name, target=False)
+
+
+def run_spycloud_on(reference: str, *, confirm_write: bool = False, env_name: str = "dev") -> str:
+    """Manual standalone SpyCloud ON for one onboarded CE / Case 3 CO (or verified CE renewal mirror) in Development.
+
+    For tenants turned OFF under the pre-2026-10-08 rule. Same applicability, dry-run default and write gate as
+    ``run_spycloud_off``: a Leonardo write only with ``confirm_write``; Development only; Salesforce never written.
+    """
+    return _run_spycloud(reference, confirm_write=confirm_write, env_name=env_name, target=True)
+
+
+def _run_spycloud(reference: str, *, confirm_write: bool, env_name: str, target: bool) -> str:
     global _ACTIVE_RUN_LOG
     if env_name != "dev":
         return "spycloud_environment_not_supported"
@@ -6390,7 +6439,7 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
         return "playwright_runtime_unavailable"
-    _ACTIVE_RUN_LOG = RunLog(reference, "spycloud_off" if confirm_write else "spycloud_dry_run", route=route)
+    _ACTIVE_RUN_LOG = RunLog(reference, ("spycloud_on" if target else "spycloud_off") if confirm_write else "spycloud_dry_run", route=route)
     log = _ACTIVE_RUN_LOG
     result = "attended_ce_runner_unavailable"
     try:
@@ -6398,8 +6447,8 @@ def run_spycloud_off(reference: str, *, confirm_write: bool = False, env_name: s
             try:
                 with _attended_page(playwright) as page:
                     log.attach(page)
-                    result = set_spycloud_off(page, tenant_name, ids[0], expected_uuid=ids[1],
-                                              confirm_write=confirm_write)
+                    setter = set_spycloud_on if target else set_spycloud_off
+                    result = setter(page, tenant_name, ids[0], expected_uuid=ids[1], confirm_write=confirm_write)
             except LoginTimeout:
                 result = "development_login_timeout"
             except RuntimeError as error:
@@ -8571,12 +8620,14 @@ def main() -> int:
                         help="With --co (and --route): read-only duplicate check against the production clone (Redash snapshot; no Leonardo, no browser).")
     parser.add_argument("--spycloud-off", action="store_true",
                         help="With --co: open the tenant's Edit form in Leonardo Development and report the SpyCloud checkbox (dry run: Cancel, nothing saved). Manual tool only: SpyCloud ON is the expected default and no run turns it OFF; add --confirm-write to turn it OFF by hand.")
+    parser.add_argument("--spycloud-on", action="store_true",
+                        help="With --co: like --spycloud-off but the target is ON (for tenants turned OFF under the old rule). Dry run: open Edit, report the SpyCloud checkbox, Cancel (nothing saved); add --confirm-write to turn it ON by hand. Leonardo Development only.")
     parser.add_argument("--renew", action="store_true",
                         help="With --co: renewal EDIT of a Case 4-6 CO's existing Leonardo Development (mirror) tenant. Dry run: open Edit, read current values, report the planned diff, Cancel (nothing saved). Add --confirm-write to apply it.")
     parser.add_argument("--renew-run", action="store_true",
                         help="With --co and --revision: the orchestrated renewal run the dashboard launches (Dev mirror if needed, renewal dry run, apply; SpyCloud is not touched). Leonardo Development only; the result is recorded in the runner state.")
     parser.add_argument("--confirm-write", action="store_true",
-                        help="With --spycloud-off, --renew or --mirror-renewal: explicitly approve the Leonardo Development write. Without it nothing is saved.")
+                        help="With --spycloud-off, --spycloud-on, --renew or --mirror-renewal: explicitly approve the Leonardo Development write. Without it nothing is saved.")
     parser.add_argument("--mirror-renewal", action="store_true",
                         help="With --co: create (dry run unless --confirm-write) a Leonardo Development mirror of the renewal CO's production tenant, from the production clone.")
     parser.add_argument("--open-dashboard", type=int, metavar="PORT",
@@ -8588,7 +8639,7 @@ def main() -> int:
     parser.add_argument("--export-tenants", action="store_true",
                         help="Read-only: page through Tenant Management and write the allow-listed tenant snapshot outside the repository.")
     parser.add_argument("--env", choices=("dev", "prod"), default="dev",
-                        help="With --export-tenants or --spycloud-off: environment (prod is refused until separately approved).")
+                        help="With --export-tenants, --spycloud-off or --spycloud-on: environment (prod is refused until separately approved).")
     parser.add_argument("--with-sweeps", action="store_true",
                         help="With --export-tenants: also validate every onboarded CO from the exported rows.")
     parser.add_argument("--csv", action="store_true",
@@ -8596,10 +8647,10 @@ def main() -> int:
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
     args = parser.parse_args()
-    if args.confirm_write and not (args.spycloud_off or args.renew or args.mirror_renewal):
-        parser.error("--confirm-write is only valid with --spycloud-off, --renew or --mirror-renewal")
-    if sum(bool(x) for x in (args.renew, args.spycloud_off, args.mirror_renewal, args.renew_run)) > 1:
-        parser.error("--renew, --spycloud-off, --mirror-renewal and --renew-run are separate runs")
+    if args.confirm_write and not (args.spycloud_off or args.spycloud_on or args.renew or args.mirror_renewal):
+        parser.error("--confirm-write is only valid with --spycloud-off, --spycloud-on, --renew or --mirror-renewal")
+    if sum(bool(x) for x in (args.renew, args.spycloud_off, args.spycloud_on, args.mirror_renewal, args.renew_run)) > 1:
+        parser.error("--renew, --spycloud-off, --spycloud-on, --mirror-renewal and --renew-run are separate runs")
     if args.renew_run:
         if not args.co or not args.revision:
             parser.error("--co and --revision are required with --renew-run")
@@ -8636,10 +8687,11 @@ def main() -> int:
                                         "only_on_tenant": list(manual_review.get("only_on_tenant") or ())}
         print(json.dumps(printed, separators=(",", ":")))
         return 0
-    if args.spycloud_off:
+    if args.spycloud_off or args.spycloud_on:
         if not args.co:
-            parser.error("--co is required with --spycloud-off")
-        result = run_spycloud_off(args.co, confirm_write=args.confirm_write, env_name=args.env)
+            parser.error("--co is required with --spycloud-off and --spycloud-on")
+        spycloud_run = run_spycloud_on if args.spycloud_on else run_spycloud_off
+        result = spycloud_run(args.co, confirm_write=args.confirm_write, env_name=args.env)
         print(json.dumps({"result": result, "leonardo_write": spycloud_write_label(result, args.confirm_write),
                           "salesforce_writeback": "not_performed"}, separators=(",", ":")))
         return 0

@@ -784,6 +784,10 @@ SPYCLOUD_MESSAGES = {
     "spycloud_off_verified": "SpyCloud is OFF (saved and read back). Leonardo's default is ON; this is informational only.",
     "spycloud_already_off": "SpyCloud is OFF; nothing was saved. Leonardo's default is ON; this is informational only.",
     "spycloud_dry_run_on": "SpyCloud is ON, Leonardo's default (dry run; nothing was saved).",
+    "spycloud_on_verified": "SpyCloud is ON (turned back ON by hand, saved and read back). Leonardo's default.",
+    "spycloud_already_on": "SpyCloud is ON, Leonardo's default; nothing was saved.",
+    "spycloud_dry_run_off": "SpyCloud is OFF (dry run; nothing was saved). Leonardo's default is ON; turning it back ON is a manual operator step.",
+    "spycloud_readback_still_off": "A manual save was made but Leonardo still shows SpyCloud OFF. Run the SpyCloud check again.",
     "spycloud_readback_still_on": "A manual save was made but Leonardo still shows SpyCloud ON (the default). Nothing else is needed.",
     "spycloud_save_id_mismatch": "Leonardo's edit reply named a different tenant. Check the tenants in Leonardo Development.",
 }

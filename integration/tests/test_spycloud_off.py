@@ -297,7 +297,8 @@ class StateFileTests(unittest.TestCase):
         self.assertTrue(json.loads(self.path.read_text(encoding="utf-8"))["CO-0762"]["warning"])
         # warning = "flag not verified": the expected ON outcome is no warning, only a failure or unknown is
         self.assertEqual(sorted(runner.SPYCLOUD_OK_OUTCOMES),
-                         ["spycloud_already_off", "spycloud_dry_run_on", "spycloud_off_verified"])
+                         ["spycloud_already_off", "spycloud_already_on", "spycloud_dry_run_off", "spycloud_dry_run_on",
+                          "spycloud_off_verified", "spycloud_on_verified"])
         self.assertEqual([runner.spycloud_state_of(o) for o in ("spycloud_dry_run_on", "spycloud_already_off",
                                                               "spycloud_off_verified", "spycloud_save_failed", "x")],
                          ["on", "off", "off", "unknown", "unknown"])

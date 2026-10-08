@@ -437,6 +437,8 @@ SpyCloud entirely. Web Agent is likewise absent from the contract. The
 contract remains execution-blocked; no execution manifest or idempotency key
 was issued.
 
+Superseded 2026-10-08: SpyCloud is ON by default (owner decision).
+
 ## CO-0717 non-executable candidate intent — 2026-09-12
 
 A fresh, bounded Salesforce re-read was processed only in memory into the
