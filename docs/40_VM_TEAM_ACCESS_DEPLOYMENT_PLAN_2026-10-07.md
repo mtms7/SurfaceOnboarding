@@ -119,7 +119,7 @@ Decisions needed from the owner:
 1. Port: **8443**.
 2. Certificate: **self-signed for now** (pilot); internal CA later.
 3. Allow-list: **the owner only for now** (milton.stevenson@pentera.io).
-4. Operators: **the owner and john.ostrander@pentera.io**. Open point: answer 3 (owner only) and answer 4 (two operators) differ — confirm whether John is on the allow-list from the start.
+4. Operators: **the owner and john.ostrander@pentera.io**. Allow-list order (confirmed): the owner first; John is added as operator after the owner has checked the pilot.
 5. Phase 1: **yes** — read-only VM, runs from the owner's Windows desktop.
 6. Proxy: **VM-local (project-run) for now**; the Redash key approach is still open.
 
