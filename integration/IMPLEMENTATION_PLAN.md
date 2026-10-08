@@ -1549,3 +1549,9 @@ Superseded by "End of day 2026-10-06" below.
 - New `--co CO-XXXX --spycloud-on [--confirm-write] [--env dev]`: dry run by default (Edit opened, checkbox read, Cancel); same path and guards as `--spycloud-off`. Outcomes `spycloud_on_verified`, `spycloud_already_on`, `spycloud_dry_run_off`, `spycloud_readback_still_off`, `spycloud_check_failed`, plus the shared failure codes. Dev only. No dashboard write button. **Live ON flow unverified (tested against fakes only).** 1479 tests OK, 1 skipped; both guards pass.
 - Docs: "Superseded 2026-10-08" lines in docs/33, docs/39, LOCAL_IMPLEMENTATION_STATUS.md.
 - Next: operator dry run `--spycloud-on` on CO-0679 first (recorded OFF), then `--confirm-write` with owner go; then CO-0757, CO-0767 mirror, CO-0728 (state unverified), CO-0762.
+
+#### Live 2026-10-08 — SpyCloud ON on Leonardo Development (operator-run, approved per CO)
+- First `--spycloud-on` dry run on CO-0679 failed once (`spycloud_edit_unavailable`, Edit click timeout 5 s while the page was still settling; rerun fine) then `spycloud_dry_run_off`. The operator then enabled CO-0679 by hand; `--spycloud-on` read it as `spycloud_already_on`.
+- `--spycloud-on --confirm-write`: **CO-0757 `spycloud_on_verified`** and **CO-0728 `spycloud_on_verified`** (first live proof of the tool's own save; both `"leonardo_write":"verified"`); CO-0767 (A2A mirror) and CO-0762 `spycloud_already_on` (no write).
+- All five Dev CE / Case 3 tenants are now ON: CO-0679, CO-0757, CO-0728, CO-0767 mirror, CO-0762. No Salesforce write, no production access. The dashboard process predates the policy change and still shows the old "must be OFF" wording until restarted (`tools\start_attended_dashboard.ps1 -Restart`).
+- Next: restart the dashboard, push (`3b21e98`, `22243fa` + this entry), then Case 4 on CO-0758 (mirror → dry run → apply; owner go at each write).
