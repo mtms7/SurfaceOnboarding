@@ -20,8 +20,9 @@ fi
 
 # Team-access mode (docs/40 step 0): identity comes from the loopback proxy, so the allow-list and the one public
 # https origin must be configured; otherwise every request would be refused anyway. Fail early and clearly.
-if [[ -z "${SURFACE_ONBOARDING_ALLOWED_USERS:-}" && -z "${SURFACE_ONBOARDING_ALLOWED_USERS_FILE:-}" ]]; then
-  echo "Refusing to start: SURFACE_ONBOARDING_ALLOWED_USERS (or _FILE) must list the allowed e-mails." >&2
+if [[ -z "${SURFACE_ONBOARDING_ALLOWED_USERS:-}" && -z "${SURFACE_ONBOARDING_ALLOWED_USERS_FILE:-}" \
+      && -z "${SURFACE_ONBOARDING_USERS_FILE:-}" ]]; then
+  echo "Refusing to start: SURFACE_ONBOARDING_USERS_FILE (or ALLOWED_USERS / _FILE) must list the allowed e-mails." >&2
   exit 2
 fi
 

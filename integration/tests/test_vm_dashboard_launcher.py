@@ -18,6 +18,10 @@ class VmDashboardLauncherTests(unittest.TestCase):
         self.assertIn("must be Python 3.12 or newer", script)
         self.assertNotIn('SURFACE_ONBOARDING_PYTHON:-python3', script)
 
+    def test_launcher_accepts_the_single_users_file_the_unit_template_sets(self):
+        script = (Path(__file__).resolve().parents[2] / "scripts" / "run_vm_dashboard.sh").read_text(encoding="utf-8")
+        self.assertIn("SURFACE_ONBOARDING_USERS_FILE", script)
+
     @unittest.skipIf(os.name == "nt", "Windows does not preserve POSIX executable modes")
     def test_ubuntu_launcher_is_executable(self):
         script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_vm_dashboard.sh"
