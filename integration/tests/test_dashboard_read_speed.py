@@ -249,6 +249,11 @@ class WarmFromQueueTests(ReadSpeedCase):
 
     def test_scheduling_does_not_wait_and_uses_the_existing_pool_size(self):
         self.assertEqual(dashboard._display_prefetch_pool._max_workers, 4)
+        # Reads left on the shared prefetch pool by an earlier test would hit this test's fake; wait until all four
+        # workers are idle (the barrier only releases when every worker is free) so the query count is this test's own.
+        barrier = threading.Barrier(4)
+        for waiter in [dashboard._display_prefetch_pool.submit(barrier.wait, 30) for _ in range(4)]:
+            waiter.result(timeout=60)
         fake = FakeSalesforce(RENEWAL_ROW, latency=0.5)
         pool = ThreadPoolExecutor(max_workers=4)
         rows = [self.queue_row(n) for n in range(1, 16)]
