@@ -5119,7 +5119,8 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
     groups = "".join(
         "<div class='navgroup " + key + "'><div class='navhead'>" + head
         + ("<span class='ro'>" + note + "</span>" if note else "") + "</div>"
-        + "".join(nav(*link) for link in links) + "</div>" for key, head, note, links in NAV_GROUPS)
+        + "".join(nav(*link) for link in links) + "</div>" for key, head, note, links in NAV_GROUPS
+        if not (vm_mode() and key == "tools"))
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>" + refresh +
@@ -6735,9 +6736,21 @@ def snapshot_banner(now: datetime | None = None) -> str:
     return "<div class='snapbanner" + (" stale" if stale else "") + "' role='status'>" + text + "</div>"
 
 
+_REFRESH_FORM = re.compile(
+    r"<form\b[^>]*\bmethod=['\"]get['\"][^>]*>(?:(?!</form>).)*?name=['\"]refresh['\"](?:(?!</form>).)*?</form>",
+    re.IGNORECASE | re.DOTALL)
+_EMPTY_MENU = re.compile(r"<details class='menu'><summary>[^<]*</summary><div class='menu-pop'>\s*</div></details>")
+
+
 def vm_strip_actions(html: str) -> str:
-    """VM pages are read-only: every POST form (Start, Confirm, Prepare sessions, checks, refresh sweeps) is removed."""
-    return _POST_FORM.sub("", html)
+    """VM pages are read-only: every POST form (Start, Confirm, Prepare sessions, checks, refresh sweeps) is removed.
+
+    The GET Refresh buttons and the then-empty More menu go too (a refresh cannot read anything on the VM), and wording
+    that implies a live Salesforce read is replaced, because the page is rendered from the published snapshot.
+    """
+    html = _EMPTY_MENU.sub("", _REFRESH_FORM.sub("", _POST_FORM.sub("", html)))
+    return (html.replace("Read from Salesforce at", "Page rendered at")
+                .replace("Unavailable · open to retry", "Not included in the published snapshot"))
 
 
 def page_vm_unavailable() -> str:

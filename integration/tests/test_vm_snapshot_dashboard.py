@@ -176,6 +176,29 @@ class VmPagesFromSnapshotTests(SnapshotDashboardCase):
             for label in ("start-form", "start onboarding", "prepare sessions", "check session"):
                 self.assertNotIn(label, lowered, path + " " + label)
 
+    def test_no_live_read_wording_refresh_buttons_or_sessions_link(self):
+        for path in PAGES:
+            status, _, body = self.get(path, email=OWNER)
+            lowered = re.sub(r"<style>.*?</style>", "", body.lower(), flags=re.DOTALL)
+            self.assertNotIn("read from salesforce at", lowered, path)
+            self.assertNotIn("open to retry", lowered, path)
+            self.assertNotIn("name='refresh'", lowered, path)
+            self.assertNotIn(">refresh<", lowered, path)
+            self.assertNotIn(">sessions<", lowered, path)
+            self.assertNotIn("<summary>more</summary>", lowered, path)
+
+    def test_strip_actions_rewrites_only_vm_markup(self):
+        page = ("<span class='note'>Read from Salesforce at 21:23:48</span><div class='head-meta'>"
+                "<form method='get' action='/'><input type='hidden' name='refresh' value='1'>"
+                "<button class='ghost' type='submit'>Refresh</button></form>"
+                "<details class='menu'><summary>More</summary><div class='menu-pop'>"
+                "<form method='post' action='/x'><button>Go</button></form></div></details></div>"
+                "<form method='get' action='/search'><input name='q'></form><small>Unavailable · open to retry</small>")
+        out = dashboard.vm_strip_actions(page)
+        self.assertEqual(out, "<span class='note'>Page rendered at 21:23:48</span><div class='head-meta'></div>"
+                              "<form method='get' action='/search'><input name='q'></form>"
+                              "<small>Not included in the published snapshot</small>")
+
     def test_server_side_refusals_remain(self):
         status, _, body = self.post("/attended/start-ce-only-runner", OWNER, "CO-0001")
         self.assertEqual(status, 403)

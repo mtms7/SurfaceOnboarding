@@ -1602,3 +1602,25 @@ Superseded by "End of day 2026-10-06" below.
 - Deletion and activation steps on the VM: look first, list exactly, one block at a time; passwords are typed only in the operator's terminal and never in chat.
 
 **Boundaries preserved (2026-10-08):** Leonardo Development only for onboarding writes (operator-run, approved); no production BackOffice access; no Salesforce write; no Redash change (one operator-run read-only `--collect`); on the VM only the operator-run steps listed above. No credential, token, MFA value or cookie was copied or persisted by the assistant.
+
+#### Handoff 2026-10-09 (evening) — VM pilot running behind an SSH tunnel; r23 UI cleanup built locally
+
+**Outcome:** the read-only VM dashboard is live on `workato-opa-01` as a **temporary, loopback-only pilot** and was reviewed by the owner through `ssh -L 8443:127.0.0.1:8443` (banner "Data as of 2026-10-09 20:14 UTC", queue, CO pages, no action buttons). Nothing is enabled at boot; `sudo sh /tmp/step2c.sh stop` stops both services and removes the marker.
+
+**Done today (all VM steps operator-run, each approved):**
+- `git push`; Actions run #31 failed on a **flaky test** (`test_scheduling_does_not_wait_and_uses_the_existing_pool_size`: 26 queries, not 24, because reads left on the shared prefetch pool by an earlier test hit this test's fake); fixed by draining the pool with a 4-way barrier (`c2ba4b4`), Actions green afterwards.
+- Step 2A (`_step2a_vm_prepare.sh`): nginx installed then **disabled and stopped** (default port-80 site removed), `/etc/surface-onboarding/` with `proxy-secret`, `users.txt` (owner as plain **viewer**), self-signed certificate (SAN localhost, 127.0.0.1, 172.26.37.20, 90 days). Lesson: the first attempt had not actually run; compare the pasted output with the expected state before moving on.
+- **Bug found before activation:** `run_vm_dashboard.sh` rejected `SURFACE_ONBOARDING_USERS_FILE` (the unit's only allow-list variable). Fixed with a test (`2f20a82`), so release **r22** (SHA-256 `DBD1CE36…3FBE`, checked by the current and the previous checker, no CR in text files) replaced r21: staged in `app-r22-staged-20261009`, suite OK on the VM.
+- Step 2B (`_step2b_vm_install.sh`): the old Sep 10 `app` directory renamed `app-prev-20260910` (rollback), `app` -> r22 symlink, dashboard unit with `PUBLIC_ORIGIN=https://localhost:8443`, loopback-only tunnel nginx site with the owner identity, `nginx -t` OK.
+- Snapshot key: a new 32-byte key generated on the desktop (`%USERPROFILE%\.surface-onboarding\snapshot.key`, outside the repo), installed on the VM as `snapshot.key` (0640 root:surface-onboarding), temp copy shredded. First **full** snapshot (read-only Salesforce reads: 9 queue rows, 11 CO details, 16 files, 107 KB) ingested as `snapshot-20261009T201453Z`.
+- Step 2C (`_step2c_vm_start_stop.sh`): owner approved the marker `approved-web-identity` and the start. Dashboard on `127.0.0.1:8000`, nginx on `127.0.0.1:8443`, nothing on `0.0.0.0`; GET / 200, POST / 403, direct call without the proxy secret 403.
+
+**Built locally after the review (release r23 candidate; tests pass):** VM pages no longer say "Read from Salesforce at" (now "Page rendered at"), the closed-history chip says "Not included in the published snapshot", and the Refresh buttons, the empty More menu and the Sessions nav link are removed in VM mode; README snapshot caps corrected to 32/64 MB. Not yet built as an archive or uploaded.
+
+**Boundaries preserved:** no Salesforce write, no Leonardo or Redash change, no production BackOffice access, no OneLogin, no firewall change, no certificate decision. No password, key, secret value or token was shown or persisted by the assistant; the `workato` password was typed only in the operator's terminal.
+
+**Next (owner/SecOps decisions unless marked):**
+1. Operator: leave the pilot running or `stop` it; delete `/tmp/step2a.sh`, `/tmp/step2b.sh`, `/tmp/step2c.sh`, `/tmp/r22-upload`, `/tmp/r21-vm-check.sh`, `~/r21-upload` when convenient; **rotate the `workato` password**; the VM reports "System restart required" (a reboot restarts the Workato agent and the validator/intake services, so schedule it).
+2. Assistant: build r23 (LF archive, both checkers) after the owner's go, stage it on the VM like r22, then the operator restarts the dashboard.
+3. Owner/SecOps: OneLogin application and allow-list, John as operator, firewall for 8443, certificate decision, SecOps acceptance of the self-signed pilot; then remove the tunnel site and the interim identity. Phase 2 (browser runner on the VM) stays a separate design.
+4. Onboarding backlog unchanged from the 2026-10-09 handoff above (Case 4 on CO-0758, Case 5 needs a real CO, `_to_delete/`).

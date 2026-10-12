@@ -168,8 +168,8 @@ python tools/publish_vm_snapshot.py --dry-run                 # lists what would
 It writes `surface-vm-snapshot-<UTC stamp>.zip` into the folder and prints counts and the path only. The zip holds only
 allow-listed files (the `attended_*.json` state files that exist, `queue.json`, `co_details.json` with exactly the
 dashboard's fixed display fields, and the latest Dev inventory); it refuses any other name. The production clone
-(about 17 MB) is larger than the 5 MB per-file cap and is not published, so the Production tenant pages show it as
-unavailable. Optional automatic publish after each runner process ends: `SURFACE_VM_SNAPSHOT_AUTOPUBLISH=1` with
+(about 17 MB) is deliberately not on the allow-list and is not published, so the Production tenant pages show it as
+unavailable (the caps are now 32 MB per file and 64 MB per bundle, so adding it later is an owner decision). Optional automatic publish after each runner process ends: `SURFACE_VM_SNAPSHOT_AUTOPUBLISH=1` with
 `SURFACE_VM_SNAPSHOT_KEY_FILE` and `SURFACE_VM_SNAPSHOT_OUT_DIR`; best effort, it never changes a run result and only
 writes `surface-vm-snapshot-latest.zip` into that folder.
 
@@ -180,7 +180,7 @@ python3 /opt/surface-onboarding/app/tools/ingest_vm_snapshot.py   --key-file /et
 ```
 
 It verifies everything first (HMAC-SHA256 over the canonical manifest, SHA-256 and size per file, allow-list, no
-folders, links, duplicates, extra or missing files, files over 5 MB, bundle over 20 MB, schema version 1, nothing older
+folders, links, duplicates, extra or missing files, files over 32 MB, bundle over 64 MB, schema version 1, nothing older
 than the current snapshot), unpacks into `<STATE_DIR>/snapshots/incoming/`, atomically switches the `current` symlink,
 keeps the newest 5 snapshots and prints only `ingested <name>` or `refused:<code>` (exit 2). On any failure the previous
 snapshot stays current. The key is a file of at least 32 characters, never in the repository: on the VM
