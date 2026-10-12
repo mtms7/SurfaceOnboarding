@@ -692,8 +692,10 @@ class StateDirTests(unittest.TestCase):
         with patch.dict(os.environ, {**clean, "SURFACE_ONBOARDING_RUNTIME": "vm"}):
             # VM mode reads the published snapshot (docs/41): <state dir>/snapshots/current/<name>.
             self.assertEqual(state_paths.state_file(default), Path("/var/lib/surface-onboarding/snapshots/current/attended_x.json"))
-            self.assertEqual(state_paths.inventory_root(Path("D")),
-                             Path("/var/lib/surface-onboarding/snapshots/current/leonardo-inventory"))
+            # Isolate from a real ingested snapshot on the host (the VM's /var/lib/surface-onboarding has one).
+            with patch.object(state_paths.vm_snapshot, "current_dir", return_value=None):
+                self.assertEqual(state_paths.inventory_root(Path("D")),
+                                 Path("/var/lib/surface-onboarding/snapshots/current/leonardo-inventory"))
         with patch.dict(os.environ, {**clean, "SURFACE_ONBOARDING_RUNTIME": "vm", "SURFACE_ONBOARDING_STATE_DIR": "/srv/state"}):
             self.assertEqual(state_paths.state_file(default), Path("/srv/state/snapshots/current/attended_x.json"))
         with patch.dict(os.environ, {**clean, "SURFACE_ONBOARDING_STATE_DIR": "/srv/state"}):  # desktop override
