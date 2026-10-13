@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import state_paths
+from integration.onboarding import review_approval
 from integration.onboarding import run_progress
 from integration.onboarding import users_file
 from integration.onboarding import vm_snapshot
@@ -89,6 +90,7 @@ from tools.attended_ce_only_playwright import (
     _chrome_executable,
     close_automation_browser,
     production_match_for,
+    production_review_inputs,
     load_check_state,
     load_runner_state,
     start_blocker,
@@ -5092,13 +5094,14 @@ PENTERA_CSS = (
 # Two areas (owner decision 2026-10-07): Leonardo Development (navy, solid dot) and Production through BackOffice
 # (amber from the warn palette, hollow dot, read-only). Red is never an environment colour.
 NAV_GROUPS = (
-    ("dev", "LEONARDO · DEV", "", (("/", "Onboardings", "onboardings"), ("/dev/onboarded", "Onboarded on Dev", "dev_onboarded"),
+    ("onboard", "ONBOARDING", "production-checked", (("/onboard", "Onboardings", "onboard"),)),
+    ("dev", "DEV · LEONARDO", "", (("/", "Onboardings", "onboardings"), ("/dev/onboarded", "Onboarded on Dev", "dev_onboarded"),
                                     ("/history", "History", "history"), ("/inventory", "Tenants", "inventory"))),
     ("prod", "PRODUCTION · BO", "read-only", (("/prod", "Readiness", "prod"), ("/prod/matches", "Matches", "prod_matches"),
                                                   ("/prod/tenants", "Tenants", "prod_tenants"))),
     ("tools", "TOOLS", "", (("/connection", "Sessions", "connection"),)),
 )
-ENV_BY_ACTIVE = {"onboardings": "dev", "dev_onboarded": "dev", "history": "dev", "inventory": "dev",
+ENV_BY_ACTIVE = {"onboard": "prod", "onboardings": "dev", "dev_onboarded": "dev", "history": "dev", "inventory": "dev",
                  "prod": "prod", "prod_matches": "prod", "prod_tenants": "prod"}
 ENV_PILLS = {"dev": "DEV · Leonardo", "prod": "PRODUCTION · read-only", "tools": "TOOLS"}
 
@@ -6286,6 +6289,191 @@ def render_prod_readiness(flt: str = "", all_open: bool = False) -> str:
     return _app_shell("Production readiness", page, active="prod", wide=True)
 
 
+# --- Review summary and approval (docs/43 section 4): production-checked onboarding, summary and approval only -----
+REVIEW_APPROVAL_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / review_approval.STATE_FILE_NAME)
+REVIEW_CLONE_MAX_AGE_SECONDS = 6 * 3600
+REVIEW_BLOCKER_TEXT = {
+    "no_automated_route": "This CO has no automated route (exact Product and Type pair not supported).",
+    "summary_source_unreadable": "The values to be sent could not be read from Salesforce.",
+    "source_revision_missing": "The Salesforce source revision could not be determined.",
+    "production_clone_stale": "The production clone (Redash) is older than 6 hours: collect it again.",
+    "production_clone_age_unknown": "The age of the production clone is unknown: collect it again.",
+    "production_exists_matches": "A live production tenant already matches this CO: this is not a new onboarding.",
+    "production_exists_differs": "A live production tenant with this name already exists and differs from the CO.",
+    "production_exists_other": "Only trial, evaluation, POV, disabled or deleted production tenants match: the owner must resolve it.",
+    "production_ambiguous": "More than one live paid production tenant has this exact name.",
+    "production_clone_unavailable": "The production clone could not be used (missing, stale or unreadable data).",
+}
+
+
+def _plain(value: Any) -> Any:
+    """JSON-safe copy (tuples to lists, other objects to text) so the summary hashes the same everywhere."""
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_plain(item) for item in (sorted(value, key=str) if isinstance(value, (set, frozenset)) else value)]
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(summary, extras) for one CO. The summary is exactly what the operator approves (it is hashed).
+
+    Read-only: Salesforce source reads and the production clone snapshot. Duplicate validation uses the production
+    clone (Redash) only; Leonardo is never consulted. ``extras`` holds display-only values that must not change the hash.
+    A Salesforce read failure propagates (ReadUnavailable); every other uncertainty becomes a blocker (fail closed).
+    """
+    row = detail_row(reference)
+    route = route_for(row)
+    product, kind = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
+    blockers: list[str] = []
+    summary: dict[str, Any] = {
+        "reference": reference, "account": row.get("Account_Name__c") or "", "product": product or "",
+        "onboarding_type": kind or "", "route": route or "", "source_revision": "", "values": {},
+        "production_check": {"status": "not_checked", "reason": "", "tenants_checked": 0, "candidates": []},
+        "leonardo_consulted": False, "blockers": blockers}
+    extras: dict[str, Any] = {"captured_at": None, "age_seconds": None}
+    if route != CE_ENGINE and route not in SURFACE_ROUTES:
+        blockers.append("no_automated_route")
+        return summary, extras
+    evaluation = (evaluate_ce_only_fill_preflight(reference) if route == CE_ENGINE
+                  else evaluate_surface_fill_preflight(reference, route))
+    summary["source_revision"] = str(evaluation.source_revision or "")
+    if not summary["source_revision"]:
+        blockers.append("source_revision_missing")
+    blockers.extend(str(item) for item in evaluation.blockers)
+    scope = getattr(evaluation, "scope", None)
+    if isinstance(scope, dict):
+        summary["values"]["scope"] = _plain(scope)
+    try:
+        inputs = production_review_inputs(reference, product, kind)
+    except Exception:  # noqa: BLE001 - any failure to read the values blocks approval
+        blockers.append("summary_source_unreadable")
+    else:
+        summary["values"].update(tenant_names=_plain(inputs["co_source"]["tenant_names"]),
+                                 domains=_plain(inputs["co_source"]["domains"]), plan=_plain(inputs["plan"]))
+    match = _match_of(reference, product, kind)
+    status = str(match.get("status") or "clone_unavailable")
+    summary["production_check"] = {
+        "status": status, "reason": str(match.get("reason") or ""), "tenants_checked": int(match.get("tenants_checked") or 0),
+        "candidates": [{key: item.get(key) for key in ("name", "domain", "live_paid", "deleted", "enabled", "license_type")}
+                       for item in match.get("candidates") or () if isinstance(item, dict)]}
+    extras = {"captured_at": match.get("captured_at"), "age_seconds": match.get("age_seconds")}
+    if status != "not_in_production":
+        blockers.append("production_" + status)
+    elif not isinstance(extras["age_seconds"], (int, float)):
+        blockers.append("production_clone_age_unknown")
+    elif extras["age_seconds"] > REVIEW_CLONE_MAX_AGE_SECONDS:
+        blockers.append("production_clone_stale")
+    return summary, extras
+
+
+def _approval_state(summary: dict[str, Any], now: datetime | None = None) -> tuple[str | None, dict[str, Any] | None]:
+    """(problem code or None, the stored record) for the summary now shown; an unreadable file is a problem."""
+    now = now or datetime.now(timezone.utc)
+    try:
+        record = review_approval.load(REVIEW_APPROVAL_PATH).get(summary["reference"])
+    except review_approval.ApprovalUnavailable:
+        return "approval_file_unreadable", None
+    return review_approval.problem(record, summary["route"], summary["source_revision"],
+                                   review_approval.summary_hash(summary), now), record
+
+
+def _kv_rows(pairs: list[tuple[str, str]]) -> str:
+    return "<table><tbody>" + "".join("<tr><th scope='row'>" + escape(key) + "</th><td>" + escape(value) + "</td></tr>"
+                                      for key, value in pairs) + "</tbody></table>"
+
+
+def _joined(item: Any) -> str:
+    return ", ".join(map(str, item)) if isinstance(item, list) else str(item)
+
+
+def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice: str = "") -> str:
+    ref = summary["reference"]
+    digest = review_approval.summary_hash(summary)
+    problem, record = _approval_state(summary)
+    blockers = summary["blockers"]
+    values = summary["values"]
+    check = summary["production_check"]
+    facts = _kv_rows([("Account", summary["account"] or "—"), ("Product", summary["product"] or "—"),
+                      ("Onboarding type", summary["onboarding_type"] or "—"), ("Route", summary["route"] or "—"),
+                      ("Salesforce source revision", summary["source_revision"] or "—")])
+    sent = ""
+    if values:
+        pairs = [("Tenant name", _joined(values.get("tenant_names") or []) or "—"),
+                 ("Domains", _joined(values.get("domains") or []) or "—")]
+        pairs += [(str(key).replace("_", " ").capitalize(), _joined(item)) for key, item in (values.get("plan") or {}).items()]
+        scope = values.get("scope")
+        if isinstance(scope, dict):
+            pairs += [("Scope · " + str(key).replace("_", " "), _joined(item)) for key, item in scope.items()]
+        sent = "<h2>Data that would be sent</h2>" + _kv_rows(pairs)
+    age = extras.get("age_seconds")
+    candidates = "".join("<li>" + escape(str(c.get("name") or "—")) + " · " + escape(str(c.get("domain") or "—"))
+                         + (" · live, paid" if c.get("live_paid") else "") + (" · deleted" if c.get("deleted") else "")
+                         + "</li>" for c in check["candidates"])
+    production = ("<h2>Duplicate validation: production only</h2><p>Checked against the Production BackOffice clone (Redash). "
+                  "Leonardo is not consulted.</p>"
+                  + _kv_rows([("Result", check["status"].replace("_", " ")),
+                              ("Tenants checked", str(check["tenants_checked"])),
+                              ("Clone captured", str(extras.get("captured_at") or "—")
+                               + (" (" + str(int(age // 60)) + " min ago)" if isinstance(age, (int, float)) else ""))])
+                  + ("<p>" + escape(check["reason"]) + "</p>" if check["reason"] else "")
+                  + ("<ul>" + candidates + "</ul>" if candidates else ""))
+    blocked = ""
+    if blockers:
+        blocked = ("<h2>Blocked</h2><ul class='blockers'>" + "".join(
+            "<li>" + escape(REVIEW_BLOCKER_TEXT.get(code, code)) + "</li>" for code in blockers) + "</ul>"
+            "<p>Correct the CO in Salesforce if the data is wrong. This page then shows a new summary and it can be approved.</p>")
+    if record is not None and problem is None:
+        status = ("<p><strong>Approved</strong> by " + escape(str(record["operator"])) + " at " + escape(str(record["approved_at"]))
+                  + ", valid until " + escape(str(record["expires_at"])) + ". The approval is bound to this exact summary.</p>")
+    elif record is not None and problem in ("summary_changed", "revision_changed", "route_changed"):
+        status = "<p><strong>Earlier approval no longer applies:</strong> the CO changed after it was approved. Review and approve again.</p>"
+    elif record is not None and problem == "approval_expired":
+        status = "<p><strong>Earlier approval expired.</strong> Review and approve again.</p>"
+    elif record is not None and problem == "approval_consumed":
+        status = "<p><strong>Earlier approval was already used.</strong> Review and approve again.</p>"
+    elif problem == "approval_file_unreadable":
+        status = "<p><strong>The approval record cannot be read.</strong> Nothing is treated as approved.</p>"
+    else:
+        status = "<p>Not approved yet.</p>"
+    form = ("<form method='post' action='/attended/review-approve'><input type='hidden' name='reference' value='" + escape(ref)
+            + "'><input type='hidden' name='source_revision' value='" + escape(summary["source_revision"])
+            + "'><input type='hidden' name='summary_hash' value='" + digest + "'>"
+            + "<button type='submit'" + (" disabled aria-disabled='true'" if blockers else "") + ">Approve this summary</button></form>")
+    notes = {"approved": "Approval recorded.", "changed": "The CO changed since the page was shown. Review the new summary.",
+             "blocked": "This summary has blockers and cannot be approved."}
+    main = ("<a class='crumb' href='/onboard'>&larr; Onboardings</a><div class='page-head'><h1>Review " + escape(ref) + "</h1></div>"
+            + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
+            + "<section class='card'>" + facts + sent + production + blocked + "<h2>Approval</h2>" + status + form
+            + "<p class='note'>Approving records your approval of exactly this summary (valid 4 hours, used once). It creates "
+              "nothing: no Leonardo, BackOffice or Salesforce write. Production creates stay blocked until the owner decisions "
+              "in docs/42 are recorded.</p></section>")
+    return _app_shell("Review " + ref, main, active="onboard")
+
+
+def render_onboard_queue() -> str:
+    body = ""
+    for row in queue_rows():
+        ref = str(row.get("Name") or "")
+        if not REFERENCE.fullmatch(ref):
+            continue
+        route = route_for(row)
+        supported = route == CE_ENGINE or route in SURFACE_ROUTES
+        body += ("<tr><td>" + ("<a href='/onboard/" + escape(ref) + "'>" + escape(ref) + "</a>" if supported else escape(ref)) + "</td><td>"
+                 + escape(str(row.get("Account__r.Name") or "—")) + "</td><td>" + escape(str(row.get("Onboarding_Product__c") or "—"))
+                 + "<br><small>" + escape(str(row.get("Onboarding_Type__c") or "—")) + "</small></td><td>"
+                 + ("Automated route" if supported else "No automated route") + "</td><td>"
+                 + ("<a href='/onboard/" + escape(ref) + "'>Review summary</a>" if supported else "—") + "</td></tr>")
+    table = ("<table><thead><tr><th>Onboarding</th><th>Account</th><th>Product</th><th>Route</th><th></th></tr></thead><tbody>"
+             + body + "</tbody></table>" if body else "<p class='empty'>No open onboardings.</p>")
+    main = ("<div class='page-head'><h1>Onboardings</h1></div><p class='note'>Review the summary of everything that would be "
+            "sent, with duplicate validation against the Production BackOffice clone only (Leonardo is not consulted). "
+            "Approval records the decision; nothing is created from this page.</p><section class='card'>" + table + "</section>")
+    return _app_shell("Onboardings", main, active="onboard")
+
+
 def render_prod_matches(all_open: bool = False) -> str:
     """/prod/matches: the current match of every CO in scope (no stored history) plus the recorded Start-gate checks."""
     scope, _evidence, note = _prod_scope(all_open)
@@ -7099,6 +7287,7 @@ POST_ROUTES = frozenset({
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
     "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
+    "/attended/review-approve",
 })
 
 
@@ -7330,6 +7519,13 @@ class Handler(BaseHTTPRequestHandler):
                 except RunnerStateUnavailable:
                     state = None
                 self.send_page(HTTPStatus.OK, page_ce_only_runner_status(state, ref)); return
+            if path == "/onboard":
+                self.send_page(HTTPStatus.OK, render_onboard_queue()); return
+            review = re.fullmatch(r"/onboard/(CO-[0-9]{4,10})", path)
+            if review:
+                review_summary, review_extras = build_review_summary(review.group(1))
+                self.send_page(HTTPStatus.OK, page_onboard_review(review_summary, review_extras,
+                                                                  parse_qs(parsed.query).get("notice", [""])[0])); return
             match = re.fullmatch(r"/co/(CO-[0-9]{4,10})", path)
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
@@ -7425,6 +7621,27 @@ class Handler(BaseHTTPRequestHandler):
                                           route=renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))[0]):  # type: ignore[index]
                 return
         self.send_redirect("/attended/ce-only-runner-status?ref=" + reference)
+
+    def _post_review_approve(self, reference: str, form: Any) -> None:
+        """Record the operator's approval of exactly the summary they saw. Creates nothing."""
+        try:
+            summary, _extras = build_review_summary(reference)
+        except ReadUnavailable:
+            self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
+        if summary["blockers"]:
+            self.send_redirect("/onboard/" + reference + "?notice=blocked"); return
+        digest = review_approval.summary_hash(summary)
+        if (exact_form_value(form, "summary_hash") != digest
+                or exact_form_value(form, "source_revision") != summary["source_revision"]):
+            self.send_redirect("/onboard/" + reference + "?notice=changed"); return
+        operator = (dashboard_operator(self.headers.get("Cookie")) if login_required() else "") or "desktop-operator"
+        try:
+            review_approval.issue(REVIEW_APPROVAL_PATH, reference, summary["route"], summary["source_revision"], digest,
+                                  operator, datetime.now(timezone.utc))
+        except (review_approval.ApprovalRefused, review_approval.ApprovalUnavailable, OSError):
+            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Approval not recorded</title><p>The approval could not be "
+                           "recorded. Nothing was started.</p><p><a href='/onboard/" + escape(reference) + "'>Return</a></p>"); return
+        self.send_redirect("/onboard/" + reference + "?notice=approved")
 
     def do_POST(self) -> None:
         # Any action may change Salesforce or local state; later pages read fresh.
@@ -7559,6 +7776,8 @@ class Handler(BaseHTTPRequestHandler):
         if reference is None or not REFERENCE.fullmatch(reference):
             self.send_page(HTTPStatus.BAD_REQUEST, "<!doctype html><title>Invalid request</title><p>Return to the dashboard and retry the attended step.</p>")
             return
+        if path == "/attended/review-approve":
+            self._post_review_approve(reference, form); return
         gated_action = SESSION_GATED_ROUTES.get(path)
         if gated_action is not None:
             # Fresh, verified sessions before any runner launch (2026-10-03).

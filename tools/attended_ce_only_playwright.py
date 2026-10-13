@@ -7968,6 +7968,15 @@ def _production_expectation(reference: str, product: Any = None,
         "spycloud_shown": engine in SPYCLOUD_ROUTES}
 
 
+def production_review_inputs(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
+    """What the production check (and so the review summary) uses for one CO: engine, CO source names/domains, plan.
+
+    Read-only Salesforce reads only; raises on any problem (the caller fails closed). No Leonardo, browser or write.
+    """
+    engine, co_source, plan = _production_expectation(reference, product, onboarding_type)
+    return {"engine": engine, "co_source": co_source, "plan": plan}
+
+
 def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
     """Read-only production match of one CO (see ``integration.onboarding.production_match``).
 

@@ -136,7 +136,7 @@ def forms(page):
 
 
 class NavigationTests(unittest.TestCase):
-    ORDER = [("/", "Onboardings"), ("/dev/onboarded", "Onboarded on Dev"), ("/history", "History"), ("/inventory", "Tenants"),
+    ORDER = [("/onboard", "Onboardings"), ("/", "Onboardings"), ("/dev/onboarded", "Onboarded on Dev"), ("/history", "History"), ("/inventory", "Tenants"),
              ("/prod", "Readiness"), ("/prod/matches", "Matches"), ("/prod/tenants", "Tenants"), ("/connection", "Sessions")]
 
     def test_groups_labels_and_order(self):
@@ -146,7 +146,7 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(links, self.ORDER)
         heads = re.findall(r"<div class='navhead'>(.*?)</div>", aside)
         self.assertEqual([re.sub(r"<[^>]+>", "", head) for head in heads],
-                         ["LEONARDO · DEV", "PRODUCTION · BOread-only", "TOOLS"])
+                         ["ONBOARDINGproduction-checked", "DEV · LEONARDO", "PRODUCTION · BOread-only", "TOOLS"])
         self.assertIn("<span class='ro'>read-only</span>", aside)
         self.assertLess(aside.index("navgroup dev"), aside.index("navgroup prod"))
         self.assertLess(aside.index("navgroup prod"), aside.index("navgroup tools"))
