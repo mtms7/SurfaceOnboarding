@@ -79,8 +79,20 @@ def get_co_page(path: str = "/co/CO-0767") -> FakeHandler:
     return handler
 
 
+def drain_prefetch_pool():
+    """Wait until all four shared prefetch workers are idle (the barrier releases only when every worker is free).
+
+    Reads left on the shared pool by an earlier test would otherwise land in this test's fakes, timing log or cache.
+    """
+    barrier = threading.Barrier(4)
+    for waiter in [dashboard._display_prefetch_pool.submit(barrier.wait, 30) for _ in range(4)]:
+        waiter.result(timeout=60)
+
+
 class ReadSpeedCase(unittest.TestCase):
     def setUp(self):
+        drain_prefetch_pool()
+        self.addCleanup(drain_prefetch_pool)
         dashboard.clear_display_cache()
         self.addCleanup(dashboard.clear_display_cache)
         dashboard.READ_TIMING_LOG.clear()
