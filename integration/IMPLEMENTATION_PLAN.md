@@ -1624,3 +1624,21 @@ Superseded by "End of day 2026-10-06" below.
 2. Assistant: build r23 (LF archive, both checkers) after the owner's go, stage it on the VM like r22, then the operator restarts the dashboard.
 3. Owner/SecOps: OneLogin application and allow-list, John as operator, firewall for 8443, certificate decision, SecOps acceptance of the self-signed pilot; then remove the tunnel site and the interim identity. Phase 2 (browser runner on the VM) stays a separate design.
 4. Onboarding backlog unchanged from the 2026-10-09 handoff above (Case 4 on CO-0758, Case 5 needs a real CO, `_to_delete/`).
+
+#### Handoff 2026-10-13 — r24 active on the VM pilot (loopback-only, behind the SSH tunnel)
+
+**Outcome:** release **r24** (built from `ca52953`) replaced r22 on `workato-opa-01`; the read-only dashboard was restarted and verified (GET / 200, POST / 403, direct call without the proxy secret 403, listeners only `127.0.0.1:8000` and `127.0.0.1:8443`, banner "Data as of 2026-10-09 20:14 UTC", new "Page rendered at" wording, old "Read from Salesforce at" gone, nothing enabled at boot).
+
+**Done (VM steps operator-run, each approved):**
+- Local: r23 UI cleanup committed (`70e0f12`), suite 1588 OK (1 skipped) and both guards pass.
+- r23 (`C97BA56D…FCD4F3`) was staged in `app-r23-staged-20261012`; the VM suite showed **one failure**, `test_vm_proxy_mode.StateDirTests.test_helper_rules`: `state_paths.inventory_root` resolves the real `snapshots/current` pointer, and the VM now has an ingested snapshot. A **test-isolation bug only** (product behaviour correct); fixed by stubbing `vm_snapshot.current_dir` in that assertion (`ca52953`). Lesson: tests must not depend on the host's real state dir; the VM is the only place that catches this.
+- r24 (`surface-onboarding-r24-ca52953.tar.gz`, SHA-256 `38D4C4C50409E60B4E4555BFC93895A89FB5C2B39326D6111F6DD2F357FEB9D5`, LF export, 0 CR bytes, current and r20-era checkers pass) staged by `_step3d_vm_stage_r24.sh` into `app-r24-staged-20261012` (suite OK, skipped=3, both guards pass), activated by `_step3e_vm_activate_r24.sh` (atomic symlink swap, dashboard-only restart; `rollback` points `app` back at r22).
+- Scripts: `_step3a/3b/3c` (r23 stage/test/show-failure), `_step3d` (r24 stage), `_step3e` (activate/rollback) in `integration/deployment/vm_pilot/`.
+
+**Boundaries preserved:** no Salesforce, Leonardo, Redash or production BackOffice access; no OneLogin, firewall or certificate change; no password, key, secret or token shown or persisted by the assistant (passwords typed only in the operator's terminal).
+
+**Next (owner/SecOps decisions unless marked):**
+1. Operator: review the r24 pages through `ssh -L 8443:127.0.0.1:8443`; later delete the unused VM folders (`app-r23-staged-20261012`, `incoming-r23`, `app-r22-staged-20261009` after a few days, `/tmp/r2*-upload`, `/tmp/step2*.sh`, `/tmp/r23-suite.log`; list first, one block at a time); **rotate the `workato` password**; schedule the reboot ("System restart required" also restarts the Workato agent, validator and intake services).
+2. Owner/SecOps: OneLogin application and allow-list, John as operator, firewall for 8443, certificate decision, SecOps acceptance of the self-signed pilot; then remove the tunnel site and the interim identity. Phase 2 (browser runner on the VM) stays a separate design.
+3. Fresh snapshot publish/ingest when the owner wants newer data (the pilot still shows 2026-10-09).
+4. Onboarding backlog unchanged (Case 4 on CO-0758, Case 5 needs a real CO, 409 response key names in the run log, reason text for "No automated route", Country alias list, `_to_delete/`).
