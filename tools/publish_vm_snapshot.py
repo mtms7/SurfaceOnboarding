@@ -23,7 +23,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -86,8 +86,11 @@ def collect_inventory_files() -> dict[str, bytes]:
     return {vm_snapshot.INVENTORY_DEV_LATEST: latest_bytes, vm_snapshot.INVENTORY_DEV_SNAPSHOT: snapshot_bytes}
 
 
-def collect_dashboard_reads() -> tuple[dict[str, bytes], dict[str, int]]:
-    """queue.json and co_details.json through the dashboard's existing fixed reads (Salesforce, read-only)."""
+def collect_dashboard_reads(extra_references: Iterable[str] = ()) -> tuple[dict[str, bytes], dict[str, int]]:
+    """queue.json and co_details.json through the dashboard's existing fixed reads (Salesforce, read-only).
+
+    ``extra_references`` are COs that must keep their page although they are no longer queued (the VM refresher passes
+    the ones the previous snapshot carried)."""
     import tools.serve_attended_open_onboardings_dashboard as dash
 
     try:
@@ -95,7 +98,7 @@ def collect_dashboard_reads() -> tuple[dict[str, bytes], dict[str, int]]:
     except dash.ReadUnavailable:
         raise PublishRefused("queue_unavailable", 3) from None
     queue = [{field: row.get(field) for field in dash.QUEUE_FIELDS} for row in rows]
-    references = {row["Name"] for row in queue if row.get("Name")}
+    references = {row["Name"] for row in queue if row.get("Name")} | set(extra_references)
     try:
         references |= set(dash.dev_onboarded_refs())  # onboarded COs leave the queue but keep their page
     except Exception:  # noqa: BLE001 - local evidence only; the queued COs are still published

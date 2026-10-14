@@ -71,6 +71,17 @@ def state_file(default: Path) -> Path:
     return default if folder is None else folder / default.name
 
 
+CLONE_SUBDIR = "clone-inventory"
+
+
+def clone_inventory_root(default: Path) -> Path:
+    """Where the production-clone (Redash) snapshot lives: ``<state dir>/clone-inventory`` whenever a state dir is
+    configured, otherwise ``default``. The VM writes it there (its own collector) and reads it from there; it is never
+    part of a published snapshot, so an ingest cannot replace or remove it."""
+    folder = state_dir()
+    return default if folder is None else folder / CLONE_SUBDIR
+
+
 def inventory_root(default: Path) -> Path:
     """The Leonardo / Redash inventory snapshot root: ``<state dir>/leonardo-inventory`` or ``default``.
 

@@ -633,6 +633,11 @@ def default_root() -> Path:
     return state_paths.inventory_root(desktop)  # SURFACE_ONBOARDING_STATE_DIR / VM default; else the desktop folder
 
 
+def clone_root() -> Path:
+    """The folder holding the production-clone snapshot (see ``state_paths.clone_inventory_root``)."""
+    return state_paths.clone_inventory_root(default_root())
+
+
 def env_dir(root: Path, env_name: str) -> Path:
     if env_name not in ENVIRONMENTS:
         raise InventoryError("unknown_environment")

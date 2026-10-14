@@ -40,6 +40,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -52,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory  # noqa: E402
 from integration.onboarding import redash_inventory as redash  # noqa: E402
+from integration.onboarding import state_paths  # noqa: E402
 
 ENVIRONMENT = "prod-clone"
 BASE_URL = inventory.ENVIRONMENTS[ENVIRONMENT].origin
@@ -94,6 +96,9 @@ class CollectorError(Exception):
 # ----- key storage (Windows DPAPI, current user) ---------------------------------
 
 def state_dir() -> Path:
+    configured = state_paths.state_dir()  # the VM (or any host with SURFACE_ONBOARDING_STATE_DIR): <state dir>/redash
+    if configured is not None:
+        return configured / "redash"
     base = os.environ.get("LOCALAPPDATA")
     return (Path(base) if base else Path.home() / "AppData" / "Local") / "SurfaceOnboarding" / "redash"
 
@@ -158,7 +163,38 @@ def store_key(raw_key: str, path: Path | None = None) -> None:
         temporary.unlink(missing_ok=True)
 
 
+KEY_FILE_ENV = "SURFACE_REDASH_KEY_FILE"
+
+
+def load_key_file(path: str | os.PathLike[str]) -> str:
+    """The key from a root-owned file (the VM: no DPAPI). Fail closed on anything but a private regular file.
+
+    A symlink, a non-regular file, a file owned by someone other than root or this user, a file the group can write or
+    that anyone else can touch is refused, and the content must have exactly the key's shape. Never printed.
+    """
+    try:
+        target = Path(path)
+        if target.is_symlink():
+            raise CollectorError("redash_key_file_unsafe")
+        info = target.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o027 or info.st_size > 256:
+            raise CollectorError("redash_key_file_unsafe")
+        if hasattr(os, "getuid") and info.st_uid not in (0, os.getuid()):
+            raise CollectorError("redash_key_file_unsafe")
+        key = target.read_text(encoding="ascii").strip()
+    except CollectorError:
+        raise
+    except (OSError, UnicodeError):
+        raise CollectorError("redash_key_unavailable") from None
+    if not KEY_PATTERN.fullmatch(key):
+        raise CollectorError("redash_key_unavailable")
+    return key
+
+
 def load_key(path: Path | None = None) -> str:
+    configured = os.environ.get(KEY_FILE_ENV, "").strip()
+    if path is None and configured:
+        return load_key_file(configured)
     try:
         blob = (path or key_path()).read_bytes()
     except OSError:
@@ -292,7 +328,7 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
             max_age: timedelta = DEFAULT_MAX_AGE, refresh: bool = True, write_csv: bool = False,
             accept_shrink: bool = False, sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
-    root = root or inventory.default_root()
+    root = root or inventory.clone_root()
     result, refreshed, refresh_failed = fetch_results(opener, key, now=now, max_age=max_age, refresh=refresh,
                                                       sleep=sleep)
     normalized = redash.normalize(result)

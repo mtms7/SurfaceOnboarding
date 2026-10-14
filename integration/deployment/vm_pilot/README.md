@@ -201,3 +201,45 @@ write access.
 - Confirm on the VM that oauth2-proxy forwards `X-Surface-Proxy-Secret` to the upstream (the dashboard refuses every
   request when it does not arrive).
 - The Redash collector key (DPAPI) stays on the desktop; the VM only reads published snapshots.
+
+## VM-side readers (docs/43 parts A and B; built locally 2026-10-14, review artifacts, nothing installed)
+
+Two timers keep the VM current without the owner's desktop. Each is gated by an approval marker that an operator creates only
+after the approval is recorded in `integration/IMPLEMENTATION_PLAN.md`; without the marker the unit does nothing.
+
+| Part | Unit pair | Tool | Credential (never in the repository or a unit) | Approval marker |
+| --- | --- | --- | --- | --- |
+| A Salesforce read | `surface-onboarding-sf-refresh.{service,timer}.template` (every 10 min) | `tools/vm_refresh_snapshot.py` via `tools/vm_salesforce_reader.py` | OAuth JWT private key `/etc/surface-onboarding/sf-reader.pem` (`0640 root:surface-sf-reader`) | `/etc/surface-onboarding/approved-sf-reader` |
+| B Redash clone | `surface-onboarding-redash-collect.{service,timer}.template` (hourly) | `tools/redash_inventory_collector.py --collect` | Read-only API key `/etc/surface-onboarding/redash-key` (`0640 root:surface-redash-reader`) | `/etc/surface-onboarding/approved-redash-collector` |
+
+The dashboard unit does **not** get either credential group: only the two timer services read them (`SupplementaryGroups=`).
+
+Command text only, not run (operator, as root, after the approvals):
+
+```
+groupadd --system surface-sf-reader
+groupadd --system surface-redash-reader
+# Salesforce: the Connected App's certificate is uploaded by the Salesforce admin; the private key is installed from the
+# admin's secure channel, never pasted into a chat, ticket or shell history.
+install -m 0640 -o root -g surface-sf-reader  <KEY_FROM_SECURE_CHANNEL>  /etc/surface-onboarding/sf-reader.pem
+install -m 0640 -o root -g surface-redash-reader <KEY_FROM_SECURE_CHANNEL> /etc/surface-onboarding/redash-key
+# Identity values only (no secret) in /etc/surface-onboarding/sf-reader.json, mode 0640 root:surface-onboarding:
+#   {"login_url": "https://<mydomain>.my.salesforce.com", "client_id": "<CONNECTED_APP_CONSUMER_KEY>",
+#    "username": "<INTEGRATION_USER>@<DOMAIN>", "private_key_file": "/etc/surface-onboarding/sf-reader.pem",
+#    "api_version": "v60.0"}
+python3 /opt/surface-onboarding/app/tools/vm_refresh_snapshot.py --config /etc/surface-onboarding/sf-reader.json \
+    --key-file /etc/surface-onboarding/snapshot.key --dry-run          # configuration and key files only; no network
+```
+
+Salesforce side (admin): a Connected App with the JWT bearer flow, a pre-authorized integration user, and a **read-only permission
+set limited to the fixed queue and detail fields** (`QUEUE_FIELDS` and `DETAIL_FIELDS` in the dashboard, objects
+`Customer_Onboarding__c`, `Account`, `DealHub_Subscription__c` as the existing queries use them). SecOps outbound allow-list:
+the Salesforce login and instance hosts, and `redash.pentera.io`, from the VM only.
+
+Behaviour (each tested): the refresher answers only the dashboard's exact `data query ... --json` call shape and only a single
+`SELECT`; it refuses to run in `vm` runtime (that mode serves snapshots); any failure leaves the previous snapshot current; the
+run history and Dev inventory published from the desktop are carried over unchanged; a CO whose read failed keeps its previous
+detail; the banner says "refreshed on the VM from Salesforce". The Redash clone is written to `/var/lib/surface-onboarding/clone-inventory`,
+a folder a snapshot ingest never replaces, and the dashboard reads it from there. Verification after enabling: the VM queue
+must match the desktop queue (a new CO such as CO-0780 appears within one interval); the banner age stays under 15 minutes.
+Rollback: `systemctl disable --now <timer>` and remove the approval marker.

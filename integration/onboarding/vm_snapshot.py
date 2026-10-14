@@ -51,6 +51,7 @@ CURRENT_LINK = "current"
 CURRENT_MARKER = "CURRENT"
 INVENTORY_SUBDIR = "leonardo-inventory"
 
+PRODUCER_VM_READER = "vm-salesforce-reader"  # the VM refreshed queue.json / co_details.json itself (docs/43 part A)
 QUEUE_FILE = "queue.json"
 CO_DETAILS_FILE = "co_details.json"
 INVENTORY_DEV_LATEST = "inventory_dev_latest.json"

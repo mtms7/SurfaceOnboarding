@@ -1,0 +1,57 @@
+# REVIEW ARTIFACT - not installed; needs the approvals in docs/43 (V1 Salesforce scope, SecOps outbound allow-list).
+# Install path (after approval): /etc/systemd/system/surface-onboarding-sf-refresh.service (run by the .timer, never enabled alone).
+# Read-only Salesforce refresh of queue.json / co_details.json into a new signed snapshot (tools/vm_refresh_snapshot.py).
+# The credential group surface-sf-reader holds the private key's read access; the dashboard unit does NOT have it.
+[Unit]
+Description=Surface onboarding: read-only Salesforce refresh of the VM snapshot (docs/43 part A)
+After=network-online.target
+Wants=network-online.target
+# Explicit approval markers, created by the operator only after the approvals are recorded in the plan.
+ConditionPathExists=/etc/surface-onboarding/approved-sf-reader
+ConditionPathExists=/etc/surface-onboarding/sf-reader.json
+ConditionPathExists=/etc/surface-onboarding/snapshot.key
+
+[Service]
+Type=oneshot
+User=surface-onboarding
+Group=surface-onboarding
+SupplementaryGroups=surface-sf-reader
+UMask=0077
+WorkingDirectory=/opt/surface-onboarding/app
+# No secrets here: file paths only. SURFACE_ONBOARDING_RUNTIME is deliberately NOT set (the refresher must read Salesforce
+# live; vm mode would serve snapshots instead and the tool refuses to run in it).
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SURFACE_ONBOARDING_STATE_DIR=/var/lib/surface-onboarding
+Environment=SURFACE_VM_SF_CONFIG_FILE=/etc/surface-onboarding/sf-reader.json
+ExecStart=/opt/surface-onboarding/runtime/python-3.12.14/bin/python3.12 /opt/surface-onboarding/app/tools/vm_refresh_snapshot.py --key-file /etc/surface-onboarding/snapshot.key
+TimeoutStartSec=300
+StateDirectory=surface-onboarding
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/surface-onboarding
+ReadOnlyPaths=/opt/surface-onboarding
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=512M
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=512

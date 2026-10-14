@@ -3329,8 +3329,8 @@ def _stage_tenant(reference: str, row: dict[str, str | None], readback: dict[str
     else:
         return None, "", ""
     try:
-        payload = inventory.load_latest(inventory_root(), environment, max_age=INVENTORY_DISPLAY_MAX_AGE,
-                                        now=now or datetime.now(timezone.utc))
+        payload = inventory.load_latest(clone_root() if environment == "prod-clone" else inventory_root(), environment,
+                                        max_age=INVENTORY_DISPLAY_MAX_AGE, now=now or datetime.now(timezone.utc))
         tenant_id = inventory.match_readbacks(payload, {reference: ids})["by_reference"].get(reference)
     except (inventory.InventoryError, OSError, ValueError, TypeError, AttributeError):
         return None, environment, ""
@@ -5749,6 +5749,11 @@ def inventory_root() -> Path:
     return inventory.default_root()
 
 
+def clone_root() -> Path:
+    """The production-clone snapshot folder: its own writable folder on the VM, the inventory folder on the desktop."""
+    return state_paths.clone_inventory_root(inventory_root())
+
+
 def start_attended_inventory_export() -> bool:
     return _start_runner_mode("--export-tenants", "--env", "dev", "--with-sweeps", "--csv")
 
@@ -5929,7 +5934,8 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
     started = ("<div class='banner'><strong>Export started.</strong> It runs read-only in the automation browser; reload "
                "this page in a minute.</div>" if notice == "started" and not clone else "")
     try:
-        payload = inventory.load_latest(inventory_root(), env, max_age=INVENTORY_DISPLAY_MAX_AGE, now=now)
+        payload = inventory.load_latest(clone_root() if env == "prod-clone" else inventory_root(), env,
+                                        max_age=INVENTORY_DISPLAY_MAX_AGE, now=now)
     except inventory.InventoryError as error:
         text = (PROD_CLONE_MISSING_TEXT if clone and error.reason == "inventory_snapshot_missing"
                 else INVENTORY_ERROR_TEXT.get(error.reason, error.reason))
@@ -6180,7 +6186,7 @@ def _differing_text(result: dict[str, Any]) -> str:
 def _clone_info() -> dict[str, Any]:
     """Age and trust of the production clone for display (any age is loaded; staleness is shown, not hidden)."""
     try:
-        payload = inventory.load_latest(inventory_root(), "prod-clone", max_age=INVENTORY_DISPLAY_MAX_AGE,
+        payload = inventory.load_latest(clone_root(), "prod-clone", max_age=INVENTORY_DISPLAY_MAX_AGE,
                                         now=datetime.now(timezone.utc))
     except inventory.InventoryError as error:
         return {"reason": error.reason}
@@ -6918,7 +6924,9 @@ def snapshot_banner(now: datetime | None = None) -> str:
     created = vm_snapshot.parse_created_at(manifest["created_at"])
     age_hours = ((now or datetime.now(timezone.utc)) - created).total_seconds() / 3600
     stale = age_hours > snapshot_stale_hours()
-    text = "Data as of " + created.strftime("%Y-%m-%d %H:%M") + " UTC (published from the desktop)"
+    origin = ("refreshed on the VM from Salesforce; run history published from the desktop"
+              if manifest.get("producer") == vm_snapshot.PRODUCER_VM_READER else "published from the desktop")
+    text = "Data as of " + created.strftime("%Y-%m-%d %H:%M") + " UTC (" + origin + ")"
     if stale:
         text += " &middot; older than " + escape(f"{snapshot_stale_hours():g}") + " h, it may be out of date"
     return "<div class='snapbanner" + (" stale" if stale else "") + "' role='status'>" + text + "</div>"

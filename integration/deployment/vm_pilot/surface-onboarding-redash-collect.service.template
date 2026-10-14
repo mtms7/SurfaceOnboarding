@@ -1,0 +1,56 @@
+# REVIEW ARTIFACT - not installed; needs the approvals in docs/43 (V3 Redash read-only key on the VM, SecOps outbound allow-list).
+# Install path (after approval): /etc/systemd/system/surface-onboarding-redash-collect.service (run by the .timer).
+# Read-only collection of the production clone (Redash saved query 251, owner approval 2026-10-05) into
+# /var/lib/surface-onboarding/clone-inventory (its own folder: a snapshot ingest never replaces it).
+[Unit]
+Description=Surface onboarding: read-only Redash production-clone collection (docs/43 part B)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/surface-onboarding/approved-redash-collector
+ConditionPathExists=/etc/surface-onboarding/redash-key
+
+[Service]
+Type=oneshot
+User=surface-onboarding
+Group=surface-onboarding
+SupplementaryGroups=surface-redash-reader
+UMask=0077
+WorkingDirectory=/opt/surface-onboarding/app
+# No secrets here: a path only. The collector refuses a key file that is a link, group-writable or world-accessible.
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SURFACE_ONBOARDING_STATE_DIR=/var/lib/surface-onboarding
+Environment=SURFACE_REDASH_KEY_FILE=/etc/surface-onboarding/redash-key
+ExecStart=/opt/surface-onboarding/runtime/python-3.12.14/bin/python3.12 /opt/surface-onboarding/app/tools/redash_inventory_collector.py --collect
+TimeoutStartSec=420
+# Exit 2 means "written but the refresh did not happen" (older data written with its true age): not a unit failure.
+SuccessExitStatus=2
+StateDirectory=surface-onboarding
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/surface-onboarding
+ReadOnlyPaths=/opt/surface-onboarding
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=1G
+CPUQuota=50%
+TasksMax=64
+LimitNOFILE=512

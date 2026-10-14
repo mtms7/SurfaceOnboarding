@@ -1,6 +1,6 @@
 # VM-native onboarding server: design and approval requests (2026-10-13)
 
-Status: **proposal, nothing built, nothing activated.** It records the owner direction of 2026-10-13 and what each part needs before it may run. It does not relax any gate: docs/36, docs/40 section 7 and the 2026-09-15 / 2026-10-08 boundaries stay in force until the approvals below are recorded in `integration/IMPLEMENTATION_PLAN.md`.
+Status: **proposal; parts A, B and D built locally (2026-10-13/14), nothing installed or activated; parts C and the VM live-read for approvals are not built.** It records the owner direction of 2026-10-13 and what each part needs before it may run. It does not relax any gate: docs/36, docs/40 section 7 and the 2026-09-15 / 2026-10-08 boundaries stay in force until the approvals below are recorded in `integration/IMPLEMENTATION_PLAN.md`.
 
 ## 1. Owner direction (2026-10-13)
 

@@ -1,0 +1,14 @@
+# REVIEW ARTIFACT - not installed; see surface-onboarding-sf-refresh.service.template.
+# Install path (after approval): /etc/systemd/system/surface-onboarding-sf-refresh.timer ; then: systemctl enable --now <this timer>.
+[Unit]
+Description=Surface onboarding: refresh the VM snapshot from Salesforce every 10 minutes (docs/43 V2 proposal)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+AccuracySec=30s
+Unit=surface-onboarding-sf-refresh.service
+
+[Install]
+WantedBy=timers.target

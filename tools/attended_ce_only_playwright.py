@@ -6997,7 +6997,7 @@ def _renewal_gate(source: RenewalSource, new_domains: Any) -> dict[str, Any]:
     from integration.onboarding import leonardo_inventory as inventory
 
     domains = list(new_domains)
-    gate = inventory.renewal_domain_gate(inventory_root(), (source.tenant_name, source.ce_tenant_name),
+    gate = inventory.renewal_domain_gate(clone_root(), (source.tenant_name, source.ce_tenant_name),
                                          source.main_domain, domains, now=datetime.now(timezone.utc))
     _log().event("renewal_gate", gate["result"],
                  detail=f"blocks={gate['blocks']} new={len(domains)} matches={len(gate['matches'])}")
@@ -7832,6 +7832,13 @@ def _sweep_from_inventory(rows: tuple[dict[str, Any], ...]) -> dict[str, str]:
 INVENTORY_PRECHECK_MAX_AGE = timedelta(days=3650)
 
 
+def clone_root() -> Path:
+    """The production-clone snapshot folder (its own writable folder on the VM, the inventory folder on the desktop)."""
+    from integration.onboarding import state_paths
+
+    return state_paths.clone_inventory_root(inventory_root())
+
+
 def inventory_root() -> Path:
     """Where the tenant inventory lives (tests point this at an empty folder)."""
     from integration.onboarding import leonardo_inventory as inventory
@@ -7853,7 +7860,7 @@ def _production_gate(contract: RouteContract, source: Any, log: "RunLog") -> dic
     """The production duplicate gate for one loaded CO source (see ``production_duplicate_gate``)."""
     from integration.onboarding import leonardo_inventory as inventory
 
-    gate = inventory.production_duplicate_gate(inventory_root(), source.tenant_name, _co_domains(contract, source),
+    gate = inventory.production_duplicate_gate(clone_root(), source.tenant_name, _co_domains(contract, source),
                                                now=datetime.now(timezone.utc))
     log.event("production_gate", gate["result"],
               detail=f"blocks={gate['blocks']} tenants={gate.get('tenants_checked', 0)} matches={len(gate['matches'])}")
@@ -7985,7 +7992,7 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     """
     from integration.onboarding import production_match as match
 
-    snapshot = match.load_snapshot(inventory_root(), datetime.now(timezone.utc))
+    snapshot = match.load_snapshot(clone_root(), datetime.now(timezone.utc))
     co_source: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     engine = None
