@@ -40,6 +40,8 @@ CLIENT_ID = re.compile(r"[A-Za-z0-9._]{20,128}")
 USERNAME = re.compile(r"[^\s@<>'\"]{1,64}@[^\s@<>'\"]{1,190}")
 API_VERSION = re.compile(r"v[0-9]{2}\.0")
 SELECT_ONLY = re.compile(r"\s*SELECT\s", re.IGNORECASE)
+# The one non-query read the dashboard makes: the Open_Onboardings list view's results (GET only, exact path).
+LISTVIEW_RESULTS = re.compile(r"/services/data/v[0-9]{2}\.0/sobjects/Customer_Onboarding__c/listviews/[A-Za-z0-9]{15,18}/results")
 JWT_LIFETIME_SECONDS = 180
 REQUEST_TIMEOUT = 30
 MAX_PAGES = 10
@@ -192,6 +194,17 @@ class RestQueryClient:
                 raise
         raise ReaderError("http_401")
 
+    def listview_results(self, path: str) -> dict[str, Any]:
+        """GET the results of the Customer_Onboarding__c list view at exactly ``path`` (the CLI's ``api request rest``)."""
+        if not isinstance(path, str) or not LISTVIEW_RESULTS.fullmatch(path):
+            raise ReaderError("path_not_allowed")
+        reply = self._get(path)
+        if not isinstance(reply, dict) or not isinstance(reply.get("records"), list):
+            raise ReaderError("response_invalid")
+        if len(reply["records"]) > MAX_RECORDS:
+            raise ReaderError("too_many_records")
+        return reply
+
     def query(self, soql: str) -> list[dict[str, Any]]:
         if not isinstance(soql, str) or not SELECT_ONLY.match(soql) or ";" in soql or len(soql) > 4000:
             raise ReaderError("query_not_allowed")
@@ -216,9 +229,17 @@ class RestQueryClient:
 
 
 def make_sf_json(client: RestQueryClient, unavailable: type[Exception]) -> Callable[..., object]:
-    """A drop-in for the dashboard's ``sf_json``: answers only the exact CLI query call, in the CLI's response shape."""
+    """A drop-in for the dashboard's ``sf_json``: answers only the two exact CLI calls it makes, in the CLI's shapes.
+
+    ``data query --query <SELECT> --json`` and ``api request rest <list view results path> --method GET``.
+    """
 
     def sf_json(args: Sequence[str], label: str | None = None) -> object:
+        if len(args) == 6 and list(args[:3]) == ["api", "request", "rest"] and list(args[4:]) == ["--method", "GET"]:
+            try:
+                return client.listview_results(args[3])
+            except ReaderError as error:
+                raise unavailable() from error
         if len(args) != 5 or list(args[:3]) != ["data", "query", "--query"] or args[4] != "--json":
             raise unavailable()
         try:

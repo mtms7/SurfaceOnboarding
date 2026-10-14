@@ -156,6 +156,45 @@ class RefreshTests(RefreshCase):
         self.assertEqual(vs.load_current_json(root, vs.QUEUE_FILE)["rows"][0]["Name"], "CO-0001")
 
 
+class RealDashboardReadsThroughTheAdapterTests(unittest.TestCase):
+    """The dashboard's real queue and detail reads, answered by the REST adapter over a fake Salesforce.
+
+    Guards against the adapter supporting a different call shape than the dashboard actually makes (the queue is a list view
+    results GET, not a SOQL query)."""
+
+    def test_queue_and_details_come_through_the_adapter_in_the_dashboards_own_shapes(self):
+        from integration.tests.test_vm_salesforce_reader import FakeOpener, login
+
+        columns = [{"fieldNameOrPath": field, "value": ("CO-0780" if field == "Name" else "x")}
+                   for field in dashboard.QUEUE_FIELDS]
+        detail_record = {field: "x" for field in dashboard.DETAIL_FIELDS}
+        detail_record["Name"] = "CO-0780"
+        opener = FakeOpener({
+            "/services/oauth2/token": [login()],
+            "FROM+ListView": [{"done": True, "records": [{"Id": "00BAA000000abcd"}]}],
+            "/listviews/": [{"size": 1, "records": [{"columns": columns}]}],
+            "CO-0780": [{"done": True, "records": [detail_record]}],
+        })
+        config = vr.ReaderConfig(**CONFIG)
+        client = vr.RestQueryClient(config, opener, lambda key_file, message: b"sig", clock=lambda: SECOND)
+        original, cached = dashboard.sf_json, dashboard._open_onboardings_view_id
+        dashboard._open_onboardings_view_id = None
+        dashboard.sf_json = vr.make_sf_json(client, dashboard.ReadUnavailable)
+        try:
+            env = {k: v for k, v in os.environ.items() if k != "SURFACE_ONBOARDING_RUNTIME"}
+            with patch.dict(os.environ, env, clear=True):
+                files, counts = publisher.collect_dashboard_reads()
+        finally:
+            dashboard.sf_json = original
+            dashboard._open_onboardings_view_id = cached
+        self.assertEqual((counts["queue_rows"], counts["co_details"], counts["co_details_unavailable"]), (1, 1, 0))
+        self.assertEqual(json.loads(files[vs.QUEUE_FILE])["rows"][0]["Name"], "CO-0780")
+        self.assertEqual(json.loads(files[vs.CO_DETAILS_FILE])["details"]["CO-0780"]["Name"], "CO-0780")
+        methods = [(m, u.split("salesforce.com")[1].split("?")[0]) for m, u, *_ in opener.requests[1:]]
+        self.assertEqual(methods[1], ("GET", "/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/00BAA000000abcd/results"))
+        self.assertTrue(all(method == "GET" for method, _ in methods), "every Salesforce call is a read")
+
+
 class CommandLineTests(RefreshCase):
     def main(self, *argv):
         out = io.StringIO()

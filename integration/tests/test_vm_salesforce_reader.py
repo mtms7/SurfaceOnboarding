@@ -183,6 +183,36 @@ class SfJsonAdapterTests(unittest.TestCase):
             with self.subTest(args=args), self.assertRaises(self.Unavailable):
                 sf_json(args)
 
+    def test_the_list_view_call_is_answered_with_the_raw_body_like_the_cli(self):
+        path = "/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/00BAA000000abcd/results"
+        body = {"size": 1, "records": [{"columns": [{"fieldNameOrPath": "Name", "value": "CO-0780"}]}]}
+        rest, opener = client({"/listviews/": [body]})
+        sf_json = vr.make_sf_json(rest, self.Unavailable)
+        self.assertEqual(sf_json(["api", "request", "rest", path, "--method", "GET"]), body)
+        self.assertEqual(opener.requests[1][0:2], ("GET", INSTANCE + path))
+        bad_paths = ("/services/data/v67.0/sobjects/Account/listviews/00BAA000000abcd/results",
+                     "/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/00BAA000000abcd/results?x=1",
+                     "/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/../results",
+                     "/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/short/results",
+                     "https://evil.example/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/00BAA000000abcd/results",
+                     "/services/data/v67.0/sobjects/Customer_Onboarding__c/00BAA000000abcd", "")
+        for bad in bad_paths:
+            with self.subTest(path=bad[:50]), self.assertRaises(self.Unavailable):
+                sf_json(["api", "request", "rest", bad, "--method", "GET"])
+        for method in ("POST", "PATCH", "DELETE"):
+            with self.subTest(method=method), self.assertRaises(self.Unavailable):
+                sf_json(["api", "request", "rest", path, "--method", method])
+        with self.assertRaises(self.Unavailable):
+            sf_json(["api", "request", "rest", path, "--method", "GET", "--body", "{}"])
+        self.assertEqual(len(opener.requests), 2)  # only the login and the one good GET were sent
+
+    def test_a_list_view_reply_without_records_fails_closed(self):
+        path = "/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/00BAA000000abcd/results"
+        for reply in ({"size": 0}, {"records": "x"}, [1]):
+            rest, _ = client({"/listviews/": [reply]})
+            with self.subTest(reply=str(reply)), self.assertRaises(self.Unavailable):
+                vr.make_sf_json(rest, self.Unavailable)(["api", "request", "rest", path, "--method", "GET"])
+
     def test_reader_errors_become_the_callers_unavailable_exception(self):
         rest, _ = client({"/query": [500]})
         with self.assertRaises(self.Unavailable):
@@ -255,8 +285,10 @@ class SourceBoundaryTests(unittest.TestCase):
     def test_no_write_verbs_or_foreign_hosts_in_the_module(self):
         source = Path(vr.__file__).read_text(encoding="utf-8")
         self.assertEqual(source.count('method="POST"') + source.count("method='POST'"), 1, "only the token exchange may POST")
-        for forbidden in ("PATCH", "DELETE", "PUT", "sobjects", "composite", "tooling", "http://"):
+        for forbidden in ("PATCH", "DELETE", "PUT", "composite", "tooling", "http://"):
             self.assertNotIn(forbidden, source.replace("DELETE FROM", ""))
+        self.assertEqual(source.count("sobjects"), 1, "the only object path is the list view results regex")
+        self.assertIn("sobjects/Customer_Onboarding__c/listviews/", source)
 
 
 if __name__ == "__main__":

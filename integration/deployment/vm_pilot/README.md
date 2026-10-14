@@ -219,9 +219,11 @@ Command text only, not run (operator, as root, after the approvals):
 ```
 groupadd --system surface-sf-reader
 groupadd --system surface-redash-reader
-# Salesforce: the Connected App's certificate is uploaded by the Salesforce admin; the private key is installed from the
-# admin's secure channel, never pasted into a chat, ticket or shell history.
-install -m 0640 -o root -g surface-sf-reader  <KEY_FROM_SECURE_CHANNEL>  /etc/surface-onboarding/sf-reader.pem
+# Salesforce: generate the key pair ON the VM; only the public certificate goes to the Salesforce admin (docs/44), so the
+# private key never travels. It is never printed, pasted into a chat or ticket, or left in shell history.
+openssl req -x509 -newkey rsa:3072 -sha256 -days 730 -nodes -subj "/CN=surface-onboarding-vm-reader"     -keyout /etc/surface-onboarding/sf-reader.pem -out /root/sf-reader.crt
+chown root:surface-sf-reader /etc/surface-onboarding/sf-reader.pem && chmod 0640 /etc/surface-onboarding/sf-reader.pem
+# Redash: the key arrives through the Redash owner's secure channel and is placed as a root-owned file:
 install -m 0640 -o root -g surface-redash-reader <KEY_FROM_SECURE_CHANNEL> /etc/surface-onboarding/redash-key
 # Identity values only (no secret) in /etc/surface-onboarding/sf-reader.json, mode 0640 root:surface-onboarding:
 #   {"login_url": "https://<mydomain>.my.salesforce.com", "client_id": "<CONNECTED_APP_CONSUMER_KEY>",
