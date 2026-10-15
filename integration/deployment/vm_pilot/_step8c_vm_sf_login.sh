@@ -43,7 +43,7 @@ run_login() {
   echo "== $label: starting the login in the background (the CLI waits on localhost:1717 for your browser) =="
   sudo -u "$RUNAS" env HOME="$SESSION" BROWSER="$HOOKDIR/open-url.sh" PATH="$HOOKDIR:/usr/local/bin:/usr/bin:/bin" \
     SF_USE_GENERIC_UNIX_KEYCHAIN=true SF_DISABLE_TELEMETRY=true SF_AUTOUPDATE_DISABLE=true SFDX_AUTOUPDATE_DISABLE=true \
-    SF_SKIP_NEW_VERSION_CHECK=true \
+    SF_SKIP_NEW_VERSION_CHECK=true SF_WEB_OAUTH_SERVER_TIMEOUT=300000 \
     "$SF" org login web --alias "$ALIAS" --instance-url "$LOGIN_URL" --no-prompt "$@" > "$LOG" 2>&1 &
   PID=$!
   i=0
