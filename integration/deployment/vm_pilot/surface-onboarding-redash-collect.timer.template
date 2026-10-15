@@ -1,4 +1,5 @@
 # REVIEW ARTIFACT - not installed; see surface-onboarding-redash-collect.service.template.
+# DEFERRED 2026-10-14: NOT part of the pilot. The owner chose no Redash credential on the VM: the production clone is collected on the desktop and travels in the signed snapshot (docs/43 V3).
 # Install path (after approval): /etc/systemd/system/surface-onboarding-redash-collect.timer ; then: systemctl enable --now <this timer>.
 [Unit]
 Description=Surface onboarding: refresh the production clone from Redash hourly (clone is trusted up to 6 hours)

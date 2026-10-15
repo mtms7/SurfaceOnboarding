@@ -6914,6 +6914,26 @@ def snapshot_stale_hours() -> float:
     return value if 0 < value < 24 * 365 else DEFAULT_SNAPSHOT_STALE_HOURS
 
 
+REFRESH_STATUS_NAME = "refresh-status.json"
+_REFRESH_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
+
+
+def refresh_status() -> dict[str, str] | None:
+    """The VM refresher's last outcome (time, result code, transport; no values), or None when absent or malformed."""
+    folder = state_paths.state_dir()
+    if folder is None:
+        return None
+    try:
+        raw = json.loads((Path(folder) / REFRESH_STATUS_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(raw, dict) or set(raw) != {"at", "result", "transport"}
+            or not isinstance(raw["at"], str) or not _REFRESH_AT.fullmatch(raw["at"])
+            or raw["result"] not in ("ok", "session_needed", "error") or raw["transport"] not in ("rest", "cli")):
+        return None
+    return raw
+
+
 def snapshot_banner(now: datetime | None = None) -> str:
     """The banner every VM page shows: when the data was published, amber when older than the threshold."""
     root = snapshot_root()
@@ -6929,6 +6949,13 @@ def snapshot_banner(now: datetime | None = None) -> str:
     text = "Data as of " + created.strftime("%Y-%m-%d %H:%M") + " UTC (" + origin + ")"
     if stale:
         text += " &middot; older than " + escape(f"{snapshot_stale_hours():g}") + " h, it may be out of date"
+    status = refresh_status()
+    if status is not None and status["result"] != "ok" and vm_snapshot.parse_created_at(status["at"]) > created:
+        attempt = vm_snapshot.parse_created_at(status["at"]).strftime("%H:%M")
+        text += ("<br><strong>Salesforce session needed:</strong> an operator must sign in on the VM (last refresh attempt "
+                 + attempt + " UTC). Showing the last good data." if status["result"] == "session_needed" else
+                 "<br><strong>Last refresh attempt failed</strong> (" + attempt + " UTC). Showing the last good data.")
+        stale = True
     return "<div class='snapbanner" + (" stale" if stale else "") + "' role='status'>" + text + "</div>"
 
 

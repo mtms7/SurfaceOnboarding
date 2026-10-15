@@ -1,4 +1,5 @@
 # REVIEW ARTIFACT - not installed; needs the approvals in docs/43 (V3 Redash read-only key on the VM, SecOps outbound allow-list).
+# DEFERRED 2026-10-14: NOT part of the pilot. The owner chose no Redash credential on the VM: the production clone is collected on the desktop and travels in the signed snapshot (docs/43 V3).
 # Install path (after approval): /etc/systemd/system/surface-onboarding-redash-collect.service (run by the .timer).
 # Read-only collection of the production clone (Redash saved query 251, owner approval 2026-10-05) into
 # /var/lib/surface-onboarding/clone-inventory (its own folder: a snapshot ingest never replaces it).

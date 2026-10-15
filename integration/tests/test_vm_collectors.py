@@ -98,42 +98,36 @@ class KeyFileTests(unittest.TestCase):
         self.assertNotIn(KEY, str(caught.exception))
 
 
-class CloneFolderTests(unittest.TestCase):
-    def test_clone_root_is_its_own_folder_whenever_a_state_dir_is_configured(self):
+class CloneRootTests(unittest.TestCase):
+    """Owner decision 2026-10-14: the clone travels in the signed snapshot, so it is read next to the Dev inventory."""
+
+    def test_the_clone_root_is_the_inventory_root_everywhere(self):
         default = Path("desktop") / "inventory"
         with clean_env():
-            self.assertEqual(state_paths.clone_inventory_root(default), default)
-        with clean_env(SURFACE_ONBOARDING_STATE_DIR=str(Path(tempfile.gettempdir()) / "state")):
-            self.assertEqual(state_paths.clone_inventory_root(default), Path(tempfile.gettempdir()) / "state" / "clone-inventory")
-        with clean_env(SURFACE_ONBOARDING_RUNTIME="vm"):
-            self.assertEqual(state_paths.clone_inventory_root(default),
-                             Path(state_paths.VM_DEFAULT_STATE_DIR) / "clone-inventory")
-
-    def test_the_clone_folder_is_outside_every_snapshot_directory(self):
-        with clean_env(SURFACE_ONBOARDING_RUNTIME="vm"):
-            clone = state_paths.clone_inventory_root(Path("x"))
-            snapshots = vs.snapshots_root(state_paths.VM_DEFAULT_STATE_DIR)
-        self.assertNotIn(snapshots, clone.parents)
-
-    def test_collector_dashboard_and_runner_agree_on_the_folder(self):
-        with clean_env(SURFACE_ONBOARDING_RUNTIME="vm"):
-            expected = Path(state_paths.VM_DEFAULT_STATE_DIR) / "clone-inventory"
-            self.assertEqual(inventory.clone_root(), expected)
-            self.assertEqual(dashboard.clone_root(), expected)
-            self.assertEqual(runner.clone_root(), expected)
-            self.assertEqual(collector.state_dir(), Path(state_paths.VM_DEFAULT_STATE_DIR) / "redash")
-
-    def test_desktop_defaults_are_unchanged(self):
-        with clean_env():
+            self.assertEqual(state_paths.clone_inventory_root(default), state_paths.inventory_root(default))
             self.assertEqual(inventory.clone_root(), inventory.default_root())
             self.assertEqual(dashboard.clone_root(), dashboard.inventory_root())
+        with clean_env(SURFACE_ONBOARDING_STATE_DIR=str(Path(tempfile.gettempdir()) / "state")):
+            self.assertEqual(state_paths.clone_inventory_root(default), state_paths.inventory_root(default))
 
-    def test_a_vm_clone_snapshot_is_read_from_the_clone_folder_not_the_published_snapshot(self):
+    def test_on_the_vm_the_clone_is_read_from_the_current_snapshot(self):
         seen = []
-        with clean_env(SURFACE_ONBOARDING_RUNTIME="vm"), \
-                patch.object(inventory, "load_latest", lambda root, env, **kw: seen.append((Path(root), env)) or {"tenants": []}):
-            dashboard._clone_info()
-        self.assertEqual(seen[0], (Path(state_paths.VM_DEFAULT_STATE_DIR) / "clone-inventory", "prod-clone"))
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            root = vs.snapshots_root(state)
+            name = "snapshot-20261014T120000Z"
+            (root / name).mkdir(parents=True)
+            vs._switch_pointer(root, name)
+            with clean_env(SURFACE_ONBOARDING_RUNTIME="vm", SURFACE_ONBOARDING_STATE_DIR=str(state)), \
+                    patch.object(inventory, "load_latest",
+                                 lambda r, env, **kw: seen.append((Path(r), env)) or {"tenants": []}):
+                dashboard._clone_info()
+                self.assertEqual(runner.clone_root(), dashboard.clone_root())
+        self.assertEqual(seen[0], (root / name / "leonardo-inventory", "prod-clone"))
+
+    def test_the_vm_has_no_redash_collection_writing_into_a_snapshot(self):
+        with clean_env(SURFACE_ONBOARDING_RUNTIME="vm"):
+            self.assertEqual(collector.state_dir(), Path(state_paths.VM_DEFAULT_STATE_DIR) / "redash")
 
 
 class UnitTemplateTests(unittest.TestCase):
@@ -144,14 +138,21 @@ class UnitTemplateTests(unittest.TestCase):
     def unit(self, name):
         return (self.FOLDER / name).read_text(encoding="utf-8")
 
-    def test_the_salesforce_refresh_unit_is_gated_credentialed_and_not_in_vm_runtime(self):
+    def test_the_salesforce_refresh_unit_keeps_the_session_in_memory_and_is_gated(self):
         text = self.unit("surface-onboarding-sf-refresh.service.template")
-        for needed in ("ConditionPathExists=/etc/surface-onboarding/approved-sf-reader", "User=surface-onboarding",
-                       "SupplementaryGroups=surface-sf-reader", "Type=oneshot", "SURFACE_VM_SF_CONFIG_FILE=/etc/surface-onboarding/sf-reader.json",
-                       "tools/vm_refresh_snapshot.py --key-file /etc/surface-onboarding/snapshot.key", *self.HARDENING):
+        for needed in ("ConditionPathExists=/etc/surface-onboarding/approved-sf-reader", "User=surface-onboarding", "Type=oneshot",
+                       "--transport cli --session-dir /run/surface-onboarding-sf --key-file /etc/surface-onboarding/snapshot.key",
+                       "ReadWritePaths=/var/lib/surface-onboarding /run/surface-onboarding-sf",
+                       "SURFACE_SF_SESSION_DIR=/run/surface-onboarding-sf", *[h for h in self.HARDENING]):
             self.assertIn(needed, text)
         self.assertNotRegex(text, r"(?m)^Environment=SURFACE_ONBOARDING_RUNTIME")
-        self.assertNotIn("sf-reader.pem", text.replace("holds the private key", ""), "the key path is read from the config, not the unit")
+        # No stored credential of any kind: no key/config groups, no service identity file, no HOME on a disk path.
+        for forbidden in ("SupplementaryGroups", "sf-reader.pem", "sf-reader.json", "SURFACE_VM_SF_CONFIG_FILE", "/var/lib/surface-onboarding/sf",
+                          "password=", "token="):
+            self.assertNotIn(forbidden, text, forbidden)
+        # The only relaxed hardening line is documented: Node's JIT needs it.
+        self.assertIn("MemoryDenyWriteExecute=no", text)
+        self.assertIn("JIT", text)
 
     def test_the_redash_unit_is_gated_credentialed_and_exit_2_is_not_a_failure(self):
         text = self.unit("surface-onboarding-redash-collect.service.template")
@@ -188,3 +189,43 @@ class BannerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishClonePairTests(unittest.TestCase):
+    """The desktop publisher includes the collector's clone as its own pair (owner decision 2026-10-14)."""
+
+    def make(self, root, env, prefix, stamp="20261014T120000Z", name=None):
+        folder = Path(root) / env
+        folder.mkdir(parents=True)
+        file_name = name or f"{prefix}inventory-{stamp}.json"
+        (folder / "latest.json").write_text('{"file": "%s"}' % file_name, encoding="utf-8")
+        (folder / file_name).write_text('{"tenants": []}', encoding="utf-8")
+
+    def collect(self, dev_root, clone_root):
+        import tools.publish_vm_snapshot as publisher
+
+        with patch.object(inventory, "default_root", return_value=Path(dev_root)), \
+                patch.object(inventory, "clone_root", return_value=Path(clone_root)):
+            return publisher.collect_inventory_files()
+
+    def test_both_pairs_are_collected_under_their_own_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, "dev", "leonardo-dev-")
+            self.make(tmp, "prod-clone", "redash-prod-clone-")
+            files = self.collect(tmp, tmp)
+        self.assertEqual(sorted(files), sorted([vs.INVENTORY_DEV_LATEST, vs.INVENTORY_DEV_SNAPSHOT,
+                                                vs.INVENTORY_CLONE_LATEST, vs.INVENTORY_CLONE_SNAPSHOT]))
+
+    def test_a_missing_clone_or_one_with_the_wrong_prefix_is_simply_not_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, "dev", "leonardo-dev-")
+            self.assertEqual(sorted(self.collect(tmp, tmp)), sorted([vs.INVENTORY_DEV_LATEST, vs.INVENTORY_DEV_SNAPSHOT]))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, "prod-clone", "", name="leonardo-dev-inventory-20261014T120000Z.json")
+            self.assertEqual(self.collect(tmp, tmp), {})
+
+    def test_an_oversize_clone_is_not_published(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.make(tmp, "prod-clone", "redash-prod-clone-")
+            with patch.object(vs, "MAX_FILE_BYTES", 5):
+                self.assertEqual(self.collect(tmp, tmp), {})

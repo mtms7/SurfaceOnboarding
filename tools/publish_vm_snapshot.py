@@ -65,25 +65,37 @@ def collect_state_files(only: list[str] | None = None) -> dict[str, bytes]:
     return found
 
 
-def collect_inventory_files() -> dict[str, bytes]:
-    """The latest Dev inventory snapshot as a pair (latest pointer + the snapshot it names), or nothing.
-
-    The production clone (Redash) is not published: it is far larger than the per-file cap.
-    """
+def _inventory_pair(root: Path, env_name: str, prefix: str, latest_key: str, snapshot_key: str) -> dict[str, bytes]:
+    """One inventory snapshot as a pair (latest pointer + the snapshot it names), or nothing (never raises)."""
     from integration.onboarding import leonardo_inventory as inventory
 
-    directory = inventory.env_dir(inventory.default_root(), "dev")
+    directory = inventory.env_dir(root, env_name)
     try:
         latest_bytes = (directory / inventory.LATEST_FILE).read_bytes()
         name = json.loads(latest_bytes.decode("utf-8"))["file"]
-        if type(name) is not str or not _INVENTORY_FILE.fullmatch(name):
+        if type(name) is not str or not _INVENTORY_FILE.fullmatch(name) or not name.startswith(prefix):
             return {}
         snapshot_bytes = (directory / name).read_bytes()
     except (OSError, ValueError, KeyError, TypeError):
         return {}
     if len(snapshot_bytes) > vm_snapshot.MAX_FILE_BYTES or len(latest_bytes) > vm_snapshot.MAX_FILE_BYTES:
         return {}
-    return {vm_snapshot.INVENTORY_DEV_LATEST: latest_bytes, vm_snapshot.INVENTORY_DEV_SNAPSHOT: snapshot_bytes}
+    return {latest_key: latest_bytes, snapshot_key: snapshot_bytes}
+
+
+def collect_inventory_files() -> dict[str, bytes]:
+    """The latest Dev inventory and (owner decision 2026-10-14) the latest production clone, each as a pair.
+
+    A missing or unusable inventory is simply not published. The clone is the collector's own sanitized snapshot
+    (no emails, phones or operator ids).
+    """
+    from integration.onboarding import leonardo_inventory as inventory
+
+    files = _inventory_pair(inventory.default_root(), "dev", "", vm_snapshot.INVENTORY_DEV_LATEST,
+                            vm_snapshot.INVENTORY_DEV_SNAPSHOT)
+    files.update(_inventory_pair(inventory.clone_root(), "prod-clone", "redash-prod-clone-",
+                                 vm_snapshot.INVENTORY_CLONE_LATEST, vm_snapshot.INVENTORY_CLONE_SNAPSHOT))
+    return files
 
 
 def collect_dashboard_reads(extra_references: Iterable[str] = ()) -> tuple[dict[str, bytes], dict[str, int]]:

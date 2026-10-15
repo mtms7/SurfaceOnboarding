@@ -71,15 +71,12 @@ def state_file(default: Path) -> Path:
     return default if folder is None else folder / default.name
 
 
-CLONE_SUBDIR = "clone-inventory"
-
-
 def clone_inventory_root(default: Path) -> Path:
-    """Where the production-clone (Redash) snapshot lives: ``<state dir>/clone-inventory`` whenever a state dir is
-    configured, otherwise ``default``. The VM writes it there (its own collector) and reads it from there; it is never
-    part of a published snapshot, so an ingest cannot replace or remove it."""
-    folder = state_dir()
-    return default if folder is None else folder / CLONE_SUBDIR
+    """Where the production-clone (Redash) snapshot lives: next to the Dev inventory (``inventory_root``).
+
+    Owner decision 2026-10-14: the clone is collected on the desktop and travels in the signed snapshot, so on the VM it
+    is read from the current snapshot like the Dev inventory (no Redash credential on the VM)."""
+    return inventory_root(default)
 
 
 def inventory_root(default: Path) -> Path:

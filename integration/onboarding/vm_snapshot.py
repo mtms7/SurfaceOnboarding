@@ -56,10 +56,16 @@ QUEUE_FILE = "queue.json"
 CO_DETAILS_FILE = "co_details.json"
 INVENTORY_DEV_LATEST = "inventory_dev_latest.json"
 INVENTORY_DEV_SNAPSHOT = "inventory_dev_snapshot.json"
+# Owner decision 2026-10-14: the production clone (Redash query 251, ~17 MB, personal data already removed by the
+# collector) travels in the signed snapshot so the VM needs no Redash credential.
+INVENTORY_CLONE_LATEST = "inventory_prod_clone_latest.json"
+INVENTORY_CLONE_SNAPSHOT = "inventory_prod_clone_snapshot.json"
+INVENTORY_PAIRS = ((INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT, "dev", ""),
+                   (INVENTORY_CLONE_LATEST, INVENTORY_CLONE_SNAPSHOT, "prod-clone", "redash-prod-clone-"))
 
 # docs/40 section 5 state files (a file that does not exist on the desktop is simply not published), the run
-# progress file named in docs/41 section 2, and the fixed-field queue / CO-detail exports. The production clone
-# (Redash, ~17 MB) exceeds the per-file cap and is deliberately NOT on the list.
+# progress file named in docs/41 section 2, and the fixed-field queue / CO-detail exports, plus (owner decision
+# 2026-10-14, supersedes the 2026-10-08 exclusion) the production clone as its own latest/snapshot pair.
 STATE_FILE_NAMES = frozenset({
     "attended_leonardo_readbacks.json", "attended_ce_only_runner_state.json", "attended_ce_only_diagnostics.json",
     "attended_ce_only_table_diagnostics.json", "attended_ce_only_run_log.json", "attended_ce_only_check_state.json",
@@ -67,7 +73,8 @@ STATE_FILE_NAMES = frozenset({
     "attended_user_created_confirmations.json", "attended_spycloud.json", "attended_salesforce_id_writebacks.json",
     "attended_surface_validation.json", "attended_renewal_mirrors.json", "attended_renewal_outcomes.json",
 })
-EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT})
+EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
+                               INVENTORY_CLONE_LATEST, INVENTORY_CLONE_SNAPSHOT})
 ALLOWED_NAMES = STATE_FILE_NAMES | EXPORT_FILE_NAMES
 
 _SNAPSHOT_DIR = re.compile(r"snapshot-[0-9]{8}T[0-9]{6}Z(?:-[0-9]{1,3})?")
@@ -322,12 +329,14 @@ def verify_bundle(source: str | os.PathLike[str] | bytes, key: bytes) -> Verifie
 
 
 def _check_inventory_pair(files: Mapping[str, bytes]) -> None:
-    """The Dev inventory is published as a pair; ``latest`` must name a well-formed snapshot file."""
-    has_latest, has_snapshot = INVENTORY_DEV_LATEST in files, INVENTORY_DEV_SNAPSHOT in files
-    if has_latest != has_snapshot:
-        raise SnapshotError("inventory_incomplete")
-    if has_latest:
-        _inventory_file_name(files[INVENTORY_DEV_LATEST])
+    """Each inventory (Dev, production clone) is published as a pair; ``latest`` must name a well-formed snapshot file
+    (the clone's must carry the clone prefix, so a Dev file can never be passed off as the clone)."""
+    for latest_name, snapshot_name, _env, prefix in INVENTORY_PAIRS:
+        has_latest, has_snapshot = latest_name in files, snapshot_name in files
+        if has_latest != has_snapshot:
+            raise SnapshotError("inventory_incomplete")
+        if has_latest and not _inventory_file_name(files[latest_name]).startswith(prefix):
+            raise SnapshotError("inventory_invalid")
 
 
 def _inventory_file_name(latest_bytes: bytes) -> str:
@@ -444,12 +453,13 @@ def _write_snapshot_dir(stage: Path, bundle: VerifiedBundle) -> None:
     for name, data in bundle.files.items():
         (stage / name).write_bytes(data)
     # The dashboard's inventory reader expects <root>/<env>/latest.json plus the named snapshot file.
-    if INVENTORY_DEV_LATEST in bundle.files:
-        file_name = _inventory_file_name(bundle.files[INVENTORY_DEV_LATEST])
-        inventory = stage / INVENTORY_SUBDIR / "dev"
-        inventory.mkdir(parents=True)
-        (inventory / "latest.json").write_bytes(bundle.files[INVENTORY_DEV_LATEST])
-        (inventory / file_name).write_bytes(bundle.files[INVENTORY_DEV_SNAPSHOT])
+    for latest_name, snapshot_name, env_name, _prefix in INVENTORY_PAIRS:
+        if latest_name in bundle.files:
+            file_name = _inventory_file_name(bundle.files[latest_name])
+            inventory = stage / INVENTORY_SUBDIR / env_name
+            inventory.mkdir(parents=True)
+            (inventory / "latest.json").write_bytes(bundle.files[latest_name])
+            (inventory / file_name).write_bytes(bundle.files[snapshot_name])
     (stage / MANIFEST_NAME).write_bytes(canonical_manifest_bytes(bundle.manifest))
 
 

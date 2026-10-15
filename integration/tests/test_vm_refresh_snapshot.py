@@ -195,6 +195,200 @@ class RealDashboardReadsThroughTheAdapterTests(unittest.TestCase):
         self.assertTrue(all(method == "GET" for method, _ in methods), "every Salesforce call is a read")
 
 
+class SessionDirTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.realpath(self.tmp.name)
+        patcher = patch.object(refresher, "MEMORY_ROOTS", (self.root + os.sep,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make(self, name="sf", auth=True, mode=0o700):
+        folder = os.path.join(self.root, name)
+        os.makedirs(folder, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(folder, mode)
+        if auth:
+            os.makedirs(os.path.join(folder, ".sfdx"), exist_ok=True)
+            Path(folder, ".sfdx", "someone@example.com.json").write_text("{}", encoding="utf-8")
+        return folder
+
+    def test_only_a_memory_folder_is_accepted(self):
+        with patch.object(refresher, "MEMORY_ROOTS", ("/run/", "/dev/shm/")):
+            for path in (self.make(), os.path.join(self.root, "sf"), "/var/lib/surface-onboarding/sf", "/home/x/.sf", "/tmp/sf"):
+                with self.subTest(path=path[-20:]):
+                    self.assertEqual(refresher.session_dir_problem(path), "session_dir_not_in_memory")
+        self.assertEqual(refresher.session_dir_problem("relative/dir"), "session_dir_not_absolute")
+        self.assertEqual(refresher.session_dir_problem(""), "session_dir_not_absolute")
+
+    def test_no_folder_or_no_login_means_session_needed(self):
+        self.assertEqual(refresher.session_dir_problem(os.path.join(self.root, "missing")), "session_needed")
+        folder = self.make("nologin", auth=False)
+        if os.name == "posix":
+            self.assertEqual(refresher.session_dir_problem(folder), "session_needed")
+
+    @unittest.skipUnless(os.name == "posix", "POSIX modes and ownership")
+    def test_folders_the_cli_creates_without_a_login_are_not_a_session(self):
+        folder = self.make("fresh", auth=False)
+        for name in (".sf", ".cache", ".sfdx"):
+            os.makedirs(os.path.join(folder, name), exist_ok=True)
+        Path(folder, ".sf", "config.json").write_text("{}", encoding="utf-8")
+        Path(folder, ".sfdx", "key.json").write_text("{}", encoding="utf-8")  # the CLI's own key file, not a login
+        self.assertEqual(refresher.session_dir_problem(folder), "session_needed")
+        Path(folder, ".sfdx", "milton@example.com.json").write_text("{}", encoding="utf-8")
+        self.assertIsNone(refresher.session_dir_problem(folder))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX modes and ownership")
+    def test_a_private_folder_with_a_login_is_accepted_and_a_loose_one_is_not(self):
+        self.assertIsNone(refresher.session_dir_problem(self.make("ok", mode=0o700)))
+        for mode in (0o750, 0o755, 0o770, 0o777):
+            with self.subTest(mode=oct(mode)):
+                self.assertEqual(refresher.session_dir_problem(self.make("loose", mode=mode)), "session_dir_unsafe")
+
+    @unittest.skipUnless(os.name == "posix", "symlinks")
+    def test_a_link_is_refused(self):
+        target = self.make("real")
+        link = os.path.join(self.root, "link")
+        os.symlink(target, link)
+        self.assertEqual(refresher.session_dir_problem(link), "session_dir_not_in_memory")
+
+
+class StatusTests(unittest.TestCase):
+    def test_result_codes(self):
+        self.assertEqual(refresher.status_result(None, "cli"), "ok")
+        self.assertEqual(refresher.status_result("session_needed", "cli"), "session_needed")
+        self.assertEqual(refresher.status_result("queue_unavailable", "cli"), "session_needed")
+        self.assertEqual(refresher.status_result("queue_unavailable", "rest"), "error")
+        self.assertEqual(refresher.status_result("bad_zip", "cli"), "error")
+
+    def test_the_status_file_has_only_time_result_and_transport_and_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            refresher.write_status(tmp, "session_needed", "cli", SECOND)
+            self.assertEqual(json.loads((Path(tmp) / refresher.STATUS_NAME).read_text(encoding="utf-8")),
+                             {"at": "2026-10-14T08:00:00Z", "result": "session_needed", "transport": "cli"})
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], [refresher.STATUS_NAME])
+        refresher.write_status("/definitely/not/a/folder", "ok", "cli")  # best effort: never raises
+
+
+class CliTransportTests(RefreshCase):
+    def run_cli(self, **reads):
+        seen = {}
+
+        def collect(extra_references=()):
+            seen["home"], seen["keychain"] = os.environ.get("HOME"), os.environ.get("SF_USE_GENERIC_UNIX_KEYCHAIN")
+            seen["sf_json"] = dashboard.sf_json
+            return ({vs.QUEUE_FILE: b'{"rows": [{"Name": "CO-0001"}]}',
+                     vs.CO_DETAILS_FILE: json.dumps({"details": {"CO-0001": detail("CO-0001", "new")}}).encode()},
+                    {"queue_rows": 1, "co_details": 1, "co_details_unavailable": 0})
+
+        session = str(self.root / "session")
+        with self.environment(), patch.object(publisher, "collect_dashboard_reads", reads.get("collect", collect)), \
+                patch.object(refresher, "session_dir_problem", return_value=reads.get("problem")):
+            os.environ["HOME"] = "original-home"
+            counts = refresher.refresh("", str(self.key), self.state, now=SECOND, transport="cli", session_dir=session)
+            seen["home_after"] = os.environ.get("HOME")
+        return counts, seen, os.path.realpath(session)
+
+    def test_the_dashboards_own_cli_reads_run_with_the_whole_cli_home_in_memory_and_the_environment_is_restored(self):
+        original = dashboard.sf_json
+        counts, seen, session = self.run_cli()
+        self.assertEqual(seen["home"], session)
+        self.assertEqual(seen["keychain"], "true")
+        self.assertIs(seen["sf_json"], original, "cli mode uses the dashboard's real CLI reader, not the REST adapter")
+        self.assertEqual(seen["home_after"], "original-home")
+        root = vs.snapshots_root(self.state)
+        self.assertEqual(vs.read_current_manifest(root)["producer"], vs.PRODUCER_VM_READER)
+        self.assertEqual(counts["files_in_bundle"], 3)
+
+    def test_environment_is_restored_even_when_the_read_fails(self):
+        def failing(extra_references=()):
+            raise publisher.PublishRefused("queue_unavailable", 3)
+        with self.environment(), patch.object(publisher, "collect_dashboard_reads", failing), \
+                patch.object(refresher, "session_dir_problem", return_value=None):
+            os.environ.pop("SF_USE_GENERIC_UNIX_KEYCHAIN", None)
+            os.environ["HOME"] = "original-home"
+            with self.assertRaises(refresher.RefreshRefused) as caught:
+                refresher.refresh("", str(self.key), self.state, now=SECOND, transport="cli", session_dir=str(self.root / "s"))
+            self.assertEqual(caught.exception.code, "queue_unavailable")
+            self.assertNotIn("SF_USE_GENERIC_UNIX_KEYCHAIN", os.environ)
+            self.assertEqual(os.environ["HOME"], "original-home")
+
+    def test_no_session_is_a_clean_session_needed_refusal_before_any_read(self):
+        with self.assertRaises(refresher.RefreshRefused) as caught:
+            self.run_cli(problem="session_needed", collect=lambda *a: self.fail("no read without a session"))
+        self.assertEqual((caught.exception.code, caught.exception.exit_code), ("session_needed", 3))
+        with self.assertRaises(refresher.RefreshRefused) as caught:
+            self.run_cli(problem="session_dir_not_in_memory", collect=lambda *a: self.fail("no read"))
+        self.assertEqual((caught.exception.code, caught.exception.exit_code), ("session_dir_not_in_memory", 2))
+
+    def test_an_unknown_transport_is_refused(self):
+        with self.assertRaises(refresher.RefreshRefused) as caught:
+            refresher.refresh("", str(self.key), self.state, transport="smtp")
+        self.assertEqual(caught.exception.code, "unknown_transport")
+
+    def test_main_records_the_status_for_the_banner(self):
+        out = io.StringIO()
+        base = ["--transport", "cli", "--session-dir", str(self.root / "s"), "--key-file", str(self.key), "--state-dir", self.state]
+        with self.environment(), patch.object(refresher, "session_dir_problem", return_value="session_needed"), \
+                patch.object(refresher, "_lock", lambda state: io.StringIO()), contextlib.redirect_stdout(out):
+            code = refresher.main(base)
+        self.assertEqual((code, out.getvalue().strip()), (3, "refused:session_needed"))
+        status = json.loads((Path(self.state) / refresher.STATUS_NAME).read_text(encoding="utf-8"))
+        self.assertEqual((status["result"], status["transport"]), ("session_needed", "cli"))
+        out = io.StringIO()
+        with self.environment(), self.fake_reads(), patch.object(refresher, "session_dir_problem", return_value=None), \
+                patch.object(refresher, "_lock", lambda state: io.StringIO()), contextlib.redirect_stdout(out):
+            code = refresher.main(base)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads((Path(self.state) / refresher.STATUS_NAME).read_text(encoding="utf-8"))["result"], "ok")
+
+    def test_main_usage_for_cli_needs_the_session_dir(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = refresher.main(["--transport", "cli", "--key-file", str(self.key), "--state-dir", self.state])
+        self.assertEqual(code, 64)
+
+
+class BannerStatusTests(unittest.TestCase):
+    def banner(self, status, producer=vs.PRODUCER_VM_READER):
+        manifest = {"created_at": "2026-10-14T08:00:00Z", "producer": producer, "files": []}
+        with patch.object(dashboard, "snapshot_root", return_value=Path("x")), \
+                patch.object(vs, "read_current_manifest", return_value=manifest), \
+                patch.object(dashboard, "refresh_status", return_value=status):
+            return dashboard.snapshot_banner(datetime(2026, 10, 14, 8, 30, tzinfo=timezone.utc))
+
+    def test_a_newer_failed_attempt_says_so_and_turns_amber(self):
+        text = self.banner({"at": "2026-10-14T08:20:00Z", "result": "session_needed", "transport": "cli"})
+        self.assertIn("Salesforce session needed", text)
+        self.assertIn("08:20 UTC", text)
+        self.assertIn("snapbanner stale", text)
+        self.assertIn("Last refresh attempt failed", self.banner({"at": "2026-10-14T08:20:00Z", "result": "error", "transport": "cli"}))
+
+    def test_ok_old_or_missing_status_adds_nothing(self):
+        for status in ({"at": "2026-10-14T08:20:00Z", "result": "ok", "transport": "cli"},
+                       {"at": "2026-10-14T07:00:00Z", "result": "session_needed", "transport": "cli"}, None):
+            text = self.banner(status)
+            self.assertNotIn("session needed", text)
+            self.assertNotIn("attempt failed", text)
+            self.assertNotIn("snapbanner stale", text)
+
+    def test_status_file_reading_is_strict(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(dashboard.state_paths, "state_dir", return_value=Path(tmp)):
+            path = Path(tmp) / dashboard.REFRESH_STATUS_NAME
+            good = {"at": "2026-10-14T08:20:00Z", "result": "ok", "transport": "rest"}
+            path.write_text(json.dumps(good), encoding="utf-8")
+            self.assertEqual(dashboard.refresh_status(), good)
+            for bad in ("not json", "[]", json.dumps({**good, "result": "fine"}), json.dumps({**good, "at": "yesterday"}),
+                        json.dumps({**good, "extra": "x"}), json.dumps({**good, "transport": "ssh"})):
+                path.write_text(bad, encoding="utf-8")
+                self.assertIsNone(dashboard.refresh_status(), bad)
+            path.unlink()
+            self.assertIsNone(dashboard.refresh_status())
+        with patch.object(dashboard.state_paths, "state_dir", return_value=None):
+            self.assertIsNone(dashboard.refresh_status())
+
+
 class CommandLineTests(RefreshCase):
     def main(self, *argv):
         out = io.StringIO()

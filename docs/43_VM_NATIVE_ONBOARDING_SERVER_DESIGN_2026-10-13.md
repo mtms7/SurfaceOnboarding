@@ -64,3 +64,11 @@ Recommendation: build A, B and D plus E first (they need no MFA). Treat C as its
 | V6 | OneLogin, firewall 8443, certificate (docs/40 section 7, unchanged) | SecOps, Identity |
 
 Boundaries unchanged by this document: no external write, no credential created or stored, no Salesforce, Redash, Leonardo or BackOffice change, no production access.
+
+## 8. Owner decisions 2026-10-14 (pilot) and what we learned
+
+- **No stored credential on the VM; MFA at login.** The owner asked that the VM hold no unsafe or private data and that the VM ask an operator to sign in with their own SSO in their own browser, as the desktop does for Leonardo. Built: `vm_refresh_snapshot.py --transport cli`, which uses an operator's Salesforce CLI session whose whole home folder is in memory (`/run/...`), plus a banner "Salesforce session needed" when there is none.
+- **Production clone travels in the signed snapshot** (supersedes the 2026-10-08 exclusion; sanitized, about 17 MB). No Redash key on the VM; the VM Redash timer is deferred. The owner's open Redash tab showed query 251 itself (unpublished queries do not appear in search), so no copy was needed.
+- **Finding (web research 2026-10-14):** the CLI route cannot be assumed to work on a headless VM. Device login with the default Salesforce CLI connected app has been blocked since 2025-08-28 (a custom connected app with `--client-id` is required), `sf org login web` is not supported on headless hosts (the maintainers block it in container mode and recommend **JWT** for headless use), and no checksum was found for the unversioned CLI tarball. So the attended in-memory session is an unproven spike, not a plan we can rely on.
+- **Safety comparison to weigh (V1):** a personal session token carries the signing user's full Salesforce permissions; a JWT service identity can be restricted to read-only fields and one IP, and its key stays root-owned and unreadable by the dashboard. For the owner's goal (nothing unsafe on the VM) the JWT identity is the smaller exposure, at the price of one admin request (docs/44, already drafted; the certificate and groups already exist).
+- **Interim that needs no VM credential and no admin:** the desktop publishes the snapshot (now including the clone); the dashboard banner already shows its age.

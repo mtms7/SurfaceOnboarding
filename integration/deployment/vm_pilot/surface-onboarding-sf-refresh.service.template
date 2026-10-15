@@ -1,33 +1,36 @@
-# REVIEW ARTIFACT - not installed; needs the approvals in docs/43 (V1 Salesforce scope, SecOps outbound allow-list).
+# REVIEW ARTIFACT - not installed; needs the approval markers in docs/43 (owner decision 2026-10-14: pilot with an operator's own session).
 # Install path (after approval): /etc/systemd/system/surface-onboarding-sf-refresh.service (run by the .timer, never enabled alone).
-# Read-only Salesforce refresh of queue.json / co_details.json into a new signed snapshot (tools/vm_refresh_snapshot.py).
-# The credential group surface-sf-reader holds the private key's read access; the dashboard unit does NOT have it.
+# Read-only Salesforce refresh of queue.json / co_details.json into a new signed snapshot (tools/vm_refresh_snapshot.py, --transport cli).
+# The Salesforce CLI session is an operator's OWN SSO login (MFA done in their browser), kept ONLY in memory: its whole home folder
+# is /run/surface-onboarding-sf (tmpfs, 0700), never on disk, removed at reboot or by the logout script. When there is no session the
+# job records "session needed" (the dashboard banner says so) and keeps the last good data. No password, token or code is in this file.
 [Unit]
-Description=Surface onboarding: read-only Salesforce refresh of the VM snapshot (docs/43 part A)
+Description=Surface onboarding: read-only Salesforce refresh of the VM snapshot (docs/43 part A, in-memory operator session)
 After=network-online.target
 Wants=network-online.target
-# Explicit approval markers, created by the operator only after the approvals are recorded in the plan.
+# Explicit approval marker, created by the operator only after the decision is recorded in the plan.
 ConditionPathExists=/etc/surface-onboarding/approved-sf-reader
-ConditionPathExists=/etc/surface-onboarding/sf-reader.json
 ConditionPathExists=/etc/surface-onboarding/snapshot.key
+ConditionPathExists=/opt/surface-onboarding/sf-cli/bin/sf
 
 [Service]
 Type=oneshot
 User=surface-onboarding
 Group=surface-onboarding
-SupplementaryGroups=surface-sf-reader
 UMask=0077
 WorkingDirectory=/opt/surface-onboarding/app
-# No secrets here: file paths only. SURFACE_ONBOARDING_RUNTIME is deliberately NOT set (the refresher must read Salesforce
-# live; vm mode would serve snapshots instead and the tool refuses to run in it).
+# SURFACE_ONBOARDING_RUNTIME is deliberately NOT set (the refresher must read Salesforce live; vm mode would serve snapshots and
+# the tool refuses to run in it). The CLI's HOME is set by the tool to the in-memory folder; nothing sensitive is configured here.
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=SURFACE_ONBOARDING_STATE_DIR=/var/lib/surface-onboarding
-Environment=SURFACE_VM_SF_CONFIG_FILE=/etc/surface-onboarding/sf-reader.json
-ExecStart=/opt/surface-onboarding/runtime/python-3.12.14/bin/python3.12 /opt/surface-onboarding/app/tools/vm_refresh_snapshot.py --key-file /etc/surface-onboarding/snapshot.key
+Environment=SURFACE_SF_CLI=/opt/surface-onboarding/sf-cli/bin/sf
+Environment=SURFACE_SF_TARGET_ORG=surface-onboarding
+Environment=SURFACE_SF_SESSION_DIR=/run/surface-onboarding-sf
+ExecStart=/opt/surface-onboarding/runtime/python-3.12.14/bin/python3.12 /opt/surface-onboarding/app/tools/vm_refresh_snapshot.py --transport cli --session-dir /run/surface-onboarding-sf --key-file /etc/surface-onboarding/snapshot.key
 TimeoutStartSec=300
 StateDirectory=surface-onboarding
 StateDirectoryMode=0750
-ReadWritePaths=/var/lib/surface-onboarding
+ReadWritePaths=/var/lib/surface-onboarding /run/surface-onboarding-sf
 ReadOnlyPaths=/opt/surface-onboarding
 NoNewPrivileges=yes
 CapabilityBoundingSet=
@@ -47,11 +50,13 @@ RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
+# Node.js (the Salesforce CLI) needs writable-and-executable memory for its JIT, so MemoryDenyWriteExecute stays OFF for
+# this unit only; every other hardening line is the dashboard baseline. Verify on the VM before enabling.
+MemoryDenyWriteExecute=no
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-MemoryMax=512M
-CPUQuota=50%
-TasksMax=64
-LimitNOFILE=512
+MemoryMax=1G
+CPUQuota=100%
+TasksMax=128
+LimitNOFILE=1024

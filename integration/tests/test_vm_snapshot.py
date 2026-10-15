@@ -119,9 +119,34 @@ class BundleRoundTripTests(TempCase):
             vs.build_bundle({}, KEY, "desktop")
         self.assertEqual(caught.exception.code, "empty_bundle")
 
-    def test_the_production_clone_is_not_publishable(self):
-        for name in ("redash_prod_clone.json", "inventory_prod_clone_snapshot.json"):
+    def test_only_the_collectors_clone_pair_is_publishable_not_a_raw_export(self):
+        # Owner decision 2026-10-14 supersedes the 2026-10-08 exclusion: the sanitized clone travels as a pair.
+        self.assertIn(vs.INVENTORY_CLONE_LATEST, vs.ALLOWED_NAMES)
+        self.assertIn(vs.INVENTORY_CLONE_SNAPSHOT, vs.ALLOWED_NAMES)
+        for name in ("redash_prod_clone.json", "redash_prod_clone.csv", "inventory_prod_clone.json"):
             self.assertNotIn(name, vs.ALLOWED_NAMES)
+
+    def test_the_clone_pair_is_unpacked_where_the_dashboard_reads_the_clone(self):
+        name_in = "redash-prod-clone-inventory-20261014T120000Z.json"
+        latest = json.dumps({"file": name_in, "environment": "prod-clone"}).encode()
+        name = self.ingest(vs.build_bundle(good_files(**{vs.INVENTORY_CLONE_LATEST: latest,
+                                                         vs.INVENTORY_CLONE_SNAPSHOT: b'{"tenants": []}'}),
+                                           KEY, "desktop", BASE_TIME))
+        folder = self.root / name / vs.INVENTORY_SUBDIR / "prod-clone"
+        self.assertEqual((folder / "latest.json").read_bytes(), latest)
+        self.assertEqual((folder / name_in).read_bytes(), b'{"tenants": []}')
+        self.assertFalse((self.root / name / vs.INVENTORY_SUBDIR / "dev").exists())
+
+    def test_a_dev_inventory_file_cannot_be_passed_off_as_the_clone_and_pairs_must_be_complete(self):
+        dev_name = json.dumps({"file": "leonardo-dev-inventory-20261004T215154Z.json"}).encode()
+        self.assertEqual(self.code(craft({vs.INVENTORY_CLONE_LATEST: dev_name, vs.INVENTORY_CLONE_SNAPSHOT: b"{}"})),
+                         "inventory_invalid")
+        clone_name = json.dumps({"file": "redash-prod-clone-inventory-20261014T120000Z.json"}).encode()
+        self.assertEqual(self.code(craft({vs.INVENTORY_CLONE_LATEST: clone_name})), "inventory_incomplete")
+        self.assertEqual(self.code(craft({vs.INVENTORY_CLONE_SNAPSHOT: b"{}"})), "inventory_incomplete")
+        both = {vs.INVENTORY_DEV_LATEST: dev_name, vs.INVENTORY_DEV_SNAPSHOT: b"{}",
+                vs.INVENTORY_CLONE_LATEST: clone_name, vs.INVENTORY_CLONE_SNAPSHOT: b"{}"}
+        self.assertIsNotNone(vs.verify_bundle(craft(both), KEY))
 
     def test_key_rules(self):
         short = self.tmp / "short.key"

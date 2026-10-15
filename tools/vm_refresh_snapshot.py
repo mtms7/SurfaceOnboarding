@@ -5,14 +5,22 @@ fixed reads (``queue_source_rows`` and ``detail_row``: same SOQL, same fields) t
 ``tools/vm_salesforce_reader.py``, keeps every other file of the current snapshot (run history and Dev
 inventory published from the desktop), signs the result and ingests it locally.
 
-    python3 tools/vm_refresh_snapshot.py --config /etc/surface-onboarding/sf-reader.json \\
+    # pilot (owner decision 2026-10-14): an operator's own SSO session, kept only in memory (tmpfs), never on disk
+    python3 tools/vm_refresh_snapshot.py --transport cli --session-dir /run/surface-onboarding-sf \\
+        --key-file /etc/surface-onboarding/snapshot.key
+
+    # later: a read-only service identity (OAuth JWT bearer), no human session
+    python3 tools/vm_refresh_snapshot.py --transport rest --config /etc/surface-onboarding/sf-reader.json \\
         --key-file /etc/surface-onboarding/snapshot.key
 
     python3 tools/vm_refresh_snapshot.py --dry-run     # checks configuration and key files; no network, no write
 
 Fail closed: any problem leaves the previous snapshot current and intact (the banner shows its age). A CO whose detail
 read fails keeps its previous detail. No Salesforce write exists in this path. Output is counts and short reason codes only.
-Exit 0 = refreshed (or dry run), 2 = refused, 3 = Salesforce read unavailable, 64 = usage, 75 = another refresh is running.
+Every run records ``refresh-status.json`` in the state directory (time, result code, transport; no values) so the dashboard
+can say "Salesforce session needed" instead of silently showing old data.
+Exit 0 = refreshed (or dry run), 2 = refused, 3 = Salesforce read unavailable or session needed, 64 = usage, 75 = another
+refresh is running.
 """
 
 from __future__ import annotations
@@ -20,7 +28,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -33,6 +43,12 @@ from tools import vm_salesforce_reader as reader  # noqa: E402
 
 DEFAULT_STATE_DIR = "/var/lib/surface-onboarding"
 LOCK_NAME = "vm-refresh.lock"
+STATUS_NAME = "refresh-status.json"
+SESSION_DIR_ENV = "SURFACE_SF_SESSION_DIR"
+# The CLI session must live in memory: only these tmpfs roots are accepted (never the state dir or a disk path).
+MEMORY_ROOTS = ("/run/", "/dev/shm/")
+SESSION_ENV = {"SF_USE_GENERIC_UNIX_KEYCHAIN": "true", "SF_DISABLE_TELEMETRY": "true", "SF_AUTOUPDATE_DISABLE": "true",
+               "SFDX_AUTOUPDATE_DISABLE": "true", "SF_SKIP_NEW_VERSION_CHECK": "true", "SF_DISABLE_LOG_FILE": "true"}
 CARRY_EXCLUDED = frozenset({vm_snapshot.QUEUE_FILE, vm_snapshot.CO_DETAILS_FILE})
 
 
@@ -41,6 +57,56 @@ class RefreshRefused(Exception):
         super().__init__(code)
         self.code = code
         self.exit_code = exit_code
+
+
+def session_dir_problem(path: str) -> str | None:
+    """Reason code when ``path`` is not an acceptable in-memory CLI session folder, else None.
+
+    It must be under a tmpfs root (``/run/`` or ``/dev/shm/``), a real directory (not a link), private to the running
+    user, and it must already hold a session (an auth file for a signed-in user): otherwise the operator has not signed in.
+    """
+    if not isinstance(path, str) or not os.path.isabs(path):
+        return "session_dir_not_absolute"
+    real = os.path.realpath(path)
+    if not real.startswith(MEMORY_ROOTS) or os.path.realpath(path + "/") != real or os.path.islink(path):
+        return "session_dir_not_in_memory"
+    try:
+        info = os.stat(real)
+    except OSError:
+        return "session_needed"
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077 or (hasattr(os, "getuid") and info.st_uid != os.getuid()):
+        return "session_dir_unsafe"
+    # A signed-in CLI keeps one auth file per user (``~/.sfdx/<username>.json``); folders the CLI creates on any run (``.sf``,
+    # ``.cache``) are not a session.
+    auth = os.path.join(real, ".sfdx")
+    try:
+        if not any(name.endswith(".json") and "@" in name for name in os.listdir(auth)):
+            return "session_needed"
+    except OSError:
+        return "session_needed"
+    return None
+
+
+def write_status(state_dir: str, result: str, transport: str, now: datetime | None = None) -> None:
+    """Record the outcome of this run (no values) for the dashboard banner; best effort, never raises."""
+    try:
+        stamp = (now or datetime.now(timezone.utc)).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+        target = Path(state_dir) / STATUS_NAME
+        handle, temp_name = tempfile.mkstemp(prefix=STATUS_NAME + ".", suffix=".tmp", dir=state_dir)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps({"at": stamp, "result": result, "transport": transport}, sort_keys=True) + "\n")
+        os.replace(temp_name, target)
+    except OSError:
+        pass
+
+
+def status_result(code: str | None, transport: str) -> str:
+    """The value-free result stored for the banner."""
+    if code is None:
+        return "ok"
+    if code == "session_needed" or (transport == "cli" and code == "queue_unavailable"):
+        return "session_needed"
+    return "error"
 
 
 def carried_files(state_dir: str) -> tuple[dict[str, bytes], dict[str, Any]]:
@@ -74,23 +140,37 @@ def carried_files(state_dir: str) -> tuple[dict[str, bytes], dict[str, Any]]:
 
 def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | None = None,
             sign: Callable[[str, bytes], bytes] = reader.openssl_sign,
-            now: datetime | None = None, dashboard: Any | None = None) -> dict[str, int]:
+            now: datetime | None = None, dashboard: Any | None = None, transport: str = "rest",
+            session_dir: str = "") -> dict[str, int]:
+    if transport not in ("rest", "cli"):
+        raise RefreshRefused("unknown_transport")
+    config = None
     try:
         key = vm_snapshot.load_key(key_file)
-        config = reader.load_config(config_path)
-        reader._private_file(Path(config.private_key_file), secret=True, reason="key_file_unsafe")
+        if transport == "rest":
+            config = reader.load_config(config_path)
+            reader._private_file(Path(config.private_key_file), secret=True, reason="key_file_unsafe")
     except vm_snapshot.SnapshotError as error:
         raise RefreshRefused(error.code) from None
     except reader.ReaderError as error:
         raise RefreshRefused(error.reason) from None
+    if transport == "cli":
+        problem = session_dir_problem(session_dir)
+        if problem is not None:
+            raise RefreshRefused(problem, 3 if problem == "session_needed" else 2)
     if dashboard is None:
         import tools.serve_attended_open_onboardings_dashboard as dashboard  # noqa: PLW0127
     if dashboard.state_paths.vm_mode():
         raise RefreshRefused("runtime_must_not_be_vm")  # VM mode serves snapshots; this process must read Salesforce live
     carried, previous_details = carried_files(state_dir)
-    client = reader.RestQueryClient(config, opener, sign, clock=lambda: now or datetime.now(timezone.utc))
     original = dashboard.sf_json
-    dashboard.sf_json = reader.make_sf_json(client, dashboard.ReadUnavailable)
+    saved_env = {name: os.environ.get(name) for name in (*SESSION_ENV, "HOME")}
+    if transport == "rest":
+        client = reader.RestQueryClient(config, opener, sign, clock=lambda: now or datetime.now(timezone.utc))
+        dashboard.sf_json = reader.make_sf_json(client, dashboard.ReadUnavailable)
+    else:  # the dashboard's own CLI reads, with the CLI's whole home folder in memory
+        os.environ.update(SESSION_ENV)
+        os.environ["HOME"] = os.path.realpath(session_dir)
     try:
         import tools.publish_vm_snapshot as publisher
 
@@ -100,6 +180,11 @@ def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | No
             raise RefreshRefused(refusal.code, refusal.exit_code) from None
     finally:
         dashboard.sf_json = original
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
     details = json.loads(reads[vm_snapshot.CO_DETAILS_FILE].decode("utf-8"))["details"]
     kept = 0
     for reference, detail in previous_details.items():  # a transient failure must not drop a CO's page
@@ -134,35 +219,52 @@ def _lock(state_dir: str) -> Any:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Refresh the VM snapshot from Salesforce (read-only).")
-    parser.add_argument("--config", default=os.environ.get(reader.CONFIG_ENV, ""), help="Reader configuration JSON file.")
+    parser.add_argument("--transport", choices=("rest", "cli"), default="rest",
+                        help="rest: read-only service identity (--config); cli: an operator's in-memory SSO session (--session-dir).")
+    parser.add_argument("--session-dir", default=os.environ.get(SESSION_DIR_ENV, ""),
+                        help="cli only: the tmpfs folder holding the Salesforce CLI's home (under /run/ or /dev/shm/).")
+    parser.add_argument("--config", default=os.environ.get(reader.CONFIG_ENV, ""), help="rest only: reader configuration JSON file.")
     parser.add_argument("--key-file", default="", help="Snapshot HMAC key file (root-owned, outside the repository).")
     parser.add_argument("--state-dir", default=os.environ.get("SURFACE_ONBOARDING_STATE_DIR", "") or DEFAULT_STATE_DIR)
     parser.add_argument("--dry-run", action="store_true", help="Check the configuration and key files only.")
     args = parser.parse_args(argv)
-    if not args.config or not args.key_file or not os.path.isabs(args.state_dir):
-        print("usage: --config and --key-file are required and --state-dir must be absolute")
+    needs = args.config if args.transport == "rest" else args.session_dir
+    if not needs or not args.key_file or not os.path.isabs(args.state_dir):
+        print("usage: --key-file and (--config for rest, --session-dir for cli) are required; --state-dir must be absolute")
         return 64
+    code: str | None = None
+    exit_code = 0
+    counts: dict[str, int] = {}
     try:
         if args.dry_run:
             vm_snapshot.load_key(args.key_file)
-            config = reader.load_config(args.config)
-            reader._private_file(Path(config.private_key_file), secret=True, reason="key_file_unsafe")
+            if args.transport == "rest":
+                config = reader.load_config(args.config)
+                reader._private_file(Path(config.private_key_file), secret=True, reason="key_file_unsafe")
+            else:
+                problem = session_dir_problem(args.session_dir)
+                if problem not in (None, "session_needed"):
+                    raise RefreshRefused(problem)
             print("dry run: configuration and key files are acceptable; nothing was read or written")
             return 0
         handle = _lock(args.state_dir)
         try:
-            counts = refresh(args.config, args.key_file, args.state_dir)
+            counts = refresh(args.config, args.key_file, args.state_dir, transport=args.transport,
+                             session_dir=args.session_dir)
         finally:
             handle.close()
     except RefreshRefused as refusal:
-        print("refused:" + refusal.code)
-        return refusal.exit_code
+        code, exit_code = refusal.code, refusal.exit_code
     except (vm_snapshot.SnapshotError, reader.ReaderError) as error:
-        print("refused:" + (getattr(error, "code", None) or getattr(error, "reason", "error")))
-        return 2
+        code, exit_code = (getattr(error, "code", None) or getattr(error, "reason", "error")), 2
     except Exception:  # noqa: BLE001 - never print a traceback that could echo a path or value
-        print("refused:unexpected_error")
-        return 2
+        code, exit_code = "unexpected_error", 2
+    if code is not None:
+        if code != "refresh_already_running":  # a competing run owns the status
+            write_status(args.state_dir, status_result(code, args.transport), args.transport)
+        print("refused:" + code)
+        return exit_code
+    write_status(args.state_dir, "ok", args.transport)
     print(" ".join(f"{key}={value}" for key, value in sorted(counts.items())))
     print("refreshed")
     return 0
