@@ -24,19 +24,21 @@ Everything runs as two systemd timers (Salesforce every 10 minutes, Redash hourl
 
 | Object | Access | Fields (read) |
 | --- | --- | --- |
-| `Customer_Onboarding__c` | Read | `Name`, `Onboarding_Approval_Status__c`, `Onboarding_Stage__c`, `Onboarding_Product__c`, `Onboarding_Type__c`, `Account__c`, `Account_Name__c`, `Account__r.Name` (via the list view), `Submission_Date__c`, `Primary_User_Name__c`, `Main_Domain__c`, `Alternate_Domains__c`, `Email_Domains__c`, `Onboarding_Comments__c`, `Surface_Account_ID__c`, `Account_UUID__c`, `LastModifiedDate` |
+| `Customer_Onboarding__c` | Read | `Name`, `Onboarding_Approval_Status__c`, `Onboarding_Stage__c`, `Onboarding_Product__c`, `Onboarding_Type__c`, `Account__c`, `Account_Name__c`, `Account__r.Name` (via the list view), `Submission_Date__c`, `Primary_User_Name__c`, `Main_Domain__c`, `Alternate_Domains__c`, `Email_Domains__c`, `Onboarding_Comments__c`, `Surface_Account_ID__c`, `Account_UUID__c`, `Account_Country__c`, `LastModifiedDate` |
+| `DealHub_Subscription__c` (added 2026-10-15) | Read | `DealHub_Account__c` (used as the filter), `Product_Full_Name__c`, `DealHub_Status__c`, `DealHub_Subscription_Start_Date__c`, `DealHub_Subscription_End_Date__c` |
 | List view `Open_Onboardings` on `Customer_Onboarding__c` | Visible to the integration user | the list view's results and its `ListView` metadata row |
 
 Please confirm or decide:
 
 - `Onboarding_Comments__c` is free text and may contain sensitive notes. The dashboard shows it on each CO page today. If you prefer, we exclude it from the VM (the page then shows "not published").
-- No Create, Edit, Delete, "Modify All" or "View All Data". No other object. (A later phase, V5 in docs/43, would add read of `DealHub_Subscription__c` and `Account` identifiers for approval summaries; it is **not** part of this request.)
+- No Create, Edit, Delete, "Modify All" or "View All Data". No other object. **Added 2026-10-15:** `DealHub_Subscription__c` (read) is part of this request, because the production check (is the customer already in production, and do the licence term and domains match) needs each CO's DealHub term; without it the VM cannot answer the production tab on its own (docs/43 section 9). `Account` identifiers for approval summaries (V5) remain a later phase.
 
 **What the client sends (all of it, GET only):**
 
 - `SELECT Id FROM ListView WHERE SobjectType = 'Customer_Onboarding__c' AND DeveloperName = 'Open_Onboardings' LIMIT 2`
 - `GET /services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/<id>/results`
 - `SELECT <the fields above> FROM Customer_Onboarding__c WHERE Name = 'CO-nnnn' LIMIT 2`, one per queued or previously published CO (roughly 10 to 30 requests per refresh, about 150 per hour).
+- `SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c WHERE DealHub_Account__c = '<account id>' LIMIT 100`, one per queued CO for the production check (added 2026-10-15; the request volume above roughly doubles).
 
 The client refuses any other call shape in code (tested): only a single `SELECT`, or a GET of that exact list-view path; no redirects; response size and record counts capped. Expected API usage is well below 1% of a typical daily limit.
 

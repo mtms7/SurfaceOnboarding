@@ -7940,6 +7940,34 @@ def run_production_duplicate_check(reference: str, route: str = CE_ENGINE) -> di
     return {"result": gate["result"], "production_clone": gate}
 
 
+def _snapshot_production_expectation(reference: str, product: Any,
+                                     onboarding_type: Any) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """VM mode: (engine, co_source, plan) of one CO from the published ``production_inputs.json`` (fails closed).
+
+    The entry must belong to the same product and type the page shows now, and have exactly the expected shape.
+    """
+    from integration.onboarding import state_paths, vm_snapshot
+
+    folder = state_paths.state_dir()
+    if folder is None:
+        raise RuntimeError("production_inputs_unavailable")
+    try:
+        data = vm_snapshot.load_current_json(vm_snapshot.snapshots_root(folder), vm_snapshot.PRODUCTION_INPUTS_FILE)
+        item = data["inputs"][reference]
+        engine, source, plan = item["engine"], item["co_source"], item["plan"]
+        names, domains = source["tenant_names"], source["domains"]
+        if (product and item.get("product") != product) or (onboarding_type and item.get("type") != onboarding_type):
+            raise ValueError("production_inputs_differ")
+        if (not isinstance(engine, str) or not isinstance(plan, dict) or not isinstance(names, list)
+                or not isinstance(domains, list)):
+            raise ValueError("production_inputs_shape")
+    except (vm_snapshot.SnapshotError, KeyError, TypeError, AttributeError):
+        raise RuntimeError("production_inputs_unavailable") from None
+    except ValueError:
+        raise RuntimeError("production_inputs_unavailable") from None
+    return engine, {"tenant_names": tuple(names), "domains": tuple(domains)}, plan
+
+
 def _production_expectation(reference: str, product: Any = None,
                             onboarding_type: Any = None) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """(engine, co_source, plan) for the production match, from read-only Salesforce reads (raises on any problem).
@@ -7947,6 +7975,10 @@ def _production_expectation(reference: str, product: Any = None,
     The expected licence dates come from the DealHub term itself: Production never uses the Dev run day or the dates
     entered in Leonardo Development (``build_fill`` is given the subscription start as the "run day").
     """
+    from integration.onboarding import state_paths
+
+    if state_paths.vm_mode():  # no live Salesforce read on the VM: the published inputs of the signed snapshot (docs/43 s.9)
+        return _snapshot_production_expectation(reference, product, onboarding_type)
     case = renewal_case(product, onboarding_type) if product and onboarding_type else None
     if case is not None and case[0] in RENEWAL_ENGINES:
         engine = case[0]

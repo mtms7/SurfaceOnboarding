@@ -54,6 +54,9 @@ INVENTORY_SUBDIR = "leonardo-inventory"
 PRODUCER_VM_READER = "vm-salesforce-reader"  # the VM refreshed queue.json / co_details.json itself (docs/43 part A)
 QUEUE_FILE = "queue.json"
 CO_DETAILS_FILE = "co_details.json"
+# Per queued CO, what the production check expects (engine, tenant names, domains, plan), computed where Salesforce is
+# readable so the VM (no live read) can answer the production match from the clone alone (docs/43 section 9).
+PRODUCTION_INPUTS_FILE = "production_inputs.json"
 INVENTORY_DEV_LATEST = "inventory_dev_latest.json"
 INVENTORY_DEV_SNAPSHOT = "inventory_dev_snapshot.json"
 # Owner decision 2026-10-14: the production clone (Redash query 251, ~17 MB, personal data already removed by the
@@ -73,7 +76,7 @@ STATE_FILE_NAMES = frozenset({
     "attended_user_created_confirmations.json", "attended_spycloud.json", "attended_salesforce_id_writebacks.json",
     "attended_surface_validation.json", "attended_renewal_mirrors.json", "attended_renewal_outcomes.json",
 })
-EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
+EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, PRODUCTION_INPUTS_FILE, INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
                                INVENTORY_CLONE_LATEST, INVENTORY_CLONE_SNAPSHOT})
 ALLOWED_NAMES = STATE_FILE_NAMES | EXPORT_FILE_NAMES
 

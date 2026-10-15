@@ -350,5 +350,68 @@ class VmCloneWordingTests(SnapshotDashboardCase):
         self.assertNotIn("redash_inventory_collector.py --collect</code>", body)
 
 
+class VmProductionMatchTests(SnapshotDashboardCase):
+    """The VM answers the production match from the signed snapshot: the clone plus the published per-CO inputs
+    (docs/43 section 9). It never reads Salesforce, and anything unexpected fails closed."""
+
+    PRODUCT, KIND = "Credential Exposure", "New Product Onboarding"
+
+    def item(self, **over):
+        value = {"engine": "case_2_ce_only", "product": self.PRODUCT, "type": self.KIND,
+                 "co_source": {"tenant_names": ["Acme Snapshot Customer - CE Only"], "domains": ["snapshot-customer.example"]},
+                 "plan": {"primary_domain": "snapshot-customer.example", "alternate_domains": [],
+                          "license_type": "Prepaid annual subscription", "license_end": "2027-10-18",
+                          "license_start": "2026-10-01", "spycloud_shown": True}}
+        value.update(over)
+        return value
+
+    def publish_inputs(self, inputs):
+        files = {**FILES, vs.PRODUCTION_INPUTS_FILE: json.dumps({"inputs": inputs}).encode()}
+        vs.ingest_bundle(vs.build_bundle(files, KEY, "desktop", datetime.now(timezone.utc)), KEY, self.state)
+        dashboard.clear_display_cache()
+
+    def test_the_expectation_comes_from_the_published_inputs(self):
+        self.publish_inputs({"CO-0001": self.item()})
+        engine, source, plan = runner._production_expectation("CO-0001", self.PRODUCT, self.KIND)
+        self.assertEqual(engine, "case_2_ce_only")
+        self.assertEqual(source, {"tenant_names": ("Acme Snapshot Customer - CE Only",), "domains": ("snapshot-customer.example",)})
+        self.assertEqual(plan["license_end"], "2027-10-18")
+
+    def test_a_missing_different_or_malformed_entry_fails_closed(self):
+        self.publish_inputs({"CO-0001": self.item(), "CO-0002": self.item(engine=None),
+                             "CO-0003": self.item(co_source={"tenant_names": "x", "domains": []})})
+        for reference, product, kind in (("CO-0009", self.PRODUCT, self.KIND),      # no entry
+                                         ("CO-0001", "Surface", self.KIND),          # the CO changed product
+                                         ("CO-0002", self.PRODUCT, self.KIND),       # no engine
+                                         ("CO-0003", self.PRODUCT, self.KIND)):      # malformed names
+            with self.subTest(reference=reference, product=product):
+                with self.assertRaises(RuntimeError):
+                    runner._production_expectation(reference, product, kind)
+
+    def test_without_a_published_file_the_expectation_is_unavailable(self):
+        with self.assertRaises(RuntimeError):
+            runner._production_expectation("CO-0001", self.PRODUCT, self.KIND)
+
+    def test_the_match_uses_the_clone_and_the_published_inputs_without_a_salesforce_read(self):
+        from integration.tests.test_production_match import snapshot as clone, tenant
+
+        self.publish_inputs({"CO-0001": self.item()})
+        with patch.object(runner, "_sf_records", side_effect=AssertionError("Salesforce read in VM mode")),                 patch("integration.onboarding.production_match.load_snapshot", return_value=clone(tenant("Other Co", "other.example"))):
+            result = runner.production_match_for("CO-0001", self.PRODUCT, self.KIND)
+            self.assertEqual(result["status"], "not_in_production")
+            self.assertEqual(result["route"], "case_2_ce_only")
+            duplicate = clone(tenant("Acme Snapshot Customer - CE Only", "snapshot-customer.example"))
+        with patch("integration.onboarding.production_match.load_snapshot", return_value=duplicate):
+            self.assertIn(runner.production_match_for("CO-0001", self.PRODUCT, self.KIND)["status"],
+                          ("exists_matches", "exists_differs"))
+
+    def test_the_page_no_longer_says_the_co_source_is_unreadable(self):
+        self.publish_inputs({"CO-0001": self.item()})
+        with patch("integration.onboarding.production_match.load_snapshot", return_value="inventory_snapshot_missing"):
+            status, _, body = self.get("/co/CO-0001?env=prod")
+        self.assertEqual(status, 200)
+        self.assertNotIn("co_source_unreadable", body)
+
+
 if __name__ == "__main__":
     unittest.main()

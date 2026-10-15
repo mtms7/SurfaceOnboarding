@@ -1,7 +1,7 @@
 #!/bin/sh
-# REVIEW ARTIFACT - Step 12A (operator-run on the VM as root): sudo sh /tmp/r27-upload/_step12a_vm_ingest.sh <snapshot-zip-name>
+# REVIEW ARTIFACT - Step 12A (operator-run on the VM as root): sudo sh /tmp/r28-upload/_step12a_vm_ingest.sh <snapshot-zip-name>
 # Verifies (HMAC, caps, names) and ingests ONE signed snapshot zip published from the desktop (docs/41, owner decision 2026-10-14:
-# the production clone travels in the signed snapshot). The zip must be in /tmp/r27-upload/. Any failure leaves the current snapshot
+# the production clone travels in the signed snapshot). The zip must be in the same folder as this script. Any failure leaves the current snapshot
 # intact. Writes a new snapshot folder under /var/lib/surface-onboarding/snapshots and switches `current`; the dashboard reads it on
 # its next request (no restart). Touches no service, marker, timer, network or Salesforce. Prints names, counts and status only.
 set -eu
@@ -10,7 +10,7 @@ ZIPNAME=${1:-}
 printf '%s' "$ZIPNAME" | grep -Eq '^surface-vm-snapshot-[0-9]{8}T[0-9]{6}Z\.zip$' || { echo "usage: sh _step12a_vm_ingest.sh surface-vm-snapshot-YYYYMMDDTHHMMSSZ.zip"; exit 1; }
 OPT=/opt/surface-onboarding
 STATE=/var/lib/surface-onboarding
-ZIP=/tmp/r27-upload/$ZIPNAME
+ZIP=$(dirname "$0")/$ZIPNAME
 PY=$OPT/runtime/python-3.12.14/bin/python3.12
 KEY=/etc/surface-onboarding/snapshot.key
 [ -f "$ZIP" ] && [ -f "$KEY" ] && [ -x "$PY" ] || { echo "missing zip, key or python: stop here"; exit 1; }

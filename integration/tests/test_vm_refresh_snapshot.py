@@ -182,17 +182,81 @@ class RealDashboardReadsThroughTheAdapterTests(unittest.TestCase):
         dashboard.sf_json = vr.make_sf_json(client, dashboard.ReadUnavailable)
         try:
             env = {k: v for k, v in os.environ.items() if k != "SURFACE_ONBOARDING_RUNTIME"}
-            with patch.dict(os.environ, env, clear=True):
+            with patch.dict(os.environ, env, clear=True),                     patch.object(dashboard, "production_review_inputs", side_effect=RuntimeError("no live read in tests")):
                 files, counts = publisher.collect_dashboard_reads()
         finally:
             dashboard.sf_json = original
             dashboard._open_onboardings_view_id = cached
         self.assertEqual((counts["queue_rows"], counts["co_details"], counts["co_details_unavailable"]), (1, 1, 0))
+        self.assertEqual((counts["production_inputs"], counts["production_inputs_unavailable"]), (0, 1))
+        self.assertEqual(json.loads(files[vs.PRODUCTION_INPUTS_FILE]), {"inputs": {}})
         self.assertEqual(json.loads(files[vs.QUEUE_FILE])["rows"][0]["Name"], "CO-0780")
         self.assertEqual(json.loads(files[vs.CO_DETAILS_FILE])["details"]["CO-0780"]["Name"], "CO-0780")
         methods = [(m, u.split("salesforce.com")[1].split("?")[0]) for m, u, *_ in opener.requests[1:]]
         self.assertEqual(methods[1], ("GET", "/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/00BAA000000abcd/results"))
         self.assertTrue(all(method == "GET" for method, _ in methods), "every Salesforce call is a read")
+
+
+class ProductionInputsTests(RefreshCase):
+    """The production-check inputs travel with every refresh; a failed read keeps the previous entry (docs/43 s.9)."""
+
+    ITEM = {"engine": "case_2_ce_only", "co_source": {"tenant_names": ["A"], "domains": ["a.example"]}, "plan": {}}
+
+    def publish_previous(self, inputs):
+        files = {vs.QUEUE_FILE: json.dumps({"rows": [{"Name": "CO-0001"}, {"Name": "CO-0002"}]}).encode(),
+                 vs.CO_DETAILS_FILE: json.dumps({"details": {"CO-0001": detail("CO-0001", "old"),
+                                                             "CO-0002": detail("CO-0002", "old")}}).encode(),
+                 vs.PRODUCTION_INPUTS_FILE: json.dumps({"inputs": inputs}).encode()}
+        vs.ingest_bundle(vs.build_bundle(files, KEY, "desktop", FIRST + timedelta(hours=1)), KEY, self.state)
+
+    def reads_with_inputs(self, fresh):
+        def collect(extra_references=()):
+            return ({vs.QUEUE_FILE: json.dumps({"rows": [{"Name": "CO-0001"}, {"Name": "CO-0003"}]}).encode(),
+                     vs.CO_DETAILS_FILE: json.dumps({"details": {"CO-0001": detail("CO-0001", "new"),
+                                                                 "CO-0003": detail("CO-0003", "new")}}).encode(),
+                     vs.PRODUCTION_INPUTS_FILE: json.dumps({"inputs": fresh}).encode()},
+                    {"queue_rows": 2, "co_details": 2, "co_details_unavailable": 0})
+        return patch.object(publisher, "collect_dashboard_reads", collect)
+
+    def published_inputs(self):
+        root, _manifest = self.current()
+        return vs.load_current_json(root, vs.PRODUCTION_INPUTS_FILE)["inputs"]
+
+    def test_fresh_inputs_win_and_a_failed_read_keeps_the_previous_entry(self):
+        self.publish_previous({"CO-0001": {**self.ITEM, "engine": "old"}, "CO-0002": self.ITEM})
+        with self.environment(), self.reads_with_inputs({"CO-0001": self.ITEM}):
+            counts = refresher.refresh(str(self.config), str(self.key), self.state, now=SECOND)
+        inputs = self.published_inputs()
+        self.assertEqual(inputs["CO-0001"]["engine"], "case_2_ce_only")        # fresh, not the old value
+        self.assertIn("CO-0002", inputs)                                      # kept: its CO page is kept too
+        self.assertNotIn("CO-0003", inputs)                                   # never had one: unavailable, not invented
+        self.assertEqual(counts["production_inputs"], 2)
+
+    def test_the_publisher_collects_the_inputs_of_every_queued_co_as_plain_json(self):
+        from datetime import date
+
+        row = {field: None for field in dashboard.QUEUE_FIELDS}
+        row.update(Name="CO-0001", Onboarding_Product__c="Credential Exposure", Onboarding_Type__c="New Product Onboarding")
+
+        def inputs(reference, product, kind):
+            if reference == "CO-0002":
+                raise RuntimeError("unreadable")
+            return {"engine": "case_2_ce_only", "co_source": {"tenant_names": ("N",), "domains": ("d.example",)},
+                    "plan": {"license_end": date(2027, 1, 2), "alternate_domains": ()}}
+
+        second = {**row, "Name": "CO-0002"}
+        with patch.object(dashboard, "queue_source_rows", return_value=[row, second]),                 patch.object(dashboard, "detail_row", return_value={"Name": "x"}),                 patch.object(dashboard, "dev_onboarded_refs", return_value=[]),                 patch.object(dashboard, "production_review_inputs", side_effect=inputs):
+            files, counts = publisher.collect_dashboard_reads()
+        stored = json.loads(files[vs.PRODUCTION_INPUTS_FILE])["inputs"]
+        self.assertEqual(sorted(stored), ["CO-0001"])                          # the unreadable CO has no entry
+        self.assertEqual(stored["CO-0001"]["co_source"], {"tenant_names": ["N"], "domains": ["d.example"]})
+        self.assertEqual(stored["CO-0001"]["plan"]["license_end"], "2027-01-02")
+        self.assertEqual((stored["CO-0001"]["product"], stored["CO-0001"]["type"]),
+                         ("Credential Exposure", "New Product Onboarding"))
+        self.assertEqual((counts["production_inputs"], counts["production_inputs_unavailable"]), (1, 1))
+
+    def test_the_file_is_never_carried_as_is_from_the_previous_snapshot(self):
+        self.assertIn(vs.PRODUCTION_INPUTS_FILE, refresher.CARRY_EXCLUDED)
 
 
 class SessionDirTests(unittest.TestCase):
@@ -299,7 +363,7 @@ class CliTransportTests(RefreshCase):
         self.assertEqual(seen["home_after"], "original-home")
         root = vs.snapshots_root(self.state)
         self.assertEqual(vs.read_current_manifest(root)["producer"], vs.PRODUCER_VM_READER)
-        self.assertEqual(counts["files_in_bundle"], 3)
+        self.assertEqual(counts["files_in_bundle"], 4)  # + production_inputs.json
 
     def test_environment_is_restored_even_when_the_read_fails(self):
         def failing(extra_references=()):

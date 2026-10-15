@@ -49,7 +49,7 @@ SESSION_DIR_ENV = "SURFACE_SF_SESSION_DIR"
 MEMORY_ROOTS = ("/run/", "/dev/shm/")
 SESSION_ENV = {"SF_USE_GENERIC_UNIX_KEYCHAIN": "true", "SF_DISABLE_TELEMETRY": "true", "SF_AUTOUPDATE_DISABLE": "true",
                "SFDX_AUTOUPDATE_DISABLE": "true", "SF_SKIP_NEW_VERSION_CHECK": "true", "SF_DISABLE_LOG_FILE": "true"}
-CARRY_EXCLUDED = frozenset({vm_snapshot.QUEUE_FILE, vm_snapshot.CO_DETAILS_FILE})
+CARRY_EXCLUDED = frozenset({vm_snapshot.QUEUE_FILE, vm_snapshot.CO_DETAILS_FILE, vm_snapshot.PRODUCTION_INPUTS_FILE})
 
 
 class RefreshRefused(Exception):
@@ -138,6 +138,16 @@ def carried_files(state_dir: str) -> tuple[dict[str, bytes], dict[str, Any]]:
     return files, previous_details
 
 
+def previous_production_inputs(state_dir: str) -> dict[str, Any]:
+    """The production-check inputs of the current snapshot (empty when there is none or it is unreadable)."""
+    try:
+        data = vm_snapshot.load_current_json(vm_snapshot.snapshots_root(state_dir), vm_snapshot.PRODUCTION_INPUTS_FILE)
+        inputs = data.get("inputs") if isinstance(data, dict) else None
+    except vm_snapshot.SnapshotError:
+        return {}
+    return inputs if isinstance(inputs, dict) else {}
+
+
 def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | None = None,
             sign: Callable[[str, bytes], bytes] = reader.openssl_sign,
             now: datetime | None = None, dashboard: Any | None = None, transport: str = "rest",
@@ -165,9 +175,20 @@ def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | No
     carried, previous_details = carried_files(state_dir)
     original = dashboard.sf_json
     saved_env = {name: os.environ.get(name) for name in (*SESSION_ENV, "HOME")}
+    import tools.attended_ce_only_playwright as runner  # the production-check inputs are read through its own query helper
+
+    original_records = runner._sf_records
     if transport == "rest":
         client = reader.RestQueryClient(config, opener, sign, clock=lambda: now or datetime.now(timezone.utc))
         dashboard.sf_json = reader.make_sf_json(client, dashboard.ReadUnavailable)
+
+        def rest_records(query: str) -> list[Any]:
+            try:
+                return client.query(query)
+            except reader.ReaderError as error:
+                raise ValueError("salesforce_rest_unavailable") from error
+
+        runner._sf_records = rest_records
     else:  # the dashboard's own CLI reads, with the CLI's whole home folder in memory
         os.environ.update(SESSION_ENV)
         os.environ["HOME"] = os.path.realpath(session_dir)
@@ -180,6 +201,7 @@ def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | No
             raise RefreshRefused(refusal.code, refusal.exit_code) from None
     finally:
         dashboard.sf_json = original
+        runner._sf_records = original_records
         for name, value in saved_env.items():
             if value is None:
                 os.environ.pop(name, None)
@@ -192,6 +214,13 @@ def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | No
             details[reference] = detail
             kept += 1
     reads[vm_snapshot.CO_DETAILS_FILE] = json.dumps({"details": details}, sort_keys=True).encode("utf-8")
+    fresh_inputs = json.loads(reads[vm_snapshot.PRODUCTION_INPUTS_FILE].decode("utf-8")).get("inputs")         if vm_snapshot.PRODUCTION_INPUTS_FILE in reads else {}
+    merged_inputs = dict(fresh_inputs if isinstance(fresh_inputs, dict) else {})
+    for reference, item in previous_production_inputs(state_dir).items():  # a failed read must not drop a CO's check
+        if reference in details and reference not in merged_inputs:
+            merged_inputs[reference] = item
+    reads[vm_snapshot.PRODUCTION_INPUTS_FILE] = json.dumps({"inputs": merged_inputs}, sort_keys=True).encode("utf-8")
+    counts["production_inputs"] = len(merged_inputs)
     files = {**carried, **reads}
     created = (now or datetime.now(timezone.utc)).replace(microsecond=0)
     try:

@@ -124,11 +124,26 @@ def collect_dashboard_reads(extra_references: Iterable[str] = ()) -> tuple[dict[
             missing += 1
             continue
         details[reference] = {field: row.get(field) for field in dash.DETAIL_FIELDS}
+    inputs: dict[str, dict[str, Any]] = {}
+    inputs_missing = 0
+    for row in queue:  # what the production check expects per queued CO, so the VM needs no live read for it
+        reference = row.get("Name")
+        if not reference:
+            continue
+        try:
+            found = dash.production_review_inputs(reference, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+            inputs[reference] = dash._plain({"engine": found["engine"], "co_source": found["co_source"], "plan": found["plan"],
+                                             "product": row.get("Onboarding_Product__c"),
+                                             "type": row.get("Onboarding_Type__c")})
+        except Exception:  # noqa: BLE001 - a CO the check cannot read simply has no entry (the VM shows it unavailable)
+            inputs_missing += 1
     files = {
         vm_snapshot.QUEUE_FILE: json.dumps({"rows": queue}, sort_keys=True).encode("utf-8"),
         vm_snapshot.CO_DETAILS_FILE: json.dumps({"details": details}, sort_keys=True).encode("utf-8"),
+        vm_snapshot.PRODUCTION_INPUTS_FILE: json.dumps({"inputs": inputs}, sort_keys=True).encode("utf-8"),
     }
-    return files, {"queue_rows": len(queue), "co_details": len(details), "co_details_unavailable": missing}
+    return files, {"queue_rows": len(queue), "co_details": len(details), "co_details_unavailable": missing,
+                   "production_inputs": len(inputs), "production_inputs_unavailable": inputs_missing}
 
 
 def output_path(out_dir: Path, autopublish: bool, now: datetime) -> Path:
@@ -191,6 +206,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"include {name} {len(data)} bytes")
             print(f"include {vm_snapshot.QUEUE_FILE} (live read of the open queue, not performed in a dry run)")
             print(f"include {vm_snapshot.CO_DETAILS_FILE} (live read of the queued and onboarded COs, not performed)")
+            print(f"include {vm_snapshot.PRODUCTION_INPUTS_FILE} (what the production check expects per queued CO, not performed)")
         print("dry run: nothing written")
         return 0
     if not args.key_file or not args.out_dir:
