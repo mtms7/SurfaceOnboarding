@@ -2084,6 +2084,8 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
     """Read comment dates transiently and return only the safe date summary."""
     if not references or any(not REFERENCE.fullmatch(reference) for reference in references):
         raise ReadUnavailable()
+    if vm_mode():  # no live read on the VM: the published CO details already carry the comment (docs/41)
+        return _snapshot_subscription_summaries(references)
     quoted = ", ".join(f"'{reference}'" for reference in references)
     response = sf_json(["data", "query", "--query", "SELECT Name, Onboarding_Comments__c FROM Customer_Onboarding__c WHERE Name IN (" + quoted + ")", "--json"])
     try:
@@ -2110,6 +2112,23 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
         return summaries
     except (KeyError, TypeError):
         raise ReadUnavailable() from None
+
+
+def _snapshot_subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, str]]:
+    """VM mode: the same safe date summary, from the published CO details (never a live read; the comment is not kept).
+
+    A CO without a published detail makes the whole read unavailable, like the live read (fail closed).
+    """
+    summaries: dict[str, dict[str, str]] = {}
+    for reference in references:
+        comment = snapshot_detail_row(reference).get("Onboarding_Comments__c")
+        parsed = extract_dealhub_dates(comment)
+        if parsed["ready_for_cse_review"]:
+            summaries[reference] = {"Subscription_Start": str(parsed["dealhub_start_date"]),
+                                    "Subscription_End": str(parsed["dealhub_end_date"])}
+        else:
+            summaries[reference] = {"Subscription_Start": "Not verified", "Subscription_End": "Not verified"}
+    return summaries
 
 
 def queue_rows() -> list[dict[str, str | None]]:

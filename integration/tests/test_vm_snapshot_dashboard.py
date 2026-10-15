@@ -302,5 +302,36 @@ class DesktopUnchangedTests(unittest.TestCase):
             self.assertTrue(runner.sf_command())
 
 
+class VmStartDatesFromSnapshotTests(SnapshotDashboardCase):
+    """Start dates on the VM come from the published CO comments (same validated parser), never a live read."""
+
+    def publish_with_comments(self, comments):
+        details = {ref: {**detail(ref, "Credential Exposure", "New Product Onboarding"), "Onboarding_Comments__c": text}
+                   for ref, text in comments.items()}
+        files = {**FILES, vs.CO_DETAILS_FILE: json.dumps({"details": details}).encode()}
+        vs.ingest_bundle(vs.build_bundle(files, KEY, "desktop", datetime.now(timezone.utc)), KEY, self.state)
+        dashboard.clear_display_cache()
+
+    def test_summaries_and_start_dates_come_from_the_published_comments(self):
+        self.publish_with_comments({"CO-0001": "DealHub 2027-03-05 - 2028-03-04 validated", "CO-0002": "no range here"})
+        self.assertEqual(dashboard.subscription_summaries(("CO-0001", "CO-0002")),
+                         {"CO-0001": {"Subscription_Start": "2027-03-05", "Subscription_End": "2028-03-04"},
+                          "CO-0002": {"Subscription_Start": "Not verified", "Subscription_End": "Not verified"}})
+        self.assertEqual(dashboard.queue_start_dates(("CO-0001", "CO-0002")), {"CO-0001": "2027-03-05"})
+
+    def test_a_co_without_a_published_detail_fails_closed(self):
+        self.publish_with_comments({"CO-0001": "2027-03-05 - 2028-03-04"})
+        with self.assertRaises(dashboard.ReadUnavailable):
+            dashboard.subscription_summaries(("CO-0001", "CO-0003"))
+
+    def test_queue_page_shows_the_start_date_without_the_unavailable_note_and_no_comment(self):
+        self.publish_with_comments({"CO-0001": "Secret note 2027-03-05 - 2028-03-04", "CO-0002": None})
+        status, _, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn("Mar 5, 2027", body)
+        self.assertNotIn("could not be read from Salesforce", body)
+        self.assertNotIn("Secret note", body)
+
+
 if __name__ == "__main__":
     unittest.main()
