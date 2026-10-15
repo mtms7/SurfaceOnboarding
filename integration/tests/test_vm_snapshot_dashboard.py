@@ -333,5 +333,22 @@ class VmStartDatesFromSnapshotTests(SnapshotDashboardCase):
         self.assertNotIn("Secret note", body)
 
 
+class VmCloneWordingTests(SnapshotDashboardCase):
+    """On the VM an unusable clone points to the VM's own collector, never to a Windows command (docs/43 section 9)."""
+
+    def test_unusable_clone_line_and_action_name_the_vm_collector(self):
+        line = dashboard._clone_line({"reason": "inventory_snapshot_missing"})
+        self.assertIn("inventory_snapshot_missing", line)
+        self.assertIn("VM", line)
+        self.assertNotIn("redash_inventory_collector.py", line)
+        action = dashboard._prod_action({"status": "clone_unavailable", "reason": "inventory_snapshot_missing"})
+        self.assertNotIn("redash_inventory_collector.py", action)
+
+    def test_the_prod_tenants_page_has_no_windows_command_when_the_clone_is_missing(self):
+        status, _, body = self.get("/prod/tenants")
+        self.assertEqual(status, 200)
+        self.assertNotIn("redash_inventory_collector.py --collect</code>", body)
+
+
 if __name__ == "__main__":
     unittest.main()

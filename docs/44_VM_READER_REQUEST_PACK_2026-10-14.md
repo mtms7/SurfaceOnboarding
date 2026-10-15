@@ -1,6 +1,6 @@
 # Request pack: read-only Salesforce and Redash access for the onboarding VM (2026-10-14)
 
-Prepared for the owner to send. It contains no credential, key, token or customer data. Status: **drafted; nothing requested, nothing created, nothing installed.** Background and design: `docs/43_VM_NATIVE_ONBOARDING_SERVER_DESIGN_2026-10-13.md`, setup text in `integration/deployment/vm_pilot/README.md`.
+Prepared for the owner to send. It contains no credential, key, token or customer data. Status: **drafted; nothing requested, nothing created, nothing installed.** 2026-10-15: the owner directed that the VM must run without the owner's computer (docs/43 section 9), so the hold on this pack is lifted for the owner to send; the owner sends it, the assistant sends nothing. Background and design: `docs/43_VM_NATIVE_ONBOARDING_SERVER_DESIGN_2026-10-13.md`, setup text in `integration/deployment/vm_pilot/README.md`.
 
 ## 1. Summary (for every reader)
 

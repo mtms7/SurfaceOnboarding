@@ -99,16 +99,44 @@ class KeyFileTests(unittest.TestCase):
 
 
 class CloneRootTests(unittest.TestCase):
-    """Owner decision 2026-10-14: the clone travels in the signed snapshot, so it is read next to the Dev inventory."""
+    """Owner decision 2026-10-14: the clone can travel in the signed snapshot; owner direction 2026-10-15: the VM also
+    collects it itself (``<state dir>/clone-inventory``) so it runs without the owner's computer."""
 
-    def test_the_clone_root_is_the_inventory_root_everywhere(self):
+    def own_clone(self, state):
+        latest = state / state_paths.CLONE_SUBDIR / state_paths.CLONE_LATEST
+        latest.parent.mkdir(parents=True)
+        latest.write_text("{}", encoding="utf-8")
+
+    def test_the_desktop_without_a_state_dir_keeps_the_clone_next_to_the_inventory(self):
         default = Path("desktop") / "inventory"
         with clean_env():
-            self.assertEqual(state_paths.clone_inventory_root(default), state_paths.inventory_root(default))
+            self.assertEqual(state_paths.clone_inventory_root(default), default)
             self.assertEqual(inventory.clone_root(), inventory.default_root())
             self.assertEqual(dashboard.clone_root(), dashboard.inventory_root())
-        with clean_env(SURFACE_ONBOARDING_STATE_DIR=str(Path(tempfile.gettempdir()) / "state")):
-            self.assertEqual(state_paths.clone_inventory_root(default), state_paths.inventory_root(default))
+
+    def test_the_collector_process_writes_to_its_own_clone_folder_under_the_state_dir(self):
+        state = Path(tempfile.gettempdir()) / "state"
+        with clean_env(SURFACE_ONBOARDING_STATE_DIR=str(state)):
+            self.assertEqual(state_paths.clone_inventory_root(Path("d")), state / "clone-inventory")
+            self.assertEqual(inventory.clone_root(), state / "clone-inventory")
+
+    def test_on_the_vm_the_own_collected_clone_wins_once_it_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            with clean_env(SURFACE_ONBOARDING_RUNTIME="vm", SURFACE_ONBOARDING_STATE_DIR=str(state)):
+                self.assertNotEqual(state_paths.clone_inventory_root(Path("d")), state / "clone-inventory")
+                self.own_clone(state)
+                self.assertEqual(state_paths.clone_inventory_root(Path("d")), state / "clone-inventory")
+                self.assertEqual(dashboard.clone_root(), runner.clone_root())
+
+    def test_a_snapshot_ingest_never_replaces_the_collected_clone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            self.own_clone(state)
+            files = {vs.QUEUE_FILE: b'{"rows": []}', vs.CO_DETAILS_FILE: b'{"details": {}}'}
+            key = b"unit-test-snapshot-key-0123456789-abcdef-NOT-REAL"
+            vs.ingest_bundle(vs.build_bundle(files, key, "desktop", datetime.now(timezone.utc)), key, state)
+            self.assertTrue((state / "clone-inventory" / "prod-clone" / "latest.json").is_file())
 
     def test_on_the_vm_the_clone_is_read_from_the_current_snapshot(self):
         seen = []

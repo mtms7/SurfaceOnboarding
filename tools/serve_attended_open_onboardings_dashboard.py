@@ -5190,6 +5190,13 @@ def _onboarding_chip(reference: str) -> str:
 
 PRODUCTION_GATE_NOTE = ("<p class='note'>Every onboarding Start checks this production list first; a match stops it.</p>")
 PRODUCTION_COLLECT_HINT = "tools\\redash_inventory_collector.py --collect"
+VM_COLLECT_HINT = ("the VM's own hourly Redash collector (nothing to run here; until it is enabled the clone comes from "
+                   "the owner's published snapshot)")
+
+
+def _collect_hint_html() -> str:
+    """How the clone gets refreshed: a command on the desktop, the VM's own collector on the VM (docs/43 section 9)."""
+    return escape(VM_COLLECT_HINT) if vm_mode() else "<code>" + escape(PRODUCTION_COLLECT_HINT) + "</code>"
 
 
 def _production_mark(check: dict[str, str] | None) -> tuple[str, list[dict], str] | None:
@@ -6182,7 +6189,7 @@ def _prod_action(result: dict[str, Any]) -> str:
         return "Resolve duplicate"
     if status == "clone_unavailable":
         if reason.startswith("inventory_snapshot") or reason == "alternate_domains_missing":
-            return PROD_ACTION_REFRESH + "<code>" + escape(PRODUCTION_COLLECT_HINT) + "</code>"
+            return PROD_ACTION_REFRESH + _collect_hint_html()
         return "Check CO source data"
     return "None"
 
@@ -6222,8 +6229,8 @@ def _age_words(seconds: int) -> str:
 
 def _clone_line(info: dict[str, Any]) -> str:
     if "reason" in info:
-        return ("Production clone unusable: <code>" + escape(info["reason"]) + "</code>. Refresh it with <code>"
-                + escape(PRODUCTION_COLLECT_HINT) + "</code>.")
+        return ("Production clone unusable: <code>" + escape(info["reason"]) + "</code>. Refresh it with "
+                + _collect_hint_html() + ".")
     return ("Production clone captured " + escape(info["captured_at"]) + " · data age " + _age_words(info["age_seconds"])
             + ("" if info["trusted"] else " · <strong>older than 6 h: not trusted</strong>")
             + (" · " + escape(info["label"]) if info["label"] else ""))
