@@ -1,0 +1,26 @@
+# Production CE-only New create: contract observed in a manual create (2026-10-16)
+
+Source: the owner's manual create of CO-0797 in BackOffice production (HAR `grupopatio.pentera.io.har`, 22 requests, host `app.pentera.io`), read structure-only (key names, types, and values only for non-identifying settings). The HAR contained a live session and was to be deleted by the owner. No customer values are recorded here. **Status: observed once, one CO; VERIFIED-in-HAR unless marked.**
+
+## 1. Create request: `POST /api/v1/backoffice/account/add` -> 200
+Body keys and the values used for CE-only New (identity values omitted):
+- identity: `accountName` (**customer account name + " - CE Only"**), `accountDomain` (customer primary domain), `accountType` `"customer"` (lower case), `accountCountryCode` (ISO-2, `CL`), `organizationEmail`, `firstName`, `lastName` (the primary user: an EXISTING internal user, not a customer address), `mfaRequired` true.
+- domains: `alternateDomains` [], `subDomains` [], `additionalNetworks` null, `userEmailDomains` [ONE entry that is an INTERNAL domain, not the customer's] (the customer domain is NOT the email domain), `operatorAccountNames` [].
+- scanning: `scanningInterval` `"NO_SCHEDULE"`, `scanNow` false, `leakedCredentialsScanningInterval` `"WEEKLY"`, `leakedCredentialsScannedDomains` [customer primary domain].
+- flags (all false): `automatedDiscoveryEnabled`, `subDomainsReconEnabled`, `webDictionaryBruteForceEnabled`, `webDorkingEnabled`, `staticOutboundIpEnabled`, `aiEnabled`, `webAiAttackerEnabled`, `vodBetaEnabled`; `campaignsTimeoutInHours` 24.
+- `license`: `assetsNumber` `"1"` and `domainsNumber` `"1"` (STRINGS), `subDomainsNumber` 1 (number), `licenseType` `"prepaid annual subscription"`, `startDate` ISO UTC of "now", `expirationDate` ISO UTC (the DealHub subscription end date; the UI date picker sent 07:00:00.000Z), `enabled` true, `notificationsAllowed` false, `multipleUsersAllowed` false, `apiAccessAllowed` false, `phishingEnabled` false, `provisioningEnabled` true, `leakedCredentialsAllowed` true, `reconLevel` null.
+- `campaignExecutionSettings`: `domainsMultiAttackStackSettings` and `subDomainsMultiAttackStackSettings`, each `{enabled:false, numOfAssetsPerStack:<number>}`.
+- `leakedCredentialsSettings.spyCloudSettings.enabled` **true in the create payload** (no later Edit is needed to turn SpyCloud on).
+- Not in the payload (so they are not set at create): `fullNucleiScanEnabled`, `authenticatedTestingEnabled`, `multipleAttackStacksEnabled` as top-level flags (the Advanced section exists in the Edit modal; at create they stayed off).
+
+## 2. Create response (200)
+Keys: `multiUsers`, `provisioningEnabled`, `subDomainsNumber`, `scanningFrequency`, `organizationEmail`, `accountName`, `leakedCredentialsScannedDomainsNumber`, `assetsNumber`, `licenseType`, `phishingEnabled`, `scanQuotaEnforcement`, `apiAccess`, `licenseStatus`, `elevatedFeaturesEnabled`, `allowedModules`, `reconLevel` (`ALL_ASSETS`), `domainsNumber`, `startDate` (ms), `notifications`, `expirationDate` (ms), `leakedCredentials`. **It contains NO account id and NO account UUID**: the UUID must be read back (below).
+
+## 3. Readback and search: `POST /api/v1/backoffice/getAllDetailedAccounts`
+Grammar (VERIFIED): `{"tableServerData": {"offset", "items_per_page", "sort": {"direction","key"}, "filters": {"and":[{"method":"search","value":"<text>"}]}, "unique_fields": [...], "projection": [...]}}`; a name-list variant uses `{"and":[{"or":[{"method","value","field"}]}]}` with `projection ["accountName"]`. A search for the exact new name returned 2 matching rows with ONE distinct `accountUuid` (32 hex) and `id` (24 hex) in the row; the row also carries `accountLicense.*`, `scanningInterval`, `leakedCredentialsScanningInterval`, `leakedCredentialsSettings.spyCloudSettings.enabled`, `userEmailDomains`, `primaryUser.*`. **Readback by exact name + domain through this endpoint is the source of the Account UUID** (D3).
+- Observed readback values to compare after a create: `accountType` `Customer`, `scanningInterval` `NO_SCHEDULE`, `leakedCredentialsScanningInterval` `WEEKLY`, license numbers 1/1/1, `reconLevel` `ALL_ASSETS`, `scanningFrequency` `NO_SCHEDULE`, `leakedCredentialsAllowed` true, `provisioningEnabled` true, notifications/multiple users/API/phishing false, SpyCloud enabled true, flags false.
+
+## 4. What this changes for the automation
+- The production create can be driven through the page (Add Account form, Confirm) and verified by the API readback above; the dry run still must confirm the form-to-payload mapping (labels, date picker, string vs number license fields).
+- CE-only conventions to confirm against docs/38 and the Dev runner before coding: name suffix ` - CE Only`; internal email domain and an existing internal primary user; scanning `NO_SCHEDULE`; leaked credentials weekly on the customer domain; counts 1/1/1; start = creation time; expiry = DealHub end date.
+- `PRODUCTION_DRY_RUN_SUPPORTED` and `PRODUCTION_RUNNER_SUPPORTED` stay False. This manual create did not use or change either.

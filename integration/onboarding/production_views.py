@@ -17,7 +17,8 @@ from typing import Any
 
 from . import leonardo_inventory as inventory
 from . import review_approval
-from .production_approval import ALLOWED_ROUTE, CO_REFERENCE, ISSUER, RECORD_FIELDS, REQUIRED_FIELDS, SCOPE
+from .production_approval import (
+    ALLOWED_ROUTE, CO_REFERENCE, ISSUER, RECORD_FIELDS, REQUIRED_FIELDS, SCOPE, valid_revision)
 from .production_create_record import (
     RECORDS_SUBDIR, ProductionCreateRecordError, editable_parameters, list_records, load)
 
@@ -60,6 +61,8 @@ def _approval_item(record: dict[str, Any], now: datetime) -> dict[str, Any]:
     issued, expires = _parse(record["issued_at"]), _parse(record["expires_at"])
     if record.get("consumed_at"):
         state = "consumed"
+    elif record.get("superseded_at"):
+        state = "superseded"
     elif issued is None or expires is None or not issued <= now.astimezone(timezone.utc) < expires:
         state = "expired"
     else:
@@ -77,7 +80,9 @@ def _valid_approval(key: Any, record: Any) -> bool:
             and record["route"] == ALLOWED_ROUTE and record["scope"] == SCOPE
             and isinstance(record["issued_by"], str) and ISSUER.fullmatch(record["issued_by"]) is not None
             and _parse(record["issued_at"]) is not None and _parse(record["expires_at"]) is not None
-            and ("consumed_at" not in record or _parse(record["consumed_at"]) is not None))
+            and valid_revision(record["source_revision"])
+            and ("consumed_at" not in record or _parse(record["consumed_at"]) is not None)
+            and ("superseded_at" not in record or _parse(record["superseded_at"]) is not None))
 
 
 def list_approvals(path: Path, now: datetime, *, missing_is_unavailable: bool = False) -> dict[str, Any]:

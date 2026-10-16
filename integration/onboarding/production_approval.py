@@ -30,7 +30,7 @@ SCOPE = "ce_only_single_co"
 DEFAULT_LIFETIME = timedelta(days=7)
 REQUIRED_FIELDS = frozenset({"approval_ref", "co_reference", "route", "scope", "source_revision", "issued_by",
                              "issued_at", "expires_at"})
-RECORD_FIELDS = REQUIRED_FIELDS | {"consumed_at"}
+RECORD_FIELDS = REQUIRED_FIELDS | {"consumed_at", "superseded_at"}
 CO_REFERENCE = re.compile(r"CO-[0-9]{4,10}")
 ISSUER = re.compile(r"[^\s<>'\"]{1,254}")
 _TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -74,8 +74,12 @@ def _valid_co(value: Any) -> bool:
     return isinstance(value, str) and CO_REFERENCE.fullmatch(value) is not None
 
 
-def _valid_revision(value: Any) -> bool:
+def valid_revision(value: Any) -> bool:
+    """The one revision validator (shared by the issuer, the record check and the dashboard view)."""
     return isinstance(value, str) and 0 < len(value) <= 128
+
+
+_valid_revision = valid_revision
 
 
 def _valid_record(key: Any, record: Any) -> bool:
@@ -85,7 +89,8 @@ def _valid_record(key: Any, record: Any) -> bool:
             and _valid_revision(record["source_revision"])
             and isinstance(record["issued_by"], str) and ISSUER.fullmatch(record["issued_by"]) is not None
             and _parse(record["issued_at"]) is not None and _parse(record["expires_at"]) is not None
-            and ("consumed_at" not in record or _parse(record["consumed_at"]) is not None))
+            and ("consumed_at" not in record or _parse(record["consumed_at"]) is not None)
+            and ("superseded_at" not in record or _parse(record["superseded_at"]) is not None))
 
 
 def _load(path: Path) -> dict[str, dict[str, Any]]:
@@ -140,18 +145,40 @@ def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_r
               "expires_at": _stamp(moment + lifetime)}
     with _lock:
         try:
-            records = _load(path)
-        except _Unreadable:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
             raise ApprovalRefused("approval_unreadable") from None
-        if approval_ref in records:
-            raise ApprovalRefused("approval_ref_reused")
-        for other in records.values():
-            expires = _parse(other["expires_at"])
-            if (other["co_reference"] != co_reference and "consumed_at" not in other
-                    and expires is not None and expires > moment):
-                raise ApprovalRefused("other_approval_active")
-        records[approval_ref] = record
-        _write(path, records)
+        fd, locked = _acquire_file_lock(path)  # the same cross-process lock consume takes
+        if fd is None:
+            raise ApprovalRefused(locked or "approval_locked")
+        lock_path = path.with_name(path.name + LOCK_SUFFIX)
+        try:
+            try:
+                records = _load(path)  # re-read under the lock: never write back a stale copy (lost consumed_at)
+            except _Unreadable:
+                raise ApprovalRefused("approval_unreadable") from None
+            if approval_ref in records:
+                raise ApprovalRefused("approval_ref_reused")
+            superseded = []
+            for key, other in records.items():
+                expires = _parse(other["expires_at"])
+                if "consumed_at" in other or "superseded_at" in other or expires is None or expires <= moment:
+                    continue  # consumed, superseded or expired: not live
+                if other["co_reference"] != co_reference:
+                    raise ApprovalRefused("other_approval_active")
+                if other["source_revision"] == source_revision:
+                    raise ApprovalRefused("approval_already_active_for_co")
+                superseded.append(key)  # bound to an older revision: it can no longer pass the gate
+            for key in superseded:
+                records[key] = {**records[key], "superseded_at": _stamp(moment)}
+            records[approval_ref] = record
+            _write(path, records)
+        finally:
+            os.close(fd)
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass
     return dict(record)
 
 
@@ -161,6 +188,8 @@ def _problem(record: Mapping[str, Any] | None, co_reference: Any, route: Any, so
         return "approval_missing"
     if record.get("consumed_at"):
         return "approval_consumed"
+    if record.get("superseded_at"):
+        return "approval_superseded"
     issued = _parse(record.get("issued_at"))
     expires = _parse(record.get("expires_at"))
     if not _aware(now) or issued is None or expires is None:

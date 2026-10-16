@@ -109,8 +109,34 @@ class ProductionApprovalTests(unittest.TestCase):
         self.issue()
         self.assertEqual(self.refusal(approval_ref="PROD-CE-0800-20261016", co_reference="CO-0800"),
                          "other_approval_active")
-        # same CO may be reissued under a new reference
-        self.issue(approval_ref="PROD-CE-0797-20261017", now=NOW + timedelta(hours=1))
+        # the same CO and the same revision may not hold a second live approval
+        self.assertEqual(self.refusal(approval_ref="PROD-CE-0797-20261017", now=NOW + timedelta(hours=1)),
+                         "approval_already_active_for_co")
+
+    def test_changed_revision_supersedes_and_never_deletes(self):
+        self.issue()
+        later = NOW + timedelta(hours=1)
+        self.issue(approval_ref="PROD-CE-0797-20261017", source_revision=REV + "x", now=later)
+        records = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(set(records), {REF, "PROD-CE-0797-20261017"})
+        self.assertEqual(records[REF]["superseded_at"], "2026-10-16T13:00:00Z")
+        self.assertEqual(self.check(now=later), "approval_superseded")
+        self.assertEqual(self.consume(now=later), "approval_superseded")
+        self.assertIsNone(self.check(approval_ref="PROD-CE-0797-20261017", source_revision=REV + "x", now=later))
+
+    def test_issue_refuses_while_the_lock_is_held_and_never_removes_it(self):
+        lock = self.path.with_name(self.path.name + pa.LOCK_SUFFIX)
+        lock.write_text("", encoding="utf-8")
+        self.assertEqual(self.refusal(), "approval_locked")
+        self.assertTrue(lock.exists())
+        self.assertFalse(self.path.exists())
+
+    def test_superseded_at_must_be_a_stamp(self):
+        self.issue()
+        records = json.loads(self.path.read_text(encoding="utf-8"))
+        records[REF]["superseded_at"] = "yesterday"
+        self.path.write_text(json.dumps(records), encoding="utf-8")
+        self.assertEqual(self.check(), "approval_unreadable")
 
     def test_other_co_allowed_after_consumed_or_expired(self):
         self.issue()

@@ -50,6 +50,21 @@ class ApprovalViewTests(TempCase):
         self.assertEqual(set(listing["items"][0]), {"approval_ref", "co_reference", "route", "scope", "issued_by", "issued_at",
                                                     "expires_at", "consumed_at", "state"})
 
+    def test_revision_is_validated_like_the_approval_module(self):
+        for bad in ("", "x" * 129, None, 5):
+            with self.subTest(revision=bad):
+                path = self.approvals(approval("PROD-CE-0797-1", source_revision=bad))
+                self.assertEqual(views.list_approvals(path, NOW)["state"], "unreadable")
+        path = self.approvals(approval("PROD-CE-0797-1", source_revision="x" * 128))
+        self.assertEqual(views.list_approvals(path, NOW)["state"], "ok")
+        self.assertIs(views.valid_revision, pa.valid_revision)
+
+    def test_superseded_state_and_bad_superseded_stamp(self):
+        path = self.approvals(approval("PROD-CE-0797-1", superseded_at="2026-10-16T10:00:00Z"))
+        self.assertEqual(views.list_approvals(path, NOW)["items"][0]["state"], "superseded")
+        path = self.approvals(approval("PROD-CE-0797-1", superseded_at="soon"))
+        self.assertEqual(views.list_approvals(path, NOW)["state"], "unreadable")
+
     def test_newest_first(self):
         path = self.approvals(approval("PROD-CE-0797-1", issued="2026-10-10T09:00:00Z", expires="2026-10-17T09:00:00Z"),
                               approval("PROD-CE-0797-2", issued="2026-10-15T09:00:00Z", expires="2026-10-22T09:00:00Z"))
