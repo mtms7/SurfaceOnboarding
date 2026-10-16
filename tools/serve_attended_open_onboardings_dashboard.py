@@ -72,6 +72,14 @@ from tools.attended_ce_only_playwright import (
     bootstrap_leonardo_session,
     check_leonardo_session,
     CE_ENGINE,
+    ce_license_dates,
+    CE_LICENSE_QUANTITIES,
+    CE_PRIMARY_USER_EMAIL_LOCAL,
+    CE_PRIMARY_USER_FIRST_NAME,
+    CE_PRIMARY_USER_LAST_NAME,
+    CE_USER_EMAIL_DOMAIN,
+    ce_only_names,
+    one_email_domain,
     format_surface_domains,
     CE_ROUTE_PRODUCT,
     CE_ROUTE_TYPE,
@@ -6694,7 +6702,7 @@ def _candidates_table(candidates: list[dict[str, Any]]) -> str:
             + "</tbody></table></div>")
 
 
-def page_detail_production(reference: str, row: dict[str, str | None], match: dict[str, Any]) -> str:
+def page_detail_production(reference: str, row: dict[str, str | None], match: dict[str, Any], country: str | None = None) -> str:
     """The Production view of a CO page (GET only: no form, no button, no write)."""
     account = row.get("Account_Name__c")
     case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
@@ -6716,7 +6724,9 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
                  + "".join("<li>" + escape(text) + "</li>" for text in BEFORE_MIGRATION) + "</ul></section>")
     onboard = _co_onboard_card(reference, row, match=match, domain_count=_domain_count_of(row), start_iso=_prod_view_start(reference),
                                ce_route=route_for(row) == CE_ENGINE)
-    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + seg + onboard + _lock_banner()
+    sheet = _onboarding_sheet_card(reference, row, match=match, ce_route=route_for(row) == CE_ENGINE,
+                                   start_iso=_prod_view_start(reference), country=country)
+    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + seg + onboard + sheet + _lock_banner()
                  + _production_marker_for(reference) + status + source + checklist)
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod")
 
@@ -7177,6 +7187,124 @@ def _co_onboard_card(reference: str, row: dict[str, str | None] | None, *, match
             "<p class='note'>Production create stays locked until the owner unlocks the runner.</p></section>")
 
 
+# The licence type text of the Dev CE-only fill (build_ce_only_fill selects "Type"); pinned against the runner in tests.
+SHEET_LICENSE_TYPE = "Prepaid annual subscription"
+
+
+def _sheet_names(account: str) -> tuple[str, str]:
+    names = ce_only_names(account)
+    return names.tenant_name, names.primary_user_alias
+
+
+def _sheet_rules() -> dict[str, Any]:
+    """The Dev CE-only mapping the production onboarding sheet follows (the runner's own names, constants and domain rule)."""
+    return {"names_of": _sheet_names, "domain_of": one_email_domain, "first_name": CE_PRIMARY_USER_FIRST_NAME,
+            "last_name": CE_PRIMARY_USER_LAST_NAME, "email_local": CE_PRIMARY_USER_EMAIL_LOCAL,
+            "email_domain": CE_USER_EMAIL_DOMAIN, "license_type": SHEET_LICENSE_TYPE, "license_dates": ce_license_dates,
+            "quantities": {"assets": CE_LICENSE_QUANTITIES["Number of assets"], "domains": CE_LICENSE_QUANTITIES["Number of domains"],
+                           "subdomains": CE_LICENSE_QUANTITIES["Number of subdomains"]}}
+
+
+def _try_sheet_country(reference: str) -> tuple[bool, str | None]:
+    """(read succeeded, country or None). A successful read of an empty field is (True, None); a failed read is (False, None)."""
+    if not REFERENCE.fullmatch(reference):
+        return False, None
+    try:
+        response = sf_json(["data", "query", "--query", "SELECT Account_Country__c FROM Customer_Onboarding__c WHERE Name = '"
+                            + reference + "' LIMIT 2", "--json"])
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:  # type: ignore[index]
+            return False, None
+        country = records[0].get("Account_Country__c")
+        return True, (" ".join(country.split()) if isinstance(country, str) and country.split() else None)
+    except Exception:  # noqa: BLE001 - fail closed: the row then shows as unavailable
+        return False, None
+
+
+@_display_cached
+def _read_sheet_country(reference: str) -> str | None:
+    """The Salesforce Account country of one CO (one fixed read-only query), or None when it cannot be read. On the VM it comes from the published production_inputs.json."""
+    if not REFERENCE.fullmatch(reference):
+        return None
+    if vm_mode():  # the published snapshot: a missing, old-format or malformed entry is None (unavailable)
+        try:
+            item = _snapshot_json(vm_snapshot.PRODUCTION_INPUTS_FILE)["inputs"][reference]
+            return vm_snapshot.country_of(item.get("country"))
+        except Exception:  # noqa: BLE001 - fail closed
+            return None
+    return _try_sheet_country(reference)[1]
+
+
+SHEET_STALE_SECONDS = 6 * 3600
+
+
+def _snapshot_as_of() -> tuple[str, bool]:
+    """(snapshot time text, older than 6 h) of the published snapshot the VM serves; unreadable is ("unknown", True)."""
+    try:
+        root = snapshot_root()
+        manifest = None if root is None else vm_snapshot.read_current_manifest(root)
+        created = vm_snapshot.parse_created_at(manifest["created_at"])  # type: ignore[index]
+        return created.strftime("%Y-%m-%d %H:%M UTC"), (production_now() - created).total_seconds() > SHEET_STALE_SECONDS
+    except Exception:  # noqa: BLE001 - fail closed: unknown age is treated as old
+        return "unknown", True
+
+
+SHEET_ROW_CHIPS = {"enter": ("chip-info", "Enter"), "leave": ("chip-neutral", "Leave"),
+                   "unavailable": ("chip-warn", "Unavailable")}
+SHEET_CHECK_CHIPS = {"ok": ("chip-ok", "OK"), "blocked": ("chip-bad", "Blocked"), "unavailable": ("chip-warn", "Unavailable")}
+
+
+def _onboarding_sheet_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None, ce_route: bool,
+                           start_iso: str | None, country: str | None = None) -> str:
+    """The read-only "Production onboarding sheet" card of both production CO pages: what to type in BackOffice Add Account.
+
+    Guidance only: no form, button, link or script, and nothing is written. Every value is escaped; a value that cannot
+    be derived shows as unavailable on this server for that row only.
+    """
+    vm = vm_mode()
+    fields = row or {}
+    uuid_state = "unread" if row is None or "Account_UUID__c" not in fields else "set" if fields.get("Account_UUID__c") else "empty"
+    co = {"ce_route": ce_route, "approval_status": fields.get("Onboarding_Approval_Status__c"),
+          "account_name": fields.get("Account_Name__c"), "email_domains": fields.get("Email_Domains__c"),
+          "uuid_state": uuid_state, "country": country, "comments": fields.get("Onboarding_Comments__c"),
+          "start_iso": start_iso}
+    as_of, stale = _snapshot_as_of() if vm else (None, False)
+    try:
+        sheet = production_views.onboarding_sheet(co, rules=_sheet_rules(), today=production_now().date(),
+                                                  days_before=ONBOARD_DAYS_BEFORE_START, vm=vm, clone=_clone_status(), match=match,
+                                                  as_of=as_of, stale=stale)
+    except Exception:  # noqa: BLE001 - fail closed: no sheet rather than a guessed one
+        sheet = {"state": "unavailable"}
+    head = ("<section class='card sheet-card' aria-labelledby='co-sheet-title'><div class='card-head'>"
+            "<h2 id='co-sheet-title' class='pill'>Production onboarding sheet</h2></div>")
+    state = sheet["state"]
+    if state == "not_applicable":
+        return head + "<p class='note'>Not applicable: this CO is not a CE-only New Product Onboarding.</p></section>"
+    if state == "unavailable":
+        return head + "<p class='note'>The sheet is " + escape(production_views.UNAVAILABLE_ON_SERVER) + ".</p></section>"
+    snapshot = ("<p class='note'>Snapshot: Salesforce data as of " + escape(sheet["as_of"]) + ".</p>" if sheet["as_of"] else "")
+    stale_note = ("<p><strong>Warning:</strong> " + escape(sheet["stale_warning"]) + "</p>" if sheet["stale_warning"] else "")
+    before = snapshot + stale_note + "<h3 class='sub-h'>1. Before you start</h3><ul class='checks'>" + "".join(
+        _check_item(item["label"], escape(item["detail"]), _chip(*SHEET_CHECK_CHIPS[item["status"]])) for item in sheet["eligibility"]
+    ) + "</ul><p class='note'>" + escape(sheet["reminder"]) + "</p>"
+    if state == "refused":
+        return (head + before + "<p><strong>Do not onboard this CO:</strong> "
+                + escape(production_views.SHEET_REFUSALS.get(sheet["reason"], "The values cannot be derived.")) + "</p>"
+                "<p class='note'>" + escape(production_views.SHEET_CLOSING) + "</p></section>")
+    body = "".join(
+        "<tr><td>" + escape(item["label"]) + "</td><td><code>" + escape(item["value"]) + "</code></td><td>"
+        + _chip(*SHEET_ROW_CHIPS[item["status"]]) + (" <small>" + escape(item["note"]) + "</small>" if item["note"] else "")
+        + "</td></tr>" for item in sheet["rows"])
+    after = "<ol>" + "".join("<li>" + escape(text) + "</li>" for text in sheet["after"]) + "</ol>"
+    warning = "<p><strong>Warning:</strong> " + escape(sheet["warning"]) + "</p>" if sheet["warning"] else ""
+    return (head + before + warning + "<h3 class='sub-h'>2. Enter in Add Account</h3><p class='note'>BackOffice: <code>"
+            + escape(production_views.SHEET_BACKOFFICE) + "</code>, Tenant Management, Add Account. Type exactly these values, "
+            "in this order.</p><div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>Field</th>"
+            "<th scope='col'>Value</th><th scope='col'>Note</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+            "<h3 class='sub-h'>3. After you click Confirm in BackOffice</h3>" + after
+            + "<p class='note'>" + escape(sheet["closing"]) + "</p></section>")
+
+
 def _prod_view_start(reference: str) -> str | None:
     try:
         return queue_start_dates((reference,)).get(reference)
@@ -7185,7 +7313,7 @@ def _prod_view_start(reference: str) -> str | None:
 
 
 def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice: str = "",
-                        row: dict[str, str | None] | None = None) -> str:
+                        row: dict[str, str | None] | None = None, country: str | None = None) -> str:
     """The production CO page (``/onboard/CO-x``): one column of read-only cards in the order of the approved mockup.
 
     ``row`` is the CO's detail row (for the Account UUID check); without it that check shows as not verified.
@@ -7268,7 +7396,9 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     domains = values.get("domains")
     onboard = _co_onboard_card(ref, row, match=check, domain_count=len(domains) if isinstance(domains, list) else None,
                                start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE)
-    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + onboard + _lock_banner() + blocked
+    sheet = _onboarding_sheet_card(ref, row, match=check, ce_route=summary["route"] == CE_ENGINE,
+                                   start_iso=str(plan.get("license_start") or ""), country=country)
+    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + onboard + sheet + _lock_banner() + blocked
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
             + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + approval_card + create_card + record_card
             + writeback_card)
@@ -8132,8 +8262,9 @@ class Handler(BaseHTTPRequestHandler):
                     review_row: dict[str, str | None] | None = detail_row(review.group(1))
                 except ReadUnavailable:
                     review_row = None  # the Account UUID check then shows as not verified
-                self.send_page(HTTPStatus.OK, page_onboard_review(review_summary, review_extras,
-                                                                  parse_qs(parsed.query).get("notice", [""])[0], row=review_row)); return
+                self.send_page(HTTPStatus.OK, page_onboard_review(
+                    review_summary, review_extras, parse_qs(parsed.query).get("notice", [""])[0], row=review_row,
+                    country=_read_sheet_country(review.group(1)) if review_summary["route"] == CE_ENGINE else None)); return
             match = re.fullmatch(r"/co/(CO-[0-9]{4,10})", path)
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
@@ -8160,7 +8291,8 @@ class Handler(BaseHTTPRequestHandler):
                 if parse_qs(parsed.query).get("env", [""])[0] == "prod":
                     # Production view: read-only comparison with the production clone; no forms, no writes.
                     html = page_detail_production(match.group(1), row, _match_of(
-                        match.group(1), row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
+                        match.group(1), row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")),
+                        country=_read_sheet_country(match.group(1)) if route_for(row) == CE_ENGINE else None)
                     record_timing("page_build", "co_prod", started, True)
                     self.send_page(HTTPStatus.OK, html)
                     return

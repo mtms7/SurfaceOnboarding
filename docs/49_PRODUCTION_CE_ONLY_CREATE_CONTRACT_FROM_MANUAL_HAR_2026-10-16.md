@@ -4,7 +4,7 @@ Source: the owner's manual create of CO-0797 in BackOffice production (HAR `grup
 
 ## 1. Create request: `POST /api/v1/backoffice/account/add` -> 200
 Body keys and the values used for CE-only New (identity values omitted):
-- identity: `accountName` (**customer account name + " - CE Only"**), `accountDomain` (customer primary domain), `accountType` `"customer"` (lower case), `accountCountryCode` (ISO-2, `CL`), `organizationEmail`, `firstName`, `lastName` (the primary user: an EXISTING internal user, not a customer address), `mfaRequired` true.
+- identity: `accountName` (**customer account name + " - CE Only"**), `accountDomain` (customer primary domain), `accountType` `"customer"` (lower case), `accountCountryCode` (ISO-2, `CL`), `organizationEmail`, `firstName`, `lastName` (the primary user, entered through the New User fields with an internal alias address `milton.stevenson+<alias>@pentera.io`, never a customer address; after the create the Edit view shows it as an existing user), `mfaRequired` true.
 - domains: `alternateDomains` [], `subDomains` [], `additionalNetworks` null, `userEmailDomains` [ONE entry that is an INTERNAL domain, not the customer's] (the customer domain is NOT the email domain), `operatorAccountNames` [].
 - scanning: `scanningInterval` `"NO_SCHEDULE"`, `scanNow` false, `leakedCredentialsScanningInterval` `"WEEKLY"`, `leakedCredentialsScannedDomains` [customer primary domain].
 - flags (all false): `automatedDiscoveryEnabled`, `subDomainsReconEnabled`, `webDictionaryBruteForceEnabled`, `webDorkingEnabled`, `staticOutboundIpEnabled`, `aiEnabled`, `webAiAttackerEnabled`, `vodBetaEnabled`; `campaignsTimeoutInHours` 24.
@@ -22,5 +22,5 @@ Grammar (VERIFIED): `{"tableServerData": {"offset", "items_per_page", "sort": {"
 
 ## 4. What this changes for the automation
 - The production create can be driven through the page (Add Account form, Confirm) and verified by the API readback above; the dry run still must confirm the form-to-payload mapping (labels, date picker, string vs number license fields).
-- CE-only conventions to confirm against docs/38 and the Dev runner before coding: name suffix ` - CE Only`; internal email domain and an existing internal primary user; scanning `NO_SCHEDULE`; leaked credentials weekly on the customer domain; counts 1/1/1; start = creation time; expiry = DealHub end date.
+- CE-only conventions to confirm against docs/38 and the Dev runner before coding: name suffix ` - CE Only`; internal email domain and the primary user entered through the New User fields with the internal alias address `milton.stevenson+<alias>@pentera.io` (the Edit view shows it as an existing user afterwards); scanning `NO_SCHEDULE`; leaked credentials weekly on the customer domain; counts 1/1/1; start = creation time; expiry = DealHub end date.
 - `PRODUCTION_DRY_RUN_SUPPORTED` and `PRODUCTION_RUNNER_SUPPORTED` stay False. This manual create did not use or change either.

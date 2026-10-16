@@ -409,6 +409,41 @@ class VmProductionMatchTests(SnapshotDashboardCase):
             self.assertIn(runner.production_match_for("CO-0001", self.PRODUCT, self.KIND)["status"],
                           ("exists_matches", "exists_differs"))
 
+    def test_country_round_trips_and_the_sheet_reads_it(self):
+        self.publish_inputs({"CO-0001": self.item(country="Chile")})
+        self.assertEqual(dashboard._read_sheet_country("CO-0001"), "Chile")
+
+    def test_a_real_country_name_with_punctuation_round_trips(self):
+        for name in ("C\u00f4te d'Ivoire", "Korea, Republic of", "Congo (Kinshasa)", "T\u00fcrkiye", "Timor-Leste"):
+            self.publish_inputs({"CO-0001": self.item(country=name)})
+            self.assertEqual(dashboard._read_sheet_country("CO-0001"), name)
+
+    def test_the_vm_country_read_never_calls_salesforce(self):
+        self.publish_inputs({"CO-0001": self.item(country="Chile")})
+        calls = []
+        dashboard.clear_display_cache()
+        with patch.object(dashboard, "sf_json", side_effect=lambda *a, **k: calls.append(a)):
+            self.assertEqual(dashboard._read_sheet_country("CO-0001"), "Chile")
+            self.assertIsNone(dashboard._read_sheet_country("CO-0009"))
+        self.assertEqual(calls, [])
+
+    def test_old_snapshot_without_country_still_ingests_and_the_country_is_unavailable(self):
+        self.publish_inputs({"CO-0001": self.item()})
+        self.assertIsNone(dashboard._read_sheet_country("CO-0001"))
+        self.assertIsNone(dashboard._read_sheet_country("CO-0009"))  # no entry at all
+
+    def test_malformed_country_is_unavailable_and_never_a_mismatch(self):
+        for bad in ("Chile<script>", "", " Chile", "Chile ", "C" * 61, "Chile" + chr(10), 7, None, ["Chile"], "Chile 2"):
+            self.publish_inputs({"CO-0001": self.item(country=bad)})
+            self.assertIsNone(dashboard._read_sheet_country("CO-0001"), repr(bad))
+            runner._production_expectation("CO-0001", self.PRODUCT, self.KIND)  # still accepted
+
+    def test_the_expectation_ignores_the_country_key(self):
+        self.publish_inputs({"CO-0001": self.item()})
+        without = runner._production_expectation("CO-0001", self.PRODUCT, self.KIND)
+        self.publish_inputs({"CO-0001": self.item(country="Chile")})
+        self.assertEqual(runner._production_expectation("CO-0001", self.PRODUCT, self.KIND), without)
+
     def test_the_page_no_longer_says_the_co_source_is_unreadable(self):
         self.publish_inputs({"CO-0001": self.item()})
         with patch("integration.onboarding.production_match.load_snapshot", return_value="inventory_snapshot_missing"):

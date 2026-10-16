@@ -281,6 +281,17 @@ class RefusalTests(TempCase):
         self.assertNotIn("SENTINEL", text)
 
 
+class CountryTests(unittest.TestCase):
+    def test_only_a_plain_country_name_is_accepted(self):
+        for good in ("Chile", "United States", "A", "x" * 60, "C\u00f4te d'Ivoire", "Korea, Republic of", "Timor-Leste",
+                     "T\u00fcrkiye", "Congo (Kinshasa)", "Saint Helena, Ascension and Tristan da Cunha", "St. Lucia",
+                     "C\u00f4te d\u2019Ivoire"):
+            self.assertEqual(vs.country_of(good), good)
+        for bad in ("", " Chile", "Chile ", "x" * 61, "Chile1", "Chile<b>", "Chile" + chr(10), None, 5, b"Chile", "R2D2", "A&B",
+                    '"Chile"', "Chile;", "Chile/Peru", "(Chile", "-Chile", "Chile,", "Chile-", "<script>", "Chile\t"):
+            self.assertIsNone(vs.country_of(bad), repr(bad))
+
+
 class StoreTests(TempCase):
     def bundle(self, minutes, **extra):
         return vs.build_bundle(good_files(**extra), KEY, "desktop", BASE_TIME + timedelta(minutes=minutes))

@@ -57,6 +57,16 @@ CO_DETAILS_FILE = "co_details.json"
 # Per queued CO, what the production check expects (engine, tenant names, domains, plan), computed where Salesforce is
 # readable so the VM (no live read) can answer the production match from the clone alone (docs/43 section 9).
 PRODUCTION_INPUTS_FILE = "production_inputs.json"
+# Each CE-only CO's entry may also carry ``country``: the Salesforce Account country, shown by the VM onboarding sheet.
+# Real country names: Unicode letters, spaces, hyphen, apostrophe, period, comma and parentheses; no digits or markup.
+_COUNTRY = re.compile(r"[^\W\d_](?:(?:[^\W\d_]|[ '\u2019.,()-])*(?:[^\W\d_]|[.)]))?")
+
+
+def country_of(value: object) -> str | None:
+    """A real country name (see above, up to 60 characters) or None: anything else is dropped, never repaired."""
+    return value if type(value) is str and len(value) <= 60 and _COUNTRY.fullmatch(value) else None
+
+
 INVENTORY_DEV_LATEST = "inventory_dev_latest.json"
 INVENTORY_DEV_SNAPSHOT = "inventory_dev_snapshot.json"
 # Owner decision 2026-10-14: the production clone (Redash query 251, ~17 MB, personal data already removed by the

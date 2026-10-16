@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 import tools.publish_vm_snapshot as publisher
 import tools.serve_attended_open_onboardings_dashboard as dashboard
@@ -50,7 +50,7 @@ class RefreshCase(unittest.TestCase):
     def fake_reads(self, queue=("CO-0001", "CO-0003"), details=None, raises=None):
         details = details if details is not None else {"CO-0001": detail("CO-0001", "new"), "CO-0003": detail("CO-0003", "new")}
 
-        def collect(extra_references=()):
+        def collect(extra_references=(), failed_countries=None):
             self.reads_calls.append(sorted(extra_references))
             self.seen_sf_json.append(dashboard.sf_json)
             if raises is not None:
@@ -209,8 +209,10 @@ class ProductionInputsTests(RefreshCase):
                  vs.PRODUCTION_INPUTS_FILE: json.dumps({"inputs": inputs}).encode()}
         vs.ingest_bundle(vs.build_bundle(files, KEY, "desktop", FIRST + timedelta(hours=1)), KEY, self.state)
 
-    def reads_with_inputs(self, fresh):
-        def collect(extra_references=()):
+    def reads_with_inputs(self, fresh, failed=()):
+        def collect(extra_references=(), failed_countries=None):
+            if failed_countries is not None:
+                failed_countries.update(failed)
             return ({vs.QUEUE_FILE: json.dumps({"rows": [{"Name": "CO-0001"}, {"Name": "CO-0003"}]}).encode(),
                      vs.CO_DETAILS_FILE: json.dumps({"details": {"CO-0001": detail("CO-0001", "new"),
                                                                  "CO-0003": detail("CO-0003", "new")}}).encode(),
@@ -254,6 +256,57 @@ class ProductionInputsTests(RefreshCase):
         self.assertEqual((stored["CO-0001"]["product"], stored["CO-0001"]["type"]),
                          ("Credential Exposure", "New Product Onboarding"))
         self.assertEqual((counts["production_inputs"], counts["production_inputs_unavailable"]), (1, 1))
+
+    def test_the_publisher_adds_a_valid_country_for_ce_only_cos_only(self):
+        row = {field: None for field in dashboard.QUEUE_FIELDS}
+        row.update(Name="CO-0001", Onboarding_Product__c="Credential Exposure", Onboarding_Type__c="New Product Onboarding")
+        rows = [row, {**row, "Name": "CO-0002"}, {**row, "Name": "CO-0003"}, {**row, "Name": "CO-0004"}]
+        engines = {"CO-0001": dashboard.CE_ENGINE, "CO-0002": dashboard.CE_ENGINE, "CO-0003": dashboard.CE_ENGINE,
+                   "CO-0004": dashboard.SURFACE_ENGINE}
+        countries = {"CO-0001": (True, "C\u00f4te d'Ivoire"), "CO-0002": (True, "<b>Chile</b>"), "CO-0003": (False, None),
+                     "CO-0004": (True, "Peru"), "CO-0005": (True, None)}
+        rows.append({**row, "Name": "CO-0005"})
+        engines["CO-0005"] = dashboard.CE_ENGINE
+
+        def inputs(reference, product, kind):
+            return {"engine": engines[reference], "co_source": {"tenant_names": ("N",), "domains": ("d.example",)}, "plan": {}}
+
+        with patch.object(dashboard, "queue_source_rows", return_value=rows),                 patch.object(dashboard, "detail_row", return_value={"Name": "x"}),                 patch.object(dashboard, "dev_onboarded_refs", return_value=[]),                 patch.object(dashboard, "production_review_inputs", side_effect=inputs),                 patch.object(dashboard, "_try_sheet_country", side_effect=lambda ref: countries[ref]) as read:
+            failed: set[str] = set()
+            files, _counts = publisher.collect_dashboard_reads(failed_countries=failed)
+        stored = json.loads(files[vs.PRODUCTION_INPUTS_FILE])["inputs"]
+        self.assertEqual(stored["CO-0001"]["country"], "C\u00f4te d'Ivoire")
+        self.assertEqual(failed, {"CO-0003"})   # only the failed read is reported; an empty or rejected value is not a failure
+        for ref in ("CO-0002", "CO-0003", "CO-0004", "CO-0005"):  # malformed, unread, and a non CE-only CO: no key, nothing else changes
+            self.assertNotIn("country", stored[ref], ref)
+        self.assertEqual(stored["CO-0001"]["co_source"], {"tenant_names": ["N"], "domains": ["d.example"]})
+        self.assertNotIn(call("CO-0004"), read.call_args_list)  # no country read for other routes
+
+    def test_a_failed_country_read_keeps_the_previous_country(self):
+        ce = {**self.ITEM, "engine": dashboard.CE_ENGINE}
+        self.publish_previous({"CO-0001": {**ce, "country": "Chile"}, "CO-0002": {**ce, "country": "Peru"}})
+        with self.environment(), self.reads_with_inputs({"CO-0001": ce, "CO-0002": {**ce, "country": "Spain"}}, failed={"CO-0001"}):
+            refresher.refresh(str(self.config), str(self.key), self.state, now=SECOND)
+        inputs = self.published_inputs()
+        self.assertEqual(inputs["CO-0001"]["country"], "Chile")   # fresh read failed: carried forward
+        self.assertEqual(inputs["CO-0002"]["country"], "Spain")   # a fresh value wins
+        self.assertEqual(inputs["CO-0001"]["co_source"], ce["co_source"])
+
+    def test_a_successful_empty_or_rejected_read_drops_the_previous_country(self):
+        ce = {**self.ITEM, "engine": dashboard.CE_ENGINE}
+        self.publish_previous({"CO-0001": {**ce, "country": "Chile"}, "CO-0002": {**ce, "country": "Peru"}})
+        with self.environment(), self.reads_with_inputs({"CO-0001": ce, "CO-0002": ce}, failed=()):  # both reads succeeded
+            refresher.refresh(str(self.config), str(self.key), self.state, now=SECOND)
+        inputs = self.published_inputs()
+        self.assertNotIn("country", inputs["CO-0001"])
+        self.assertNotIn("country", inputs["CO-0002"])
+
+    def test_a_malformed_previous_country_is_not_carried(self):
+        ce = {**self.ITEM, "engine": dashboard.CE_ENGINE}
+        self.publish_previous({"CO-0001": {**ce, "country": "<b>x</b>"}})
+        with self.environment(), self.reads_with_inputs({"CO-0001": ce}, failed={"CO-0001"}):
+            refresher.refresh(str(self.config), str(self.key), self.state, now=SECOND)
+        self.assertNotIn("country", self.published_inputs()["CO-0001"])
 
     def test_the_file_is_never_carried_as_is_from_the_previous_snapshot(self):
         self.assertIn(vs.PRODUCTION_INPUTS_FILE, refresher.CARRY_EXCLUDED)
@@ -339,7 +392,7 @@ class CliTransportTests(RefreshCase):
     def run_cli(self, **reads):
         seen = {}
 
-        def collect(extra_references=()):
+        def collect(extra_references=(), failed_countries=None):
             seen["home"], seen["keychain"] = os.environ.get("HOME"), os.environ.get("SF_USE_GENERIC_UNIX_KEYCHAIN")
             seen["sf_json"] = dashboard.sf_json
             return ({vs.QUEUE_FILE: b'{"rows": [{"Name": "CO-0001"}]}',
@@ -366,7 +419,7 @@ class CliTransportTests(RefreshCase):
         self.assertEqual(counts["files_in_bundle"], 4)  # + production_inputs.json
 
     def test_environment_is_restored_even_when_the_read_fails(self):
-        def failing(extra_references=()):
+        def failing(extra_references=(), failed_countries=None):
             raise publisher.PublishRefused("queue_unavailable", 3)
         with self.environment(), patch.object(publisher, "collect_dashboard_reads", failing), \
                 patch.object(refresher, "session_dir_problem", return_value=None):

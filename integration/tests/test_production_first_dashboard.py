@@ -403,7 +403,7 @@ class CoPageTests(unittest.TestCase):
 
     def test_cards_in_the_mockup_order(self):
         page = self.page()
-        self.assertEqual(self.heads(page), ["Onboard", "Salesforce facts", "Production checks", "Approval", "Create", "D2 record",
+        self.assertEqual(self.heads(page), ["Onboard", "Production onboarding sheet", "Salesforce facts", "Production checks", "Approval", "Create", "D2 record",
                                             "UUID writeback to Salesforce"])
         self.assertIn("<a class='crumb' href='/'>", page)
         self.assertIn("envpill prod", page)

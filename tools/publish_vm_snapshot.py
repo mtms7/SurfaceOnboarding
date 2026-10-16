@@ -98,11 +98,13 @@ def collect_inventory_files() -> dict[str, bytes]:
     return files
 
 
-def collect_dashboard_reads(extra_references: Iterable[str] = ()) -> tuple[dict[str, bytes], dict[str, int]]:
+def collect_dashboard_reads(extra_references: Iterable[str] = (), failed_countries: set[str] | None = None
+                            ) -> tuple[dict[str, bytes], dict[str, int]]:
     """queue.json and co_details.json through the dashboard's existing fixed reads (Salesforce, read-only).
 
     ``extra_references`` are COs that must keep their page although they are no longer queued (the VM refresher passes
-    the ones the previous snapshot carried)."""
+    the ones the previous snapshot carried). ``failed_countries``, when given, receives the COs whose country READ failed
+    (an empty or rejected value from a successful read is not a failure: it simply leaves the key out)."""
     import tools.serve_attended_open_onboardings_dashboard as dash
 
     try:
@@ -135,6 +137,13 @@ def collect_dashboard_reads(extra_references: Iterable[str] = ()) -> tuple[dict[
             inputs[reference] = dash._plain({"engine": found["engine"], "co_source": found["co_source"], "plan": found["plan"],
                                              "product": row.get("Onboarding_Product__c"),
                                              "type": row.get("Onboarding_Type__c")})
+            if found["engine"] == dash.CE_ENGINE:  # the sheet's country: one fixed read; a bad or missing value is left out
+                read_ok, raw_country = dash._try_sheet_country(reference)
+                country = vm_snapshot.country_of(raw_country) if read_ok else None
+                if country is not None:
+                    inputs[reference]["country"] = country
+                elif not read_ok and failed_countries is not None:
+                    failed_countries.add(reference)
         except Exception:  # noqa: BLE001 - a CO the check cannot read simply has no entry (the VM shows it unavailable)
             inputs_missing += 1
     files = {

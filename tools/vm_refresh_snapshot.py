@@ -196,7 +196,8 @@ def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | No
         import tools.publish_vm_snapshot as publisher
 
         try:
-            reads, counts = publisher.collect_dashboard_reads(sorted(previous_details))
+            failed_countries: set[str] = set()
+            reads, counts = publisher.collect_dashboard_reads(sorted(previous_details), failed_countries)
         except publisher.PublishRefused as refusal:
             raise RefreshRefused(refusal.code, refusal.exit_code) from None
     finally:
@@ -219,6 +220,13 @@ def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | No
     for reference, item in previous_production_inputs(state_dir).items():  # a failed read must not drop a CO's check
         if reference in details and reference not in merged_inputs:
             merged_inputs[reference] = item
+    for reference, item in previous_production_inputs(state_dir).items():  # ONLY a failed country read keeps the previous one
+        if reference not in failed_countries:
+            continue
+        fresh = merged_inputs.get(reference)
+        country = vm_snapshot.country_of(item.get("country")) if isinstance(item, dict) else None
+        if isinstance(fresh, dict) and "country" not in fresh and country is not None and fresh.get("engine") == dashboard.CE_ENGINE:
+            merged_inputs[reference] = {**fresh, "country": country}
     reads[vm_snapshot.PRODUCTION_INPUTS_FILE] = json.dumps({"inputs": merged_inputs}, sort_keys=True).encode("utf-8")
     counts["production_inputs"] = len(merged_inputs)
     files = {**carried, **reads}

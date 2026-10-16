@@ -17,6 +17,7 @@ from typing import Any
 
 from . import leonardo_inventory as inventory
 from . import review_approval
+from phase1_validator.onboarding_comment_dates import extract_dealhub_dates
 from .production_approval import (
     ALLOWED_ROUTE, CO_REFERENCE, ISSUER, RECORD_FIELDS, REQUIRED_FIELDS, SCOPE, valid_revision)
 from .production_create_record import (
@@ -445,3 +446,199 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, sessio
         items.append(_item("dry_run", "ready" if done >= 1 else pending, "Dry run recorded." if done >= 1 else "No dry run recorded."))
         items.append(_item("owner_go", "ready" if done >= 2 else pending, "Owner go recorded." if done >= 2 else "No owner go recorded."))
     return items
+
+
+# --- Production onboarding sheet (assisted manual create: guidance only, never a control) --------------------------------
+# Docs/49 section 1 plus the Dev runner's CE-only mapping. Pure: the caller reads Salesforce (or the published snapshot)
+# and passes the values in; nothing here reads a file, the network or a clock. A value that cannot be derived is shown
+# as "unavailable on this server" for that row only, never guessed and never green.
+
+SHEET_REMINDER = ("A missing match is never a clearance: search the exact name and the primary domain in BackOffice yourself; "
+                  "the domain must not be a demo domain.")
+SHEET_CLOSING = "Production create stays locked in the dashboard: this sheet is guidance only."
+SHEET_BACKOFFICE = "https://app.pentera.io"
+SHEET_REFUSALS = {
+    "one_email_domain_required": "Exactly one email domain is required for CE-only, so there is no single primary domain to enter.",
+    "email_domain_invalid": "The one email domain is not a valid domain name, so it must not be entered.",
+    "account_uuid_set": "Salesforce already holds an Account UUID for this CO: a tenant exists, do not create another.",
+    "account_uuid_unread": "The Account UUID of this CO could not be read, so an empty field is not confirmed.",
+    "account_name_unavailable": "The account name could not be read, so the tenant name cannot be derived.",
+    "approval_not_approved": "Salesforce does not show this CO as Approved.",
+    "duplicate_in_production": "The production clone already holds a tenant that matches this name or domain.",
+    "live_paid_in_production": "The production clone shows more than one live paid tenant for this CO.",
+    "dealhub_range_missing": "Onboarding Comments hold no usable DealHub date range, so the expiration date cannot be derived.",
+    "dealhub_range_ambiguous": "Onboarding Comments hold more than one DealHub date range, so the expiration date is ambiguous.",
+    "dealhub_range_invalid": "The DealHub date range in Onboarding Comments is invalid (the end is not after the start).",
+    "dealhub_range_ended": "The license would already be over: the expiration date is not after today.",
+}
+SHEET_STALE_WARNING = "Salesforce data may be out of date: re-check the CO in Salesforce before you start."
+SHEET_SOFT_WARNING = "The clone check or the timing window is not clear for this CO: check BackOffice yourself."
+SHEET_SALESFORCE_CHIPS = ("Salesforce approval", "Email domain", "Account UUID")
+
+
+def _row(label: str, value: str, note: str = "", status: str = "enter") -> dict[str, str]:
+    """One sheet row; ``status`` is ``enter`` (type or select the value), ``leave`` (empty, None or off) or ``unavailable``."""
+    return {"label": label, "value": _text(value), "note": _text(note), "status": status}
+
+
+def _unavailable(label: str, note: str) -> dict[str, str]:
+    return _row(label, UNAVAILABLE_ON_SERVER, note, "unavailable")
+
+
+def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clone: dict[str, Any] | None,
+                       match: dict[str, Any] | None, domain_ok: bool, as_of: str | None = None) -> list[dict[str, str]]:
+    """The "before you start" chips: ``{"label", "status": ok | blocked | unavailable, "detail"}``."""
+    def chip(label: str, status: str, detail: str) -> dict[str, str]:
+        return {"label": label, "status": status, "detail": _text(detail)}
+    items = [chip("Route", "ok", "CE-only, New Product Onboarding")]
+    approval = co.get("approval_status")
+    items.append(chip("Salesforce approval", "ok" if approval == "Approved" else "blocked" if approval else "unavailable",
+                      "Approved" if approval == "Approved" else ("Status is " + _text(approval)) if approval else "Not read"))
+    items.append(chip("Email domain", "ok" if domain_ok else "blocked",
+                      "Exactly one valid domain" if domain_ok else "Exactly one valid domain is required"))
+    uuid_state = co.get("uuid_state")
+    items.append(chip("Account UUID", "ok" if uuid_state == "empty" else "blocked" if uuid_state == "set" else "unavailable",
+                      {"empty": "Empty", "set": "Already set"}.get(uuid_state, "Not read")))
+    clone_state = clone.get("state") if isinstance(clone, dict) else None
+    check = production_check(match)
+    age = age_words(clone.get("age_seconds")) if isinstance(clone, dict) else "unknown"
+    label = "Clone and production match"
+    if clone_state == "fresh" and check["code"] == "clear":
+        items.append(chip(label, "ok", "Not in production; clone " + age + " old, limit 6 h"))
+    elif clone_state == "stale":
+        items.append(chip(label, "blocked", "Clone " + age + " old: older than 6 h, not trusted"))
+    elif check["code"] in ("duplicate", "live_paid"):
+        items.append(chip(label, "blocked", check["label"] + " in the production clone"))
+    else:
+        items.append(chip(label, "unavailable", check["label"] + ": " + UNAVAILABLE_ON_SERVER))
+    window = timing_window(co.get("start_iso"), today, days_before)
+    items.append(chip("Timing window", {"open": "ok", "closed": "blocked"}.get(window["state"], "unavailable"),
+                      {"open": "Open since " + window["opens"], "closed": "Opens " + window["opens"]}.get(
+                          window["state"], "Start date not available")))
+    if as_of:  # a snapshot: every Salesforce-derived chip says when it was read
+        for item in items:
+            if item["label"] in SHEET_SALESFORCE_CHIPS:
+                item["detail"] = _text(item["detail"] + " (as of " + as_of + ")")
+    return items
+
+
+def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, days_before: int, vm: bool,
+                     clone: dict[str, Any] | None = None, match: dict[str, Any] | None = None,
+                     as_of: str | None = None, stale: bool = False) -> dict[str, Any]:
+    """The read-only "Production onboarding sheet" of one CO.
+
+    ``co`` carries what the caller read: ``ce_route`` (bool), ``approval_status``, ``account_name``, ``email_domains`` (the
+    raw Email_Domains__c text or None), ``uuid_state`` (``empty`` / ``set`` / ``unread``), ``country`` (text or None),
+    ``comments`` (Onboarding_Comments__c or None), ``start_iso``. ``rules`` pins the Dev runner mapping: ``names_of`` (account
+    name -> (tenant name, alias), raising ValueError), ``domain_of`` (raw text -> the one valid domain or None), and the
+    constants ``first_name``, ``last_name``, ``email_local``, ``email_domain``, ``license_type``, ``quantities``, and
+    ``license_dates`` (the Dev runner's ``ce_license_dates``: DealHub start, end -> contract start, expiry).
+    ``as_of`` is the snapshot time (VM only): the Salesforce-derived chips say "as of" it, and ``stale`` adds a warning.
+
+    Result: ``{"state": "not_applicable" | "refused" | "ready", "reason": code, "eligibility": [...], "rows": [...],
+    "after": [...], "reminder", "closing", "tenant_name", "as_of", "stale_warning", "warning"}``. A refused sheet ("Do not
+    onboard this CO") has no rows to type: a hard blocker holds (Salesforce approval, Account UUID, email domain, a
+    duplicate or live paid tenant in the clone, or an unusable DealHub range). A soft condition (stale or unavailable
+    clone, timing window not open) keeps the rows and sets ``warning``.
+    """
+    base: dict[str, Any] = {"state": "ready", "reason": "", "eligibility": [], "rows": [], "after": [],
+                            "reminder": SHEET_REMINDER, "closing": SHEET_CLOSING, "tenant_name": "", "as_of": as_of or "",
+                            "stale_warning": SHEET_STALE_WARNING if stale else "", "warning": ""}
+    if co.get("ce_route") is not True:
+        return {**base, "state": "not_applicable"}
+    raw = co.get("email_domains")
+    tokens = [item for item in re.split(r"[,;\s]+", raw.strip()) if item] if isinstance(raw, str) else []
+    try:
+        domain = rules["domain_of"](raw) if len(tokens) == 1 else None
+    except (ValueError, TypeError):
+        domain = None
+    base["eligibility"] = _sheet_eligibility(co, today=today, days_before=days_before, clone=clone, match=match,
+                                             domain_ok=domain is not None, as_of=as_of)
+    name = co.get("account_name")
+    tenant = alias = None
+    if isinstance(name, str) and " ".join(name.split()):
+        try:
+            tenant, alias = rules["names_of"](name)
+        except (ValueError, TypeError):
+            tenant = alias = None
+    check_code = production_check(match)["code"]
+    reason = ("account_uuid_set" if co.get("uuid_state") == "set"
+              else "account_uuid_unread" if co.get("uuid_state") != "empty"
+              else "approval_not_approved" if co.get("approval_status") != "Approved"
+              else "live_paid_in_production" if check_code == "live_paid"
+              else "duplicate_in_production" if check_code == "duplicate"
+              else "one_email_domain_required" if len(tokens) != 1
+              else "email_domain_invalid" if domain is None
+              else "account_name_unavailable" if tenant is None else "")
+    dates = extract_dealhub_dates(co.get("comments"))
+    expiry = None
+    if not reason:
+        try:
+            if dates.get("result") != "dealhub_dates_extracted":
+                raise ValueError(str(dates.get("error_category") or ""))
+            range_start = date.fromisoformat(str(dates.get("dealhub_start_date")))
+            range_end = date.fromisoformat(str(dates.get("dealhub_end_date")))
+            _contract_start, expiry = rules["license_dates"](range_start, range_end)
+            if expiry <= today:
+                reason = "dealhub_range_ended"
+        except (ValueError, TypeError):
+            category = str(dates.get("error_category") or "")
+            reason = ("dealhub_range_ambiguous" if "ambiguous" in category
+                      else "dealhub_range_invalid" if "invalid" in category else "dealhub_range_missing")
+    if reason:
+        return {**base, "state": "refused", "reason": reason}
+    base["tenant_name"] = _text(tenant)
+    q = rules["quantities"]
+
+    def off(label: str, note: str = "") -> dict[str, str]:
+        return _row(label, "Off", note, "leave")
+
+    def leave(label: str, value: str) -> dict[str, str]:
+        return _row(label, value, "", "leave")
+
+    country = co.get("country")
+    if isinstance(country, str) and " ".join(country.split()):
+        country_row = _row("Country", " ".join(country.split()), "As shown on the Salesforce Account: pick the same country.")
+    else:
+        country_row = _unavailable("Country", "The published snapshot does not carry the country." if vm
+                                   else "The country could not be read from Salesforce: take it from the Account.")
+    expiry_row = _row("Expiration date", expiry.isoformat(),
+                      "One year minus a day from the DealHub range start " + str(dates.get("dealhub_start_date"))
+                      + ", never later than the range end " + str(dates.get("dealhub_end_date")) + " (Onboarding Comments).")
+    base["rows"] = [
+        _row("Company name", tenant, "Account name + ' - CE Only'."),
+        _row("Account Type", "Customer"),
+        _row("Company primary domain", domain, "The single Salesforce email domain. It must not be a demo domain."),
+        leave("Alternate Domains", "Leave empty"), leave("SubDomains", "Leave empty"),
+        _row("User email domains", str(rules["email_domain"]), "Internal domain, not the customer's."),
+        leave("Networks", "Leave empty"), country_row,
+        _row("Primary user", "New User", "Pick New User, not an existing user."),
+        _row("First name", str(rules["first_name"])), _row("Last name", str(rules["last_name"])),
+        _row("Organization Email", str(rules["email_local"]) + "+" + str(alias) + "@" + str(rules["email_domain"]),
+             "Internal address, never a customer address."),
+        _row("MFA required", "On", "Keep the form default ON.", "leave"),
+        leave("Operator Account", "None"), leave("Scanning interval", "None"), off("Scan now"),
+        off("Notifications"), off("Multiple users"), off("API access"), off("Phishing"),
+        _row("Leaked Credentials", "On", "Turn ON."),
+        _row("Leaked Credentials scanning interval", "Weekly"),
+        _row("Leaked Credentials scanned domains", domain, "The same primary domain."),
+        _row("Include Provisioning", "On"), _row("Include subdomains", "On"),
+        off("Advanced switches", "Leave every Advanced switch off."),
+        _row("License Type", str(rules["license_type"])),
+        _row("Number of assets", str(q["assets"])), _row("Number of domains", str(q["domains"])),
+        _row("Number of subdomains", str(q["subdomains"])),
+        _row("Start date", today.isoformat(), "The day you enter it: if that is not " + today.isoformat() + ", use that day."),
+        expiry_row,
+        _row("SpyCloud", "On", "It is set in the create payload: verify it is ON after the create."),
+    ]
+    if any(item["status"] != "ok" for item in base["eligibility"] if item["label"] in ("Clone and production match", "Timing window")):
+        base["warning"] = SHEET_SOFT_WARNING
+    base["after"] = [
+        "Click Confirm in BackOffice yourself.",
+        "Search the new tenant by its exact name: " + _text(tenant) + ".",
+        "Open Edit once to confirm the Advanced switches are all off except as above. Never change anything there.",
+        "Copy the Account UUID from the tenant (32 hex characters).",
+        "Write it into Salesforce Customer_Onboarding__c Account_UUID__c for this CO (or ask Claude to run the guarded "
+        "one-field write), then move the Onboarding Stage yourself.",
+    ]
+    return base

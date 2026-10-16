@@ -47,7 +47,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import json
 import os
@@ -65,7 +65,8 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import (  # noqa: E402
-    production_approval, production_create, production_create_record, production_dry_run, production_probe, run_progress)
+    production_approval, production_contract, production_create, production_create_record, production_dry_run,
+    production_probe, run_progress)
 from integration.onboarding.run_target import (  # noqa: E402
     ProductionLocked, RunTarget, development_target, production_dry_run_target, production_target)
 from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
@@ -528,6 +529,9 @@ class CeFillSource:
     primary_user_alias: str
     # True when Account_UUID__c already holds a value (pre-create gate).
     salesforce_id_present: bool = False
+    # The CO's Account_UUID__c text, kept only for the read-only production readback comparison (never printed,
+    # never in a repr, never part of equality).
+    salesforce_account_uuid: str = field(default="", repr=False, compare=False)
 
 
 class RouteMismatch(RuntimeError):
@@ -587,7 +591,9 @@ def ce_fill_source(reference: str) -> CeFillSource:
             email_domain, " ".join(country.split()),
             subscription_start, subscription_end,
             names.tenant_name, names.primary_user_alias,
-            salesforce_id_present=bool((row.get("Account_UUID__c") or "").strip()))
+            salesforce_id_present=bool((row.get("Account_UUID__c") or "").strip()),
+            salesforce_account_uuid=(row.get("Account_UUID__c") or "").strip()
+            if isinstance(row.get("Account_UUID__c"), str) else "")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("salesforce_fill_source_unavailable") from exc
 
@@ -9394,6 +9400,157 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
         return refused("production_dry_run_crashed")
 
 
+# --- Production READ-ONLY readback (docs/42 section 6.3, docs/49 section 3) ------------------------------------------
+# One attended, read-only look at ONE created tenant: the page's own fetch searches getAllDetailedAccounts by the exact
+# tenant name, the single row whose name AND domain match is compared with the intended CE-only values, and its
+# accountUuid is compared with the CO's Account_UUID__c. It types nothing, clicks nothing (no ClickLog exists here)
+# and never opens the create form. Probe-class gate; PRODUCTION_RUNNER_SUPPORTED and PRODUCTION_DRY_RUN_SUPPORTED are
+# not read or changed. Results are field names and pass/fail only; neither UUID is printed or kept.
+READBACK_RESULT_COMPLETE = "production_readback_complete"
+READBACK_RESULT_REFUSED = "production_readback_refused"
+READBACK_BROWSER_REASONS = {"production_dry_run_login_timeout": "sign_in_timeout",
+                            "playwright_runtime_unavailable": "playwright_runtime_unavailable"}
+READBACK_ROW_REASONS = {"no_match": "tenant_not_found", "multiple_matches": "ambiguous_rows",
+                        "name_only_match": "name_only_match", "case_variant_match": "case_variant_match"}
+
+
+class _ReadbackStop(Exception):
+    """A readback refusal with its stable reason code."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def ce_production_intended(source: CeFillSource, run_day: date | None = None) -> dict[str, Any]:
+    """The intended CE-only values for the production contract, taken from the Dev fill plan (no second copy)."""
+    plan = build_ce_only_fill(source, run_day or source.subscription_start)
+    texts = plan["texts"]
+    return {
+        "tenant_name": texts["Company name"], "primary_domain": texts["Company primary domain"],
+        "email_domain": texts["User email domains  (Comma Separated Values)"],
+        "first_name": texts["First name"], "last_name": texts["Last name"],
+        "organization_email": texts["Organization Email"],
+        "license_start": plan["license_start"], "license_end": plan["license_end"],
+    }
+
+
+def _readback_fields(result: str, reason: str, tenant_found: bool = False, mismatches: Any = (), uuid_ok: bool = False,
+                     sf_match: bool | None = None) -> dict[str, Any]:
+    return {"result": result, "reason": reason, "tenant_found": tenant_found, "mismatches": list(mismatches),
+            "uuid_ok": uuid_ok, "salesforce_uuid_matches": sf_match,
+            "production_write": "not_performed", "salesforce_writeback": "not_performed"}
+
+
+def _readback_refused(reason: str, **extra: Any) -> dict[str, Any]:
+    return _readback_fields(READBACK_RESULT_REFUSED, reason, **extra)
+
+
+def readback_analyse(reply: Any, tenant_name: str, domain: str, expected_row: dict[str, Any],
+                     salesforce_uuid: str) -> dict[str, Any]:
+    """Judge the page's search reply: one exact name+domain row, then compare it. Pure; returns the result fields."""
+    status = reply.get("status") if isinstance(reply, dict) else None
+    if status in (401, 403):
+        return _readback_refused("session_expired")
+    rows = reply.get("rows") if isinstance(reply, dict) else None
+    total = reply.get("total") if isinstance(reply, dict) else None
+    if status != 200 or not isinstance(rows, list) or type(total) is not int or total < 0:
+        return _readback_refused("search_unavailable")
+    if total > len(rows):
+        return _readback_refused("ambiguous_rows")
+    row, code = production_contract.select_unique_row(rows, tenant_name, domain)
+    if row is None:
+        return _readback_refused(READBACK_ROW_REASONS.get(code or "", "search_unavailable"))
+    mismatches, uuid_ok = production_contract.compare_readback(expected_row, row)
+    sf_match = production_contract.salesforce_uuid_matches(salesforce_uuid, row.get("accountUuid"))
+    return _readback_fields(READBACK_RESULT_COMPLETE, "compared", True, mismatches, uuid_ok, sf_match)
+
+
+def _readback_blocked_writes(guard: production_probe.RequestGuard) -> int:
+    """Aborted non-read requests (any create or edit attempt counts here)."""
+    return sum(count for (method, _where), count in guard.blocked.items() if method not in production_probe.SAFE_METHODS)
+
+
+def run_production_readback(reference: str, *, environ: Any | None = None, now: datetime | None = None,
+                            wait_seconds: float = MAX_WAIT_SECONDS, report_base: Path | None = None,
+                            load_source: Any = None, open_page: Any = None) -> str:
+    """One attended READ-ONLY production readback of one CE-only tenant. Returns the printed line.
+
+    Order: probe-class gate and exact origin; the fixed Salesforce read of the Dev runner (intended values and the CO's
+    Account_UUID__c) BEFORE any browser; then in the signed-in page (sign-in wait: 3 consecutive authenticated polls,
+    15 minutes) the request guard, the service-worker check, one page-context search POST and the comparison.
+    """
+    environ = os.environ if environ is None else environ
+    now = now or datetime.now(timezone.utc)
+    if not isinstance(reference, str) or not REFERENCE.fullmatch(reference):
+        return json.dumps(_readback_refused("invalid_co_reference"), separators=(",", ":"))
+    try:
+        probe_reference = production_probe.probe_gate(environ)
+        target = production_probe.probe_target()
+    except production_probe.ProbeRefused as refused:
+        reason = "gate_missing" if refused.code == "production_probe_flag_missing" else "gate_reference_invalid"
+        return json.dumps(_readback_refused(reason), separators=(",", ":"))
+    except ValueError:
+        return json.dumps(_readback_refused("origin_not_approved"), separators=(",", ":"))
+    guard: production_probe.RequestGuard | None = None
+    try:
+        try:
+            source = (load_source or CE_ROUTE.load_source)(reference)
+        except RouteMismatch:
+            raise _ReadbackStop("route_not_ce_only_new") from None
+        except Exception:
+            raise _ReadbackStop("salesforce_read_failed") from None
+        try:
+            intended = ce_production_intended(source)
+            expected_row = production_contract.expected_readback_row(intended)
+            body = production_contract.build_readback_body(intended["tenant_name"])
+        except Exception:
+            raise _ReadbackStop("intended_unavailable") from None
+        try:
+            with (open_page or _pdr_browser_page)(target, wait_seconds) as page:
+                guard = production_probe.RequestGuard()
+                guard.install(page)
+                try:
+                    worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
+                except Exception:
+                    worker = None
+                worker_problem = production_dry_run.service_worker_verdict(worker)
+                if worker_problem:
+                    raise _ReadbackStop(worker_problem)
+                reply = _pdr_evaluate(page, production_contract.READBACK_JS, "POST", production_contract.ACCOUNTS_PATH,
+                                      [production_contract.ACCOUNTS_PATH, body,
+                                       list(production_contract.READBACK_PICK_PATHS)])
+                outcome = readback_analyse(reply, intended["tenant_name"], intended["primary_domain"], expected_row,
+                                           getattr(source, "salesforce_account_uuid", "") or "")
+                if _readback_blocked_writes(guard):
+                    outcome = _readback_refused("write_request_blocked", tenant_found=outcome["tenant_found"],
+                                                mismatches=outcome["mismatches"], uuid_ok=outcome["uuid_ok"],
+                                                sf_match=outcome["salesforce_uuid_matches"])
+        except _ReadbackStop:
+            raise
+        except RuntimeError as error:
+            raise _ReadbackStop(READBACK_BROWSER_REASONS.get(str(error), "browser_unavailable")) from None
+        except Exception:
+            raise _ReadbackStop("readback_crashed") from None
+    except _ReadbackStop as stop:
+        outcome = _readback_refused(stop.reason)
+    report = {"schema": 1, "kind": "production_readonly_readback", "reference": probe_reference, "co_reference": reference,
+              "captured_at": now.astimezone(timezone.utc).isoformat(timespec="seconds"),
+              "origin": production_probe.PRODUCTION_ORIGIN, "profile": target.profile_dir_name, **outcome,
+              "clicks": 0,
+              "api_calls": guard.api_report() if guard is not None else [],
+              "blocked_requests": guard.blocked_report() if guard is not None else []}
+    try:
+        production_contract.write_readback_report(report_base or _probe_report_base(), report, now)
+    except (ValueError, OSError):
+        outcome = _readback_refused("report_unavailable", tenant_found=outcome["tenant_found"],
+                                    mismatches=outcome["mismatches"], uuid_ok=outcome["uuid_ok"],
+                                    sf_match=outcome["salesforce_uuid_matches"])
+    line = json.dumps(outcome, separators=(",", ":"))
+    return line if production_dry_run.line_problem(line) is None else json.dumps(
+        _readback_refused("line_not_redacted"), separators=(",", ":"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Attended Leonardo Development CE-only auto-confirm runner.")
     parser.add_argument("--co", required=False, help="Customer Onboarding reference (e.g. CO-0702).")
@@ -9467,7 +9624,20 @@ def main() -> int:
                         help="With --co and --revision: one attended production DRY RUN of a CE-only New CO (docs/42 section 6.2): the real "
                              "production form is filled, read back and Cancelled; Confirm is never clicked and nothing is created. Locked "
                              "by PRODUCTION_DRY_RUN_SUPPORTED (False) until the owner says go.")
+    parser.add_argument("--production-readback", action="store_true",
+                        help="With --co: one attended READ-ONLY BackOffice production readback of a created CE-only tenant (docs/42 section 6.3): "
+                             "needs SURFACE_ONBOARDING_PRODUCTION_PROBE=1 and SURFACE_ONBOARDING_PRODUCTION_PROBE_REF; you sign in with MFA; "
+                             "nothing is typed, clicked, filled, submitted or created.")
     args = parser.parse_args()
+    if args.production_readback:
+        if not args.co:
+            parser.error("--co is required with --production-readback")
+        if (args.revision or args.dry_run or args.confirm_write or args.production_probe or args.production_dry_run
+                or args.diagnose_confirm or args.readback_only):
+            parser.error("--production-readback is a separate read-only run (no --revision, --dry-run, --confirm-write, "
+                         "--production-probe, --production-dry-run, --diagnose-confirm or --readback-only)")
+        print(run_production_readback(args.co))
+        return 0
     if args.production_dry_run:
         if not args.co or not args.revision:
             parser.error("--co and --revision are required with --production-dry-run")
