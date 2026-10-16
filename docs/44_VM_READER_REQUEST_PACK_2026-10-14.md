@@ -90,3 +90,18 @@ The client refuses any other call shape in code (tested): only a single `SELECT`
 | V4, V5 | Owner, SecOps | MFA approach for browser runs, and who may approve summaries on the VM (later phase; not needed for this request) |
 
 Contacts and ticket numbers: `<to be filled in by the owner when sending>`.
+
+## Addendum 2026-10-16 - why the clone is stale and what makes it fully automatic (owner request: Redash to the VM, no PC)
+
+**Finding (reproduced twice today, 2026-10-05 and 2026-10-16):** the collector's refresh call to `redash.pentera.io` for saved query 251 fails with the per-query key (`refresh_failed`, exit 2), so every run returns the cached result and its age only grows (91 minutes at 12:38 UTC today; the production gate stops trusting it at 6 hours). A collector on the VM would hit the same wall.
+
+**The fix is on the Redash side, not on the VM:** ask the Redash owner to set a **scheduled refresh on saved query 251 (every 60 minutes)**. Redash then re-runs the query itself and the VM only does read calls (GET of the latest result), which the per-query key already permits. No POST refresh is needed, so the VM never needs more than read access.
+
+**Three items only others can provide (nothing else blocks this):**
+1. Redash owner: hourly scheduled refresh on query 251, and the read-only key for query 251 delivered securely to the VM operator (root-owned file `0640 root:surface-redash-reader`, never in chat).
+2. SecOps/network: outbound HTTPS 443 from `172.26.37.20` to `redash.pentera.io`.
+3. You (owner): the approval marker for the Redash timer once 1 and 2 exist. Activation then follows section 6: place the key, create the marker, `enable --now surface-onboarding-redash-collect.timer`, accept when `/prod/tenants` on the VM shows a clone younger than 2 hours.
+
+**Draft message to the Redash owner (the owner sends it; the assistant sends nothing):** "Could you set a scheduled refresh of 60 minutes on saved query 251 (Surface Onboarding | Tenant inventory (read-only)), and send the existing read-only API key for that query to <VM operator> by a secure channel? A read-only service on our onboarding VM (172.26.37.20) will fetch the latest result once an hour; it never edits or deletes anything. Outbound HTTPS to redash.pentera.io from that VM will be requested from SecOps."
+
+Until these exist, the desktop publish (`tools/publish_vm_snapshot.py` plus the VM ingest) stays the interim path, and the clone stays valid for at most 6 hours.

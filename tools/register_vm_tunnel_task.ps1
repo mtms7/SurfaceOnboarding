@@ -43,7 +43,12 @@ if ($out -match 'Permission denied|Host key verification failed|Connection (time
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -WorkingDirectory (Split-Path -Parent $PSScriptRoot) `
     -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}"' -f $script)
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME)
+# At sign-in AND every 5 minutes: if the loop ever dies (closed console, sleep/resume, logoff of a helper), the next
+# repetition starts it again; while it is still running, MultipleInstances IgnoreNew skips the duplicate start.
+$logon = New-ScheduledTaskTrigger -AtLogOn -User ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME)
+$repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 3650)
+$trigger = @($logon, $repeat)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
