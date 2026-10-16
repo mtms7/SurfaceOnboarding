@@ -14,3 +14,15 @@ def require_development_origin(origin: str) -> str:
     if origin != LEONARDO_DEVELOPMENT_ORIGIN:
         raise ValueError("leonardo_origin_not_approved")
     return LEONARDO_DEVELOPMENT_ORIGIN
+
+
+def require_production_origin(origin: str) -> str:
+    """Return the exact production BackOffice origin or reject every variation.
+
+    Nothing may call this from existing code while the production lock holds.
+    """
+    if not isinstance(origin, str):
+        raise ValueError("invalid_backoffice_origin")
+    if origin != PRODUCTION_BACKOFFICE_ORIGIN:
+        raise ValueError("backoffice_origin_not_approved")
+    return PRODUCTION_BACKOFFICE_ORIGIN

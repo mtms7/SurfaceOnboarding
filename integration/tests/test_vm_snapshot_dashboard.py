@@ -25,7 +25,7 @@ RUNNER_NAMES = ("RUNNER_STATE_PATH", "CHECK_STATE_PATH", "READBACK_PATH", "SCAN_
 DASHBOARD_NAMES = ("ATTENDED_LEONARDO_READBACK_PATH", "ATTENDED_REMINDERS_PATH", "USER_CREATED_CONFIRMATION_PATH",
                    "ID_WRITEBACK_PATH", "SCAN_STATUS_PATH", "MIRROR_PATH", "RENEWAL_OUTCOMES_PATH",
                    "SPYCLOUD_STATE_PATH", "VALIDATION_PATH")
-PAGES = ("/", "/history", "/dev/history", "/dev/onboarded", "/prod", "/prod/matches", "/prod/tenants", "/inventory",
+PAGES = ("/", "/dev", "/prod/approvals", "/history", "/dev/history", "/dev/onboarded", "/prod", "/prod/matches", "/prod/tenants", "/inventory",
          "/connection", "/co/CO-0001", "/co/CO-0002", "/co/CO-0001?env=prod", "/attended/ce-only-runner-status?ref=CO-0001")
 SENTINEL_ACCOUNT = "Acme Snapshot Customer"
 
@@ -138,7 +138,7 @@ class VmPagesFromSnapshotTests(SnapshotDashboardCase):
         self.assertNotIn("snapbanner empty", body)
 
     def test_local_state_comes_from_the_snapshot_files(self):
-        _, _, body = self.get("/")
+        _, _, body = self.get("/dev")  # the Dev queue moved from / to /dev (production-first dashboard, 2026-10-16)
         self.assertIn("Account Scanning", body)  # attended_leonardo_readbacks.json of the snapshot
 
     def test_every_page_renders_with_the_banner_and_without_calling_out(self):
@@ -411,6 +411,54 @@ class VmProductionMatchTests(SnapshotDashboardCase):
             status, _, body = self.get("/co/CO-0001?env=prod")
         self.assertEqual(status, 200)
         self.assertNotIn("co_source_unreadable", body)
+
+
+class VmProductionFirstPagesTests(SnapshotDashboardCase):
+    """The production landing, CO page and Approvals page on the VM (docs/47 0.5): the approval files and the create
+    records are not part of the signed snapshot, so those cells say "unavailable on this server", never "None",
+    "Not approved yet" or "No approvals recorded"."""
+
+    def test_landing_says_unavailable_not_none_and_has_no_controls(self):
+        status, _, body = self.get("/", email=OWNER)
+        self.assertEqual(status, 200)
+        self.assertIn("Data as of ", body)
+        row = body[body.index(">CO-0001<"):body.index("</tr>", body.index(">CO-0001<"))]
+        self.assertEqual(row.count("Unavailable on this server"), 2)  # create approval and create record
+        self.assertIn("<a class='co' href='/co/CO-0001?env=prod'>CO-0001</a>", body)  # the review summary cannot be built on the VM; the snapshot-backed view is linked
+        for wording in ("chip-neutral'>None</span>", "Not approved yet", "No approvals recorded", "Locked</span>"):
+            self.assertNotIn(wording, row)
+        self.assertNotIn("<form method='post'", body)
+        self.assertNotIn("<button", re.sub(r"<form class='sidesearch'.*?</form>", "", body, flags=re.S))
+
+    def test_approvals_page_is_unavailable_read_only_and_names_both_kinds(self):
+        status, _, body = self.get("/prod/approvals", email=OWNER)
+        self.assertEqual(status, 200)
+        self.assertEqual(body.count("unavailable on this server"), 2)
+        for wording in ("No approvals recorded", "Not approved yet"):
+            self.assertNotIn(wording, body)
+        self.assertIn("Create approvals (7 days, one use)", body)
+        self.assertIn("Summary approvals (4 hours)", body)
+        self.assertNotIn("<form method='post'", body)
+
+    def test_dev_queue_moved_to_dev_and_the_nav_is_production_first(self):
+        status, _, body = self.get("/dev")
+        self.assertEqual(status, 200)
+        self.assertIn("CO-0001", body)
+        aside = body[body.index("<aside"):body.index("</aside>")]
+        self.assertIn("PRODUCTION", aside)
+        self.assertLess(aside.index("PRODUCTION"), aside.index("DEV - LEONARDO"))
+        self.assertNotIn(">Sessions<", aside)  # no Sessions link on the VM
+        self.assertEqual(self.calls, [])
+
+    def test_the_co_page_is_unavailable_or_read_only_never_a_create_control(self):
+        status, _, body = self.get("/onboard/CO-0001", email=OWNER)
+        self.assertIn(status, (200, 503))
+        lowered = body.lower()
+        self.assertNotIn("create in production", lowered)
+        self.assertNotIn("start onboarding", lowered)
+        self.assertNotIn("not approved yet", lowered)
+        self.assertNotIn("<form method='post'", lowered)
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":

@@ -442,7 +442,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         ], "validation")
         self.assertIn("CO-0747", page)
         self.assertNotIn("/co/CO-0740", page)
-        self.assertIn("/?queue=validation", page)
+        self.assertIn("/dev?queue=validation", page)  # the Dev queue moved from / to /dev (2026-10-16)
 
     def test_blank_approval_status_is_labelled_as_a_manual_review_condition(self):
         page = page_queue([{"Name": "CO-0742", "Onboarding_Stage__c": "New"}])
@@ -2140,7 +2140,7 @@ class ScanStatusSweepTests(unittest.TestCase):
                     patch.object(dashboard, "start_attended_scan_status_all", return_value=launched):
                 dashboard.Handler.do_POST(request)
             if expected == "redirect":
-                self.assertEqual(request.redirects, ["/?queue=scanning&scan=started"])
+                self.assertEqual(request.redirects, ["/dev?queue=scanning&scan=started"])
             else:
                 self.assertEqual(request.pages, [503])
 
@@ -2306,7 +2306,7 @@ class SurfaceValidationCardTests(unittest.TestCase):
         with patch.object(dashboard, "post_form", side_effect=AssertionError("no form needed")), \
                 patch.object(dashboard, "start_attended_validation_all", return_value=True):
             dashboard.Handler.do_POST(request)
-        self.assertEqual(request.redirects, ["/?queue=scanning&scan=started"])
+        self.assertEqual(request.redirects, ["/dev?queue=scanning&scan=started"])
 
     def test_queue_marks_drift_and_offers_validate_all(self):
         rows = [{"Name": "CO-0649", "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "Account Scanning",
@@ -2351,7 +2351,7 @@ class QueueOrderingTests(unittest.TestCase):
         self.assertEqual(self._order(page), ["CO-9103", "CO-9102", "CO-9101", "CO-9104"])
         self.assertIn("<b>Oct 12</b><span class='sub'>in 7d</span>", page)
         self.assertIn("chip chip-bad'>overdue 2d", page)  # a pending CO whose start has passed
-        self.assertIn("aria-sort='ascending'><a class='sort' href='/?sort=start&amp;dir=desc'>Start", page)
+        self.assertIn("aria-sort='ascending'><a class='sort' href='/dev?sort=start&amp;dir=desc'>Start", page)
 
     def test_sort_links_and_directions(self):
         by_start_desc = self._page(sort="start", direction="desc")
@@ -2372,8 +2372,8 @@ class QueueOrderingTests(unittest.TestCase):
 
     def test_filter_chips_keep_the_sort_and_show_counts(self):
         page = self._page(sort="co")
-        self.assertIn("href='/?sort=co'", page)  # All open
-        self.assertIn("href='/?queue=ready&amp;sort=co'", page)
+        self.assertIn("href='/dev?sort=co'", page)  # All open
+        self.assertIn("href='/dev?queue=ready&amp;sort=co'", page)
         self.assertIn("Ready to onboard <b>2</b>", page)
         self.assertIn("Needs validation <b>2</b>", page)
         filtered = self._page("validation")

@@ -54,6 +54,11 @@ class Case(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             enter = stack.enter_context
             enter(patch.object(dashboard, "REVIEW_APPROVAL_PATH", self.path))
+            # /onboard is now the production landing: its start dates, approvals and records stay local and hermetic.
+            enter(patch.object(dashboard, "queue_start_dates", return_value={}))
+            enter(patch.object(dashboard, "prefetch_display_read"))
+            enter(patch.object(dashboard, "PRODUCTION_APPROVAL_PATH", Path(self.tmp.name) / "production_create_approvals.json"))
+            enter(patch.object(dashboard, "production_records_parent", return_value=Path(self.tmp.name)))
             enter(patch.object(dashboard, "detail_row", side_effect=lambda ref: dict(self.row)))
             enter(patch.object(dashboard, "evaluate_ce_only_fill_preflight", side_effect=evaluation))
             enter(patch.object(dashboard, "evaluate_surface_fill_preflight", side_effect=evaluation))

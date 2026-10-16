@@ -1,0 +1,340 @@
+"""Read-only view helpers for the production-first dashboard (docs/46, docs/47).
+
+Everything here only READS the paths it is given and returns plain dicts for the page to render. Nothing here writes,
+issues, consumes or records an approval or a create record, starts a run, or touches the network. Every reader fails
+closed: a missing, corrupt or unexpected file is reported as ``unreadable`` (or ``unavailable`` where the caller says a
+missing file means "not published to this server"), never as "none" or "valid". Output carries only allow-listed
+fields: no source revisions, no approval file internals, no secrets and no raw payloads.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta, timezone
+import json
+from pathlib import Path
+import re
+from typing import Any
+
+from . import leonardo_inventory as inventory
+from . import review_approval
+from .production_approval import ALLOWED_ROUTE, CO_REFERENCE, ISSUER, RECORD_FIELDS, REQUIRED_FIELDS, SCOPE
+from .production_create_record import (
+    RECORDS_SUBDIR, ProductionCreateRecordError, editable_parameters, list_records, load)
+
+CLONE_LIMIT_SECONDS = int(inventory.PRODUCTION_GATE_MAX_AGE.total_seconds())
+DISPLAY_MAX_AGE = timedelta(days=3650)  # any snapshot is loaded for display; staleness is shown, not hidden
+MAX_TEXT = 160
+MAX_LIST = 20
+_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+LOCK_REASON_TEXT = {
+    "production_sessions_flag_missing": "Production sessions are not enabled.",
+    "production_approval_missing": "No valid production approval is configured.",
+    "production_approval_expired": "The configured production approval is expired.",
+    "production_runner_not_supported": "The production runner is not supported in this build.",
+}
+
+
+def lock_reason_text(code: str | None) -> str:
+    """Plain words for a ``session_readiness.production_unlock_problem`` code (unknown codes stay generic)."""
+    return LOCK_REASON_TEXT.get(code or "", "Production create is not unlocked.")
+
+
+def _text(value: Any) -> str:
+    """A bounded, control-character-free string; never raises."""
+    text = _CONTROL.sub(" ", value if isinstance(value, str) else "").strip()
+    return text if len(text) <= MAX_TEXT else text[:MAX_TEXT - 1] + "…"
+
+
+def _parse(value: Any) -> datetime | None:
+    try:
+        return datetime.strptime(value, _STAMP).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+# --- Create approvals (7 days, one use): production_create_approvals.json -------------------------------------------
+
+def _approval_item(record: dict[str, Any], now: datetime) -> dict[str, Any]:
+    issued, expires = _parse(record["issued_at"]), _parse(record["expires_at"])
+    if record.get("consumed_at"):
+        state = "consumed"
+    elif issued is None or expires is None or not issued <= now.astimezone(timezone.utc) < expires:
+        state = "expired"
+    else:
+        state = "valid"
+    return {"approval_ref": _text(record["approval_ref"]), "co_reference": _text(record["co_reference"]),
+            "route": _text(record["route"]), "scope": _text(record["scope"]), "issued_by": _text(record["issued_by"]),
+            "issued_at": record["issued_at"], "expires_at": record["expires_at"],
+            "consumed_at": _text(record.get("consumed_at") or ""), "state": state}
+
+
+def _valid_approval(key: Any, record: Any) -> bool:
+    return (isinstance(key, str) and isinstance(record, dict) and REQUIRED_FIELDS <= set(record) <= RECORD_FIELDS
+            and record["approval_ref"] == key and isinstance(record["co_reference"], str)
+            and CO_REFERENCE.fullmatch(record["co_reference"]) is not None
+            and record["route"] == ALLOWED_ROUTE and record["scope"] == SCOPE
+            and isinstance(record["issued_by"], str) and ISSUER.fullmatch(record["issued_by"]) is not None
+            and _parse(record["issued_at"]) is not None and _parse(record["expires_at"]) is not None
+            and ("consumed_at" not in record or _parse(record["consumed_at"]) is not None))
+
+
+def list_approvals(path: Path, now: datetime, *, missing_is_unavailable: bool = False) -> dict[str, Any]:
+    """All create approvals, newest first, for display.
+
+    ``{"state": "ok" | "unavailable" | "unreadable", "reason": str, "items": [...]}``. A missing file is "ok" with no
+    items on the desktop; with ``missing_is_unavailable`` (a server that never receives the file) it is "unavailable".
+    Items never carry the Salesforce source revision.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        if missing_is_unavailable:
+            return {"state": "unavailable", "reason": "approvals_not_published", "items": []}
+        return {"state": "ok", "reason": "", "items": []}
+    except (OSError, ValueError):
+        return {"state": "unreadable", "reason": "approval_unreadable", "items": []}
+    if not isinstance(raw, dict) or not all(_valid_approval(key, record) for key, record in raw.items()):
+        return {"state": "unreadable", "reason": "approval_unreadable", "items": []}
+    items = [_approval_item(record, now) for record in raw.values()]
+    items.sort(key=lambda item: (item["issued_at"], item["approval_ref"]), reverse=True)
+    return {"state": "ok", "reason": "", "items": items}
+
+
+def pick_approval(listing: dict[str, Any], co_reference: str) -> dict[str, Any]:
+    """The create approval that applies to one CO out of a ``list_approvals`` result: a valid one if any, else the newest.
+
+    ``{"state": "none" | "valid" | "expired" | "consumed" | "unreadable" | "unavailable", "reason": str, "item": dict | None}``.
+    """
+    if listing["state"] != "ok":
+        return {"state": listing["state"], "reason": listing["reason"], "item": None}
+    mine = [item for item in listing["items"] if item["co_reference"] == co_reference]
+    if not mine:
+        return {"state": "none", "reason": "", "item": None}
+    chosen = next((item for item in mine if item["state"] == "valid"), mine[0])
+    return {"state": chosen["state"], "reason": "", "item": chosen}
+
+
+def approval_for_co(path: Path, co_reference: str, now: datetime, *, missing_is_unavailable: bool = False) -> dict[str, Any]:
+    """``pick_approval`` over a fresh read of the approvals file."""
+    return pick_approval(list_approvals(path, now, missing_is_unavailable=missing_is_unavailable), co_reference)
+
+
+# --- Summary approvals (4 hours, one use): onboarding_review_approvals.json -----------------------------------------
+
+def list_summary_approvals(path: Path, now: datetime, *, missing_is_unavailable: bool = False) -> dict[str, Any]:
+    """The 4-hour review-summary approvals for display (a different record from the 7-day create approval).
+
+    Same result shape as ``list_approvals``; items carry the CO, operator, approval and expiry times and a state, never
+    the summary hash or the source revision. A corrupt file is "unreadable": nothing is treated as approved.
+    """
+    if missing_is_unavailable and not Path(path).exists():
+        return {"state": "unavailable", "reason": "approvals_not_published", "items": []}
+    try:
+        records = review_approval.load(Path(path))
+    except (review_approval.ApprovalUnavailable, OSError, ValueError):
+        return {"state": "unreadable", "reason": "approval_unreadable", "items": []}
+    items = []
+    for reference, record in records.items():
+        approved, expires = _parse(record.get("approved_at")), _parse(record.get("expires_at"))
+        if record.get("consumed_at"):
+            state = "consumed"
+        elif approved is None or expires is None or not approved <= now.astimezone(timezone.utc) < expires:
+            state = "expired"
+        else:
+            state = "valid"
+        items.append({"co_reference": _text(reference), "operator": _text(record.get("operator")),
+                      "route": _text(record.get("route")), "approved_at": _text(record.get("approved_at")),
+                      "expires_at": _text(record.get("expires_at")), "state": state})
+    items.sort(key=lambda item: (item["approved_at"], item["co_reference"]), reverse=True)
+    return {"state": "ok", "reason": "", "items": items}
+
+
+# --- D2 create records: production-create-records/ ----------------------------------------------------------------
+
+def _record_view(record: dict[str, Any]) -> dict[str, Any]:
+    checks = record.get("form_fields_checked") if isinstance(record.get("form_fields_checked"), dict) else {}
+    domains = [_text(item) for item in (record.get("domains") or [])[:MAX_LIST]]
+    view: dict[str, Any] = {
+        "co_reference": _text(record["co_reference"]), "outcome": record["outcome"], "recorded_at": record["recorded_at"],
+        "redactions": int(record.get("redactions") or 0),
+        "domains": domains,
+        "form_checks": {"pass": sum(1 for v in checks.values() if v == "pass"),
+                        "fail": sum(1 for v in checks.values() if v == "fail")},
+        "editable": editable_parameters(record)}
+    for name in ("route", "approval_ref", "refusal_reason", "tenant_name", "account_id", "account_uuid", "plan_summary"):
+        view[name] = _text(record.get(name) or "")
+    return view
+
+
+def create_records_by_co(parent_dir: Path, *, missing_is_unavailable: bool = False) -> dict[str, Any]:
+    """The newest create record per CO.
+
+    ``parent_dir`` is the folder that contains ``production-create-records``. Result:
+    ``{"state": "ok" | "unavailable" | "unreadable", "reason": str, "by_co": {co: view}}``. One corrupt record makes the
+    whole answer ``unreadable`` (nothing partial is shown). A missing folder is "ok" and empty unless the caller says
+    it is "unavailable" (a server that never receives the folder).
+    """
+    folder = Path(parent_dir) / RECORDS_SUBDIR
+    try:
+        present = folder.is_dir()
+    except OSError:
+        return {"state": "unreadable", "reason": "record_unreadable", "by_co": {}}
+    if not present:
+        if missing_is_unavailable:
+            return {"state": "unavailable", "reason": "records_not_published", "by_co": {}}
+        return {"state": "ok", "reason": "", "by_co": {}}
+    try:
+        by_co: dict[str, dict[str, Any]] = {}
+        for path in list_records(parent_dir):  # oldest first, so a later record replaces an earlier one
+            view = _record_view(load(path))
+            by_co[view["co_reference"]] = view
+    except (ProductionCreateRecordError, OSError, ValueError, TypeError, KeyError):
+        return {"state": "unreadable", "reason": "record_unreadable", "by_co": {}}
+    return {"state": "ok", "reason": "", "by_co": by_co}
+
+
+def latest_create_record(parent_dir: Path, co_reference: str, *, missing_is_unavailable: bool = False) -> dict[str, Any]:
+    """``{"state": "none" | "found" | "unreadable" | "unavailable", "reason": str, "record": view | None}`` for one CO."""
+    found = create_records_by_co(parent_dir, missing_is_unavailable=missing_is_unavailable)
+    if found["state"] != "ok":
+        return {"state": found["state"], "reason": found["reason"], "record": None}
+    record = found["by_co"].get(co_reference)
+    return {"state": "found" if record else "none", "reason": "", "record": record}
+
+
+# --- Create state (landing "Create" column and the CO page steps) ---------------------------------------------------
+
+STEPS = ("Dry run", "Owner go", "Submit", "Readback")
+OUTCOME_CHIPS = {
+    "readback_verified": ("chip-ok", "Verified", 4), "created_unverified": ("chip-warn", "Created, not verified", 3),
+    "uncertain_submit": ("chip-bad", "Uncertain: do not retry", 3), "dry_run_passed": ("chip-info", "Dry run passed", 1),
+    "refused": ("chip-warn", "Refused", 0), "attempt_started": ("chip-warn", "Attempt started", 2)}
+CREATED_OUTCOMES = frozenset({"readback_verified", "created_unverified", "uncertain_submit"})
+
+
+def create_state(records: dict[str, Any], co_reference: str, *, locked: bool) -> dict[str, Any]:
+    """The Create chip for one CO: ``{"code", "css", "label", "steps_done"}``. Unreadable or unavailable never reads as "none"."""
+    state = records.get("state")
+    if state == "unavailable":
+        return {"code": "unavailable", "css": "chip-neutral", "label": "Unavailable on this server", "steps_done": 0}
+    if state != "ok":
+        return {"code": "unreadable", "css": "chip-warn", "label": "Records unreadable", "steps_done": 0}
+    record = (records.get("by_co") or {}).get(co_reference)
+    if record is not None:
+        css, label, done = OUTCOME_CHIPS.get(record["outcome"], ("chip-warn", "Unknown outcome", 0))
+        return {"code": record["outcome"], "css": css, "label": label, "steps_done": done}
+    if locked:
+        return {"code": "locked", "css": "chip-warn", "label": "Locked", "steps_done": 0}
+    return {"code": "dry_run_ready", "css": "chip-neutral", "label": "Dry run ready", "steps_done": 0}
+
+
+# --- Production checks chip -----------------------------------------------------------------------------------------
+
+def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
+    """One chip for a per-CO production match: Clear, Duplicate, Live paid x N, Clone stale or Clone unavailable.
+
+    ``{"code", "css", "label", "blocked", "live_paid", "reason"}``. Anything unexpected is "unavailable" and blocked:
+    a missing or unreadable match is never a clearance.
+    """
+    unusable = {"code": "unavailable", "css": "chip-warn", "label": "Clone unavailable", "blocked": True, "live_paid": 0,
+                "reason": ""}
+    if not isinstance(match, dict):
+        return unusable
+    status, reason = match.get("status"), _text(match.get("reason") or "")
+    candidates = [item for item in (match.get("candidates") or []) if isinstance(item, dict)]
+    live = sum(1 for item in candidates if item.get("live_paid") is True)
+    base = {"blocked": True, "live_paid": live, "reason": reason}
+    if status == "clone_unavailable":
+        if reason == "inventory_snapshot_stale":
+            return {**base, "code": "clone_stale", "css": "chip-warn", "label": "Clone stale"}
+        return {**base, "code": "unavailable", "css": "chip-warn", "label": "Clone unavailable"}
+    if status == "not_in_production":
+        return {**base, "code": "clear", "css": "chip-ok", "label": "Clear", "blocked": False}
+    if status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
+        if live > 1 or status == "ambiguous":
+            return {**base, "code": "live_paid", "css": "chip-bad", "label": "Live paid x " + str(max(live, 2))}
+        return {**base, "code": "duplicate", "css": "chip-bad", "label": "Duplicate"}
+    return unusable
+
+
+def _name_key(value: Any) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def duplicate_validation(match: dict[str, Any] | None, tenant_names: list[str], domains: list[str]) -> dict[str, Any]:
+    """Duplicate by name, duplicate by domain and the live paid count of exact-name tenants, from the match candidates.
+
+    ``{"available": bool, "by_name": [...], "by_domain": [...], "other": int, "live_paid_exact": int,
+    "tenants_checked": int}``. Unavailable (no usable clone) is reported as ``available: False``, never as zero matches.
+    """
+    if not isinstance(match, dict) or match.get("status") == "clone_unavailable" or match.get("status") not in (
+            "not_in_production", "exists_matches", "exists_differs", "exists_other", "ambiguous"):
+        return {"available": False, "by_name": [], "by_domain": [], "other": 0, "live_paid_exact": 0, "tenants_checked": 0}
+    names = {_name_key(item) for item in tenant_names if item}
+    wanted_domains = {str(item).casefold() for item in domains if item}
+    by_name, by_domain, other, live_exact = [], [], 0, 0
+    for item in (match.get("candidates") or []):
+        if not isinstance(item, dict):
+            continue
+        row = {"name": _text(item.get("name")), "domain": _text(item.get("domain")), "live_paid": item.get("live_paid") is True,
+               "deleted": item.get("deleted") is True, "license_type": _text(item.get("license_type"))}
+        same_name = _name_key(item.get("name")) in names
+        same_domain = str(item.get("domain") or "").casefold() in wanted_domains
+        if same_name:
+            by_name.append(row)
+            live_exact += 1 if row["live_paid"] else 0
+        if same_domain:
+            by_domain.append(row)
+        if not same_name and not same_domain:
+            other += 1
+    try:
+        checked = int(match.get("tenants_checked") or 0)
+    except (TypeError, ValueError):
+        checked = 0
+    return {"available": True, "by_name": by_name, "by_domain": by_domain, "other": other, "live_paid_exact": live_exact,
+            "tenants_checked": checked}
+
+
+def timing_window(start_iso: str | None, today: date, days_before: int) -> dict[str, Any]:
+    """The Start-minus-N-days rule: ``{"state": "open" | "closed" | "unknown", "opens": iso | "", "start": iso | ""}``.
+
+    The CSM-request exception has no recorded source, so it is never assumed.
+    """
+    try:
+        start = date.fromisoformat(str(start_iso or "")[:10])
+    except ValueError:
+        return {"state": "unknown", "opens": "", "start": ""}
+    opens = start - timedelta(days=days_before)
+    return {"state": "open" if today >= opens else "closed", "opens": opens.isoformat(), "start": start.isoformat()}
+
+
+# --- Clone status (the strip on every production page) --------------------------------------------------------------
+
+def clone_status(root: Path, now: datetime) -> dict[str, Any]:
+    """Age and trust of the production clone (Redash) for display.
+
+    ``{"state": "fresh" | "stale" | "unusable", "captured_at", "age_seconds", "limit_seconds": 21600, "reason", "label"}``.
+    Exactly 6 h old is still fresh (the gate uses ``age <= 6 h``); older shows its age but is not trusted. Any problem
+    with the snapshot is "unusable" with the loader's reason code.
+    """
+    base = {"state": "unusable", "captured_at": "", "age_seconds": None, "limit_seconds": CLONE_LIMIT_SECONDS,
+            "reason": "", "label": ""}
+    try:
+        payload = inventory.load_latest(Path(root), "prod-clone", max_age=DISPLAY_MAX_AGE, now=now)
+    except inventory.InventoryError as error:
+        return {**base, "reason": _text(error.reason)}
+    except (OSError, ValueError, TypeError):
+        return {**base, "reason": "inventory_snapshot_unreadable"}
+    age = int(payload.get("age_seconds") or 0)
+    return {**base, "state": "fresh" if age <= CLONE_LIMIT_SECONDS else "stale",
+            "captured_at": _text(payload.get("captured_at")), "age_seconds": age, "label": _text(payload.get("environment_label"))}
+
+
+def age_words(seconds: int | None) -> str:
+    """``2 h 10 min`` or ``35 min``; an unknown age is ``unknown``."""
+    if not isinstance(seconds, int) or isinstance(seconds, bool):
+        return "unknown"
+    hours, minutes = divmod(max(0, seconds) // 60, 60)
+    return (str(hours) + " h " + str(minutes) + " min") if hours else (str(minutes) + " min")

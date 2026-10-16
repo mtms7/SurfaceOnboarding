@@ -356,7 +356,7 @@ class TimingLogTests(ReadSpeedCase):
             p.start()
             self.addCleanup(p.stop)
         with self.assertLogs("surface_dashboard.timing", level="INFO") as logs:
-            get_co_page("/")
+            get_co_page("/dev")  # the Dev queue moved from / to /dev (2026-10-16)
             get_co_page("/co/CO-0767")
         pages = [e["label"] for e in dashboard.READ_TIMING_LOG if e["kind"] == "page_build"]
         self.assertEqual(pages, ["queue", "co"])

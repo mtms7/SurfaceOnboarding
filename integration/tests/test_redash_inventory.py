@@ -734,10 +734,11 @@ class TenantsTabTests(unittest.TestCase):
 
     def test_sidebar_has_a_dev_tenants_page_and_a_production_tenants_page(self):
         # Moved 2026-10-07: Leonardo Development > Tenants (/inventory) and Production > Tenants (/prod/tenants).
+        # 2026-10-16: the Dev entry is labelled "Dev tenants" inside the collapsed last group.
         for active, own in (("prod_tenants", "/prod/tenants"), ("inventory", "/inventory")):
             shell = dashboard._app_shell("t", "", active=active)
-            for href in ("/prod/tenants", "/inventory"):
-                self.assertIn("<a href='" + href + "'" + (" class='active'" if href == own else "") + ">Tenants</a>", shell)
+            for href, label in (("/prod/tenants", "Tenants"), ("/inventory", "Dev tenants")):
+                self.assertIn("<a href='" + href + "'" + (" class='active'" if href == own else "") + ">" + label + "</a>", shell)
             self.assertEqual(shell.count("class='active'"), 1)
         self.assertNotIn("DevOps", dashboard._app_shell("t", "", active="inventory"))
         self._collect()

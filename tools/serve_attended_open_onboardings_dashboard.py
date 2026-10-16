@@ -40,12 +40,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import state_paths
+from integration.onboarding import production_views
 from integration.onboarding import review_approval
 from integration.onboarding import run_progress
 from integration.onboarding import users_file
 from integration.onboarding import vm_snapshot
 from integration.onboarding.state_paths import state_file
 from integration.onboarding.dev_onboarded import dev_onboarded_evidence, dev_status
+from integration.onboarding.production_approval import STATE_FILE_NAME as PRODUCTION_APPROVAL_FILE
 from integration.onboarding.renewal_mirror import mirror_tenant_ids
 from integration.onboarding import session_readiness as readiness
 from integration.onboarding.session_readiness import SessionState, SessionStatus
@@ -56,6 +58,7 @@ from phase2_leonardo.case4_comment_validation import (
     validate_case4_onboarding_comments,
 )
 from tools.attended_ce_only_playwright import (
+    ONBOARD_DAYS_BEFORE_START,
     SCAN_STATUS_COMPLETED,
     SCAN_STATUS_FAILED,
     SCAN_STATUS_PATH,
@@ -3124,7 +3127,7 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
         params = {"queue": selected if queue is None else queue, "sort": sort if sort != "start" else "",
                   "dir": direction if direction != ("desc" if sort == "age" else "asc") else "", **changes}
         query = urlencode({name: value for name, value in params.items() if value})
-        return "/?" + query if query else "/"
+        return "/dev?" + query if query else "/dev"
 
     def chip(href: str, label: str, number: int, current: bool, extra: str = "") -> str:
         on = " on" if current else ""
@@ -3196,7 +3199,7 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
         table = f"<div class='tbl-wrap'><table class='dense'>{head_row}<tbody>{body}</tbody></table></div>"
     elif rows:
         helper_label = labels.get(selected, "this view")
-        table = f"<p class='empty'>Nothing in {escape(helper_label)} right now. <a href='/'>Show all open ({len(rows)})</a></p>"
+        table = f"<p class='empty'>Nothing in {escape(helper_label)} right now. <a href='/dev'>Show all open ({len(rows)})</a></p>"
     else:
         table = (f"<p class='empty'>No open onboardings. The Salesforce Open_Onboardings view returned 0 records at "
                  f"{escape(read_at)}.</p>")
@@ -3205,7 +3208,7 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
               + "<input type='hidden' name='refresh' value='1'>")
     title = labels.get(selected, "Open onboardings")
     head = (f"<div class='page-head'><h1>{escape(title)}</h1><span class='note'>Read from Salesforce at "
-            f"{escape(read_at)}</span><div class='head-meta'><form method='get' action='/'>{hidden}"
+            f"{escape(read_at)}</span><div class='head-meta'><form method='get' action='/dev'>{hidden}"
             "<button class='ghost' type='submit'>Refresh</button></form>"
             "<details class='menu'><summary>More</summary><div class='menu-pop'>"
             "<form method='post' action='/attended/scan-status-refresh-all'>"
@@ -3732,7 +3735,7 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
     seg = _env_segment(reference, "dev", _dev_status_chip(dev_evidence_for(reference)),
                        _match_chip(cached_match["status"]) if isinstance(cached_match, dict) and "status" in cached_match
                        else "<span class='chip chip-neutral'>Not checked</span>")
-    main_html = ("<a class='crumb' href='/'>&larr; Open Onboardings</a>" + header + seg + _tenant_ids_block(ctx)
+    main_html = ("<a class='crumb' href='/dev'>&larr; Open Onboardings</a>" + header + seg + _tenant_ids_block(ctx)
                  + _stage_tracker_html(stage_state, reference)
                  + toast + ("<div class='pinned' role='region' aria-label='Alerts'>" + pinned + "</div>" if pinned else "")
                  + _do_now_card(ctx) + _key_facts_grid(_key_facts(ctx)) + health + record_fold + history + diagnostics
@@ -5094,6 +5097,19 @@ PENTERA_CSS = (
     "border:2px solid #8b94a5;box-sizing:border-box}"
     ".navgroup.dev a::before{background:var(--env-dev-line);border-color:var(--env-dev-line)}"
     ".navgroup.prod a::before{background:transparent;border-color:var(--env-prod-bg)}"
+    "details.navgroup.dev>summary{cursor:pointer;list-style:none;color:#fff;background:var(--env-dev);"
+    "border:1px solid var(--env-dev-line);border-radius:5px;padding:3px 8px;"
+    "font:800 11px/1.3 -apple-system,'Segoe UI',sans-serif;letter-spacing:.6px}"
+    "details.navgroup.dev>summary::-webkit-details-marker{display:none}"
+    "details.navgroup.dev>summary::after{content:' \\25B8';float:right}"
+    "details.navgroup.dev[open]>summary::after{content:' \\25BE'}"
+    "details.navgroup.dev[open]>a:first-of-type{margin-top:4px}"
+    ".checks{list-style:none;margin:0;padding:0}"
+    ".checks li{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}"
+    ".checks li:last-child{border-bottom:0}.checks .what{flex:1;min-width:0;overflow-wrap:anywhere}"
+    ".checks .what small{display:block;color:var(--muted);font-size:12px}.checks .chip{flex:none}"
+    ".locked{opacity:.75}"
+    "@media(max-width:760px){.checks li{flex-wrap:wrap}}"
     ".seg{display:inline-flex;gap:8px;margin:0 0 14px}.seg a{display:inline-flex;align-items:center;gap:8px;background:#fff;"
     "color:var(--primary);border:1px solid var(--primary);border-radius:6px;padding:6px 14px;font-weight:600}"
     ".seg a:hover{background:#f3f7fe;text-decoration:none}.seg a.on{background:var(--primary);color:#fff}"
@@ -5110,18 +5126,20 @@ PENTERA_CSS = (
 )
 
 
-# Two areas (owner decision 2026-10-07): Leonardo Development (navy, solid dot) and Production through BackOffice
-# (amber from the warn palette, hollow dot, read-only). Red is never an environment colour.
+# Production-first navigation (owner decision 2026-10-16, docs/46): Production on top with only Onboarding, Tenants,
+# History and Approvals; Tools; Leonardo Development last and collapsed. Production is amber from the warn palette with
+# a hollow dot, Dev is navy with a solid dot. Red is never an environment colour.
 NAV_GROUPS = (
-    ("onboard", "ONBOARDING", "production-checked", (("/onboard", "Onboardings", "onboard"),)),
-    ("dev", "DEV · LEONARDO", "", (("/", "Onboardings", "onboardings"), ("/dev/onboarded", "Onboarded on Dev", "dev_onboarded"),
-                                    ("/history", "History", "history"), ("/inventory", "Tenants", "inventory"))),
-    ("prod", "PRODUCTION · BO", "read-only", (("/prod", "Readiness", "prod"), ("/prod/matches", "Matches", "prod_matches"),
-                                                  ("/prod/tenants", "Tenants", "prod_tenants"))),
+    ("prod", "PRODUCTION", "read-only", (("/", "Onboarding", "prod_onboarding"), ("/prod/tenants", "Tenants", "prod_tenants"),
+                                         ("/history", "History", "history"), ("/prod/approvals", "Approvals", "prod_approvals"))),
     ("tools", "TOOLS", "", (("/connection", "Sessions", "connection"),)),
 )
-ENV_BY_ACTIVE = {"onboard": "prod", "onboardings": "dev", "dev_onboarded": "dev", "history": "dev", "inventory": "dev",
-                 "prod": "prod", "prod_matches": "prod", "prod_tenants": "prod"}
+DEV_NAV_HEAD = "DEV - LEONARDO"
+DEV_NAV_LINKS = (("/dev", "Onboardings", "onboardings"), ("/dev/onboarded", "Onboarded on Dev", "dev_onboarded"),
+                 ("/inventory", "Dev tenants", "inventory"))
+ENV_BY_ACTIVE = {"prod_onboarding": "prod", "prod_tenants": "prod", "history": "prod", "prod_approvals": "prod",
+                 "prod": "prod", "prod_matches": "prod",
+                 "onboardings": "dev", "dev_onboarded": "dev", "inventory": "dev"}
 ENV_PILLS = {"dev": "DEV · Leonardo", "prod": "PRODUCTION · read-only", "tools": "TOOLS"}
 
 
@@ -5143,6 +5161,10 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
         + ("<span class='ro'>" + note + "</span>" if note else "") + "</div>"
         + "".join(nav(*link) for link in links) + "</div>" for key, head, note, links in NAV_GROUPS
         if not (vm_mode() and key == "tools"))
+    # Leonardo Development is last and collapsed; it opens by itself when a Dev page is active.
+    dev_open = any(key == active for _href, _label, key in DEV_NAV_LINKS)
+    groups += ("<details class='navgroup dev'" + (" open" if dev_open else "") + "><summary>" + DEV_NAV_HEAD + "</summary>"
+               + "".join(nav(*link) for link in DEV_NAV_LINKS) + "</details>")
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>" + refresh +
@@ -6318,7 +6340,7 @@ def render_prod_readiness(flt: str = "", all_open: bool = False) -> str:
             "<p class='note'>" + _clone_line(info) + "</p><nav class='strip' aria-label='Production match filters'>" + chips
             + "</nav>" + _scope_toggle("/prod", all_open, flt) + ("<p class='note'>" + escape(note) + "</p>" if note else "")
             + "<section class='card tbl-card'>" + table + "</section>")
-    return _app_shell("Production readiness", page, active="prod", wide=True)
+    return _app_shell("Production readiness", page, active="prod_onboarding", wide=True)
 
 
 # --- Review summary and approval (docs/43 section 4): production-checked onboarding, summary and approval only -----
@@ -6412,98 +6434,8 @@ def _approval_state(summary: dict[str, Any], now: datetime | None = None) -> tup
                                    review_approval.summary_hash(summary), now), record
 
 
-def _kv_rows(pairs: list[tuple[str, str]]) -> str:
-    return "<table><tbody>" + "".join("<tr><th scope='row'>" + escape(key) + "</th><td>" + escape(value) + "</td></tr>"
-                                      for key, value in pairs) + "</tbody></table>"
-
-
 def _joined(item: Any) -> str:
     return ", ".join(map(str, item)) if isinstance(item, list) else str(item)
-
-
-def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice: str = "") -> str:
-    ref = summary["reference"]
-    digest = review_approval.summary_hash(summary)
-    problem, record = _approval_state(summary)
-    blockers = summary["blockers"]
-    values = summary["values"]
-    check = summary["production_check"]
-    facts = _kv_rows([("Account", summary["account"] or "—"), ("Product", summary["product"] or "—"),
-                      ("Onboarding type", summary["onboarding_type"] or "—"), ("Route", summary["route"] or "—"),
-                      ("Salesforce source revision", summary["source_revision"] or "—")])
-    sent = ""
-    if values:
-        pairs = [("Tenant name", _joined(values.get("tenant_names") or []) or "—"),
-                 ("Domains", _joined(values.get("domains") or []) or "—")]
-        pairs += [(str(key).replace("_", " ").capitalize(), _joined(item)) for key, item in (values.get("plan") or {}).items()]
-        scope = values.get("scope")
-        if isinstance(scope, dict):
-            pairs += [("Scope · " + str(key).replace("_", " "), _joined(item)) for key, item in scope.items()]
-        sent = "<h2>Data that would be sent</h2>" + _kv_rows(pairs)
-    age = extras.get("age_seconds")
-    candidates = "".join("<li>" + escape(str(c.get("name") or "—")) + " · " + escape(str(c.get("domain") or "—"))
-                         + (" · live, paid" if c.get("live_paid") else "") + (" · deleted" if c.get("deleted") else "")
-                         + "</li>" for c in check["candidates"])
-    production = ("<h2>Duplicate validation: production only</h2><p>Checked against the Production BackOffice clone (Redash). "
-                  "Leonardo is not consulted.</p>"
-                  + _kv_rows([("Result", check["status"].replace("_", " ")),
-                              ("Tenants checked", str(check["tenants_checked"])),
-                              ("Clone captured", str(extras.get("captured_at") or "—")
-                               + (" (" + str(int(age // 60)) + " min ago)" if isinstance(age, (int, float)) else ""))])
-                  + ("<p>" + escape(check["reason"]) + "</p>" if check["reason"] else "")
-                  + ("<ul>" + candidates + "</ul>" if candidates else ""))
-    blocked = ""
-    if blockers:
-        blocked = ("<h2>Blocked</h2><ul class='blockers'>" + "".join(
-            "<li>" + escape(REVIEW_BLOCKER_TEXT.get(code, code)) + "</li>" for code in blockers) + "</ul>"
-            "<p>Correct the CO in Salesforce if the data is wrong. This page then shows a new summary and it can be approved.</p>")
-    if record is not None and problem is None:
-        status = ("<p><strong>Approved</strong> by " + escape(str(record["operator"])) + " at " + escape(str(record["approved_at"]))
-                  + ", valid until " + escape(str(record["expires_at"])) + ". The approval is bound to this exact summary.</p>")
-    elif record is not None and problem in ("summary_changed", "revision_changed", "route_changed"):
-        status = "<p><strong>Earlier approval no longer applies:</strong> the CO changed after it was approved. Review and approve again.</p>"
-    elif record is not None and problem == "approval_expired":
-        status = "<p><strong>Earlier approval expired.</strong> Review and approve again.</p>"
-    elif record is not None and problem == "approval_consumed":
-        status = "<p><strong>Earlier approval was already used.</strong> Review and approve again.</p>"
-    elif problem == "approval_file_unreadable":
-        status = "<p><strong>The approval record cannot be read.</strong> Nothing is treated as approved.</p>"
-    else:
-        status = "<p>Not approved yet.</p>"
-    form = ("<form method='post' action='/attended/review-approve'><input type='hidden' name='reference' value='" + escape(ref)
-            + "'><input type='hidden' name='source_revision' value='" + escape(summary["source_revision"])
-            + "'><input type='hidden' name='summary_hash' value='" + digest + "'>"
-            + "<button type='submit'" + (" disabled aria-disabled='true'" if blockers else "") + ">Approve this summary</button></form>")
-    notes = {"approved": "Approval recorded.", "changed": "The CO changed since the page was shown. Review the new summary.",
-             "blocked": "This summary has blockers and cannot be approved."}
-    main = ("<a class='crumb' href='/onboard'>&larr; Onboardings</a><div class='page-head'><h1>Review " + escape(ref) + "</h1></div>"
-            + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
-            + "<section class='card'>" + facts + sent + production + blocked + "<h2>Approval</h2>" + status + form
-            + "<p class='note'>Approving records your approval of exactly this summary (valid 4 hours, used once). It creates "
-              "nothing: no Leonardo, BackOffice or Salesforce write. Production creates stay blocked until the owner decisions "
-              "in docs/42 are recorded.</p></section>")
-    return _app_shell("Review " + ref, main, active="onboard")
-
-
-def render_onboard_queue() -> str:
-    body = ""
-    for row in queue_rows():
-        ref = str(row.get("Name") or "")
-        if not REFERENCE.fullmatch(ref):
-            continue
-        route = route_for(row)
-        supported = route == CE_ENGINE or route in SURFACE_ROUTES
-        body += ("<tr><td>" + ("<a href='/onboard/" + escape(ref) + "'>" + escape(ref) + "</a>" if supported else escape(ref)) + "</td><td>"
-                 + escape(str(row.get("Account__r.Name") or "—")) + "</td><td>" + escape(str(row.get("Onboarding_Product__c") or "—"))
-                 + "<br><small>" + escape(str(row.get("Onboarding_Type__c") or "—")) + "</small></td><td>"
-                 + ("Automated route" if supported else "No automated route") + "</td><td>"
-                 + ("<a href='/onboard/" + escape(ref) + "'>Review summary</a>" if supported else "—") + "</td></tr>")
-    table = ("<table><thead><tr><th>Onboarding</th><th>Account</th><th>Product</th><th>Route</th><th></th></tr></thead><tbody>"
-             + body + "</tbody></table>" if body else "<p class='empty'>No open onboardings.</p>")
-    main = ("<div class='page-head'><h1>Onboardings</h1></div><p class='note'>Review the summary of everything that would be "
-            "sent, with duplicate validation against the Production BackOffice clone only (Leonardo is not consulted). "
-            "Approval records the decision; nothing is created from this page.</p><section class='card'>" + table + "</section>")
-    return _app_shell("Onboardings", main, active="onboard")
 
 
 def render_prod_matches(all_open: bool = False) -> str:
@@ -6546,7 +6478,7 @@ def render_prod_matches(all_open: bool = False) -> str:
             "<section class='card tbl-card'><div class='card-head'><h2 class='pill'>Latest Start-gate checks</h2></div>"
             "<p class='note'>The latest recorded production duplicate check per CO (written when a Start was stopped by it).</p>"
             + gates + "</section>")
-    return _app_shell("Production matches", page, active="prod_matches", wide=True)
+    return _app_shell("Production matches", page, active="prod_onboarding", wide=True)
 
 
 def _ids_cell(route: str | None, readback: dict[str, str] | None) -> str:
@@ -6782,10 +6714,540 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
               "database, personal data removed. A missing match is never a clearance.</p>")
     checklist = ("<section class='card'><div class='card-head'><h2 class='pill'>Before migration</h2></div><ul>"
                  + "".join("<li>" + escape(text) + "</li>" for text in BEFORE_MIGRATION) + "</ul></section>")
-    main_html = ("<a class='crumb' href='/prod'>&larr; Production readiness</a>" + header + seg
-                 + "<p class='prodnote'>Production view, read-only. Nothing on this page writes to production, Leonardo or "
-                 "Salesforce.</p>" + _production_marker_for(reference) + status + source + checklist)
-    return _app_shell(reference + " production", main_html, active="prod", env="prod")
+    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + seg + _lock_banner()
+                 + _production_marker_for(reference) + status + source + checklist)
+    return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod")
+
+
+# ---- Production-first pages (owner decision 2026-10-16, docs/46 + docs/47) ----------------------------------------
+# Read-only: GET pages only. While PRODUCTION_RUNNER_SUPPORTED is False (and whenever the lock state cannot be read) no
+# page carries a create, Start or Confirm control, and no route here reaches a production write, a Salesforce write or
+# an approval issue. The one form is the existing 4-hour summary approval on the CO page (a local record, nothing else).
+PRODUCTION_APPROVAL_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / PRODUCTION_APPROVAL_FILE)
+PROD_FILTERS = (("ready", "Ready for dry run"), ("blocked", "Blocked"), ("approved", "Approved"), ("created", "Created"))
+PROD_SORTS = frozenset({"start", "co", "age"})
+WRONG_CREATE_NOTE = "Wrong create: the owner edits the parameters in BackOffice; the delete path is unknown."
+
+
+def production_records_parent() -> Path:
+    """The folder that holds ``production-create-records``: the published snapshot on the VM, the state folder, else the repo."""
+    current = state_paths.snapshot_current_dir()
+    if current is not None:
+        return current
+    folder = state_paths.state_dir()
+    return folder if folder is not None else Path(__file__).resolve().parents[1]
+
+
+def production_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _state_not_published() -> bool:
+    """True on a server that does not receive the approval files and create records (the VM, docs/47 section 0.5)."""
+    return vm_mode()
+
+
+def _production_lock() -> tuple[bool, str | None]:
+    """(locked, reason code) from session_readiness; an unreadable lock state counts as locked."""
+    try:
+        problem = readiness.production_unlock_problem(os.environ, production_now())
+    except Exception:  # noqa: BLE001 - fail closed
+        return True, "production_lock_unreadable"
+    if problem is None and readiness.PRODUCTION_RUNNER_SUPPORTED is not True:
+        problem = "production_runner_not_supported"
+    return problem is not None, problem
+
+
+def _lock_banner() -> str:
+    locked, reason = _production_lock()
+    if locked:
+        return ("<div class='banner banner-warn' role='status'><strong>Production create is locked.</strong> Review only. "
+                "No create control is shown until the owner unlocks the runner.<span class='sub'>"
+                + escape(production_views.lock_reason_text(reason)) + "</span></div>")
+    return ("<div class='banner' role='status'><strong>Runner unlocked by configuration.</strong> This dashboard still has no "
+            "create control: a create is a separate step with its own owner go, outside these pages.</div>")
+
+
+def _lock_chip() -> str:
+    return "<span class='chip chip-warn'>Create locked</span>" if _production_lock()[0] else ""
+
+
+def _chip(css: str, label: str) -> str:
+    return "<span class='chip " + css + "'>" + escape(label) + "</span>"
+
+
+def _clone_status() -> dict[str, Any]:
+    try:
+        return production_views.clone_status(clone_root(), production_now())
+    except Exception:  # noqa: BLE001 - the strip never breaks a page; an unreadable clone is unusable
+        return {"state": "unusable", "captured_at": "", "age_seconds": None, "reason": "inventory_snapshot_unreadable",
+                "limit_seconds": production_views.CLONE_LIMIT_SECONDS, "label": ""}
+
+
+def _clone_strip() -> str:
+    """The clone-status strip on every production page (the former Readiness page): age against the 6 h rule."""
+    info = _clone_status()
+    limit = str(info["limit_seconds"] // 3600) + " h"
+    if info["state"] == "unusable":
+        chip = _chip("chip-warn", "Clone unusable: " + (info["reason"] or "unknown"))
+    else:
+        words = "Clone " + production_views.age_words(info["age_seconds"]) + " old, limit " + limit
+        chip = ("<span class='chip chip-ok'>" + escape(words) + " &middot; trusted</span>" if info["state"] == "fresh"
+                else "<span class='chip chip-warn'>" + escape(words) + " &middot; stale, not trusted</span>")
+    note = ("" if info["state"] == "fresh" else
+            "<p class='note'>No production check is trusted until the clone is fresh. Refresh it with " + _collect_hint_html() + ".</p>")
+    return ("<div class='strip'>" + chip + "<span class='chip chip-neutral'>Source: Redash, personal data removed</span></div>" + note)
+
+
+def _create_approval_chip(view: dict[str, Any]) -> str:
+    state = view["state"]
+    if state == "valid":
+        return _chip("chip-ok", "Valid to " + str(view["item"]["expires_at"])[5:10])
+    return {"expired": _chip("chip-warn", "Expired"), "consumed": _chip("chip-neutral", "Used"),
+            "none": _chip("chip-neutral", "None"), "unreadable": _chip("chip-warn", "Unreadable"),
+            "unavailable": _chip("chip-neutral", "Unavailable on this server")}.get(state, _chip("chip-warn", "Unreadable"))
+
+
+def _co_page_href(reference: str) -> str:
+    """The production CO page. The VM cannot build the review summary (its preflight needs live reads), so it links the
+    snapshot-backed production view instead."""
+    return "/co/" + reference + "?env=prod" if vm_mode() else "/onboard/" + reference
+
+
+def _prod_start_cell(start: str, today: date) -> str:
+    cell = _start_cell(start, "ready", today)
+    window = production_views.timing_window(start, today, ONBOARD_DAYS_BEFORE_START)
+    if window["state"] == "unknown":
+        return cell
+    text = (str(ONBOARD_DAYS_BEFORE_START) + "-day window open" if window["state"] == "open"
+            else str(ONBOARD_DAYS_BEFORE_START) + "-day window opens " + window["opens"][5:])
+    return cell + "<span class='sub'>" + escape(text) + "</span>"
+
+
+def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> str:
+    """The production landing (``/`` and ``/onboard``): every open CO with its production checks, approval and create state.
+
+    Read-only. A queue read failure propagates (ReadUnavailable); every other missing value shows as unavailable.
+    """
+    rows = [row for row in queue_rows() if REFERENCE.fullmatch(str(row.get("Name") or ""))]
+    now = production_now()
+    today = now.date()
+    published = _state_not_published()
+    try:
+        starts: dict[str, str] | None = queue_start_dates(tuple(str(row["Name"]) for row in rows)) if rows else {}
+    except ReadUnavailable:
+        starts = None
+    approvals = production_views.list_approvals(PRODUCTION_APPROVAL_PATH, now, missing_is_unavailable=published)
+    records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=published)
+    locked = _production_lock()[0]
+    for row in rows:
+        if route_for(row) == CE_ENGINE or route_for(row) in SURFACE_ROUTES:
+            prefetch_display_read(production_match_display, str(row["Name"]), row.get("Onboarding_Product__c") or "",
+                                  row.get("Onboarding_Type__c") or "")
+    items = []
+    for row in rows:
+        ref = str(row["Name"])
+        route = route_for(row)
+        supported = route == CE_ENGINE or route in SURFACE_ROUTES
+        check = (production_views.production_check(_match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
+                 if supported else None)
+        approval = production_views.pick_approval(approvals, ref)
+        create = production_views.create_state(records, ref, locked=locked)
+        created = create["code"] in production_views.CREATED_OUTCOMES
+        items.append({"row": row, "ref": ref, "supported": supported, "check": check, "approval": approval, "create": create,
+                      "flags": {"blocked": supported and bool(check and check["blocked"]),
+                                "ready": supported and bool(check) and not check["blocked"] and not created,
+                                "approved": supported and approval["state"] == "valid", "created": created}})
+    flt = flt if flt in {key for key, _label in PROD_FILTERS} else ""
+    sort = sort if sort in PROD_SORTS else "start"
+    if direction not in ("asc", "desc"):
+        direction = "desc" if sort == "age" else "asc"
+    descending = direction == "desc"
+
+    def start_of(item: dict[str, Any]) -> str:
+        return (starts or {}).get(item["ref"], "") if starts is not None else str(item["row"].get("Submission_Date__c") or "")[:10]
+
+    def sort_value(item: dict[str, Any]) -> str:
+        if sort == "co":
+            return item["ref"]
+        if sort == "age":
+            try:
+                return f"{(today - date.fromisoformat(str(item['row'].get('Submission_Date__c') or '')[:10])).days + 100000:06d}"
+            except ValueError:
+                return ""
+        return start_of(item)
+
+    def link(**changes: str) -> str:
+        params = {"filter": flt, "sort": sort if sort != "start" else "",
+                  "dir": direction if direction != ("desc" if sort == "age" else "asc") else "", **changes}
+        query = urlencode({name: value for name, value in params.items() if value})
+        return "/?" + query if query else "/"
+
+    shown = [item for item in items if not flt or item["flags"][flt]]
+    base = sorted(shown, key=lambda item: item["ref"])
+    ordered = sorted((item for item in base if sort_value(item)), key=sort_value, reverse=descending)
+    ordered += [item for item in base if not sort_value(item)]  # blanks always last
+    chips = ("<a class='fchip" + (" on" if not flt else "") + "' href='" + escape(link(filter="")) + "'>All <b>" + str(len(items))
+             + "</b></a>")
+    for key, label in PROD_FILTERS:
+        chips += ("<a class='fchip" + (" on" if flt == key else "") + "' href='" + escape(link(filter=key)) + "'>" + escape(label)
+                  + " <b>" + str(sum(1 for item in items if item["flags"][key])) + "</b></a>")
+
+    def header(key: str, label: str, css: str = "") -> str:
+        active = key == sort
+        target = link(sort=key, dir=("asc" if descending else "desc") if active else "")
+        aria = " aria-sort='" + ("descending" if descending else "ascending") + "'" if active else ""
+        return ("<th scope='col'" + (" class='" + css + "'" if css else "") + aria + "><a class='sort' href='" + escape(target)
+                + "'>" + escape(label) + "</a></th>")
+
+    head = ("<thead><tr>" + header("start", "Start") + header("co", "Onboarding", "stick") + "<th scope='col'>Account</th>"
+            "<th scope='col'>Product</th><th scope='col'>Production checks</th>"
+            "<th scope='col'>Approval<span class='sub'>create · 7 days</span></th><th scope='col'>Create</th>"
+            + header("age", "Age", "num") + "</tr></thead>")
+    body = ""
+    for item in ordered:
+        row, ref, check = item["row"], item["ref"], item["check"]
+        product, kind = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
+        start = (starts or {}).get(ref) if starts is not None else None
+        if item["supported"]:
+            checks = (_chip(check["css"], check["label"])
+                      + ("<span class='sub'>" + escape(check["reason"]) + "</span>" if check["blocked"] and check["reason"] else ""))
+            approval_cell = _create_approval_chip(item["approval"])
+            create_cell = _chip(item["create"]["css"], item["create"]["label"])
+            onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
+        else:
+            checks = _chip("chip-neutral", "No automated route") + "<span class='sub'>Exact Product and Type pair not supported</span>"
+            approval_cell = create_cell = "<span class='muted'>—</span>"
+            onboarding = "<span class='co'>" + escape(ref) + "</span>"
+        body += ("<tr" + ("" if item["supported"] else " class='locked'") + "><td class='c-start'>"
+                 + (_prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='stick'>"
+                 + onboarding + "</td><td>" + escape(str(row.get("Account__r.Name") or "Account unavailable")) + "</td><td>"
+                 + escape(_PRODUCT_SHORT.get(product or "", product or "—")) + "<span class='sub'>"
+                 + escape(_TYPE_SHORT.get(kind or "", kind or "—")) + "</span></td><td>" + checks + "</td><td>" + approval_cell
+                 + "</td><td>" + create_cell + "</td><td class='num'>" + _age_days(row.get("Submission_Date__c"), today) + "</td></tr>")
+    if ordered:
+        table = "<div class='tbl-wrap'><table class='dense'>" + head + "<tbody>" + body + "</tbody></table></div>"
+    elif items:
+        table = "<p class='empty'>Nothing in this view right now. <a href='/'>Show all open (" + str(len(items)) + ")</a></p>"
+    else:
+        table = "<p class='empty'>No open onboardings.</p>"
+    notes = ("<p class='note'>Subscription start dates could not be read from Salesforce, so the list is ordered by submission "
+             "date and the 2-day window is not shown.</p>" if starts is None and rows else "")
+    page = ("<div class='page-head'><h1>Onboarding</h1>" + _lock_chip() + "</div>" + _clone_strip()
+            + "<nav class='fbar' aria-label='Filter'><span class='fgroup'>" + chips + "</span></nav>" + notes
+            + "<p class='note'>Every open onboarding with its duplicate validation against the Production BackOffice clone only "
+              "(Leonardo is not consulted). Approval is the 7-day create approval; the 4-hour summary approval is on the CO page. "
+              "Nothing is created from this page.</p><section class='card tbl-card'>" + table + "</section>")
+    return _app_shell("Onboarding", page, active="prod_onboarding", wide=True)
+
+
+def _kv_grid(pairs: list[tuple[str, str]], code: frozenset[str] = frozenset()) -> str:
+    return ("<dl class='kv'>" + "".join(
+        "<div><dt>" + escape(key) + "</dt><dd>" + ("<code>" + escape(value) + "</code>" if key in code else escape(value))
+        + "</dd></div>" for key, value in pairs) + "</dl>")
+
+
+def _check_item(label: str, small: str, chip: str) -> str:
+    """One row of a checks list. ``small`` is already escaped HTML."""
+    return ("<li><span class='what'>" + escape(label) + ("<small>" + small + "</small>" if small else "") + "</span>" + chip + "</li>")
+
+
+def _match_count_chip(rows: list[dict[str, Any]]) -> str:
+    return (_chip("chip-ok", "None") if not rows
+            else _chip("chip-bad", str(len(rows)) + (" match" if len(rows) == 1 else " matches")))
+
+
+def _duplicate_items(check: dict[str, Any], values: dict[str, Any]) -> tuple[str, int]:
+    """(list items, number of failed checks) for the duplicate validation: by name, by domain and live paid tenants."""
+    dup = production_views.duplicate_validation(
+        {"status": check["status"], "candidates": check["candidates"], "tenants_checked": check["tenants_checked"]},
+        [str(item) for item in values.get("tenant_names") or []], [str(item) for item in values.get("domains") or []])
+    status = str(check["status"])
+    status_css = "chip-ok" if status == "not_in_production" else "chip-warn" if status in ("clone_unavailable", "not_checked") else "chip-bad"
+    result_small = escape(check["reason"]) + (" " if check["reason"] else "") + "Tenants checked: " + str(int(check["tenants_checked"] or 0))
+    items = _check_item("Result", result_small, _chip(status_css, status.replace("_", " ")))
+    if not dup["available"]:
+        why = "Duplicate check unavailable (" + escape(check["reason"] or status) + "). Treated as blocked."
+        unavailable = _chip("chip-warn", "Unavailable")
+        return items + "".join(_check_item(label, why, unavailable) for label in (
+            "Duplicate by name", "Duplicate by domain", "Live paid tenants (exact name)")), 3
+
+    def names(rows: list[dict[str, Any]]) -> str:
+        return (escape(", ".join(item["name"] or "—" for item in rows)) if rows
+                else "0 of " + str(dup["tenants_checked"]) + " production tenants")
+    live = dup["live_paid_exact"]
+    items += (_check_item("Duplicate by name", names(dup["by_name"]), _match_count_chip(dup["by_name"]))
+              + _check_item("Duplicate by domain", names(dup["by_domain"]), _match_count_chip(dup["by_domain"]))
+              + _check_item("Live paid tenants (exact name)", "At most 1 allowed",
+                            _chip("chip-ok" if live == 0 else "chip-warn" if live == 1 else "chip-bad", str(live))))
+    if dup["other"]:
+        items += _check_item("Other candidates", "Matched by something other than the exact name or the listed domain",
+                             _chip("chip-neutral", str(dup["other"])))
+    failed = int(bool(dup["by_name"])) + int(bool(dup["by_domain"])) + int(live > 1)
+    return items, failed
+
+
+def _other_checks(summary: dict[str, Any], row: dict[str, str | None] | None) -> tuple[str, int]:
+    values, route = summary["values"], summary["route"]
+    plan = values.get("plan") if isinstance(values.get("plan"), dict) else {}
+    window = production_views.timing_window(str(plan.get("license_start") or ""), production_now().date(), ONBOARD_DAYS_BEFORE_START)
+    failed = 0
+    if window["state"] == "open":
+        timing = _check_item("Timing window", "Start " + escape(window["start"]) + " minus " + str(ONBOARD_DAYS_BEFORE_START)
+                             + " days has passed. CSM request: not recorded.", _chip("chip-ok", "Open"))
+    elif window["state"] == "closed":
+        failed += 1
+        timing = _check_item("Timing window", "Window opens " + escape(window["opens"]) + ". CSM request: not recorded.",
+                             _chip("chip-bad", "Closed"))
+    else:
+        failed += 1
+        timing = _check_item("Timing window", "Start date not verified.", _chip("chip-warn", "Not determined"))
+    domains = values.get("domains") or []
+    if route == CE_ENGINE:
+        email = _check_item("Email domain", "Exactly one valid domain is required for CE-only.",
+                            _chip("chip-ok" if len(domains) == 1 else "chip-warn", str(len(domains))))
+        failed += int(len(domains) != 1)
+    else:
+        email = _check_item("Email domain", "Not required for this route.", _chip("chip-neutral", "Not required"))
+    if row is None or "Account_UUID__c" not in row:
+        uuid = _check_item("Account UUID", "Not verified: the CO could not be read for this check.", _chip("chip-warn", "Not verified"))
+        failed += 1
+    elif row.get("Account_UUID__c"):
+        uuid = _check_item("Account UUID", "Salesforce already holds a UUID for this CO.", _chip("chip-bad", "Already set"))
+        failed += 1
+    else:
+        uuid = _check_item("Account UUID", "Must be empty before a create.", _chip("chip-ok", "Empty"))
+    return timing + email + uuid, failed
+
+
+def _clone_item() -> tuple[str, int]:
+    info = _clone_status()
+    if info["state"] == "unusable":
+        return _check_item("Clone age", "Clone unusable: " + escape(info["reason"] or "unknown"), _chip("chip-warn", "Unusable")), 1
+    age = production_views.age_words(info["age_seconds"])
+    if info["state"] == "fresh":
+        return _check_item("Clone age", "Captured " + escape(info["captured_at"]) + ", " + age + " ago. Rule: at most 6 h.",
+                           _chip("chip-ok", "Fresh")), 0
+    return _check_item("Clone age", "Captured " + escape(info["captured_at"]) + ", " + age + " ago. Older than 6 h: not trusted.",
+                       _chip("chip-warn", "Stale")), 1
+
+
+def _summary_approval_html(summary: dict[str, Any], digest: str, blockers: list[str]) -> str:
+    """The 4-hour summary approval: status text and the one existing form (a local record, nothing else)."""
+    if _state_not_published() and not REVIEW_APPROVAL_PATH.exists():
+        return "<p>Summary approvals are unavailable on this server.</p>"
+    problem, record = _approval_state(summary)
+    if record is not None and problem is None:
+        status = ("<p><strong>Approved</strong> by " + escape(str(record["operator"])) + " at " + escape(str(record["approved_at"]))
+                  + ", valid until " + escape(str(record["expires_at"])) + ". The approval is bound to this exact summary.</p>")
+    elif record is not None and problem in ("summary_changed", "revision_changed", "route_changed"):
+        status = "<p><strong>Earlier approval no longer applies:</strong> the CO changed after it was approved. Review and approve again.</p>"
+    elif record is not None and problem == "approval_expired":
+        status = "<p><strong>Earlier approval expired.</strong> Review and approve again.</p>"
+    elif record is not None and problem == "approval_consumed":
+        status = "<p><strong>Earlier approval was already used.</strong> Review and approve again.</p>"
+    elif problem == "approval_file_unreadable":
+        status = "<p><strong>The approval record cannot be read.</strong> Nothing is treated as approved.</p>"
+    else:
+        status = "<p>Not approved yet.</p>"
+    form = ("<form method='post' action='/attended/review-approve'><input type='hidden' name='reference' value='"
+            + escape(summary["reference"]) + "'><input type='hidden' name='source_revision' value='" + escape(summary["source_revision"])
+            + "'><input type='hidden' name='summary_hash' value='" + digest + "'>"
+            + "<button type='submit'" + (" disabled aria-disabled='true'" if blockers else "") + ">Approve this summary</button></form>")
+    return status + form
+
+
+def _create_approval_html(reference: str) -> str:
+    view = production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, production_now(),
+                                            missing_is_unavailable=_state_not_published())
+    state, item = view["state"], view["item"]
+    if state == "none":
+        return "<p>No create approval recorded.</p>"
+    if state == "unreadable":
+        return "<p><strong>The create approval record cannot be read.</strong> Nothing is treated as approved.</p>"
+    if state == "unavailable":
+        return "<p>Create approvals are unavailable on this server.</p>"
+    word = {"valid": "Valid", "expired": "Expired", "consumed": "Used"}[state]
+    css = {"valid": "chip-ok", "expired": "chip-warn", "consumed": "chip-neutral"}[state]
+    note = {"valid": "Bound to one CO, one route and the revision seen at approval. Used once by the create.",
+            "expired": "Expired: a new create approval is needed.", "consumed": "Used once: a new create approval is needed."}[state]
+    return ("<p>" + _chip(css, word) + "</p>" + _kv_grid([
+        ("Reference", item["approval_ref"]), ("Scope", "One CO, CE-only"), ("Issued by", item["issued_by"]),
+        ("Expires", item["expires_at"][:10] + " (7 days)"), ("Consumed", "Yes" if item["consumed_at"] else "No")],
+        frozenset({"Reference"})) + "<p class='note'>" + escape(note) + "</p>")
+
+
+def _create_steps_html(done: int, locked: bool) -> str:
+    items = ""
+    for index, name in enumerate(production_views.STEPS):
+        state = "done" if index < done else "current" if index == done and not locked else ""
+        items += ("<li class='st" + (" " + state if state else "") + "'" + (" aria-current='step'" if state == "current" else "") + ">"
+                  "<span class='dot' aria-hidden='true'>" + str(index + 1) + "</span><span class='lbl'>" + escape(name) + "</span></li>")
+    return "<ol class='stages'>" + items + "</ol>"
+
+
+def _record_html(found: dict[str, Any]) -> tuple[str, str]:
+    """(card chip, card body) for the D2 record of one CO: allow-listed fields only."""
+    state = found["state"]
+    if state == "unavailable":
+        return _chip("chip-neutral", "Unavailable"), "<p class='note'>Create records are unavailable on this server.</p>"
+    if state == "unreadable":
+        return (_chip("chip-warn", "Unreadable"), "<p class='note'>Create records unreadable (" + escape(found["reason"])
+                + "). Do not retry a create until the owner has checked the records.</p>")
+    if state == "none":
+        return (_chip("chip-neutral", "Not created yet"), "<p class='note'>No create record. After a create, a redacted local record "
+                "shows here: tenant name, account id, UUID, domains and plan. No secrets. " + escape(WRONG_CREATE_NOTE) + "</p>")
+    rec = found["record"]
+    css, label, _done = production_views.OUTCOME_CHIPS.get(rec["outcome"], ("chip-warn", "Unknown outcome", 0))
+    pairs = [("Outcome", label), ("Recorded", rec["recorded_at"].replace("T", " ").rstrip("Z") + " UTC"), ("Route", rec["route"] or "—"),
+             ("Approval reference", rec["approval_ref"] or "—"), ("Tenant name", rec["tenant_name"] or "—"),
+             ("Account ID", rec["account_id"] or "—"), ("Account UUID", rec["account_uuid"] or "—"),
+             ("Domains", ", ".join(rec["domains"]) or "—"), ("Plan", rec["plan_summary"] or "—"),
+             ("Form checks", str(rec["form_checks"]["pass"]) + " passed, " + str(rec["form_checks"]["fail"]) + " failed")]
+    if rec["refusal_reason"]:
+        pairs.append(("Refusal reason", rec["refusal_reason"]))
+    if rec["editable"]:
+        pairs.append(("Editable parameters", ", ".join(rec["editable"])))
+    return _chip(css, label), _kv_grid(pairs) + "<p class='note'>" + escape(WRONG_CREATE_NOTE) + "</p>"
+
+
+def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice: str = "",
+                        row: dict[str, str | None] | None = None) -> str:
+    """The production CO page (``/onboard/CO-x``): one column of read-only cards in the order of the approved mockup.
+
+    ``row`` is the CO's detail row (for the Account UUID check); without it that check shows as not verified.
+    """
+    ref = summary["reference"]
+    digest = review_approval.summary_hash(summary)
+    blockers = list(summary["blockers"])
+    values = summary["values"]
+    check = summary["production_check"]
+    locked, _reason = _production_lock()
+    plan = values.get("plan") if isinstance(values.get("plan"), dict) else {}
+    # Salesforce facts.
+    facts = [("Account", summary["account"] or "—"),
+             ("Product / type", (summary["product"] or "—") + " / " + (summary["onboarding_type"] or "—")),
+             ("Route", ENGINE_LABELS.get(summary["route"], "No automated route")), ("Start date", str(plan.get("license_start") or "—")),
+             ("Tenant name", _joined(values.get("tenant_names") or []) or "—"), ("Domains", _joined(values.get("domains") or []) or "—")]
+    facts += [(str(key).replace("_", " ").capitalize(), _joined(item)) for key, item in plan.items() if key != "license_start"]
+    scope = values.get("scope")
+    if isinstance(scope, dict):
+        facts += [("Scope · " + str(key).replace("_", " "), _joined(item)) for key, item in scope.items()]
+    facts.append(("Source revision", summary["source_revision"] or "—"))
+    # Production checks, including the duplicate validation.
+    clone_item, clone_failed = _clone_item()
+    duplicate_items, duplicate_failed = _duplicate_items(check, values)
+    other_items, other_failed = _other_checks(summary, row)
+    problems = len(blockers) + (0 if blockers else clone_failed) + duplicate_failed + other_failed
+    candidates = "".join("<li>" + escape(str(c.get("name") or "—")) + " · " + escape(str(c.get("domain") or "—"))
+                         + (" · live, paid" if c.get("live_paid") else "") + (" · deleted" if c.get("deleted") else "") + "</li>"
+                         for c in check["candidates"])
+    checks_card = ("<section class='card'><div class='card-head'><h2 class='pill'>Production checks</h2>"
+                   + (_chip("chip-bad", str(problems) + " blocked") if problems else _chip("chip-ok", "All passed")) + "</div>"
+                   "<ul class='checks'>" + clone_item + "</ul>"
+                   "<h3 class='sub-h'>Duplicate validation: production only</h3><p class='note'>Checked against the Production "
+                   "BackOffice clone (Redash). Leonardo is not consulted.</p><ul class='checks'>" + duplicate_items + "</ul>"
+                   + ("<h3 class='sub-h'>Matched production tenants</h3><ul>" + candidates + "</ul>" if candidates else "")
+                   + "<h3 class='sub-h'>Other checks</h3><ul class='checks'>" + other_items + "</ul>"
+                   "<p class='note'>A missing match is never a clearance.</p></section>")
+    # Two different approvals, labelled apart.
+    approval_card = ("<section class='card'><div class='card-head'><h2 class='pill'>Approval</h2></div>"
+                     "<h3 class='sub-h'>Summary approval (4 hours)</h3>" + _summary_approval_html(summary, digest, blockers)
+                     + "<h3 class='sub-h'>Create approval (7 days, one use)</h3>" + _create_approval_html(ref)
+                     + "<p class='note'>Approving the summary records your approval of exactly this summary (valid 4 hours, used once). "
+                       "It creates nothing: no Leonardo, BackOffice or Salesforce write. The create approval is a separate record, "
+                       "issued outside this page.</p></section>")
+    # Create, D2 record and UUID writeback: never a control.
+    records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=_state_not_published())
+    state = production_views.create_state(records, ref, locked=locked)
+    found = ({"state": records["state"], "reason": records["reason"], "record": None} if records["state"] != "ok"
+             else {"state": "found" if ref in records["by_co"] else "none", "reason": "", "record": records["by_co"].get(ref)})
+    create_note = ("The production runner is not supported in this build. Review only: no create control exists on this page."
+                   if locked else "Create is a separate step with its own owner go, outside this page.")
+    if state["code"] == "uncertain_submit":
+        create_note += " Never re-click Create after an uncertain submit: check BackOffice first."
+    create_card = ("<section class='card" + (" locked" if locked else "") + "'><div class='card-head'><h2 class='pill'>Create</h2>"
+                   + _chip(state["css"], state["label"]) + "</div>" + _create_steps_html(state["steps_done"], locked)
+                   + "<p class='note'>" + escape(create_note) + "</p></section>")
+    record_chip, record_body = _record_html(found)
+    record_card = ("<section class='card'><div class='card-head'><h2 class='pill'>D2 record</h2>" + record_chip + "</div>"
+                   + record_body + "</section>")
+    verified = state["code"] == "readback_verified"
+    writeback_card = ("<section class='card" + ("" if verified else " locked") + "'><div class='card-head'><h2 class='pill'>"
+                      "UUID writeback to Salesforce</h2>" + _chip("chip-neutral", "Separate go needed" if verified else "Locked")
+                      + "</div><p class='note'>"
+                      + ("A verified create exists. The Account UUID writeback needs its own separate owner go and is not "
+                         "available in this dashboard." if verified else "Locked until a verified create.")
+                      + " Field <code>Account_UUID__c</code> only: it must be empty or equal, the revision unchanged, and verified "
+                        "by a read back from Salesforce.</p></section>")
+    blocked = ""
+    if blockers:
+        blocked = ("<ul class='blockers'>" + "".join("<li>" + escape(REVIEW_BLOCKER_TEXT.get(code, code)) + "</li>" for code in blockers)
+                   + "</ul><p class='note'>Correct the CO in Salesforce if the data is wrong. This page then shows a new summary and it "
+                     "can be approved.</p>")
+    notes = {"approved": "Approval recorded.", "changed": "The CO changed since the page was shown. Review the new summary.",
+             "blocked": "This summary has blockers and cannot be approved."}
+    route_label = ENGINE_LABELS.get(summary["route"])
+    head = ("<a class='crumb' href='/'>&larr; Onboarding</a><div class='page-head'><h1>" + escape(ref) + "</h1>"
+            + ("<span class='acct'>" + escape(summary["account"]) + "</span>" if summary["account"] else "")
+            + (_chip("chip-info", route_label) if route_label else _chip("chip-neutral", "No automated route"))
+            + (_chip("chip-bad", "Blocked") if blockers else _chip("chip-ok", "Checks clear")) + _lock_chip() + "</div>")
+    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + _lock_banner() + blocked
+            + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
+            + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + approval_card + create_card + record_card
+            + writeback_card)
+    return _app_shell("Review " + ref, main, active="prod_onboarding")
+
+
+_APPROVAL_STATE_CHIPS = {"valid": ("chip-ok", "Valid"), "expired": ("chip-warn", "Expired"), "consumed": ("chip-neutral", "Used")}
+
+
+def _approval_table(listing: dict[str, Any], columns: tuple[str, ...], rows_html: str, noun: str, singular: str) -> str:
+    state = listing["state"]
+    if state == "unavailable":
+        return "<p class='empty'>" + noun + " are unavailable on this server.</p>"
+    if state == "unreadable":
+        return "<p class='empty'><strong>The " + singular + " record cannot be read.</strong> Nothing is treated as approved.</p>"
+    if not listing["items"]:
+        return "<p class='empty'>No approvals recorded.</p>"
+    return ("<div class='tbl-wrap'><table class='dense'><thead><tr>" + "".join("<th scope='col'>" + escape(name) + "</th>" for name in columns)
+            + "</tr></thead><tbody>" + rows_html + "</tbody></table></div>")
+
+
+def _stamp_words(value: str) -> str:
+    return escape(str(value).replace("T", " ").rstrip("Z")[:16])
+
+
+def _onboard_link(reference: str) -> str:
+    return "<a class='co' href='" + escape(_co_page_href(reference)) + "'>" + escape(reference) + "</a>"
+
+
+def render_prod_approvals() -> str:
+    """``/prod/approvals``: the 7-day create approvals and the 4-hour summary approvals, read-only and labelled apart."""
+    now, published = production_now(), _state_not_published()
+    create = production_views.list_approvals(PRODUCTION_APPROVAL_PATH, now, missing_is_unavailable=published)
+    summary = production_views.list_summary_approvals(REVIEW_APPROVAL_PATH, now, missing_is_unavailable=published)
+    create_rows = "".join(
+        "<tr><td><code>" + escape(item["approval_ref"]) + "</code></td><td>" + _onboard_link(item["co_reference"]) + "</td><td>"
+        + escape(ENGINE_LABELS.get(item["route"], item["route"])) + "</td><td>" + escape(item["issued_by"]) + "</td><td>"
+        + _stamp_words(item["issued_at"]) + "</td><td>" + _stamp_words(item["expires_at"]) + "</td><td>"
+        + _chip(*_APPROVAL_STATE_CHIPS[item["state"]]) + "</td></tr>" for item in create["items"])
+    summary_rows = "".join(
+        "<tr><td>" + _onboard_link(item["co_reference"]) + "</td><td>" + escape(item["operator"]) + "</td><td>"
+        + escape(ENGINE_LABELS.get(item["route"], item["route"])) + "</td><td>" + _stamp_words(item["approved_at"]) + "</td><td>"
+        + _stamp_words(item["expires_at"]) + "</td><td>" + _chip(*_APPROVAL_STATE_CHIPS[item["state"]]) + "</td></tr>"
+        for item in summary["items"])
+    page = ("<div class='page-head'><h1>Approvals</h1>" + _lock_chip() + "</div>" + _clone_strip()
+            + "<p class='note'>Read-only. A summary approval (4 hours, one use) records that one CO summary was reviewed. A create "
+              "approval (7 days, one use) is a separate record issued outside this page; only it can be consumed by a production "
+              "create.</p>"
+            "<section class='card tbl-card'><div class='card-head'><h2 class='pill'>Create approvals (7 days, one use)</h2></div>"
+            + _approval_table(create, ("Approval", "CO", "Route", "Issued by", "Issued", "Expires", "Status"), create_rows,
+                              "Create approvals", "create approval") + "</section>"
+            "<section class='card tbl-card'><div class='card-head'><h2 class='pill'>Summary approvals (4 hours)</h2></div>"
+            + _approval_table(summary, ("CO", "Approved by", "Route", "Approved", "Expires", "Status"), summary_rows,
+                              "Summary approvals", "summary approval") + "</section>")
+    return _app_shell("Approvals", page, active="prod_approvals", wide=True)
 
 
 # Dashboard login (2026-10-03, owner decision): the operator's Salesforce SSO.
@@ -7531,7 +7993,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
-            if path == "/":
+            if path in ("/", "/onboard"):
+                query = parse_qs(parsed.query)
+                html = render_onboard_queue(query.get("filter", [""])[0], query.get("sort", [""])[0], query.get("dir", [""])[0])
+                record_timing("page_build", "production_queue", started, True)
+                self.send_page(HTTPStatus.OK, html); return
+            if path == "/dev":
                 selected_queue = parse_qs(parsed.query).get("queue", [""])[0]
                 scan_started = parse_qs(parsed.query).get("scan", [""])[0] == "started"
                 html = render_dashboard(
@@ -7558,6 +8025,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.send_page(HTTPStatus.OK, page)
                 return
+            if path == "/prod/approvals":
+                self.send_page(HTTPStatus.OK, render_prod_approvals()); return
             if path == "/prod":
                 self.send_page(HTTPStatus.OK, render_prod_readiness(params.get("filter", [""])[0],
                                                                     params.get("all", [""])[0] == "1")); return
@@ -7580,13 +8049,15 @@ class Handler(BaseHTTPRequestHandler):
                 except RunnerStateUnavailable:
                     state = None
                 self.send_page(HTTPStatus.OK, page_ce_only_runner_status(state, ref)); return
-            if path == "/onboard":
-                self.send_page(HTTPStatus.OK, render_onboard_queue()); return
             review = re.fullmatch(r"/onboard/(CO-[0-9]{4,10})", path)
             if review:
                 review_summary, review_extras = build_review_summary(review.group(1))
+                try:
+                    review_row: dict[str, str | None] | None = detail_row(review.group(1))
+                except ReadUnavailable:
+                    review_row = None  # the Account UUID check then shows as not verified
                 self.send_page(HTTPStatus.OK, page_onboard_review(review_summary, review_extras,
-                                                                  parse_qs(parsed.query).get("notice", [""])[0])); return
+                                                                  parse_qs(parsed.query).get("notice", [""])[0], row=review_row)); return
             match = re.fullmatch(r"/co/(CO-[0-9]{4,10})", path)
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
@@ -7810,7 +8281,7 @@ class Handler(BaseHTTPRequestHandler):
             if not start_attended_validation_all():
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Validation unavailable</title><p>The read-only validation could not be started on this desktop.</p>")
                 return
-            self.send_redirect("/?queue=scanning&scan=started")
+            self.send_redirect("/dev?queue=scanning&scan=started")
             return
         if path == "/attended/inventory-refresh":
             # Read-only export + validation sweep: no CO reference, no Leonardo or Salesforce write.
@@ -7830,7 +8301,7 @@ class Handler(BaseHTTPRequestHandler):
             if not start_attended_scan_status_all():
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, "<!doctype html><title>Scan status unavailable</title><p>The read-only scan-status sweep could not be started on this desktop.</p>")
                 return
-            self.send_redirect("/?queue=scanning&scan=started")
+            self.send_redirect("/dev?queue=scanning&scan=started")
             return
         form = post_form(self)
         reference = exact_form_value(form, "reference")

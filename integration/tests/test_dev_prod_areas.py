@@ -136,28 +136,30 @@ def forms(page):
 
 
 class NavigationTests(unittest.TestCase):
-    ORDER = [("/onboard", "Onboardings"), ("/", "Onboardings"), ("/dev/onboarded", "Onboarded on Dev"), ("/history", "History"), ("/inventory", "Tenants"),
-             ("/prod", "Readiness"), ("/prod/matches", "Matches"), ("/prod/tenants", "Tenants"), ("/connection", "Sessions")]
+    # Production-first order (owner decision 2026-10-16, docs/46): the Dev group moved last and collapsed, History and
+    # Approvals joined Production, Readiness and Matches left the menu. The full contract is in test_production_first_dashboard.
+    ORDER = [("/", "Onboarding"), ("/prod/tenants", "Tenants"), ("/history", "History"), ("/prod/approvals", "Approvals"),
+             ("/connection", "Sessions"), ("/dev", "Onboardings"), ("/dev/onboarded", "Onboarded on Dev"), ("/inventory", "Dev tenants")]
 
     def test_groups_labels_and_order(self):
-        shell = dashboard._app_shell("t", "", active="onboardings")
+        shell = dashboard._app_shell("t", "", active="prod_onboarding")
         aside = shell[shell.index("<aside"):shell.index("</aside>")]
         links = re.findall(r"<a href='([^']+)'(?: class='active')?>([^<]+)</a>", aside)
         self.assertEqual(links, self.ORDER)
         heads = re.findall(r"<div class='navhead'>(.*?)</div>", aside)
-        self.assertEqual([re.sub(r"<[^>]+>", "", head) for head in heads],
-                         ["ONBOARDINGproduction-checked", "DEV · LEONARDO", "PRODUCTION · BOread-only", "TOOLS"])
+        self.assertEqual([re.sub(r"<[^>]+>", "", head) for head in heads], ["PRODUCTIONread-only", "TOOLS"])
         self.assertIn("<span class='ro'>read-only</span>", aside)
-        self.assertLess(aside.index("navgroup dev"), aside.index("navgroup prod"))
+        self.assertIn("<summary>DEV - LEONARDO</summary>", aside)
         self.assertLess(aside.index("navgroup prod"), aside.index("navgroup tools"))
+        self.assertLess(aside.index("navgroup tools"), aside.index("navgroup dev"))
         for icon in ("<svg", "<img", "&#x1f", "emoji"):
             self.assertNotIn(icon, aside)
         self.assertIn(".navgroup.dev a::before{background", dashboard.PENTERA_CSS)  # solid dot
         self.assertIn(".navgroup.prod a::before{background:transparent", dashboard.PENTERA_CSS)  # hollow dot
 
     def test_each_page_has_exactly_one_active_link_and_the_right_environment(self):
-        expected = {"onboardings": "dev", "dev_onboarded": "dev", "history": "dev", "inventory": "dev", "prod": "prod",
-                    "prod_matches": "prod", "prod_tenants": "prod", "connection": "tools"}
+        expected = {"onboardings": "dev", "dev_onboarded": "dev", "inventory": "dev", "history": "prod",
+                    "prod_tenants": "prod", "prod_onboarding": "prod", "prod_approvals": "prod", "connection": "tools"}
         pills = {"dev": "DEV · Leonardo", "prod": "PRODUCTION · read-only", "tools": "TOOLS"}
         for active, env in expected.items():
             shell = dashboard._app_shell("t", "<p>body</p>", active=active)
@@ -186,7 +188,7 @@ class NavigationTests(unittest.TestCase):
             self.assertIn("envpill prod", dashboard.render_prod_matches())
             self.assertIn("envpill dev", dashboard.render_inventory(env="dev"))
             self.assertIn("envpill prod", dashboard.render_inventory(env="prod-clone"))
-            self.assertIn("envpill dev", dashboard.page_history(None, failed=True))
+            self.assertIn("envpill prod", dashboard.page_history(None, failed=True))  # History moved under Production
             self.assertIn("envpill dev", dashboard.page_queue(ROWS))
 
     def test_co_page_dev_and_production_views_have_their_pill_bar_and_segmented_control(self):

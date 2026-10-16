@@ -76,7 +76,7 @@ class ServerCase(unittest.TestCase):
 
 class ProxyIdentityTests(ServerCase):
     def setUp(self):
-        patcher = patch.object(dashboard, "render_dashboard", return_value="<html>QUEUE-OK</html>")
+        patcher = patch.object(dashboard, "render_onboard_queue", return_value="<html>QUEUE-OK</html>")
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -276,7 +276,7 @@ class ProxySecretTests(ServerCase):
     """docs/40 step 0 follow-up 1: a shared secret on top of the loopback check."""
 
     def setUp(self):
-        patcher = patch.object(dashboard, "render_dashboard", return_value="<html>QUEUE-OK</html>")
+        patcher = patch.object(dashboard, "render_onboard_queue", return_value="<html>QUEUE-OK</html>")
         patcher.start()
         self.addCleanup(patcher.stop)
 

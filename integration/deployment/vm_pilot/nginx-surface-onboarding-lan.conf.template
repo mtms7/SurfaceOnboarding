@@ -1,0 +1,90 @@
+# REVIEW ARTIFACT - not installed; installed by _step16b_vm_lan_site.sh after owner approval.
+# INTERIM internal-network (VPN) site WITHOUT OneLogin: https://172.26.37.20:8443/ for named people only.
+# Install path: /etc/nginx/sites-available/surface-onboarding-lan.conf (symlink in sites-enabled).
+#
+# Request path:  browser on the VPN --https--> VM 172.26.37.20:8443 (this site) --> dashboard 127.0.0.1:8000
+# The existing loopback tunnel site (surface-onboarding-tunnel.conf, 127.0.0.1:8443) is NOT changed and keeps working.
+#
+# CONTROLS (all must pass): (1) the client address must be in lan-allow.conf (network check, see LIMITS);
+# (2) HTTP basic auth against /etc/nginx/surface-onboarding/htpasswd (bcrypt, one entry per person, username = email);
+# (3) the dashboard still checks the email against users.txt and applies the viewer/operator role; an email missing
+# from users.txt is refused by the dashboard (fail closed) even with a valid password.
+#
+# LIMITS (also in the plan): a VPN that NATs everyone to one address (the VM saw 10.213.213.1) makes the network check
+# admit everyone behind that gateway; basic auth is then the real control. Basic auth over the pilot self-signed
+# certificate is weaker than OneLogin with MFA. Brute-force throttling is per client address (shared behind NAT), so
+# passwords must be long (the helper enforces 14+ characters). Never add a non-VPN allow range without SecOps.
+
+limit_req_zone $binary_remote_addr zone=surface_onboarding_lan:2m rate=10r/s;
+
+server {
+    # The VM's own address only: not a wildcard, no port 80. Replaced at install time if the address differs.
+    listen 172.26.37.20:8443 ssl;
+    server_name 172.26.37.20;
+
+    server_tokens off;
+
+    # Same shared-secret include as the tunnel site (root-owned, outside the repository).
+    include /etc/nginx/surface-onboarding-proxy-secret.conf;
+
+    # Written by the install script: `allow <cidr>;` lines, then `deny all;`.
+    include /etc/nginx/surface-onboarding/lan-allow.conf;
+
+    auth_basic "Surface onboarding";
+    auth_basic_user_file /etc/nginx/surface-onboarding/htpasswd;
+
+    ssl_certificate     /etc/nginx/surface-onboarding/tls/surface-onboarding.crt;
+    ssl_certificate_key /etc/nginx/surface-onboarding/tls/surface-onboarding.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 10m;
+    ssl_session_tickets off;
+
+    proxy_hide_header X-Powered-By;
+    proxy_hide_header X-Frame-Options;
+    proxy_hide_header X-Content-Type-Options;
+    proxy_hide_header Referrer-Policy;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "same-origin" always;
+    add_header Cross-Origin-Opener-Policy "same-origin" always;
+    add_header Cross-Origin-Resource-Policy "same-origin" always;
+    add_header Cache-Control "no-store" always;
+
+    client_max_body_size 64k;
+    limit_req zone=surface_onboarding_lan burst=40 nodelay;
+
+    if ($request_method !~ ^(GET|HEAD|POST)$) {
+        return 405;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+
+        # Strip every client-supplied identity / role / forwarding header first.
+        proxy_set_header X-Forwarded-User         "";
+        proxy_set_header X-Forwarded-Groups       "";
+        proxy_set_header X-Forwarded-Preferred-Username "";
+        proxy_set_header X-Auth-Request-Email     "";
+        proxy_set_header X-Auth-Request-User      "";
+        proxy_set_header X-Auth-Request-Groups    "";
+        proxy_set_header X-Surface-Role           "";
+
+        # The person who passed basic auth (an email address; the helper enforces that). Never client-supplied.
+        proxy_set_header X-Forwarded-Email        $remote_user;
+
+        proxy_set_header X-Surface-Proxy-Secret   $surface_proxy_secret;
+
+        # The dashboard accepts exactly one public host:port (SURFACE_ONBOARDING_PUBLIC_ORIGIN, today https://localhost:8443).
+        # nginx presents that fixed value, so the dashboard unit does not change and is not restarted.
+        proxy_set_header Host              "localhost:8443";
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+
+        proxy_http_version 1.1;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout    120s;
+        proxy_redirect off;
+    }
+}

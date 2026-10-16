@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Production onboardings (mockup)</title>
+<style>
+:root{--nav:#0f1626;--nav-active:#283043;--canvas:#f4f5f7;--card:#fff;--line:#e5e7eb;--text:#2e3440;--muted:#6b7280;--heading:#4b5563;--primary:#1f7ae0;--primary-dark:#1664c0;--ok-bg:#d9f7be;--ok:#237804;--bad-bg:#ffd6d6;--bad:#b42318;--warn-bg:#fff1b8;--warn:#9a5b00;--info-bg:#dbe7ff;--info:#1d4ed8;--pill:#f0f1f3;--env-dev:#1e3a8a;--env-dev-line:#6f8fdc;--env-prod:var(--warn);--env-prod-bg:var(--warn-bg)}
+*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+.shell{display:flex;min-height:100vh}
+.side{flex:0 0 190px;background:var(--nav);color:#fff;padding:22px 14px;display:flex;flex-direction:column;gap:6px}
+.brand{font:800 26px/1 'Arial Black','Segoe UI Black',sans-serif;letter-spacing:.5px;background:#fff;color:var(--nav);padding:4px 6px;display:inline-block;margin:0 0 4px 4px;align-self:flex-start}
+.brand-sub{color:#aeb6c4;font-size:12px;margin:0 0 22px 6px}
+.side a{color:#e5e9f0;text-decoration:none;padding:10px;border-radius:6px;font:600 15px/1.2 'Barlow Condensed','Oswald','Arial Narrow','Segoe UI',sans-serif;font-stretch:condensed}
+.side a:hover,.side a.active{background:var(--nav-active);color:#fff}
+.side-foot{margin-top:auto;color:#8b94a5;font-size:11px;padding:0 8px}
+main{flex:1;min-width:0;max-width:1100px;padding:28px 36px 48px}
+a{color:var(--primary-dark);text-decoration:none;font-weight:600}a:hover{text-decoration:underline}
+a:focus-visible,button:focus-visible,summary:focus-visible,input:focus-visible{outline:2px solid var(--primary);outline-offset:2px;border-radius:6px}.side a:focus-visible,.side summary:focus-visible{outline-color:#fff}
+.crumb{font-size:13px}
+.page-head{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:10px 0 16px}
+h1{margin:0;font-size:24px}h2{margin:0;font-size:15px;color:var(--heading)}
+.acct{color:var(--muted);font-size:15px;font-weight:600}
+.chip{display:inline-block;padding:2px 9px;border-radius:5px;font-size:12px;font-weight:700;white-space:nowrap}
+.chip-ok{background:var(--ok-bg);color:var(--ok)}.chip-bad{background:var(--bad-bg);color:var(--bad)}.chip-warn{background:var(--warn-bg);color:var(--warn)}.chip-info{background:var(--info-bg);color:var(--info)}.chip-neutral{background:var(--pill);color:var(--heading)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:0 0 16px;box-shadow:0 1px 2px #1018280a}
+.card-head{display:flex;align-items:center;gap:12px;margin:0 0 12px}.card-head .chip{margin-left:auto}
+.tbl-card{padding:0;overflow:hidden}
+.note{color:var(--muted);font-size:12.5px;margin:4px 0 0}
+.envbar{position:fixed;top:0;left:0;right:0;height:3px;z-index:5;background:var(--env-prod)}
+.envrow{margin:-8px 0 6px;padding:4px 0}
+.envpill{display:inline-block;padding:3px 12px;border-radius:999px;font:800 12px/1.4 -apple-system,'Segoe UI',sans-serif;letter-spacing:.4px;background:var(--env-prod-bg);color:var(--env-prod);border:1px solid var(--env-prod)}
+.navgroup{display:flex;flex-direction:column;gap:2px;margin:0 0 12px}
+.navhead{font:800 11px/1.3 -apple-system,'Segoe UI',sans-serif;letter-spacing:.6px;color:#aeb6c4;margin:2px 8px 4px}
+.navgroup.prod .navhead{color:var(--env-prod);background:var(--env-prod-bg);border-radius:5px;padding:3px 8px;margin:2px 0 4px}
+.navgroup a::before{content:'';display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:9px;vertical-align:1px;border:2px solid #8b94a5}
+.navgroup.prod a::before{background:transparent;border-color:var(--env-prod-bg)}
+details.navgroup.dev>summary{cursor:pointer;list-style:none;color:#fff;background:var(--env-dev);border:1px solid var(--env-dev-line);border-radius:5px;padding:3px 8px;font:800 11px/1.3 -apple-system,'Segoe UI',sans-serif;letter-spacing:.6px}
+details.navgroup.dev>summary::-webkit-details-marker{display:none}
+details.navgroup.dev>summary::after{content:' \25B8';float:right}details.navgroup.dev[open]>summary::after{content:' \25BE'}
+details.navgroup.dev a::before{background:var(--env-dev-line);border-color:var(--env-dev-line)}
+details.navgroup.dev[open]>a:first-of-type{margin-top:4px}
+.fbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:0 0 14px}
+.fgroup{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.fchip{padding:5px 11px;font-size:12.5px;font-weight:600;color:var(--heading);background:#fff;border-right:1px solid var(--line)}.fchip:last-child{border-right:0}.fchip.on{background:var(--info-bg);color:var(--info)}.fchip b{color:var(--text)}
+.strip{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 14px}
+.tbl-wrap{overflow:auto}
+.dense{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}
+.dense th{background:#f9fafb;color:var(--muted);font-size:12px;font-weight:600;padding:8px 10px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--line)}
+.dense td{padding:8px 10px;vertical-align:top;border-bottom:1px solid var(--line)}
+.dense .stick{position:sticky;left:0;background:var(--card);border-right:1px solid var(--line)}.dense th.stick{background:#f9fafb}
+.dense tbody tr:hover td{background:#f8fafc}.dense tr.is-ready td{background:#f6fdf0}.dense tr.is-ready td:first-child{box-shadow:inset 3px 0 0 var(--ok)}
+.dense .co{display:block;font-weight:700}.sub{display:block;color:var(--muted);font-size:12px}
+.btn{display:inline-block;background:var(--primary);color:#fff;border-radius:6px;padding:4px 12px;font-weight:600}.btn:hover{background:var(--primary-dark);color:#fff;text-decoration:none}
+.btn.ghost{background:#fff;color:var(--primary);border:1px solid var(--primary)}
+.banner{background:var(--info-bg);border-radius:6px;padding:10px 14px;margin:0 0 14px}.banner-warn{background:var(--warn-bg);color:var(--warn)}
+.blockers{list-style:none;margin:0 0 12px;padding:0;display:grid;gap:6px}.blockers li{background:#fff3f2;border-radius:6px;padding:8px 12px}
+dl.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px 24px;margin:0}dl.kv>div{min-width:0}
+dl.kv dt{font-size:12px;color:var(--muted)}dl.kv dd{margin:0;font-weight:600;font-size:13.5px;overflow-wrap:anywhere}
+.checks{list-style:none;margin:0;padding:0}.checks li{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid var(--line)}.checks li:last-child{border-bottom:0}
+.checks .what{flex:1}.checks .what small{display:block;color:var(--muted);font-size:12px}.checks .chip{flex:none}
+.steps{list-style:none;margin:0 0 12px;padding:0;display:flex;gap:0}
+.st{flex:1 1 0;min-width:0;position:relative;display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center;font-size:12.5px;color:var(--muted)}
+.st::before{content:'';position:absolute;top:13px;left:-50%;width:100%;height:2px;background:var(--line)}.st:first-child::before{display:none}.st.done::before{background:var(--ok)}
+.dot{position:relative;z-index:1;width:28px;height:28px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:13px;background:var(--pill);color:var(--muted);border:2px solid var(--line)}
+.st.done .dot{background:var(--ok);border-color:var(--ok);color:#fff}.st.current .dot{background:#fff;border-color:var(--primary);color:var(--primary-dark)}.st.current{color:var(--text);font-weight:700}
+button{font:inherit;font-weight:600;border-radius:6px;cursor:pointer;padding:8px 16px;border:1px solid var(--primary);background:var(--primary);color:#fff}button:hover{background:var(--primary-dark)}
+button.ghost{background:#fff;color:var(--primary)}button.ghost:hover{background:#f3f7fe}
+.confirm{display:grid;gap:8px;padding:12px 14px;background:var(--canvas);border-radius:8px;margin:10px 0}.confirm label{display:flex;gap:8px;align-items:flex-start}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:10px 0 0}
+.locked{opacity:.75}
+code{font:12px/1.4 Consolas,'SFMono-Regular',monospace;background:var(--pill);padding:1px 5px;border-radius:4px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.mock{background:var(--pill);color:var(--heading);font-size:12px;padding:6px 10px;border-radius:6px;margin:0 0 14px}
+.view{display:none}#queue{display:block}
+body:has(#detail-open:target) #queue,body:has(#detail-locked:target) #queue{display:none}
+.view:target{display:block}
+@media(max-width:760px){.shell{display:block}.side{flex-direction:row;flex-wrap:wrap;align-items:center;padding:12px}.brand-sub,.side-foot{display:none}.navgroup{flex-direction:row;flex-wrap:wrap;margin:0 8px 0 0}.navhead{display:none}main{padding:18px 16px}.steps{flex-direction:column;gap:8px}.st{flex-direction:row;text-align:left}.st::before{display:none}.checks li{flex-wrap:wrap}.opt{display:none}}
+</style></head>
+<body>
+<div class="envbar" aria-hidden="true"></div>
+<div class="shell">
+<aside class="side" aria-label="Sections">
+<span class="brand">PENTERA.</span><div class="brand-sub">Surface Onboarding</div>
+<nav aria-label="Main">
+<div class="navgroup prod"><div class="navhead">PRODUCTION · BO</div>
+<a href="#queue" class="active" aria-current="page">Production onboardings</a>
+<a href="#queue">Tenants</a><a href="#queue">History</a><a href="#queue">Approvals</a></div>
+<div class="navgroup tools"><div class="navhead">TOOLS</div><a href="#queue">Sessions</a></div>
+<details class="navgroup dev"><summary>LEONARDO DEVELOPMENT</summary>
+<a href="#queue">Onboardings</a><a href="#queue">Onboarded on Dev</a><a href="#queue">Dev tenants</a></details>
+</nav>
+<div class="side-foot">Attended · localhost only</div>
+</aside>
+<main>
+<div class="envrow"><span class="envpill">PRODUCTION · read-only</span></div>
+<p class="mock">Mockup, fake data. View:
+<a href="#queue">1 Queue</a> · <a href="#detail-open">2 CO detail, unlocked dry run</a> · <a href="#detail-locked">3 CO detail, locked</a></p>
+
+<!-- VIEW 1: queue -->
+<section id="queue" class="view" aria-labelledby="h-queue">
+<div class="page-head"><h1 id="h-queue">Production onboardings</h1><span class="chip chip-warn">Create locked</span></div>
+<div class="strip"><span class="chip chip-ok">Clone 2 h 10 min old (limit 6 h)</span><span class="chip chip-neutral">Source: Redash, personal data removed</span></div>
+<div class="fbar"><div class="fgroup" role="group" aria-label="Filter">
+<a class="fchip on" href="#queue">All <b>4</b></a><a class="fchip" href="#queue">Ready for dry run <b>1</b></a><a class="fchip" href="#queue">Blocked <b>2</b></a><a class="fchip" href="#queue">Approved <b>1</b></a><a class="fchip" href="#queue">Created <b>0</b></a></div></div>
+<section class="card tbl-card"><div class="tbl-wrap"><table class="dense">
+<caption class="sr">Open production onboardings</caption>
+<thead><tr><th scope="col" class="stick">CO</th><th scope="col">Account</th><th scope="col" class="opt">Product / type</th><th scope="col">Start</th><th scope="col">Production checks</th><th scope="col">Approval</th><th scope="col">Create</th><th scope="col">Next step</th></tr></thead>
+<tbody>
+<tr class="is-ready"><td class="stick"><a class="co" href="#detail-open">CO-9001</a></td><td>Example Foods</td><td class="opt">Credential Exposure<span class="sub">New</span></td><td>2026-05-21<span class="sub">window open</span></td><td><span class="chip chip-ok">Clear</span></td><td><span class="chip chip-ok">Valid to 10-23</span></td><td><span class="chip chip-neutral">Dry run ready</span></td><td><a href="#detail-open">Review</a></td></tr>
+<tr><td class="stick"><a class="co" href="#detail-locked">CO-9002</a></td><td>Sample Retail</td><td class="opt">Credential Exposure<span class="sub">New</span></td><td>2026-06-02<span class="sub">window open</span></td><td><span class="chip chip-ok">Clear</span></td><td><span class="chip chip-neutral">None</span></td><td><span class="chip chip-warn">Locked</span></td><td><a href="#detail-locked">Review</a></td></tr>
+<tr><td class="stick"><a class="co" href="#detail-locked">CO-9003</a></td><td>Demo Logistics</td><td class="opt">Credential Exposure<span class="sub">New</span></td><td>2026-11-20<span class="sub">window opens 11-18</span></td><td><span class="chip chip-bad">Duplicate name</span></td><td><span class="chip chip-neutral">None</span></td><td><span class="chip chip-neutral">Blocked</span></td><td><a href="#detail-locked">See blocker</a></td></tr>
+<tr><td class="stick"><span class="co">CO-9004</span></td><td>Test Energy</td><td class="opt">Surface<span class="sub">Renewal</span></td><td>2026-07-01</td><td><span class="chip chip-neutral">Not checked</span></td><td><span class="chip chip-neutral">None</span></td><td><span class="chip chip-neutral">No automated route</span></td><td>&mdash;</td></tr>
+</tbody></table></div></section>
+</section>
+
+<!-- VIEW 2: detail, unlocked dry run -->
+<section id="detail-open" class="view" aria-labelledby="h-open">
+<a class="crumb" href="#queue">&larr; Production onboardings</a>
+<div class="page-head"><h1 id="h-open">CO-9001</h1><span class="acct">Example Foods</span><span class="chip chip-info">Credential Exposure</span><span class="chip chip-ok">Checks clear</span><span class="chip chip-ok">Approved</span></div>
+<div class="banner">Runner unlocked for this CO: dry run available. Create needs your separate go.</div>
+
+<section class="card"><div class="card-head"><h2>Salesforce facts</h2></div>
+<dl class="kv"><div><dt>Product / type</dt><dd>Credential Exposure / New</dd></div><div><dt>Route</dt><dd>CE-only</dd></div><div><dt>Start date</dt><dd>2026-05-21</dd></div><div><dt>Tenant name</dt><dd>Example Foods</dd></div><div><dt>Domains</dt><dd>example-foods.test</dd></div><div><dt>Plan</dt><dd>CE, 1 year</dd></div><div><dt>Source revision</dt><dd><code>2026-10-16T08:00Z</code></dd></div><div><dt>Account UUID</dt><dd>empty</dd></div></dl></section>
+
+<section class="card"><div class="card-head"><h2>Production checks</h2><span class="chip chip-ok">All passed</span></div>
+<ul class="checks">
+<li><span class="what">Clone age<small>Captured 2026-10-16 09:50 UTC, 2 h 10 min ago. Rule: under 6 h.</small></span><span class="chip chip-ok">Fresh</span></li>
+<li><span class="what">Duplicate by name<small>0 of 1,204 production tenants</small></span><span class="chip chip-ok">None</span></li>
+<li><span class="what">Duplicate by domain<small>0 matches for example-foods.test</small></span><span class="chip chip-ok">None</span></li>
+<li><span class="what">Live paid tenants (exact name)<small>At most 1 allowed</small></span><span class="chip chip-ok">0</span></li>
+<li><span class="what">Timing window<small>Start minus 2 days has passed</small></span><span class="chip chip-ok">Open</span></li>
+<li><span class="what">Email domain<small>Exactly one valid domain</small></span><span class="chip chip-ok">1</span></li></ul>
+<p class="note">A missing match is never a clearance.</p></section>
+
+<section class="card"><div class="card-head"><h2>Approval</h2><span class="chip chip-ok">Valid</span></div>
+<dl class="kv"><div><dt>Reference</dt><dd><code>PROD-CE-9001-20261016</code></dd></div><div><dt>Scope</dt><dd>One CO, CE-only</dd></div><div><dt>Issued by</dt><dd>Owner</dd></div><div><dt>Expires</dt><dd>2026-10-23 (7 days)</dd></div><div><dt>Consumed</dt><dd>No</dd></div></dl>
+<p class="note">Bound to this exact summary and revision. Used once by the create.</p></section>
+
+<section class="card"><div class="card-head"><h2>Create</h2><span class="chip chip-info">Dry run next</span></div>
+<ol class="steps"><li class="st current"><span class="dot">1</span>Dry run</li><li class="st"><span class="dot">2</span>Owner go</li><li class="st"><span class="dot">3</span>Submit</li><li class="st"><span class="dot">4</span>Readback</li></ol>
+<div class="row"><button type="button" class="ghost">Run dry run (no Confirm)</button></div>
+<form class="confirm" onsubmit="return false"><label><input type="checkbox" id="go" disabled> <span>I confirm one production tenant for this CO. Available after a passed dry run.</span></label>
+<div><button type="button" disabled>Create in production</button></div></form>
+<p class="note">Never re-click Create after an uncertain submit.</p></section>
+
+<section class="card"><div class="card-head"><h2>D2 record</h2><span class="chip chip-neutral">Not created yet</span></div>
+<p class="note">After a create, a redacted local record is linked here: tenant name, account id, UUID, domains, plan, key form fields. No secrets. A wrong create is fixed by owner edit in BO; a delete path is unknown.</p></section>
+
+<section class="card locked"><div class="card-head"><h2>UUID writeback to Salesforce</h2><span class="chip chip-neutral">Waiting for verified create</span></div>
+<p class="note">Separate go. Field <code>Account_UUID__c</code> only, must be empty or equal, revision unchanged, read-after-write in Salesforce.</p></section>
+</section>
+
+<!-- VIEW 3: detail, locked -->
+<section id="detail-locked" class="view" aria-labelledby="h-locked">
+<a class="crumb" href="#queue">&larr; Production onboardings</a>
+<div class="page-head"><h1 id="h-locked">CO-9003</h1><span class="acct">Demo Logistics</span><span class="chip chip-info">Credential Exposure</span><span class="chip chip-bad">Blocked</span><span class="chip chip-warn">Create locked</span></div>
+<div class="banner banner-warn" role="status"><strong>Production create is locked.</strong> Review and dry run only. No create control is shown until the owner unlocks the runner.</div>
+<ul class="blockers"><li>Duplicate name: 1 production tenant already named "Demo Logistics" (live, paid). Owner decision: confirm it is the same customer or correct the CO in Salesforce.</li><li>Timing window opens 2026-11-18.</li></ul>
+
+<section class="card"><div class="card-head"><h2>Salesforce facts</h2></div>
+<dl class="kv"><div><dt>Product / type</dt><dd>Credential Exposure / New</dd></div><div><dt>Route</dt><dd>CE-only</dd></div><div><dt>Start date</dt><dd>2026-11-20</dd></div><div><dt>Tenant name</dt><dd>Demo Logistics</dd></div><div><dt>Domains</dt><dd>demo-logistics.test</dd></div><div><dt>Source revision</dt><dd><code>2026-10-16T08:00Z</code></dd></div></dl></section>
+
+<section class="card"><div class="card-head"><h2>Production checks</h2><span class="chip chip-bad">2 blocked</span></div>
+<ul class="checks">
+<li><span class="what">Clone age<small>2 h 10 min ago. Rule: under 6 h.</small></span><span class="chip chip-ok">Fresh</span></li>
+<li><span class="what">Duplicate by name<small>Demo Logistics, live, paid</small></span><span class="chip chip-bad">1 match</span></li>
+<li><span class="what">Duplicate by domain<small>0 matches</small></span><span class="chip chip-ok">None</span></li>
+<li><span class="what">Live paid tenants (exact name)<small>At most 1 allowed</small></span><span class="chip chip-warn">1</span></li>
+<li><span class="what">Timing window<small>Opens 2026-11-18</small></span><span class="chip chip-bad">Closed</span></li></ul></section>
+
+<section class="card locked"><div class="card-head"><h2>Approval</h2><span class="chip chip-neutral">Not available</span></div>
+<p class="note">Cannot be approved while blocked. Earlier approvals show as expired, used or changed here, never as valid.</p></section>
+
+<section class="card locked"><div class="card-head"><h2>Create</h2><span class="chip chip-warn">Locked</span></div>
+<ol class="steps"><li class="st"><span class="dot">1</span>Dry run</li><li class="st"><span class="dot">2</span>Owner go</li><li class="st"><span class="dot">3</span>Submit</li><li class="st"><span class="dot">4</span>Readback</li></ol>
+<p class="note">The runner is not supported in this build. There is no create button on this page.</p></section>
+
+<section class="card locked"><div class="card-head"><h2>D2 record and UUID writeback</h2><span class="chip chip-neutral">Locked</span></div>
+<p class="note">Both stay empty until a verified create exists and the owner gives a separate go.</p></section>
+</section>
+
+</main></div></body></html>
