@@ -16,7 +16,8 @@ import tarfile
 
 MAX_ARCHIVE_BYTES = 5 * 1024 * 1024
 MAX_MEMBER_BYTES = 1024 * 1024
-MAX_UNPACKED_BYTES = 5 * 1024 * 1024
+# Raised 2026-10-16 from 5 MiB (r31 unpacked at 5.3 MB); still bounds a decompression bomb. Archive and per-member caps unchanged.
+MAX_UNPACKED_BYTES = 8 * 1024 * 1024
 REQUIRED_MEMBERS = frozenset({
     "integration/onboarding/__init__.py",
     "integration/onboarding/dashboard_view.py",

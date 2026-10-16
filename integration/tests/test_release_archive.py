@@ -34,6 +34,17 @@ class ReleaseArchiveTests(unittest.TestCase):
             )
             self.assertEqual(check_release_archive(archive, sidecar), 0)
 
+    def test_unpacked_size_cap_is_enforced_and_allows_a_release_of_the_current_size(self):
+        from tools.check_release_archive import MAX_UNPACKED_BYTES
+        self.assertGreaterEqual(MAX_UNPACKED_BYTES, 8 * 1024 * 1024)
+        with TemporaryDirectory() as temp:
+            members = {name: b"safe" for name in REQUIRED_MEMBERS}
+            chunk = b"0" * (900 * 1024)  # compresses to almost nothing; each member stays under the per-member cap
+            for index in range(MAX_UNPACKED_BYTES // len(chunk) + 2):
+                members[f"integration/filler/part{index}.txt"] = chunk
+            archive, sidecar = self._write_archive(Path(temp), members)
+            self.assertEqual(check_release_archive(archive, sidecar), 1)
+
     def test_checksum_and_required_members_fail_closed(self):
         with TemporaryDirectory() as temp:
             archive, sidecar = self._write_archive(Path(temp), {"integration/onboarding/__init__.py": b"safe"})
