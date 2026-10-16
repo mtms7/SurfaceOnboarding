@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import tempfile
+import os
 import unittest
 from unittest import mock
 
@@ -495,13 +496,27 @@ class RunnerWiringTests(unittest.TestCase):
             runner.resolve_run_target("staging")
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
 
+    @unittest.skipUnless(os.name == "nt", "the persisted probe profile exists only on the Windows operator desktop")
     def test_probe_profile_is_separate_from_dev_and_ignores_dev_override(self):
         with mock.patch.dict("os.environ", {"SURFACE_LEONARDO_PROFILE_DIR": str(self.base / "dev"),
-                                            "LOCALAPPDATA": str(self.base)}), mock.patch.object(runner.os, "name", "nt"):
+                                            "LOCALAPPDATA": str(self.base)}):
             profile, persist = runner.leonardo_profile(probe.probe_target())
         self.assertTrue(persist)
         self.assertEqual(profile.name, "backoffice-production-automation")
         self.assertNotEqual(profile, self.base / "dev")
+
+    def test_probe_profile_off_windows_is_temporary_and_never_persisted(self):
+        # No production session is ever retained off the operator desktop (same rule as the Dev profile).
+        env = {k: v for k, v in os.environ.items() if k not in ("SURFACE_LEONARDO_PROFILE_DIR", "LOCALAPPDATA")}
+        with mock.patch.dict("os.environ", env, clear=True), mock.patch.object(runner.os, "name", "posix"):
+            profile, persist = runner.leonardo_profile(probe.probe_target())
+        try:
+            self.assertFalse(persist)
+            self.assertNotEqual(profile.name, "backoffice-production-automation")
+            self.assertNotEqual(profile, self.base / "dev")
+        finally:
+            import shutil
+            shutil.rmtree(profile, ignore_errors=True)
 
     def test_cdp_open_tab_accepts_only_the_targets_origin(self):
         with mock.patch.object(runner, "_cdp_json", return_value={"id": "ABC-123"}) as cdp:
