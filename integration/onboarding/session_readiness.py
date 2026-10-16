@@ -62,14 +62,16 @@ ENVIRONMENTS: dict[str, SessionEnvironment] = {
 # runner is a separate, reviewed change. Until then production stays locked
 # whatever the configuration says.
 PRODUCTION_RUNNER_SUPPORTED = False
+# A SEPARATE hard-coded lock for the production CE-only DRY RUN (docs/42 section 6.2): the dry run opens the real
+# production form, types into it and cancels, never clicking Confirm. Owner decision 2026-10-16: no production run
+# until the owner says go, so this stays False until a separate, reviewed change after that go. It never unlocks the
+# create: `production_unlock_problem` and `production_target` ignore it, and the dry-run target ignores
+# PRODUCTION_RUNNER_SUPPORTED.
+PRODUCTION_DRY_RUN_SUPPORTED = False
 
 
-def production_unlock_problem(environ: Mapping[str, str], now: datetime) -> str | None:
-    """Why production sessions stay locked, else None (flag + approval + runner support).
-
-    `now` must be timezone-aware. Being signed in to production never
-    authorises a write; creates and edits keep their own gates.
-    """
+def _production_session_problem(environ: Mapping[str, str], now: datetime) -> str | None:
+    """The shared unlock checks: flag, approval reference, timestamps, lifetime and expiry (no runner flag)."""
     if environ.get("SURFACE_ONBOARDING_PRODUCTION_SESSIONS") != "1":
         return "production_sessions_flag_missing"
     reference = environ.get("SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF", "")
@@ -84,8 +86,34 @@ def production_unlock_problem(environ: Mapping[str, str], now: datetime) -> str 
         return "production_approval_missing"
     if expires <= issued or expires - issued > MAX_APPROVAL_LIFETIME or not issued <= now < expires:
         return "production_approval_expired"
+    return None
+
+
+def production_unlock_problem(environ: Mapping[str, str], now: datetime) -> str | None:
+    """Why production sessions stay locked, else None (flag + approval + runner support).
+
+    `now` must be timezone-aware. Being signed in to production never
+    authorises a write; creates and edits keep their own gates.
+    """
+    problem = _production_session_problem(environ, now)
+    if problem is not None:
+        return problem
     if not PRODUCTION_RUNNER_SUPPORTED:
         return "production_runner_not_supported"
+    return None
+
+
+def production_dry_run_unlock_problem(environ: Mapping[str, str], now: datetime) -> str | None:
+    """Why the production DRY RUN stays locked, else None (same checks, but its own hard-coded flag).
+
+    The dry run fills and cancels the form; it never clicks Confirm and never consumes an approval. It is locked by
+    PRODUCTION_DRY_RUN_SUPPORTED (False) and is not opened by PRODUCTION_RUNNER_SUPPORTED.
+    """
+    problem = _production_session_problem(environ, now)
+    if problem is not None:
+        return problem
+    if PRODUCTION_DRY_RUN_SUPPORTED is not True:
+        return "production_dry_run_not_supported"
     return None
 
 

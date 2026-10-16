@@ -64,13 +64,19 @@ import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from integration.onboarding import run_progress  # noqa: E402
+from integration.onboarding import (  # noqa: E402
+    production_approval, production_create, production_create_record, production_dry_run, production_probe, run_progress)
+from integration.onboarding.run_target import (  # noqa: E402
+    ProductionLocked, RunTarget, development_target, production_dry_run_target, production_target)
 from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
 
 REFERENCE = re.compile(r"CO-[0-9]{4,10}$")
-DEVELOPMENT_LOGIN = "https://leonardo.dev.app.pentera.io/login"
-TENANT_MANAGEMENT = "https://leonardo.dev.app.pentera.io/backoffice/tenantManagement"
+# Origin, profile directory name and URLs come from a validated RunTarget (docs/42 section 3). The default target is
+# Leonardo Development, so every value below is exactly what it was when these were literals.
+DEV_TARGET = development_target()
 TENANT_MANAGEMENT_PATH = "/backoffice/tenantManagement"
+DEVELOPMENT_LOGIN = DEV_TARGET.origin + "/login"
+TENANT_MANAGEMENT = DEV_TARGET.origin + TENANT_MANAGEMENT_PATH
 MAX_WAIT_SECONDS = 15 * 60
 POLL_SECONDS = 5
 # Bounded window for the read-only session check: long enough for a valid
@@ -187,7 +193,7 @@ EMPTY_STATE_MESSAGES = frozenset({
 # Re-reads of an unclassifiable table after a search (1 s apart) so a
 # transient loading row can settle; a table that never settles fails closed.
 TABLE_SETTLE_RETRIES = 4
-DEVELOPMENT_ORIGIN = "https://leonardo.dev.app.pentera.io"
+DEVELOPMENT_ORIGIN = DEV_TARGET.origin
 # Add Account <select> controls by their stable name attribute (the live
 # selects have no associated <label>; 2026-09-29 diagnostics).
 SELECT_NAMES = {
@@ -2811,15 +2817,16 @@ def _cdp_page_urls(port: int, tab: "_AutomationTab | None" = None) -> list[str]:
     return [target["url"] for target in targets]
 
 
-def _cdp_open_tab(port: int, url: str) -> str | None:
+def _cdp_open_tab(port: int, url: str, origin: str = DEVELOPMENT_ORIGIN) -> str | None:
     """Open a new tab at url in the automation browser; return its target id.
 
     Uses the CDP HTTP endpoint (PUT /json/new, required since Chrome 111), so
     the tab exists before any Playwright attach and is tracked by target id.
-    Only the fixed Leonardo Development URLs, the anchor tab, or the local
+    Only URLs of the target's exact origin (Leonardo Development unless a
+    validated target says otherwise), the anchor tab, or the local
     dashboard's sign-in page are opened.
     """
-    if url != ANCHOR_TAB_URL and not url.startswith(DEVELOPMENT_ORIGIN + "/") and _dashboard_port(url) is None:
+    if url != ANCHOR_TAB_URL and not url.startswith(origin + "/") and _dashboard_port(url) is None:
         return None
     created = _cdp_json(port, "/json/new?" + url, method="PUT")
     if not isinstance(created, dict):
@@ -3043,7 +3050,7 @@ def _classify_leonardo_session(port: int, timeout_seconds: float, stable_polls: 
     return "expired" if saw_page else "unavailable"
 
 
-def leonardo_profile() -> tuple[Path, bool]:
+def leonardo_profile(target: RunTarget | None = None) -> tuple[Path, bool]:
     """Return (profile_dir, persist) for the attended Leonardo browser.
 
     On the operator desktop this is a dedicated, persisted automation profile
@@ -3055,13 +3062,21 @@ def leonardo_profile() -> tuple[Path, bool]:
     host, or when an override is not set, a fresh temporary profile is used and
     persist=False so no session is ever retained off the operator desktop.
     """
+    target = target or DEV_TARGET
+    if target.environment_key != DEV_TARGET.environment_key:
+        # A non-Development target (the read-only production probe) never uses the Dev override and never shares
+        # cookies with the Dev profile: its own directory name, persisted only on the Windows desktop.
+        if os.name != "nt":
+            return Path(tempfile.mkdtemp(prefix="attended_probe_chrome_")), False
+        base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+        return Path(base) / "SurfaceOnboarding" / target.profile_dir_name, True
     override = os.environ.get("SURFACE_LEONARDO_PROFILE_DIR")
     if override:
         return Path(override), True
     if os.name != "nt":
         return Path(tempfile.mkdtemp(prefix="attended_ce_chrome_")), False
     base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
-    return Path(base) / "SurfaceOnboarding" / "leonardo-automation", True
+    return Path(base) / "SurfaceOnboarding" / target.profile_dir_name, True
 
 
 @dataclass
@@ -3158,7 +3173,7 @@ def _launch_automation_chrome(executable: str, profile_dir: Path, persist: bool)
     return chrome_proc, None
 
 
-def _open_automation_tab(playwright: Any, url: str) -> _AutomationTab:
+def _open_automation_tab(playwright: Any, url: str, target: RunTarget | None = None) -> _AutomationTab:
     """Open a new tab at url in the (reused or freshly launched) automation browser.
 
     With the persisted desktop profile an already-running automation Chrome
@@ -3175,7 +3190,7 @@ def _open_automation_tab(playwright: Any, url: str) -> _AutomationTab:
     Raises RuntimeError with leonardo_profile_unavailable,
     browser_cdp_unavailable, or browser_tab_unavailable.
     """
-    profile_dir, persist = leonardo_profile()
+    profile_dir, persist = leonardo_profile() if target is None else leonardo_profile(target)
     try:
         profile_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -3190,7 +3205,7 @@ def _open_automation_tab(playwright: Any, url: str) -> _AutomationTab:
             if port is None:
                 raise RuntimeError("browser_cdp_unavailable")
         preexisting = frozenset(target["id"] for target in _cdp_page_targets(port) if target["id"])
-        target_id = _cdp_open_tab(port, url)
+        target_id = _cdp_open_tab(port, url) if target is None else _cdp_open_tab(port, url, target.origin)
         if target_id is None:
             raise RuntimeError("browser_tab_unavailable")
         return _AutomationTab(port=port, target_id=target_id, preexisting=preexisting,
@@ -8689,6 +8704,696 @@ def run_probe_tenant_details(reference: str) -> dict[str, Any]:
         _ACTIVE_RUN_LOG = None
 
 
+# --- Target resolution and the D4 read-only production probe (docs/42 section 6, docs/45 D4) ----------------------
+def resolve_run_target(env_name: str, environ: Any | None = None, now: datetime | None = None) -> RunTarget:
+    """The validated RunTarget for a run: Development by default; production only through production_target().
+
+    production_target() raises ProductionLocked while PRODUCTION_RUNNER_SUPPORTED is False, so no production write
+    target can be built today. The read-only probe does not use this: it has its own gate (production_probe).
+    """
+    if env_name == "dev":
+        return development_target()
+    if env_name == "prod":
+        return production_target(os.environ if environ is None else environ, now or datetime.now(timezone.utc))
+    raise ValueError("unknown_environment")
+
+
+# Labels / name attributes the Dev create contract relies on; the probe reports which ones production lacks.
+PROBE_DEV_LABELS = ("Company name", "Company primary domain", USER_EMAIL_DOMAINS_LABEL, "First name", "Last name",
+                    "Organization Email", LC_SCANNED_DOMAINS_LABEL, *CE_LICENSE_QUANTITIES, *SELECT_NAMES)
+PROBE_DEV_NAMES = ("mfaRequired", *ADVANCED_TOGGLES_OFF, "notificationsAllowed", "multipleUsersAllowed",
+                   "apiAccessAllowed", "phishingEnabled", "leakedCredentialsAllowed", "provisioningEnabled",
+                   "subDomainsNumberAllowed", *SELECT_NAMES.values(), *LICENSE_DATE_DATA_AM.values())
+_PROBE_LOGIN_WORDS = ("login", "signin", "sign-in", "sso", "auth", "mfa", "saml", "oauth", "logout")
+PROBE_STABLE_POLLS = 5
+
+
+def _probe_signed_in(url: str) -> bool:
+    """True when a page is on the exact production origin and not on a sign-in style path."""
+    path = production_probe.url_path(url).casefold()
+    return (production_probe.url_origin(url) == production_probe.PRODUCTION_ORIGIN
+            and not any(word in path for word in _PROBE_LOGIN_WORDS))
+
+
+def _probe_snapshot(page: Any) -> tuple[str, Any]:
+    """(path on the production origin or "", sign-in snapshot). Reads only; nothing is clicked or typed."""
+    try:
+        url = page.url
+        path = production_probe.url_path(url) if production_probe.url_origin(url) == production_probe.PRODUCTION_ORIGIN else ""
+        return path, page.evaluate(production_probe.AUTH_JS)
+    except Exception:
+        return "", None
+
+
+def _probe_wait_for_login(page: Any, timeout_seconds: float) -> bool:
+    """Wait (bounded, up to 15 min) on the visible page for the human to sign in: authenticated on 3 consecutive polls."""
+    return production_probe.wait_for_login(lambda: _probe_snapshot(page), timeout_seconds)
+
+
+def _probe_attach(playwright: Any, tab: _AutomationTab) -> tuple[Any, Any]:
+    """Attach over CDP and return this run's own tab (matched by target id) as the one page used for everything."""
+    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{tab.port}")
+    context = browser.contexts[0] if browser.contexts else browser.new_context()
+    target_id = tab.current_target_id()
+    matches = [page for page in context.pages
+               if target_id is not None and _page_target_id(context, page) == target_id]
+    if len(matches) != 1:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        raise RuntimeError("production_probe_page_unavailable")
+    return browser, matches[0]
+
+
+def _probe_report_base() -> Path:
+    return state_file(Path(__file__).resolve().parents[1] / "integration" / "production_probe_state.json").parent
+
+
+def _probe_line(result: str) -> str:
+    return json.dumps({"result": result, "production_write": "not_performed"}, separators=(",", ":"))
+
+
+def run_production_probe(environ: Any | None = None, now: datetime | None = None,
+                         wait_seconds: float = MAX_WAIT_SECONDS, report_base: Path | None = None) -> str:
+    """One attended, READ-ONLY BackOffice production probe (owner decision D4, 2026-10-16). Returns the printed line.
+
+    Gate: SURFACE_ONBOARDING_PRODUCTION_PROBE=1 and a valid SURFACE_ONBOARDING_PRODUCTION_PROBE_REF, plus the exact
+    production origin. It opens the dedicated profile backoffice-production-automation, waits for the human to sign
+    in with MFA (nothing is typed), then reads page titles, URL paths, create-form control metadata (nothing filled
+    or submitted), Search/Edit presence, and API call names. Every non-read request is aborted. It never builds a
+    production RunTarget and never calls the create path.
+    """
+    environ = os.environ if environ is None else environ
+    now = now or datetime.now(timezone.utc)
+    try:
+        reference = production_probe.probe_gate(environ)
+        target = production_probe.probe_target()
+        url = production_probe.start_url(target)
+    except production_probe.ProbeRefused as refused:
+        return _probe_line(refused.code)
+    except ValueError as error:
+        return _probe_line(str(error))
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        return _probe_line("playwright_runtime_unavailable")
+    collected: dict[str, Any] | None = None
+    result = "production_probe_complete"
+    with sync_playwright() as playwright:
+        try:
+            tab = _open_automation_tab(playwright, url, target)
+        except RuntimeError as error:
+            return _probe_line(str(error))
+        browser = None
+        try:
+            try:
+                browser, page = _probe_attach(playwright, tab)
+                # The same visible tab is navigated (a GET to the exact production origin) and used for everything.
+                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                page.bring_to_front()
+                print("Sign in with SSO and MFA in the window titled app.pentera.io; waiting up to 15 minutes", flush=True)
+                if not _probe_wait_for_login(page, wait_seconds)                         or not production_probe.is_authenticated(*_probe_snapshot(page)):
+                    result = "production_probe_login_timeout"
+                else:
+                    guard = production_probe.RequestGuard()
+                    guard.install(page)
+                    collected = production_probe.collect(page, guard, production_probe.ClickLog(),
+                                                         dev_labels=PROBE_DEV_LABELS, dev_names=PROBE_DEV_NAMES)
+            except production_probe.ProbeRefused as refused:
+                result = refused.code
+            except Exception:
+                result = "production_probe_page_unavailable"
+        finally:
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            _release_automation_tab(tab)
+            if tab.persist:  # end the loopback CDP exposure of the signed-in production session
+                _close_automation_browser_at(tab.profile_dir)
+    report = production_probe.build_report(reference, now, result, collected)
+    try:
+        path = production_probe.write_report(report_base or _probe_report_base(), report, now)
+    except (production_probe.ProbeRefused, OSError):
+        return _probe_line("production_probe_report_unavailable")
+    return production_probe.summary_line(report, path)
+
+
+# --- Production CE-only DRY RUN (docs/42 section 6.2, docs/48 section 5 step 5) ----------------------------------
+# Opens the real production Add Account form for ONE CE-only New CO, types the intended values, READS the advanced
+# controls, verifies every control by reading it back and Cancels. It never clicks Confirm/Submit/Save, has no create
+# path (click_confirm raises NotImplementedError) and writes only a redacted record (names and pass/fail).
+# Locked by PRODUCTION_DRY_RUN_SUPPORTED (False): while it is False there is no Salesforce read, no browser, no network.
+PDR_ENV_ISSUED = "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_ISSUED"
+PDR_ENV_EXPIRES = "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_EXPIRES"
+PDR_FORM_POLLS = 20
+PDR_FORM_POLL_MS = 250
+PDR_CLONE_MAX_AGE_FOREVER = timedelta(days=3650)  # the gate (production_create) enforces the 6 h limit itself
+PDR_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _pdr_line(result: str, **extra: Any) -> str:
+    return json.dumps({"result": result, **extra, "production_write": "not_performed",
+                       "salesforce_writeback": "not_performed"}, separators=(",", ":"))
+
+
+def _pdr_reason(value: object, default: str = "unexpected_error") -> str:
+    """A reason code from the fixed enum only; anything else (exception text included) is ``unexpected_error``."""
+    text = value.replace(":", "_") if isinstance(value, str) else ""
+    return production_dry_run.known_reason(text)
+
+
+def _pdr_records_parent() -> Path:
+    from integration.onboarding import state_paths
+
+    folder = state_paths.state_dir()
+    return folder if folder is not None else Path(__file__).resolve().parents[1]
+
+
+def _pdr_approval_path() -> Path:
+    return state_file(Path(__file__).resolve().parents[1] / "integration" / production_approval.STATE_FILE_NAME)
+
+
+def _pdr_page_get(page: Any, path: str) -> Any:
+    """One page-context GET (status and authority names only). Never reads a token, cookie or header."""
+    if not production_dry_run.fetch_allowed("GET", path):
+        raise RuntimeError("production_dry_run_fetch_not_allowed")
+    try:
+        reply = page.evaluate(production_dry_run.SESSION_GET_JS, path)
+    except Exception:
+        return {"status": 0}
+    return reply if isinstance(reply, dict) else {"status": 0}
+
+
+def _pdr_session_problem(page: Any) -> str | None:
+    """docs/48 section 1: GET getAuthorities and accountInfo from the page; fail closed unless both are 200."""
+    return production_dry_run.session_verdict(_pdr_page_get(page, production_dry_run.AUTHORITIES_PATH),
+                                              _pdr_page_get(page, production_dry_run.ACCOUNT_INFO_PATH))
+
+
+def _pdr_evaluate(page: Any, script: str, method: str, path: str, argument: Any) -> Any:
+    if not production_dry_run.fetch_allowed(method, path):
+        raise RuntimeError("production_dry_run_fetch_not_allowed")
+    try:
+        reply = page.evaluate(script, argument)
+    except Exception:
+        return {"status": 0}
+    return reply if isinstance(reply, dict) else {"status": 0}
+
+
+def _pdr_duplicate_problem(page: Any, tenant_name: str, domains: tuple[str, ...]) -> str | None:
+    """docs/48 section 2: name and domain searches through the page's own fetch, plus the demo-domain list."""
+    replies = [_pdr_evaluate(page, production_dry_run.ACCOUNT_SEARCH_JS, "POST", production_dry_run.ACCOUNTS_PATH,
+                             [production_dry_run.ACCOUNTS_PATH, production_dry_run.build_search_body(value)])
+               for value in (tenant_name, *domains)]
+    demo = _pdr_evaluate(page, production_dry_run.DEMO_DOMAINS_JS, "GET", production_dry_run.DEMO_DOMAINS_PATH,
+                         [production_dry_run.DEMO_DOMAINS_PATH, list(domains)])
+    return production_dry_run.duplicate_verdict(replies, demo, tenant_name, domains)
+
+
+def _pdr_clone_facts(source: Any, now: datetime) -> dict[str, Any]:
+    """Facts from the production-clone snapshot (Redash, read only): captured time, usable, duplicate, live paid count."""
+    from integration.onboarding import leonardo_inventory as inventory
+
+    facts: dict[str, Any] = {"collected_at": None, "clone_matches": False, "duplicate_found": False,
+                             "live_paid_tenant_count": 0}
+    try:
+        payload = inventory.load_latest(clone_root(), "prod-clone", max_age=PDR_CLONE_MAX_AGE_FOREVER, now=now)
+        facts["collected_at"] = datetime.strptime(payload["captured_at"], PDR_STAMP).replace(tzinfo=timezone.utc)
+    except (inventory.InventoryError, KeyError, ValueError, TypeError, OSError):
+        return facts
+    gate = inventory.production_duplicate_gate(clone_root(), source.tenant_name, _co_domains(CE_ROUTE, source), now=now,
+                                               max_age=PDR_CLONE_MAX_AGE_FOREVER)
+    facts["duplicate_found"] = gate["result"] == "duplicate_production_clone_match"
+    facts["clone_matches"] = gate["result"] in ("production_clone_no_match", "duplicate_production_clone_match")
+    name = " ".join(source.tenant_name.casefold().split())
+    facts["live_paid_tenant_count"] = sum(
+        1 for tenant in payload.get("tenants") or ()
+        if isinstance(tenant, dict) and " ".join(str(tenant.get("account_name") or "").casefold().split()) == name
+        and inventory.is_live_paid_tenant(tenant))
+    return facts
+
+
+def _pdr_finish_line(result: Any) -> str:
+    """The one printed line for a run() result: a reason from the fixed enum, a record file name, no free text."""
+    name = result.record_path.name if result.record_path else None
+    passed = result.outcome == production_create.OUTCOME_DRY_RUN
+    line = _pdr_line("dry_run_passed" if passed else _pdr_reason(result.reason or "unexpected_error"),
+                     outcome=result.outcome, record=name, record_error=result.record_error)
+    return line if production_dry_run.line_problem(line) is None else _pdr_line("dry_run_line_not_redacted")
+
+
+def _pdr_end_problem(inputs: Any, environ: Any, moment: datetime) -> str | None:
+    """Re-judge the time-bound gates with a fresh clock after the login wait and the form work."""
+    try:
+        production_dry_run_target(environ, moment)
+    except ProductionLocked as locked:
+        return "approval_expired_during_run" if locked.reason == "production_approval_expired" else "production_locked_during_run"
+    except ValueError:
+        return "production_locked_during_run"
+    problem = production_approval.check(inputs.approval_path, inputs.approval_ref, inputs.co_reference, inputs.route,
+                                        inputs.source_revision_now, moment)
+    if problem == "approval_expired":
+        return "approval_expired_during_run"
+    if problem is not None:
+        return problem
+    collected = inputs.clone_collected_at
+    if (not isinstance(collected, datetime) or moment.tzinfo is None
+            or moment - collected > production_create.CLONE_MAX_AGE or moment < collected):
+        return "clone_stale_during_run"
+    return None
+
+
+def _pdr_click_confirm(_inputs: Any) -> Any:
+    """The real create click is NOT implemented in the dry-run task: a separate, owner-approved change."""
+    raise NotImplementedError("production_confirm_not_implemented")
+
+
+def _pdr_read_back(_inputs: Any) -> Any:
+    raise NotImplementedError("production_readback_not_implemented")
+
+
+def _pdr_read_form(page: Any, polls: int = PDR_FORM_POLLS) -> dict[str, Any] | None:
+    for _poll in range(polls):
+        try:
+            form = production_probe.sanitize_form(page.evaluate(production_probe.FORM_JS))
+        except Exception:
+            form = None
+        if form and form["fields"]:
+            return form
+        page.wait_for_timeout(PDR_FORM_POLL_MS)
+    return None
+
+
+def _pdr_open_form(page: Any, clicks: Any) -> dict[str, Any] | None:
+    """Click the one button whose exact visible text is "Add Account" (exactly one match) and read the form.
+
+    No other label is ever clicked: a generic label could hit another control.
+    """
+    found = page.get_by_role("button", name=production_dry_run.CREATE_LABEL, exact=True)
+    if production_probe._count(found) != 1:
+        return None
+    clicks.click(production_dry_run.CLICK_OPEN_CREATE_FORM, found.first, production_dry_run.CREATE_LABEL,
+                 timeout=FIELD_TIMEOUT_MS)
+    return _pdr_read_form(page)
+
+
+def _pdr_form_closed(page: Any) -> bool:
+    """True only when the form is gone, the page is still Tenant Management and "Add Account" is visible again.
+
+    A navigation, a crash or an unreadable page is NOT closed.
+    """
+    try:
+        form = production_probe.sanitize_form(page.evaluate(production_probe.FORM_JS))
+        if form and form["fields"]:
+            return False
+        if production_probe.url_path(page.url).casefold() != production_probe.PROBE_START_PATH.casefold():
+            return False
+        add = page.get_by_role("button", name=production_dry_run.CREATE_LABEL, exact=True)
+        return production_probe._count(add) == 1 and bool(add.first.is_visible())
+    except Exception:
+        return False
+
+
+def _pdr_close_form(page: Any, clicks: Any) -> bool:
+    """Cancel (its own button), then Escape, verifying after each that the form is really gone. Never Confirm."""
+    for attempt in ("cancel", "escape"):
+        try:
+            if attempt == "cancel":
+                cancel = page.get_by_role("button", name="Cancel", exact=True)
+                if production_probe._count(cancel) != 1:
+                    continue
+                clicks.click(production_dry_run.CLICK_CANCEL_CREATE_FORM, cancel.first, "Cancel", timeout=FIELD_TIMEOUT_MS)
+            else:
+                page.keyboard.press("Escape")
+        except Exception:
+            continue
+        for _poll in range(PDR_FORM_POLLS):
+            if _pdr_form_closed(page):
+                return True
+            page.wait_for_timeout(100)
+    return False
+
+
+def _pdr_text(page: Any, label: str) -> Any | None:
+    """The one control whose label matches (whitespace tolerant, otherwise exact), else None."""
+    try:
+        control = page.get_by_label(production_dry_run.label_regex(label))
+        return control if control.count() == 1 else None
+    except Exception:
+        return None
+
+
+def _pdr_checkbox(page: Any, key: str) -> Any | None:
+    if key == "scan_now":
+        found = _pdr_text(page, production_dry_run.SCAN_NOW_LABEL)
+        return found if found is not None else _locate_checkbox(page, key)
+    return _locate_checkbox(page, key)
+
+
+def _pdr_set_toggle(page: Any, clicks: Any, key: str, target: bool) -> bool:
+    """Set one toggle by a plain click. False when the control is missing; FormRefusal(toggle_click_failed) when the
+    click cannot be made safely: no forced click ever, and the element at the toggle's centre must be the toggle (or
+    its own label) before it is clicked."""
+    failed = production_create.FormRefusal("toggle_click_failed", {f"toggle.{key}": "fail"})
+    control = _pdr_checkbox(page, key)
+    if control is None:
+        return False
+    try:
+        if control.first.is_checked() == target:
+            return True
+        if control.first.evaluate(production_dry_run.HIT_TEST_JS) is not True:
+            raise failed
+        clicks.click(production_dry_run.CLICK_SET_TOGGLE, control.first, key, timeout=TOGGLE_CLICK_TIMEOUT_MS)
+        for _poll in range(20):
+            if control.first.is_checked() == target:
+                return True
+            page.wait_for_timeout(200)
+    except production_dry_run.ClickRefused:
+        raise
+    except production_create.FormRefusal:
+        raise
+    except Exception:
+        raise failed from None
+    raise failed
+
+
+def _pdr_select_by_name(page: Any, name: str, option: str) -> tuple[str | None, str]:
+    """Select one option of the exact-name <select>; (failure code | None, option text actually targeted)."""
+    try:
+        control = page.locator(f'select[name="{name}"]')
+        if control.count() != 1 or not control.first.is_enabled():
+            return "fill_form_schema_unavailable", option
+        target = option
+        if name == "accountCountry":
+            labels = [t for t in control.first.locator("option").all_text_contents() if isinstance(t, str)]
+            target = (country_option_label(labels, option) if labels else None) or option
+        control.first.select_option(label=target, timeout=FIELD_TIMEOUT_MS)
+        if _selected_option_text(control.first) != target:
+            return "fill_value_mismatch", target
+        return None, target
+    except Exception:
+        return "fill_form_schema_unavailable", option
+
+
+def _pdr_read_selected(page: Any, name: str) -> str | None:
+    try:
+        control = page.locator(f'select[name="{name}"]')
+        return _selected_option_text(control.first) if control.count() == 1 else None
+    except Exception:
+        return None
+
+
+def _pdr_input_value(page: Any, label: str) -> str | None:
+    control = _pdr_text(page, label)
+    try:
+        value = control.first.input_value() if control is not None else None
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _pdr_read_checked(page: Any, key: str) -> bool | None:
+    control = _pdr_checkbox(page, key)
+    try:
+        return None if control is None else bool(control.first.is_checked())
+    except Exception:
+        return None
+
+
+def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool]) -> dict[str, Any]:
+    """Expand the Advanced section if one exists and READ (never change) the advanced controls by name."""
+    first = production_dry_run.ADVANCED_NAMES[0]
+    found = _locate_checkbox(page, first) is not None
+    if not found:
+        try:
+            button = page.get_by_text(production_dry_run.ADVANCED_BUTTON_TEXT, exact=True)
+            if button.count() >= 1:
+                found = True
+                clicks.click(production_dry_run.CLICK_EXPAND_ADVANCED, button.first,
+                             production_dry_run.ADVANCED_BUTTON_TEXT, timeout=FIELD_TIMEOUT_MS)
+                for _poll in range(ADVANCED_EXPAND_POLLS):
+                    if _locate_checkbox(page, first) is not None:
+                        break
+                    page.wait_for_timeout(100)
+        except production_dry_run.ClickRefused:
+            raise
+        except Exception:
+            pass
+    states: dict[str, Any] = {}
+    for name in (*production_dry_run.ADVANCED_NAMES, *production_dry_run.INFO_ADVANCED_NAMES):
+        control = _locate_checkbox(page, name)
+        try:
+            states[name] = None if control is None else bool(control.first.is_checked())
+        except Exception:
+            states[name] = None
+    return production_dry_run.advanced_report(found, states, targets)
+
+
+def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extras: dict[str, Any],
+                         fill_date: Any, date_kept: Any) -> dict[str, str]:
+    """Open the form, check its schema, fill, read the advanced controls, verify by read-back, re-check the session.
+
+    Returns ``{field key: "pass" | "fail"}``; raises FormRefusal for a refusal with its own reason. The form is always
+    cancelled (never confirmed) before this returns or raises; ``extras["form_cancelled"] = False`` when it did not close.
+    """
+    refusal = production_create.FormRefusal
+    try:
+        form = _pdr_open_form(page, clicks)
+        problem = production_dry_run.schema_problem(form)
+        if problem:
+            raise refusal(problem)
+        for name, option, early in intended.selects:
+            if early:
+                failure, _target = _pdr_select_by_name(page, name, option)
+                if failure:
+                    raise refusal(failure)
+        if intended.scan_now is not None and not _pdr_set_toggle(page, clicks, "scan_now", intended.scan_now):
+            raise refusal("fill_form_schema_unavailable")
+        for key, target in intended.toggles:
+            if not _pdr_set_toggle(page, clicks, key, target):
+                raise refusal("fill_form_schema_unavailable")
+        overrides: dict[str, str] = {}
+        for name, option, early in intended.selects:
+            if not early:
+                failure, target = _pdr_select_by_name(page, name, option)
+                if failure:
+                    raise refusal(failure)
+                overrides[name] = target
+        for label, expected in intended.texts:
+            control = _pdr_text(page, label)
+            if control is None or not control.first.is_enabled():
+                raise refusal("fill_form_schema_unavailable")
+            control.first.fill(expected, timeout=FIELD_TIMEOUT_MS)
+            if control.first.input_value() != expected:
+                raise refusal("fill_value_mismatch")
+        for key, value in intended.dates:
+            if not fill_date(page, key, value):
+                raise refusal("fill_form_schema_unavailable")
+        extras.update(_pdr_read_advanced(page, clicks, dict(intended.advanced_targets)))
+        after = production_probe.sanitize_form(page.evaluate(production_probe.FORM_JS))
+        problem = production_dry_run.schema_problem(after, after_advanced=True) or production_dry_run.advanced_problem(extras)
+        if problem:
+            raise refusal(problem)
+        reads = {
+            "texts": {label: _pdr_input_value(page, label) for label, _v in intended.texts},
+            "blanks": {label: _pdr_input_value(page, label) for label in intended.blanks},
+            "selects": {name: _pdr_read_selected(page, name) for name, _o, _e in intended.selects},
+            "toggles": {key: _pdr_read_checked(page, key) for key, _t in intended.toggles},
+            "dates": {key: bool(date_kept(page, key, value)) for key, value in intended.dates},
+            "operator_empty": _verify_operator_account_empty(page) is None,
+            "scan_now": _pdr_read_checked(page, "scan_now") if intended.scan_now is not None else None,
+        }
+        fields = production_dry_run.compare_reads(intended, reads, overrides)
+        session = _pdr_session_problem(page)
+        if session:
+            raise refusal(session, fields)
+        if guard.blocked_api_writes():
+            raise refusal("write_request_blocked", fields)
+        return fields
+    finally:
+        if production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds and not _pdr_close_form(page, clicks):
+            extras["form_cancelled"] = False
+            print("FORM LEFT OPEN: close the Add Account window in the production browser yourself (Cancel). "
+                  "Nothing was submitted.", flush=True)
+            raise production_create.FormRefusal("form_left_open")
+
+
+@contextmanager
+def _pdr_browser_page(target: RunTarget, wait_seconds: float):
+    """Open the dedicated production profile, wait for the human to sign in (MFA), yield the one page. Always cleans up."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        raise RuntimeError("playwright_runtime_unavailable") from None
+    url = production_probe.start_url(target)
+    with sync_playwright() as playwright:
+        tab = _open_automation_tab(playwright, url, target)
+        browser = None
+        try:
+            browser, page = _probe_attach(playwright, tab)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            page.bring_to_front()
+            print("Sign in with SSO and MFA in the window titled app.pentera.io; waiting up to 15 minutes", flush=True)
+            if not _probe_wait_for_login(page, wait_seconds) or not production_probe.is_authenticated(*_probe_snapshot(page)):
+                raise RuntimeError("production_dry_run_login_timeout")
+            yield page
+        finally:
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            _release_automation_tab(tab)
+            if tab.persist:  # end the loopback CDP exposure of the signed-in production session
+                _close_automation_browser_at(tab.profile_dir)
+
+
+def run_production_dry_run(reference: str, acknowledged_revision: str, *, environ: Any | None = None,
+                           now: datetime | None = None, records_parent: Path | None = None,
+                           approval_path: Path | None = None, wait_seconds: float = MAX_WAIT_SECONDS,
+                           load_source: Any = None, clone_facts: Any = None, open_page: Any = None,
+                           fill_date: Any = None, date_kept: Any = None, clock: Any = None) -> str:
+    """One attended production DRY RUN for one CE-only New CO. Returns the printed line; never creates anything.
+
+    Every external step is injectable (tests): ``load_source`` (the fixed Salesforce read), ``clone_facts`` (the Redash
+    clone helpers), ``open_page`` (a context manager yielding the signed-in page) and the two date helpers. Order: the
+    unlock target (PRODUCTION_DRY_RUN_SUPPORTED, sessions flag, approval reference, exact origin) before any read;
+    Salesforce source and clone; the ordered gate (approval bound to CO, route and CURRENT revision) before the browser;
+    then, in the page, the session check, the duplicate pre-check, the form fill and read-back, Cancel; and one
+    redacted record through ``production_create.run(dry_run=True)``, which never consumes the approval.
+    """
+    environ = dict(os.environ if environ is None else environ)
+    given_now = now
+    now = now or datetime.now(timezone.utc)
+    if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference)
+            or not production_dry_run.revision_ok(acknowledged_revision)):
+        return _pdr_line("production_dry_run_arguments_invalid")
+    parent = records_parent or _pdr_records_parent()
+    approval_file = approval_path or _pdr_approval_path()
+    extras: dict[str, Any] = {}
+    reference_value = environ.get(production_create.SESSION_REF_ENV, "")
+
+    def stamp() -> datetime:
+        return given_now or datetime.now(timezone.utc)
+
+    def write_record(data: dict[str, Any]) -> Path:
+        merged = {**data, **extras}
+        if "refusal_reason" in merged:
+            merged["refusal_reason"] = _pdr_reason(merged["refusal_reason"])
+        return production_create_record.record(parent, merged, stamp())
+
+    def refused(reason: str) -> str:
+        data = {"co_reference": reference, "route": CE_ENGINE, "outcome": production_create.OUTCOME_REFUSED,
+                "refusal_reason": _pdr_reason(reason),
+                "salesforce_revision": acknowledged_revision}
+        if production_approval.REFERENCE_PATTERN.fullmatch(reference_value):
+            data["approval_ref"] = reference_value
+        try:
+            name = write_record(data).name
+        except Exception:
+            name = None
+        return _pdr_line(data["refusal_reason"], outcome="refused", record=name)
+
+    # 1. The unlock target first: while PRODUCTION_DRY_RUN_SUPPORTED is False nothing below runs (no read, no browser).
+    if reference_value and not (environ.get(PDR_ENV_ISSUED) and environ.get(PDR_ENV_EXPIRES)):
+        record = production_approval.record_for(approval_file, reference_value)
+        if record is not None:
+            try:
+                for key, value in production_approval.unlock_environ(record).items():
+                    environ.setdefault(key, value)
+            except production_approval.ApprovalRefused:
+                pass
+    try:
+        production_dry_run_target(environ, now)
+    except ProductionLocked as locked:
+        return refused(f"production_locked_{locked.reason}")
+    except ValueError as error:
+        return refused(str(error))
+
+    # 2. Source of the intended values: the fixed Salesforce reads of the Dev runner (no new query).
+    try:
+        source = (load_source or CE_ROUTE.load_source)(reference)
+        plan = build_ce_only_fill(source, source.subscription_start)
+        intended = production_dry_run.map_plan(plan, SELECT_NAMES, EARLY_SELECTS)
+    except production_dry_run.MappingError as error:
+        return refused(str(error))
+    except ValueError as error:
+        return refused(str(error))
+    except RuntimeError as error:
+        return refused(_pdr_reason(str(error)))
+    except Exception:
+        return refused("salesforce_fill_source_unavailable")
+    try:
+        facts = (clone_facts or _pdr_clone_facts)(source, now)
+    except Exception:
+        facts = {}
+    facts = facts if isinstance(facts, dict) else {}
+    inputs = production_create.CreateInputs(
+        co_reference=reference, route=CE_ENGINE, approval_ref=reference_value, approval_path=approval_file,
+        source_revision=acknowledged_revision, source_revision_now=source.source_revision, now=now, environ=environ,
+        sf_email_domains=(source.email_domain,), sf_source_consistent=True,
+        prior_account_uuid="present" if source.salesforce_id_present else None,
+        clone_collected_at=facts.get("collected_at"), clone_matches=facts.get("clone_matches") is True,
+        duplicate_found=facts.get("duplicate_found") is not False,
+        live_paid_tenant_count=facts.get("live_paid_tenant_count", 99),
+        timing_allowed=onboarding_allowed_now(source.subscription_start, now.date(), environment="prod"),
+        csm_request_recorded=False, sessions_ready=True, schema_ok=True,
+        expected_tenant_name=source.tenant_name, expected_domains=(source.email_domain,),
+        plan_summary="Credential Exposure CE-only dry run")
+
+    def no_fill(_inputs: Any) -> Any:
+        raise RuntimeError("production_dry_run_form_not_reached")
+
+    finish = _pdr_finish_line
+
+    # 3. The ordered gate BEFORE any browser: a refusal here opens nothing. The session and duplicate facts only the
+    #    browser can learn are passed as "no problem yet" here and judged for real by run() below.
+    if production_create.evaluate_gate(inputs, production_dry_run_target) is not None:
+        return finish(production_create.run(inputs, True, no_fill, _pdr_click_confirm, _pdr_read_back, write_record,
+                                             prior_records=()))
+
+    # 4. The browser: session check, duplicate pre-check, form fill and read-back, Cancel; one record via run().
+    try:
+        target = production_dry_run_target(environ, now)
+        with (open_page or _pdr_browser_page)(target, wait_seconds) as page:
+            guard = production_dry_run.DryRunRequestGuard()
+            guard.install(page)
+            clicks = production_dry_run.ClickLog()
+            # Service workers and WebSockets bypass the request guard: any registration refuses before anything else.
+            try:
+                worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
+            except Exception:
+                worker = None
+            worker_problem = production_dry_run.service_worker_verdict(worker)
+            if worker_problem:
+                return refused(worker_problem)
+            session = _pdr_session_problem(page)
+            duplicate = None if session else _pdr_duplicate_problem(page, source.tenant_name, (source.email_domain,))
+            problem = session or duplicate
+            final = dataclasses.replace(inputs, sessions_ready=session is None, duplicate_found=duplicate is not None,
+                                        precheck_reason=problem or "")
+
+            def fill(_inputs: Any) -> dict[str, str]:
+                fields = _pdr_fill_and_verify(page, guard, clicks, intended, extras,
+                                              fill_date or _fill_license_date, date_kept or _license_date_kept)
+                late = _pdr_end_problem(final, environ, (clock or stamp)())
+                if late:
+                    raise production_create.FormRefusal(late, fields)
+                return fields
+
+            return finish(production_create.run(final, True, fill, _pdr_click_confirm, _pdr_read_back, write_record,
+                                                 prior_records=()))
+    except production_dry_run.ClickRefused:
+        return refused("production_dry_run_click_not_allowed")
+    except RuntimeError as error:
+        return refused(_pdr_reason(str(error)))
+    except Exception:
+        return refused("production_dry_run_crashed")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Attended Leonardo Development CE-only auto-confirm runner.")
     parser.add_argument("--co", required=False, help="Customer Onboarding reference (e.g. CO-0702).")
@@ -8755,7 +9460,27 @@ def main() -> int:
                         help="With --export-tenants: also write a CSV of the allow-listed fields next to the snapshot.")
     parser.add_argument("--route", choices=sorted(ROUTES), default=CE_ENGINE,
                         help="Route contract for --co runs (default: the CE-only route, case_2_new_ce_only).")
+    parser.add_argument("--production-probe", action="store_true",
+                        help="One attended READ-ONLY BackOffice production probe (docs/42 section 6): needs SURFACE_ONBOARDING_PRODUCTION_PROBE=1 and "
+                             "SURFACE_ONBOARDING_PRODUCTION_PROBE_REF; you sign in with MFA; nothing is filled, submitted or created.")
+    parser.add_argument("--production-dry-run", action="store_true",
+                        help="With --co and --revision: one attended production DRY RUN of a CE-only New CO (docs/42 section 6.2): the real "
+                             "production form is filled, read back and Cancelled; Confirm is never clicked and nothing is created. Locked "
+                             "by PRODUCTION_DRY_RUN_SUPPORTED (False) until the owner says go.")
     args = parser.parse_args()
+    if args.production_dry_run:
+        if not args.co or not args.revision:
+            parser.error("--co and --revision are required with --production-dry-run")
+        if (args.dry_run or args.confirm_write or args.production_probe or args.diagnose_confirm
+                or args.route != CE_ENGINE):
+            parser.error("--production-dry-run is a separate run (CE-only route; no --dry-run, --confirm-write, --production-probe or --diagnose-confirm)")
+        print(run_production_dry_run(args.co, args.revision))
+        return 0
+    if args.production_probe:
+        if args.co or args.revision or args.dry_run or args.confirm_write:
+            parser.error("--production-probe is a separate read-only run (no --co, --revision, --dry-run or --confirm-write)")
+        print(run_production_probe())
+        return 0
     if args.confirm_write and not (args.spycloud_off or args.spycloud_on or args.renew or args.mirror_renewal):
         parser.error("--confirm-write is only valid with --spycloud-off, --spycloud-on, --renew or --mirror-renewal")
     if sum(bool(x) for x in (args.renew, args.spycloud_off, args.spycloud_on, args.mirror_renewal, args.renew_run)) > 1:

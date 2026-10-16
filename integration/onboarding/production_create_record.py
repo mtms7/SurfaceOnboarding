@@ -33,7 +33,10 @@ EDITABLE_CANDIDATES = ("account_id", "account_uuid", "domains", "plan_summary", 
 _SCALAR_FIELDS = ("route", "approval_ref", "refusal_reason", "tenant_name", "account_id", "account_uuid",
                   "plan_summary", "salesforce_revision")
 _LIST_FIELDS = ("domains", "response_shape")
+ADVANCED_SECTION_VALUES = ("found", "not_found")
+ADVANCED_CONTROL_STATES = ("on", "off", "absent")
 _ALLOWED = frozenset({"co_reference", "outcome", "recorded_at", "redactions", "form_fields_checked",
+                      "advanced_section", "advanced_controls", "advanced_mismatches",
                       *_SCALAR_FIELDS, *_LIST_FIELDS})
 _CO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
 _STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -118,6 +121,22 @@ def _sanitize(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
             if cleaned_key:
                 fields[cleaned_key] = verdict if verdict in ("pass", "fail") else "fail"
         out["form_fields_checked"] = fields
+    # Production dry run: whether the Advanced section was found, each advanced control's name with on/off/absent
+    # (never a value), and the names whose state differs from the Dev target or that are absent.
+    if data.get("advanced_section") in ADVANCED_SECTION_VALUES:
+        out["advanced_section"] = data["advanced_section"]
+    controls = data.get("advanced_controls")
+    if isinstance(controls, dict):
+        states: dict[str, str] = {}
+        for key, state in list(controls.items())[:MAX_DICT_ITEMS]:
+            cleaned_key = _clean_name(key, counter)
+            if cleaned_key and cleaned_key != REDACTED and state in ADVANCED_CONTROL_STATES:
+                states[cleaned_key] = state
+        out["advanced_controls"] = states
+    mismatches = data.get("advanced_mismatches")
+    if isinstance(mismatches, (list, tuple)):
+        names = [_clean_name(v, counter) for v in list(mismatches)[:MAX_LIST_ITEMS]]
+        out["advanced_mismatches"] = [n for n in names if n and n != REDACTED]
     return out, counter[0]
 
 

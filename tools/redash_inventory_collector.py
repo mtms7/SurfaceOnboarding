@@ -19,13 +19,20 @@ Safety properties (each is tested):
   future data, too large) fails closed and leaves the previous snapshot untouched.
 * A refresh that did not happen is visible: the run exits 2 (a scheduled-task
   failure), not 0, while the older data is still written with its true age.
+  On the VM (``--cached-ok``) the same condition is an honest, expected state, not a failure: Redash's own
+  scheduled refresh keeps the cached result fresh and the per-query key may only read. The report then says
+  ``refreshed: false``, ``refresh_reason: redash_refresh_not_permitted`` and the data age, and exits 0; the
+  6 h age gate downstream still decides whether the clone is trusted.
+* Key on Linux: ``SURFACE_REDASH_KEY_FILE`` names a root-owned file (0640 root:surface-redash-reader); no
+  Windows DPAPI call is made on that path.
 * The snapshot is informational: it can block a duplicate, it never clears one.
 
 Usage:
     python tools/redash_inventory_collector.py --store-key   # once, in your own terminal
     python tools/redash_inventory_collector.py --probe       # shape only: column names, types, counts
     python tools/redash_inventory_collector.py --collect     # what the scheduled task runs
-Exit codes: 0 ok, 1 failed (nothing written), 2 written but the refresh did not happen.
+Exit codes: 0 ok, 1 failed (nothing written), 2 written but the refresh did not happen
+(with --cached-ok, that last case exits 0 instead; the report still says refresh_failed and refresh_reason).
 """
 
 from __future__ import annotations
@@ -300,20 +307,35 @@ def _refresh(opener: Any, key: str, sleep: Callable[[float], None], clock: Calla
     raise CollectorError("redash_refresh_timeout")
 
 
+# Refresh errors that mean "this key may read but not re-run the query" (the per-query key's known limit).
+_REFRESH_NOT_PERMITTED = frozenset({"redash_auth_failed", "redash_http_error", "redash_refresh_failed",
+                                    "redash_query_not_found", "redash_redirect_refused"})
+REFRESH_NOT_PERMITTED = "redash_refresh_not_permitted"
+
+
+def refresh_reason_for(error_reason: str) -> str:
+    """The stable, value-free refresh reason recorded in the report."""
+    return REFRESH_NOT_PERMITTED if error_reason in _REFRESH_NOT_PERMITTED else error_reason
+
+
 def fetch_results(opener: Any, key: str, *, now: datetime, max_age: timedelta, refresh: bool,
-                  sleep: Callable[[float], None] = time.sleep) -> tuple[Any, bool, bool]:
+                  sleep: Callable[[float], None] = time.sleep,
+                  outcome: dict[str, Any] | None = None) -> tuple[Any, bool, bool]:
     """The newest result, refreshed first when older than ``max_age`` (if allowed).
 
     Returns (result, refreshed, refresh_failed). ``refresh_failed`` is True when a refresh was wanted
     (the cached result was too old) and the data is still older than ``max_age`` afterwards.
+    ``outcome``, when given, receives ``refresh_reason`` (a value-free code) if a refresh was attempted and failed.
     """
     result = _call(opener, key, "GET", RESULTS_PATH)
     refreshed = False
     if refresh and now - _retrieved_at(result) > max_age:
         try:
             result, refreshed = _refresh(opener, key, sleep), True
-        except CollectorError:
-            pass  # fall back to the cached result; the run is flagged below and the age limits still apply
+        except CollectorError as error:
+            if outcome is not None:
+                outcome["refresh_reason"] = refresh_reason_for(error.reason)
+            # fall back to the cached result; the run is flagged below and the age limits still apply
     retrieved = _retrieved_at(result)
     if retrieved - now > FUTURE_SKEW:
         raise CollectorError("redash_results_future")
@@ -329,8 +351,9 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
             accept_shrink: bool = False, sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     root = root or inventory.clone_root()
+    outcome: dict[str, Any] = {}
     result, refreshed, refresh_failed = fetch_results(opener, key, now=now, max_age=max_age, refresh=refresh,
-                                                      sleep=sleep)
+                                                      sleep=sleep, outcome=outcome)
     normalized = redash.normalize(result)
     if normalized.unexpected_columns:
         raise CollectorError("redash_query_changed")  # someone edited query 251: stop, do not guess
@@ -355,6 +378,7 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
                "row_count": payload["row_count"], "deleted_count": payload["deleted_count"],
                "uuid_missing_count": payload["uuid_missing_count"], "refreshed": refreshed,
                "refresh_failed": refresh_failed,
+               "refresh_reason": (outcome.get("refresh_reason") or "redash_refresh_result_still_old") if refresh_failed else None,
                "data_age_minutes": int((now - normalized.retrieved_at).total_seconds() // 60),
                "schema_drift": {name: len(drift.get(name, [])) for name in ("unknown", "missing", "type_changed")},
                "missing_columns": len(normalized.missing_columns)}
@@ -427,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--collect", action="store_true", help="Refresh if needed and write the local snapshot.")
     parser.add_argument("--max-age-minutes", type=int, default=int(DEFAULT_MAX_AGE.total_seconds() // 60))
     parser.add_argument("--no-refresh", action="store_true", help="Never ask Redash to re-run the query.")
+    parser.add_argument("--cached-ok", action="store_true",
+                        help="VM: a refresh Redash does not permit is an honest state, not a failure (exit 0, not 2).")
     parser.add_argument("--csv", action="store_true", help="Also write a CSV next to the snapshot.")
     parser.add_argument("--accept-shrink", action="store_true",
                         help="Accept a result more than 10%% smaller than the last snapshot (a deliberate clean-up).")
@@ -456,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     _log_line(json.dumps(report, sort_keys=True))
     print(json.dumps(report, sort_keys=True))
-    return 2 if report.get("refresh_failed") else 0
+    return 2 if report.get("refresh_failed") and not args.cached_ok else 0
 
 
 if __name__ == "__main__":

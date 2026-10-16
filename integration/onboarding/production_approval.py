@@ -233,6 +233,16 @@ def consume(path: Path, approval_ref: str, co_reference: str, route: str, source
     return None
 
 
+def record_for(path: Path, approval_ref: str) -> dict[str, Any] | None:
+    """A copy of one approval record (read only), or None when the file is unreadable or has no such reference."""
+    try:
+        records = _load(path)
+    except _Unreadable:
+        return None
+    found = records.get(approval_ref) if isinstance(approval_ref, str) else None
+    return dict(found) if isinstance(found, dict) else None
+
+
 def unlock_environ(record: Mapping[str, Any]) -> dict[str, str]:
     """The three approval values session_readiness.production_unlock_problem reads (never the SESSIONS flag)."""
     try:

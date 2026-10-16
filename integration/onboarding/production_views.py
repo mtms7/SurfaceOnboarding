@@ -338,3 +338,105 @@ def age_words(seconds: int | None) -> str:
         return "unknown"
     hours, minutes = divmod(max(0, seconds) // 60, 60)
     return (str(hours) + " h " + str(minutes) + " min") if hours else (str(minutes) + " min")
+
+
+# --- Onboard card checklist (the production row of the card at the top of the CO page) -------------------------------
+
+UNAVAILABLE_ON_SERVER = "unavailable on this server"
+CHECK_CHIPS = {"locked": ("chip-warn", "Locked"), "ready": ("chip-ok", "Ready"), "blocked": ("chip-bad", "Blocked"),
+               "unavailable": ("chip-neutral", "Unavailable")}
+CHECK_ORDER = (("unlock", "Production runner unlocked"), ("session", "Production session"), ("clone", "Clone fresh under 6 h"),
+               ("duplicate", "No duplicate in production"), ("data", "Salesforce data valid"), ("timing", "Timing window"),
+               ("approval", "One-CO create approval"), ("dry_run", "Dry run done"), ("owner_go", "Owner go"))
+
+
+def _item(key: str, status: str, detail: str) -> dict[str, str]:
+    return {"key": key, "label": dict(CHECK_ORDER)[key], "status": status, "detail": _text(detail)}
+
+
+def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, session_ready: bool | None, clone: dict[str, Any] | None,
+                      match: dict[str, Any] | None, domain_count: int | None, uuid_state: str, ce_route: bool,
+                      start_iso: str | None, today: date, days_before: int, approval: dict[str, Any] | None,
+                      create: dict[str, Any] | None) -> list[dict[str, str]]:
+    """The nine production onboarding checks as ``{"key", "label", "status", "detail"}``, in display order.
+
+    ``status`` is ``locked``, ``ready``, ``blocked`` or ``unavailable``. Pure: every input is already read by the caller
+    (``clone`` from ``clone_status``, ``approval`` from ``approval_for_co``, ``create`` from ``create_state``). Anything that
+    cannot be evaluated is ``unavailable``, never ``ready``; ``uuid_state`` is ``empty``, ``set`` or ``unread``.
+    """
+    items = []
+    # 1 runner unlock
+    if locked:
+        items.append(_item("unlock", "locked", lock_reason_text(lock_reason)))
+    else:
+        items.append(_item("unlock", "ready", "Runner unlocked by configuration."))
+    # 2 production session: nothing in this build records one, so it is never green without an explicit ready flag
+    if vm:
+        items.append(_item("session", "unavailable", "Sessions: " + UNAVAILABLE_ON_SERVER + "."))
+    elif locked:
+        items.append(_item("session", "locked", "Production sessions stay locked. See the Sessions page."))
+    elif session_ready is True:
+        items.append(_item("session", "ready", "Production session ready."))
+    else:
+        items.append(_item("session", "unavailable", "No production session status is recorded. See the Sessions page."))
+    # 3 clone
+    state = clone.get("state") if isinstance(clone, dict) else None
+    if state == "fresh":
+        items.append(_item("clone", "ready", "Clone " + age_words(clone.get("age_seconds")) + " old. Limit 6 h."))
+    elif state == "stale":
+        items.append(_item("clone", "blocked", "Clone " + age_words(clone.get("age_seconds")) + " old. Older than 6 h: not trusted."))
+    else:
+        reason = _text((clone or {}).get("reason")) or "no snapshot"
+        items.append(_item("clone", "unavailable", "Clone unusable: " + reason))
+    # 4 duplicate validation
+    check = production_check(match)
+    if check["code"] == "clear":
+        items.append(_item("duplicate", "ready", "No match in the production clone (" + str(int((match or {}).get("tenants_checked") or 0))
+                           + " tenants checked)."))
+    elif check["code"] in ("duplicate", "live_paid"):
+        items.append(_item("duplicate", "blocked", check["label"] + " in the production clone."))
+    else:
+        items.append(_item("duplicate", "unavailable", check["label"] + ". A missing match is never a clearance."))
+    # 5 Salesforce data
+    if uuid_state not in ("empty", "set") or (ce_route and not isinstance(domain_count, int)):
+        items.append(_item("data", "unavailable", "The CO could not be read for this check."))
+    elif uuid_state == "set":
+        items.append(_item("data", "blocked", "Salesforce already holds an Account UUID for this CO."))
+    elif ce_route and domain_count != 1:
+        items.append(_item("data", "blocked", "Exactly one email domain is required for CE-only (found " + str(domain_count) + ")."))
+    else:
+        items.append(_item("data", "ready", ("One email domain, " if ce_route else "") + "no prior Account UUID."))
+    # 6 timing window
+    window = timing_window(start_iso, today, days_before)
+    if window["state"] == "open":
+        items.append(_item("timing", "ready", "Start " + window["start"] + " minus " + str(days_before) + " days has passed."))
+    elif window["state"] == "closed":
+        items.append(_item("timing", "blocked", "Window opens " + window["opens"] + "."))
+    else:
+        items.append(_item("timing", "unavailable", "Start date not available."))
+    # 7 one-CO create approval
+    a_state = approval.get("state") if isinstance(approval, dict) else None
+    if a_state == "valid":
+        items.append(_item("approval", "ready", "Valid to " + _text(str((approval.get("item") or {}).get("expires_at") or ""))[:10] + "."))
+    elif a_state == "unavailable":
+        items.append(_item("approval", "unavailable", "Create approvals: " + UNAVAILABLE_ON_SERVER + "."))
+    elif a_state in ("expired", "consumed", "none", "unreadable"):
+        words = {"expired": "Expired: a new create approval is needed.", "consumed": "Used once: a new create approval is needed.",
+                 "none": "No create approval recorded.", "unreadable": "The create approval record cannot be read."}
+        items.append(_item("approval", "blocked", words[a_state]))
+    else:
+        items.append(_item("approval", "unavailable", "Create approval state not available."))
+    # 8 dry run, 9 owner go: from the create record steps
+    code = create.get("code") if isinstance(create, dict) else None
+    if code == "unavailable":
+        for key, text in (("dry_run", "Create records"), ("owner_go", "Create records")):
+            items.append(_item(key, "unavailable", text + ": " + UNAVAILABLE_ON_SERVER + "."))
+    elif code == "unreadable" or not isinstance(create, dict):
+        for key in ("dry_run", "owner_go"):
+            items.append(_item(key, "unavailable", "Create records unreadable or not available."))
+    else:
+        done = int(create.get("steps_done") or 0)
+        pending = "locked" if locked else "blocked"
+        items.append(_item("dry_run", "ready" if done >= 1 else pending, "Dry run recorded." if done >= 1 else "No dry run recorded."))
+        items.append(_item("owner_go", "ready" if done >= 2 else pending, "Owner go recorded." if done >= 2 else "No owner go recorded."))
+    return items

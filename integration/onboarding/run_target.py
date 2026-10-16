@@ -42,3 +42,18 @@ def production_target(environ: Mapping[str, str], now: datetime) -> RunTarget:
     environment = session_readiness.ENVIRONMENTS[session_readiness.BACKOFFICE_PRODUCTION]
     return RunTarget(environment.key, require_production_origin(environment.origin),
                      environment.profile_dir_name)
+
+
+def production_dry_run_target(environ: Mapping[str, str], now: datetime) -> RunTarget:
+    """Raise ProductionLocked unless the production DRY RUN unlock conditions hold (docs/42 section 6.2).
+
+    Distinct from `production_target`: it is locked by PRODUCTION_DRY_RUN_SUPPORTED (reason
+    ``production_dry_run_not_supported``) and never by, or for, PRODUCTION_RUNNER_SUPPORTED. The target it returns has
+    the exact production origin and the dedicated production profile; it authorises no create.
+    """
+    problem = session_readiness.production_dry_run_unlock_problem(environ, now)
+    if problem is not None:
+        raise ProductionLocked(problem)
+    environment = session_readiness.ENVIRONMENTS[session_readiness.BACKOFFICE_PRODUCTION]
+    return RunTarget(environment.key, require_production_origin(environment.origin),
+                     environment.profile_dir_name)

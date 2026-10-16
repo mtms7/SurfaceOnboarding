@@ -217,3 +217,7 @@ Assumptions (not verified): whether the CE-only/Surface preflight (`evaluate_*_f
 - **Safety test blind spot**: `test_new_code_never_touches_a_production_session_or_writes` scans a source slice; code placed outside it is unprotected.
 - **Records containing free text** (`plan_summary`, `tenant_name`) are redacted by pattern only (`production_create_record.py:55-122`); display them escaped and length-limited anyway.
 - **Moving `/` to production** changes many Dev-page tests and the old Dev `/` route; keep redirects (docs/46 line 17).
+
+## Addendum 2026-10-16: what the clone strip shows by source
+
+The clone strip (`_clone_line` / `/prod/tenants` banner) reads `captured_at` (Redash's own `retrieved_at`), not the time the collector ran. **VM collector active** (`<state>/clone-inventory/prod-clone/latest.json` exists): the age is that of Redash's latest cached result, normally under about 1 h while the Redash owner's hourly schedule on query 251 runs; if only GET works the collector still succeeds (`refresh_reason:redash_refresh_not_permitted` in its log, not on the page) and the strip simply shows the real, growing age, turning "older than 6 h: not trusted" after 6 h. **Desktop publish** (no VM clone yet): the strip shows the age of the clone that travelled in the signed snapshot, which is as old as the last manual publish plus ingest. Either way the strip never shows "fresh" for old data and the 6 h gate is unchanged. (Doc-only statement; the page code is untouched.)

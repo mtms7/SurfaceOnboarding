@@ -6714,7 +6714,9 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
               "database, personal data removed. A missing match is never a clearance.</p>")
     checklist = ("<section class='card'><div class='card-head'><h2 class='pill'>Before migration</h2></div><ul>"
                  + "".join("<li>" + escape(text) + "</li>" for text in BEFORE_MIGRATION) + "</ul></section>")
-    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + seg + _lock_banner()
+    onboard = _co_onboard_card(reference, row, match=match, domain_count=_domain_count_of(row), start_iso=_prod_view_start(reference),
+                               ce_route=route_for(row) == CE_ENGINE)
+    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + seg + onboard + _lock_banner()
                  + _production_marker_for(reference) + status + source + checklist)
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod")
 
@@ -7111,6 +7113,77 @@ def _record_html(found: dict[str, Any]) -> tuple[str, str]:
     return _chip(css, label), _kv_grid(pairs) + "<p class='note'>" + escape(WRONG_CREATE_NOTE) + "</p>"
 
 
+DESKTOP_DASHBOARD_ADDRESS = "http://127.0.0.1:8012"
+_STEP_TAGS = re.compile(r"</?(?:b|span)[^>]*>")
+
+
+def _dev_start_state(reference: str, row: dict[str, str | None] | None) -> tuple[bool, str]:
+    """(startable on Dev, reason) from the same rule as the queue's "Review & start" button; unreadable input is never startable."""
+    if row is None:
+        return False, "The CO could not be read, so Dev start is not verified."
+    try:
+        record = load_runner_state().get(reference)
+    except RunnerStateUnavailable:
+        return False, "The local run record could not be read, so Dev start is not verified."
+    except Exception:  # noqa: BLE001 - fail closed
+        return False, "Dev start is not verified."
+    try:
+        key, step, owner = classify_queue_row(row, record)
+    except Exception:  # noqa: BLE001 - fail closed
+        return False, "Dev start is not verified."
+    if key == "ready" and owner == "you" and route_for(row):
+        return True, ""
+    return False, " ".join(_STEP_TAGS.sub(" ", step).split())
+
+
+def _domain_count_of(row: dict[str, str | None] | None) -> int | None:
+    if row is None or "Email_Domains__c" not in row:
+        return None
+    return len([item for item in re.split(r"[,;\s]+", str(row.get("Email_Domains__c") or "").strip()) if item])
+
+
+def _co_onboard_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None,
+                     domain_count: int | None, start_iso: str | None, ce_route: bool) -> str:
+    """The "Onboard" card at the top of both production CO pages. Read-only: the production row is a checklist, never a control.
+
+    The only link is the existing Dev "Review & start" route, on the desktop, when the CO is Dev-startable.
+    """
+    vm = vm_mode()
+    locked, reason = _production_lock()
+    now = production_now()
+    published = _state_not_published()
+    uuid_state = "unread" if row is None or "Account_UUID__c" not in row else "set" if row.get("Account_UUID__c") else "empty"
+    records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=published)
+    items = production_views.onboard_checklist(
+        vm=vm, locked=locked, lock_reason=reason, session_ready=None, clone=_clone_status(), match=match, domain_count=domain_count,
+        uuid_state=uuid_state, ce_route=ce_route, start_iso=start_iso, today=now.date(), days_before=ONBOARD_DAYS_BEFORE_START,
+        approval=production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, now, missing_is_unavailable=published),
+        create=production_views.create_state(records, reference, locked=locked))
+    if vm:
+        where = ("<p class='lede'>Onboarding runs from the desktop dashboard</p><p class='note'>Desktop address: <code>"
+                 + escape(DESKTOP_DASHBOARD_ADDRESS) + "</code></p>")
+        dev_body = "<p class='note'>Dev start is available on the desktop dashboard only.</p>"
+    else:
+        where = ""
+        startable, why = _dev_start_state(reference, row)
+        dev_body = ("<p><a class='btn' href='/co/" + escape(reference) + "'>Review &amp; start (Dev)</a></p>" if startable
+                    else "<p class='note'>Not startable on Dev: " + escape(why) + "</p>")
+    rows = "".join(_check_item(item["label"], escape(item["detail"]), _chip(*production_views.CHECK_CHIPS[item["status"]]))
+                   for item in items)
+    return ("<section class='card onboard-card' aria-labelledby='co-onboard-title'><div class='card-head'>"
+            "<h2 id='co-onboard-title' class='pill'>Onboard</h2></div>" + where
+            + "<h3 class='sub-h'>Leonardo Development (test)</h3>" + dev_body
+            + "<h3 class='sub-h'>Production BackOffice</h3><ol class='checks'>" + rows + "</ol>"
+            "<p class='note'>Production create stays locked until the owner unlocks the runner.</p></section>")
+
+
+def _prod_view_start(reference: str) -> str | None:
+    try:
+        return queue_start_dates((reference,)).get(reference)
+    except Exception:  # noqa: BLE001 - the card shows the start date as unavailable
+        return None
+
+
 def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice: str = "",
                         row: dict[str, str | None] | None = None) -> str:
     """The production CO page (``/onboard/CO-x``): one column of read-only cards in the order of the approved mockup.
@@ -7192,7 +7265,10 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
             + ("<span class='acct'>" + escape(summary["account"]) + "</span>" if summary["account"] else "")
             + (_chip("chip-info", route_label) if route_label else _chip("chip-neutral", "No automated route"))
             + (_chip("chip-bad", "Blocked") if blockers else _chip("chip-ok", "Checks clear")) + _lock_chip() + "</div>")
-    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + _lock_banner() + blocked
+    domains = values.get("domains")
+    onboard = _co_onboard_card(ref, row, match=check, domain_count=len(domains) if isinstance(domains, list) else None,
+                               start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE)
+    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + onboard + _lock_banner() + blocked
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
             + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + approval_card + create_card + record_card
             + writeback_card)

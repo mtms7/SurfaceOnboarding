@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from . import production_approval, salesforce_uuid_writeback
-from .run_target import ProductionLocked, production_target
+from .run_target import ProductionLocked, production_dry_run_target, production_target
 
 CLONE_MAX_AGE = timedelta(hours=6)
 SUBMITTED = "submitted"
@@ -40,7 +40,10 @@ OUTCOME_UNCERTAIN = "uncertain_submit"
 OUTCOME_ATTEMPT_STARTED = "attempt_started"
 RECORD_ERROR = "record_write_failed"
 SESSION_REF_ENV = "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF"
+# Exactly "1" in the run's environment enables the underscore seams of run() (tests only).
+TEST_HOOKS_ENV = "SURFACE_ONBOARDING_TEST_HOOKS"
 
+_REASON = re.compile(r"[a-z][a-z0-9_]{2,80}")
 _DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 
 
@@ -70,6 +73,21 @@ class CreateInputs:
     expected_domains: Any
     expected_account_id: str = ""   # optional: compared when non-empty
     plan_summary: str = ""
+    # A dry run learns the session and duplicate facts in the browser before the gate runs. When ``sessions_ready`` or
+    # ``duplicate_found`` fails, this more specific reason code (``^[a-z][a-z0-9_]{2,80}$``) is returned instead of the
+    # generic one; empty keeps the generic code. It never opens a gate.
+    precheck_reason: str = ""
+
+
+class FormRefusal(Exception):
+    """Raised by ``fill_form`` to refuse with a specific reason code (e.g. ``unexpected_schema``) and, optionally, the
+    field names checked so far (name -> "pass"/"fail"). Anything else raised by ``fill_form`` is ``form_fill_failed``."""
+
+    def __init__(self, reason: str, fields: Mapping[str, str] | None = None) -> None:
+        reason = reason if isinstance(reason, str) and _REASON.fullmatch(reason) else "form_fill_failed"
+        super().__init__(reason)
+        self.reason = reason
+        self.fields = dict(fields) if isinstance(fields, Mapping) else None
 
 
 @dataclass(frozen=True)
@@ -92,6 +110,11 @@ def _domain_problem(domains: Any) -> bool:
         return True
     domain = domains[0]
     return not (isinstance(domain, str) and _DOMAIN.fullmatch(domain.strip().lower()))
+
+
+def _specific(inputs: CreateInputs, generic: str) -> str:
+    reason = inputs.precheck_reason
+    return reason if isinstance(reason, str) and _REASON.fullmatch(reason) else generic
 
 
 def _clone_problem(inputs: CreateInputs) -> str | None:
@@ -148,14 +171,14 @@ def evaluate_gate(inputs: CreateInputs,
     if problem is not None:
         return problem
     if inputs.duplicate_found is not False:
-        return "duplicate_in_production"
+        return _specific(inputs, "duplicate_in_production")
     count = inputs.live_paid_tenant_count
     if isinstance(count, bool) or not isinstance(count, int) or count < 0 or count > 1:
         return "multiple_live_paid_tenants"
     if inputs.timing_allowed is not True and inputs.csm_request_recorded is not True:
         return "timing_window_not_met"
     if inputs.sessions_ready is not True:
-        return "sessions_not_ready"
+        return _specific(inputs, "sessions_not_ready")
     if inputs.schema_ok is not True:
         return "schema_unexpected"
     return None
@@ -283,7 +306,7 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         write_record: Callable[[dict[str, Any]], Any], *, owner_go: bool = False,
         prior_records: Any = (), prior_review_cleared_by_owner: bool = False,
         clock: Callable[[], datetime] | None = None,
-        _production_target_fn: Callable[[Mapping[str, str], datetime], Any] = production_target,
+        _production_target_fn: Callable[[Mapping[str, str], datetime], Any] | None = None,
         _approval_check_fn: Callable[..., str | None] = production_approval.check) -> CreateResult:
     """Run one guarded create attempt. See the module docstring; every path writes at least one record.
 
@@ -294,6 +317,14 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     used just before the approval is consumed (default: real UTC now). ``prior_records`` are loaded
     production_create_record dicts; ``prior_review_cleared_by_owner=True`` waives only the unreviewed-attempt refusal.
     """
+    # The underscore gate seams exist for tests only: without SURFACE_ONBOARDING_TEST_HOOKS == "1" in the run's
+    # environment they are ignored and the real target and approval check apply.
+    if not (isinstance(inputs.environ, Mapping) and inputs.environ.get(TEST_HOOKS_ENV) == "1"):
+        _production_target_fn = None
+        _approval_check_fn = production_approval.check
+    # A dry run is gated by its own target (PRODUCTION_DRY_RUN_SUPPORTED); a live create only by production_target.
+    if _production_target_fn is None:
+        _production_target_fn = production_dry_run_target if dry_run is True else production_target
     reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn)
     if reason is not None:
         return _refuse(write_record, inputs, reason)
@@ -308,6 +339,8 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
 
     try:
         fields = fill_form(inputs)
+    except FormRefusal as refusal:
+        return _refuse(write_record, inputs, refusal.reason, refusal.fields)
     except Exception:
         return _refuse(write_record, inputs, "form_fill_failed")
     checked = {k: v for k, v in fields.items() if isinstance(k, str)} if isinstance(fields, Mapping) else None

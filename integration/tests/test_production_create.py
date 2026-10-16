@@ -42,6 +42,7 @@ def make_inputs(**over):
         expected_tenant_name="Grupo Patio", expected_domains=("patio.cl",), expected_account_id="",
         plan_summary="Credential Exposure, 1 year")
     data.update(over)
+    data["environ"] = {**data["environ"], "SURFACE_ONBOARDING_TEST_HOOKS": "1"}
     return pc.CreateInputs(**data)
 
 

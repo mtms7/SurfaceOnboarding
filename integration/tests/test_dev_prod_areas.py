@@ -533,7 +533,8 @@ class ProductionCoViewTests(unittest.TestCase):
     def test_it_has_the_before_migration_checklist_as_text(self):
         page = self.view()
         self.assertIn("Before migration", page)
-        self.assertEqual(page.count("<li>"), len(dashboard.BEFORE_MIGRATION))
+        # The Onboard card (nine checklist items) now sits above this card: count only the Before migration list.
+        self.assertEqual(page[page.index("Before migration"):].count("<li>"), len(dashboard.BEFORE_MIGRATION))
         self.assertIn("Onboarding Stage", page)
         self.assertIn("redash_inventory_collector.py --collect", page)
 

@@ -21,6 +21,7 @@ passwords.txt
 integration/attended_leonardo_readbacks.json
 integration/attended_ce_only_runner_state.json
 integration/attended_ce_only_diagnostics.json
+integration/production-probe/
 integration/attended_ce_only_table_diagnostics.json
 integration/attended_ce_only_table_diagnostics.*.bak.json
 
@@ -67,3 +68,9 @@ integration/attended_renewal_outcomes.json
 
 # Local reset backups (demo CO records)
 integration/attended_reset_backups/
+
+# operator state written by the dashboard (never committed)
+integration/onboarding_review_approvals.json
+integration/production_create_approvals.json
+production-create-records/
+integration/production-create-records/

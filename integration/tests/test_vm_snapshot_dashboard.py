@@ -86,6 +86,10 @@ class SnapshotDashboardCase(ServerCase):
                 patcher = patch.object(module, name, folder / getattr(module, name).name)
                 patcher.start()
                 self.addCleanup(patcher.stop)
+        # The summary-approval file is a desktop-time constant under the repo; keep the test hermetic (nothing there = unavailable).
+        patcher = patch.object(dashboard, "REVIEW_APPROVAL_PATH", folder / "onboarding_review_approvals.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.calls = []
         self.guard("subprocess.run", "subprocess.Popen", "subprocess.check_output", "os.system", "webbrowser.open_new_tab")
         real_connect = socket.create_connection

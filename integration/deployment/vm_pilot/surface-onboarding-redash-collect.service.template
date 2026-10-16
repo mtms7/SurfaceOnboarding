@@ -22,9 +22,9 @@ WorkingDirectory=/opt/surface-onboarding/app
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=SURFACE_ONBOARDING_STATE_DIR=/var/lib/surface-onboarding
 Environment=SURFACE_REDASH_KEY_FILE=/etc/surface-onboarding/redash-key
-ExecStart=/opt/surface-onboarding/runtime/python-3.12.14/bin/python3.12 /opt/surface-onboarding/app/tools/redash_inventory_collector.py --collect
+ExecStart=/opt/surface-onboarding/runtime/python-3.12.14/bin/python3.12 /opt/surface-onboarding/app/tools/redash_inventory_collector.py --collect --cached-ok
 TimeoutStartSec=420
-# Exit 2 means "written but the refresh did not happen" (older data written with its true age): not a unit failure.
+# --cached-ok: when Redash does not let this key re-run the query (the known per-query-key limit; the Redash owner sets an hourly scheduled refresh instead), the run reads the latest cached result, records refreshed:false + refresh_reason:redash_refresh_not_permitted + the age, and exits 0. Exit 2 stays a success status for safety. The 6 h age gate downstream decides trust.
 SuccessExitStatus=2
 StateDirectory=surface-onboarding
 StateDirectoryMode=0750
