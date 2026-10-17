@@ -6231,12 +6231,17 @@ def _unreadable_match(reason: str = "co_source_unreadable") -> dict[str, Any]:
             "captured_at": None, "age_seconds": None, "tenants_checked": 0, "route": None}
 
 
+UNSTAMPED_MATCH_ALLOWED = False  # TEST-ONLY hook: production matches always carry computed_at; canned test values do not
+
+
 def _fresh_match(match: Any, now: datetime | None = None) -> Any:
     """Re-check the clone age at READ time: a cached match computed inside the 6 h limit is never replayed as usable once the
-    clone has passed it. The age is the age at compute time plus the time since (``computed_at``); a match without those
-    fields (canned or legacy) is returned as is, a malformed one fails closed."""
-    if not isinstance(match, dict) or match.get("status") in ("clone_unavailable", "not_checked") or "computed_at" not in match:
+    clone has passed it. The age is the age at compute time plus the time since (``computed_at``); a match without that
+    stamp or a malformed one fails closed (``UNSTAMPED_MATCH_ALLOWED`` is a test-only exemption)."""
+    if not isinstance(match, dict) or match.get("status") in ("clone_unavailable", "not_checked"):
         return match
+    if "computed_at" not in match:  # fail closed: the age of an unstamped match cannot be re-checked
+        return match if UNSTAMPED_MATCH_ALLOWED else _unreadable_match("match_age_unverified")
     try:
         computed = datetime.fromisoformat(str(match["computed_at"]))
         age = float(match["age_seconds"]) + ((now or datetime.now(timezone.utc)) - computed).total_seconds()

@@ -100,6 +100,7 @@ def patched(env, rows=ROWS, matches=MATCHES, starts=STARTS, unavailable=False, u
         enter(patch.object(dashboard, "queue_rows", side_effect=lambda: [dict(item) for item in rows]))
         enter(patch.object(dashboard, "queue_start_dates", return_value=dict(starts)))
         enter(patch.object(dashboard, "prefetch_display_read"))
+        enter(patch.object(dashboard, "UNSTAMPED_MATCH_ALLOWED", True))  # canned matches carry no computed_at
         enter(patch.object(dashboard, "production_match_for",
                            side_effect=lambda ref, product=None, kind=None: matches.get(ref, match())))
         enter(patch.object(dashboard, "inventory_root", return_value=env.clone_root))

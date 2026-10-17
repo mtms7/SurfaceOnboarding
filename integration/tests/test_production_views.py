@@ -251,6 +251,11 @@ class ProductionCheckTests(unittest.TestCase):
         self.assertEqual((chip["label"], chip["code"], chip["blocked"]), ("Ambiguous", "ambiguous", True))
         self.assertEqual(self.check("ambiguous", candidates=[{"live_paid": True}, {"live_paid": True}])["label"], "Live paid x 2")
 
+    def test_a_deleted_or_disabled_uuid_owner_is_onboarded_review_not_clean(self):
+        for code in ("tenant_deleted", "tenant_disabled"):
+            chip = self.check("onboarded", review={"warnings": [code]})
+            self.assertEqual((chip["label"], chip["css"]), ("Onboarded: review", "chip-warn"))
+
     def test_a_duplicate_says_the_uuid_check_did_not_run_when_it_did_not(self):
         chip = self.check("exists_matches", uuid_checked=False)
         self.assertIn("UUID check runs on the VM dashboard", chip["reason"])

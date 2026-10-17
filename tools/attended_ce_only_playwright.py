@@ -8076,6 +8076,7 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     uuid_value = _snapshot_account_uuid(reference)
     result = match.production_match(co_source, plan, snapshot, account_uuid=uuid_value or None, ce_only=engine == CE_ENGINE)
     result["uuid_checked"] = uuid_value is not None
+    result["co_uuid_set"] = bool(uuid_value) if uuid_value is not None else None
     result["computed_at"] = datetime.now(timezone.utc).isoformat()  # lets a cached match be re-aged at read time
     if result["status"] == "not_checked" and result["reason"] == "co_source_unreadable":
         result["reason"] = "production_inputs_not_prepared"

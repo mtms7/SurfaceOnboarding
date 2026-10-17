@@ -12,7 +12,7 @@ Run once, in your own PowerShell, after `--store-key` and a successful `--probe`
     powershell -File tools\register_redash_inventory_task.ps1             # register
     powershell -File tools\register_redash_inventory_task.ps1 -Remove     # unregister
 Query 253 (v2 inventory): store its own key first (`--store-key --query-id 253`), then register with `-QueryId 253`; the
-same task name is replaced (-Force), so this is also how to switch back (`-QueryId 251`, the default, behaves as before).
+same task name is replaced (-Force), so this is also how to switch back (`-QueryId 251`, the default; the task now passes `--query-id 251` explicitly).
 
 Results are one line per run in %LOCALAPPDATA%\SurfaceOnboarding\redash\collector.log (reason codes and counts only).
 Exit codes: 0 = ok, 1 = failed (nothing written), 2 = written but Redash could not refresh (data is older than wanted);
@@ -31,7 +31,9 @@ $taskName = 'SurfaceOnboarding-RedashInventory'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $collector = Join-Path $projectRoot 'tools\redash_inventory_collector.py'
 $keyFile = Join-Path $env:LOCALAPPDATA ('SurfaceOnboarding\redash\query-{0}.key' -f $QueryId)
-$queryArgs = if ($QueryId -eq 251) { '' } else { ' --query-id {0}' -f $QueryId }
+# The id is ALWAYS passed explicitly (251 too): SURFACE_REDASH_QUERY_ID can never silently override the task, and the
+# key file checked above is the one of this same registered id.
+$queryArgs = ' --query-id {0}' -f $QueryId
 
 if ($Remove) {
     if ($PSCmdlet.ShouldProcess($taskName, 'Unregister scheduled task')) {

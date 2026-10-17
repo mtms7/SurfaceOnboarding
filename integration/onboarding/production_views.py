@@ -243,6 +243,7 @@ NOT_CHECKED_TEXT = {
     "co_source_unreadable": "The CO's name or domains could not be read; the clone itself is fine."}
 
 
+REVIEW_LABEL_WARNINGS = frozenset({"identity_mismatch", "tenant_deleted", "tenant_disabled"})
 UUID_NOTE = "UUID check runs on the VM dashboard."
 
 
@@ -271,7 +272,7 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
                 "reason": NOT_CHECKED_TEXT.get(reason, reason)}
     if status == "onboarded":
         warnings = (match.get("review") or {}).get("warnings") if isinstance(match.get("review"), dict) else None
-        label = "Onboarded: review" if "identity_mismatch" in (warnings or []) else "Onboarded"
+        label = "Onboarded: review" if set(warnings or []) & REVIEW_LABEL_WARNINGS else "Onboarded"
         return {**base, "code": "onboarded", "css": "chip-warn" if warnings else "chip-ok", "label": label,
                 "blocked": False, "warnings": list(warnings or [])}
     if status == "uuid_not_in_clone":
@@ -424,14 +425,19 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, sessio
         items.append(_item("duplicate", "ready", "No match in the production clone (" + str(int((match or {}).get("tenants_checked") or 0))
                            + " tenants checked)."))
     elif check["code"] == "onboarded":
-        items.append(_item("duplicate", "ready", check["reason"] or "Already onboarded: tenant found in production (UUID matches the CO)."))
+        items.append(_item("duplicate", "blocked", "Already onboarded: tenant found in production (UUID matches the CO). "
+                           + (check["reason"] or "")))
+    elif check["code"] == "uuid_not_in_clone":
+        items.append(_item("duplicate", "blocked", "UUID set but tenant not found in clone (the clone may be older than the create)."))
     elif check["code"] in ("duplicate", "live_paid", "other_tenants", "ambiguous"):
         items.append(_item("duplicate", "blocked", check["label"] + " in the production clone."
                            + (" " + UUID_NOTE if (match or {}).get("uuid_checked") is False else "")))
     else:
         items.append(_item("duplicate", "unavailable", check["label"] + ". A missing match is never a clearance."))
     # 5 Salesforce data
-    if uuid_state not in ("empty", "set") or (ce_route and not isinstance(domain_count, int)):
+    if uuid_state == "empty" and isinstance(match, dict) and match.get("co_uuid_set") is True:
+        items.append(_item("data", "blocked", "UUID sources disagree: the snapshot holds an Account UUID, the read shows none."))
+    elif uuid_state not in ("empty", "set") or (ce_route and not isinstance(domain_count, int)):
         items.append(_item("data", "unavailable", "The CO could not be read for this check."))
     elif uuid_state == "set":
         items.append(_item("data", "blocked", "Salesforce already holds an Account UUID for this CO."))
@@ -493,6 +499,10 @@ SHEET_REFUSALS = {
     "approval_not_approved": "Salesforce does not show this CO as Approved.",
     "duplicate_in_production": "The production clone already holds a tenant that matches this name or domain.",
     "live_paid_in_production": "The production clone shows more than one live paid tenant for this CO.",
+    "already_onboarded": "Already onboarded: tenant found in production (the UUID matches the CO). Do not create another.",
+    "uuid_not_in_clone": "UUID set but tenant not found in clone (the clone may be older than the create). Do not create another.",
+    "match_not_checked": "The production match was not computed for this CO, so a missing match is not a clearance.",
+    "uuid_sources_disagree": "UUID sources disagree: the published snapshot holds an Account UUID but the Salesforce read shows it empty.",
     "dealhub_range_missing": "Onboarding Comments hold no usable DealHub date range, so the expiration date cannot be derived.",
     "dealhub_range_ambiguous": "Onboarding Comments hold more than one DealHub date range, so the expiration date is ambiguous.",
     "dealhub_range_invalid": "The DealHub date range in Onboarding Comments is invalid (the end is not after the start).",
@@ -514,6 +524,11 @@ def _unavailable(label: str, note: str) -> dict[str, str]:
     return _row(label, UNAVAILABLE_ON_SERVER, note, "unavailable")
 
 
+def _uuid_disagrees(co: dict[str, Any], match: dict[str, Any] | None) -> bool:
+    """The match saw an Account UUID on the CO (published snapshot) but the CO read shows the field empty."""
+    return co.get("uuid_state") == "empty" and isinstance(match, dict) and match.get("co_uuid_set") is True
+
+
 def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clone: dict[str, Any] | None,
                        match: dict[str, Any] | None, domain_ok: bool, as_of: str | None = None) -> list[dict[str, str]]:
     """The "before you start" chips: ``{"label", "status": ok | blocked | unavailable, "detail"}``."""
@@ -526,8 +541,11 @@ def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clo
     items.append(chip("Email domain", "ok" if domain_ok else "blocked",
                       "Exactly one valid domain" if domain_ok else "Exactly one valid domain is required"))
     uuid_state = co.get("uuid_state")
-    items.append(chip("Account UUID", "ok" if uuid_state == "empty" else "blocked" if uuid_state == "set" else "unavailable",
-                      {"empty": "Empty", "set": "Already set"}.get(uuid_state, "Not read")))
+    if _uuid_disagrees(co, match):
+        items.append(chip("Account UUID", "blocked", "UUID sources disagree (the snapshot holds one, the read shows none)"))
+    else:
+        items.append(chip("Account UUID", "ok" if uuid_state == "empty" else "blocked" if uuid_state == "set" else "unavailable",
+                          {"empty": "Empty", "set": "Already set"}.get(uuid_state, "Not read")))
     clone_state = clone.get("state") if isinstance(clone, dict) else None
     check = production_check(match)
     age = age_words(clone.get("age_seconds")) if isinstance(clone, dict) else "unknown"
@@ -537,7 +555,9 @@ def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clo
     elif clone_state == "stale":
         items.append(chip(label, "blocked", "Clone " + age + " old: older than 6 h, not trusted"))
     elif check["code"] == "onboarded":
-        items.append(chip(label, "ok", "Already onboarded: tenant found in production (UUID matches the CO)"))
+        items.append(chip(label, "blocked", "Already onboarded: tenant found in production (UUID matches the CO)"))
+    elif check["code"] == "uuid_not_in_clone":
+        items.append(chip(label, "blocked", "UUID set but tenant not found in clone (the clone may be older than the create)"))
     elif check["code"] in ("duplicate", "live_paid", "other_tenants", "ambiguous"):
         items.append(chip(label, "blocked", check["label"] + " in the production clone"
                           + (". " + UUID_NOTE if (match or {}).get("uuid_checked") is False else "")))
@@ -596,7 +616,11 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
     check_code = production_check(match)["code"]
     reason = ("account_uuid_set" if co.get("uuid_state") == "set"
               else "account_uuid_unread" if co.get("uuid_state") != "empty"
+              else "uuid_sources_disagree" if _uuid_disagrees(co, match)
               else "approval_not_approved" if co.get("approval_status") != "Approved"
+              else "already_onboarded" if check_code == "onboarded"
+              else "uuid_not_in_clone" if check_code == "uuid_not_in_clone"
+              else "match_not_checked" if check_code == "not_checked"
               else "live_paid_in_production" if check_code == "live_paid"
               else "duplicate_in_production" if check_code in ("duplicate", "other_tenants", "ambiguous")
               else "one_email_domain_required" if len(tokens) != 1

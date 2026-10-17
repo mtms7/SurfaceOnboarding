@@ -553,3 +553,44 @@ class NoWriteRouteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OnboardedAndUnverifiedMatchTests(unittest.TestCase):
+    """Only exactly 'clear' may lead to a creatable sheet; every other production status refuses or blocks (review 2026-10-17)."""
+
+    def refused(self, match, **over):
+        result = sheet(match=match, **over)
+        self.assertEqual(result["state"], "refused", match)
+        return result
+
+    def test_onboarded_always_blocks_with_the_clear_reason_even_with_an_empty_uuid_read(self):
+        for warnings in ([], ["spycloud_off"], ["tenant_deleted"]):
+            match = {"status": "onboarded", "reason": "x", "candidates": [], "review": {"warnings": warnings}}
+            result = self.refused(match)
+            self.assertEqual(result["reason"], "already_onboarded")
+            self.assertEqual(result["rows"], [])
+            self.assertEqual([i["status"] for i in result["eligibility"] if i["label"] == "Clone and production match"], ["blocked"])
+            self.assertIn("Already onboarded: tenant found in production", views.SHEET_REFUSALS["already_onboarded"])
+
+    def test_uuid_not_in_clone_and_not_checked_refuse(self):
+        self.assertEqual(self.refused({"status": "uuid_not_in_clone", "reason": "", "candidates": []})["reason"], "uuid_not_in_clone")
+        self.assertEqual(self.refused({"status": "not_checked", "reason": "production_inputs_not_prepared", "candidates": []})["reason"],
+                         "match_not_checked")
+
+    def test_snapshot_uuid_set_while_the_read_shows_empty_is_a_disagreement(self):
+        match = {"status": "not_in_production", "reason": "", "candidates": [], "tenants_checked": 5, "co_uuid_set": True}
+        result = self.refused(match, uuid_state="empty")
+        self.assertEqual(result["reason"], "uuid_sources_disagree")
+        self.assertEqual([i["status"] for i in result["eligibility"] if i["label"] == "Account UUID"], ["blocked"])
+        self.assertNotEqual(sheet(match={**match, "co_uuid_set": False}, uuid_state="empty")["state"], "refused")
+
+    def test_the_checklist_blocks_onboarded_and_disagreement(self):
+        base = dict(vm=True, locked=True, lock_reason=None, session_ready=None, clone={"state": "fresh", "age_seconds": 60},
+                    domain_count=1, uuid_state="empty", ce_route=True, start_iso="2026-10-18", today=date(2026, 10, 17),
+                    days_before=2, approval=None, create=None)
+        items = {i["key"]: i for i in views.onboard_checklist(match={"status": "onboarded", "reason": "", "candidates": [],
+                                                                      "review": {"warnings": []}}, **base)}
+        self.assertEqual(items["duplicate"]["status"], "blocked")
+        items = {i["key"]: i for i in views.onboard_checklist(match={"status": "not_in_production", "candidates": [],
+                                                                      "co_uuid_set": True}, **base)}
+        self.assertEqual(items["data"]["status"], "blocked")

@@ -99,6 +99,7 @@ def areas(rows=ROWS, matches=MATCHES, state=RECORDS, readbacks=READBACKS, outcom
         enter(patch.object(dashboard, "load_check_state", return_value=checks or {}))
         enter(patch.object(dashboard, "inventory_root", return_value=root))
         enter(patch.object(dashboard, "prefetch_display_read"))
+        enter(patch.object(dashboard, "UNSTAMPED_MATCH_ALLOWED", True))  # canned matches carry no computed_at
         enter(patch.object(dashboard, "production_match_for",
                            side_effect=lambda ref, product=None, kind=None: matches.get(ref, canned("not_in_production"))))
         enter(patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce in area tests")))

@@ -645,7 +645,12 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         later = dashboard._fresh_match(cached, now + timedelta(minutes=2))
         self.assertEqual((later["status"], later["reason"]), ("clone_unavailable", "inventory_snapshot_stale"))
         self.assertEqual(dashboard._fresh_match({**cached, "computed_at": "garbage"}, now)["status"], "clone_unavailable")
-        self.assertEqual(dashboard._fresh_match({"status": "not_in_production"})["status"], "not_in_production")  # canned: untouched
+        unstamped = {"status": "not_in_production", "reason": "", "candidates": []}
+        failed = dashboard._fresh_match(unstamped)  # production default: no computed_at -> fail closed
+        self.assertEqual((failed["status"], failed["reason"]), ("clone_unavailable", "match_age_unverified"))
+        with patch.object(dashboard, "UNSTAMPED_MATCH_ALLOWED", True):  # the explicit test-only exemption
+            self.assertEqual(dashboard._fresh_match(unstamped)["status"], "not_in_production")
+        self.assertFalse(dashboard.UNSTAMPED_MATCH_ALLOWED)
 
     def test_two_deleted_uuid_twins_read_ambiguous_not_live_paid(self):
         self.publish({"CO-0001": self.item()}, uuid=self.UUID)

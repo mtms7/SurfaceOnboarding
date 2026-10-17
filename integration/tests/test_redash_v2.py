@@ -106,7 +106,9 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(extra.unexpected_columns, ("surpriseColumn",))
         short = row253(1)
         del short["aiEnabled"]
-        self.assertEqual(redash.normalize(reply([short]), 253).missing_columns, ("aiEnabled",))
+        with self.assertRaises(inventory.InventoryError) as raised:  # query 253: a missing column is an error, not a count
+            redash.normalize(reply([short]), 253)
+        self.assertEqual(raised.exception.reason, "redash_columns_missing")
         with self.assertRaises(inventory.InventoryError):  # required columns stay required
             redash.normalize(reply([{key: value for key, value in row253(1).items() if key != "accountName"}]), 253)
 
@@ -174,7 +176,9 @@ class SelectionTests(unittest.TestCase):
 
     def test_main_refuses_an_unsupported_id_without_output_of_secrets(self):
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+        temp = __import__("tempfile").TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        with contextlib.redirect_stdout(out), patch.object(collector, "state_dir", return_value=Path(temp.name)):  # never the real log
             code = collector.main(["--probe", "--query-id", "999"])
         self.assertEqual((code, json.loads(out.getvalue())), (1, {"result": "redash_query_id_unsupported"}))
 
@@ -300,6 +304,73 @@ class PushTests(cp.Base):
         size = max(path.stat().st_size for path in (self.desktop / "prod-clone").glob("redash-*.json"))
         per_row = size / 50
         self.assertLess(per_row * 6000, vs.MAX_FILE_BYTES)  # about 5,450 tenants today; headroom up to 6,000
+
+
+class RegistrationScriptTests(unittest.TestCase):
+    def test_the_task_always_passes_its_query_id_and_checks_that_ids_key_file(self):
+        text = (Path(__file__).resolve().parents[2] / "tools" / "register_redash_inventory_task.ps1").read_text(encoding="utf-8")
+        self.assertIn("$queryArgs = ' --query-id {0}' -f $QueryId", text)  # 251 too: the env var can never override
+        self.assertNotIn("if ($QueryId -eq 251) { '' }", text)
+        self.assertIn("query-{0}.key' -f $QueryId", text)
+
+
+class ShapeTests(unittest.TestCase):
+    """Review 2026-10-17: PII-shaped free text, huge numbers and oversized rows never enter the clone."""
+
+    def refused(self, **overrides):
+        with self.assertRaises(inventory.InventoryError) as raised:
+            redash.normalize(reply([row253(1, **overrides)]), 253)
+        return raised.exception.reason
+
+    def test_hostname_lists_reject_pii_shaped_items_and_oversize(self):
+        for column in ("userEmailDomains", "leakedCredentialsScannedDomains", "alternateDomains", "accountLicense.allowedModules"):
+            for bad in (["jane@example.com"], ["two words.example.com"], ["a" * 254], ["ok.example.com"] * 51, [5], ["tab	.example"]):
+                with self.subTest(column=column, bad=bad[:1]):
+                    self.assertEqual(self.refused(**{column: bad}), "redash_schema_unavailable")
+        redash.normalize(reply([row253(1, userEmailDomains=["ok.example.com"] * 3, alternateDomains=["Alt.Example.com."])]), 253)
+
+    def test_country_enums_and_text_shapes(self):
+        for column, bad in (("accountCountryCode", "us"), ("accountCountryCode", "USA"), ("accountCountryCode", "Jane Doe"),
+                            ("enumerationScanningInterval", "Jane Doe <jane@example.com>"), ("accountLicense.reconLevel", "x" * 33),
+                            ("leakedCredentialsScanningInterval", "a@b")):
+            with self.subTest(column=column):
+                self.assertEqual(self.refused(**{column: bad}), "redash_schema_unavailable")
+
+    def test_huge_numbers_are_a_clean_refusal_not_a_traceback(self):
+        for column, bad in (("subDomainsCount", 10 ** 400), ("enumerationScanningInterval", 10 ** 400),
+                            ("accountLicense.assetsNumber", 10 ** 400), ("lastReconScanDurationMilliseconds", 10 ** 400),
+                            ("_modified", 10 ** 400), ("_modified", float("1e400")), ("subDomainsCount", float("inf"))):
+            with self.subTest(column=column):
+                self.assertIn(self.refused(**{column: bad}), ("redash_schema_unavailable", "redash_date_unparseable"))
+
+    def test_source_query_must_agree_with_the_row_schema(self):
+        payload = snapshot_253(Path(__import__("tempfile").mkdtemp()), 3)
+        self.assertEqual(redash.validate_row_schema(payload), "v2")
+        for mutate in (lambda p: p["source"].update(query_id=251), lambda p: p["source"].update(query_id=999),
+                       lambda p: p.pop("source"), lambda p: p.update(row_schema="v1")):
+            clone = json.loads(json.dumps(payload))
+            mutate(clone)
+            with self.assertRaises(inventory.InventoryError) as raised:
+                redash.validate_row_schema(clone)
+            self.assertEqual(raised.exception.reason, "inventory_row_schema_invalid")
+        v1 = json.loads(json.dumps(payload))
+        v1.pop("row_schema")
+        for tenant in v1["tenants"]:
+            tenant.pop("v2")
+        v1["source"]["query_id"] = 253  # a v1 snapshot that claims query 253
+        with self.assertRaises(inventory.InventoryError):
+            redash.validate_row_schema(v1)
+
+    def test_a_row_of_maximal_valid_lists_stays_inside_the_file_limit(self):
+        host = "h" * 60 + ".example.com"  # 72 chars
+        lists = {"alternateDomains": [host] * 4, "userEmailDomains": [host] * 4, "leakedCredentialsScannedDomains": [host] * 4,
+                 "accountLicense.allowedModules": ["m" * 20] * 3}
+        redash.normalize(reply([row253(1, **lists)]), 253)  # inside the per-row list budget: accepted
+        self.assertEqual(self.refused(**{**lists, "alternateDomains": [host] * 50}), "redash_schema_unavailable")  # over budget
+        root = Path(__import__("tempfile").mkdtemp())
+        snapshot_253(root, 20, **lists, accountName="N" * 120)
+        size = max(path.stat().st_size for path in (root / "prod-clone").glob("redash-*.json"))
+        self.assertLess(size / 20 * 6000, vs.MAX_FILE_BYTES)  # 6,000 worst-case rows
 
 
 if __name__ == "__main__":

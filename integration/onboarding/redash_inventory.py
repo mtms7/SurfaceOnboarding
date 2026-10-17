@@ -97,8 +97,13 @@ V2_LICENSE_COLUMNS: dict[str, str] = {
     "accountLicense.multipleUsersAllowed": "bool", "accountLicense.apiAccessAllowed": "bool",
     "accountLicense.phishingEnabled": "bool", "accountLicense.provisioningEnabled": "bool",
     "accountLicense.allowedModules": "list", "accountLicense.elevatedFeaturesEnabled": "bool"}
-_MAX_LIST_ITEMS = 500
-_MAX_TEXT = 512
+# Shape limits (review 2026-10-17): PII-shaped free text must never enter the clone, and lists cannot grow the file.
+_MAX_LIST_ITEMS = 50
+_MAX_TEXT = 128
+_HOSTNAME = re.compile(r"[A-Za-z0-9*_.-]{1,253}")  # no '@', no spaces, at most 253 characters
+_COUNTRY_CODE = re.compile(r"[A-Z]{2}")
+_ENUM = re.compile(r"[A-Za-z0-9_ -]{1,32}")
+MAX_ROW_LIST_CHARS = 1500  # all list items of one row together: bounds the worst-case row so 6,000 rows stay under 32 MB
 
 
 def v2_key(column: str) -> str:
@@ -142,19 +147,27 @@ def _v2_value(kind: str, value: Any) -> Any:
         if number is not None and 0 <= number < 10 ** 12:
             return number
     elif kind == "str":
-        if type(value) is str and len(value) <= _MAX_TEXT:
+        if type(value) is str and _COUNTRY_CODE.fullmatch(value):
             return value
     elif kind == "interval":
-        if type(value) is str and len(value) <= 64:
+        if type(value) is str and _ENUM.fullmatch(value):
             return value
-        if type(value) in (int, float) and value == value and float(value).is_integer() and 0 <= value < 10 ** 12:
+        if type(value) is int and 0 <= value < 10 ** 12:
+            return value
+        if type(value) is float and value == value and abs(value) < 1e12 and value.is_integer() and value >= 0:
             return int(value)
     elif kind == "list":
         items = _domain_list(value)
-        if items is not None and len(items) <= _MAX_LIST_ITEMS \
-                and all(type(item) is str and len(item) <= _MAX_TEXT for item in items):
-            return items
+        if items is not None:
+            return _hostnames(items)
     raise InventoryError("redash_schema_unavailable")
+
+
+def _hostnames(items: Any) -> list[str]:
+    """A bounded list of hostname-shaped strings; anything else refuses (fail closed, no value in the reason)."""
+    if type(items) is not list or len(items) > _MAX_LIST_ITEMS             or not all(type(item) is str and _HOSTNAME.fullmatch(item) for item in items):
+        raise InventoryError("redash_schema_unavailable")
+    return items
 
 
 def validate_row_schema(payload: Any) -> str:
@@ -165,6 +178,13 @@ def validate_row_schema(payload: Any) -> str:
     schema = payload.get("row_schema", ROW_SCHEMA_V1)
     tenants = payload.get("tenants")
     if schema not in (ROW_SCHEMA_V1, ROW_SCHEMA_V2) or type(tenants) is not list:
+        raise InventoryError("inventory_row_schema_invalid")
+    source = payload.get("source")
+    query_id = source.get("query_id") if isinstance(source, dict) else None
+    if query_id is not None:  # the recorded source query and the row schema must agree (253 <-> v2, 251 <-> v1)
+        if query_id not in PROFILES or PROFILES[query_id].row_schema != schema:
+            raise InventoryError("inventory_row_schema_invalid")
+    elif schema == ROW_SCHEMA_V2:
         raise InventoryError("inventory_row_schema_invalid")
     for tenant in tenants:
         if not isinstance(tenant, dict):
@@ -322,8 +342,12 @@ def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> t
             value = parse_timestamp_ms(value)
         elif column in INT_COLUMNS:
             value = _whole_number(value)
+            if value is not None and abs(value) >= 10 ** 15:
+                raise InventoryError("redash_schema_unavailable")
         elif column in LIST_COLUMNS:
             value = _domain_list(value)
+            if value is not None:
+                _hostnames(value)
         if column == "operatorCount":  # only "is an operator assigned" is kept, never who
             if value is not None and not 0 <= value <= MAX_OPERATOR_COUNT:
                 raise InventoryError("redash_schema_unavailable")
@@ -337,6 +361,16 @@ def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> t
     if any(item is not None for item in license_.values()):
         row["accountLicense"] = license_
     return row, v2
+
+
+def _list_chars(row: Mapping[str, Any], v2: Mapping[str, Any]) -> int:
+    """Characters held in every list of one row (alternate domains, v2 lists, allowed modules)."""
+    total = sum(len(item) for item in row.get("alternateDomains") or () if type(item) is str)
+    lic = row.get("accountLicense")
+    for value in [*(v2.values()), *((lic or {}).values() if isinstance(lic, dict) else ())]:
+        if type(value) is list:
+            total += sum(len(item) for item in value if type(item) is str)
+    return total
 
 
 def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
@@ -366,7 +400,12 @@ def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
     for raw in table:
         if not isinstance(raw, dict):
             raise InventoryError("redash_schema_unavailable")
-        row, v2 = _build_row(raw, profile)
+        try:
+            row, v2 = _build_row(raw, profile)
+        except (OverflowError, ValueError, TypeError):  # huge or odd numbers: a clean refusal, never a traceback
+            raise InventoryError("redash_schema_unavailable") from None
+        if _list_chars(row, v2) > MAX_ROW_LIST_CHARS:
+            raise InventoryError("redash_schema_unavailable")
         rows.append(row)
         if profile.row_schema == ROW_SCHEMA_V2 and type(row.get("id")) is str:
             v2_rows.setdefault(row["id"], v2)  # a repeated id keeps its first row, as assemble_rows does
@@ -377,6 +416,11 @@ def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
         latest_modified = datetime.fromtimestamp(latest / 1000, tz=timezone.utc) if latest is not None else None
     except (OverflowError, OSError, ValueError):
         raise InventoryError("redash_date_unparseable") from None
+    has_spycloud = any(name in names for name in (SPYCLOUD_OBJECT_COLUMN, SPYCLOUD_COLUMN))
+    if profile.row_schema == ROW_SCHEMA_V2 and any(
+            column not in names and not (has_spycloud and column == "spyCloudEnabled")
+            for column in (*V2_COLUMNS, *V2_LICENSE_COLUMNS)):
+        raise InventoryError("redash_columns_missing")  # query 253 must project every v2 column: not a count, an error
     unexpected = sorted(name if _SAFE_COLUMN.fullmatch(name) else "<column>"
                         for name in names if name not in profile.known)
     optional = profile.known - frozenset(REQUIRED_COLUMNS)

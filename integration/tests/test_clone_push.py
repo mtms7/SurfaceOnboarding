@@ -224,7 +224,7 @@ class IngestTests(Base):
     def test_output_never_contains_content_or_key(self):
         raw = self.bundle()
         buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
+        with contextlib.redirect_stdout(buffer), patch.object(ingest, "datetime", wraps=datetime, **{"now.return_value": NOW}):
             ingest.main(["--key-file", str(self.key_file), "--state-dir", str(self.state)], stdin=io.BytesIO(raw))
         text = buffer.getvalue()
         self.assertTrue(text.startswith("ingested "))
