@@ -246,6 +246,7 @@ class Harness:
         self.state_dir, self.approval_path = state_dir, approval_path
         self.counts = {"fill": 0, "click": 0, "readback": 0, "write": 0}
         self.dup_result = None
+        self.source_result = None
         self.order = []
         self._click, self._fill, self._readback = click, fill, readback
         self.clock_state = {"now": NOW}
@@ -285,6 +286,11 @@ class Harness:
         return {"tenant_name": "Grupo Patio", "domains": ["patio.cl"], "account_id": "a" * 24, "account_uuid": UUID,
                 "response_shape": ["id", "uuid", "access_token"], "contract_mismatches": []}
 
+    def source_check(self, inputs):
+        self.counts["src"] = self.counts.get("src", 0) + 1
+        self.order.append("src")
+        return self.source_result if self.source_result is not None else (inputs.source_revision, False)
+
     def dup_check(self, inputs):
         self.counts["dup"] = self.counts.get("dup", 0) + 1
         self.order.append("dup")
@@ -309,6 +315,7 @@ class Harness:
         if not dry_run:
             kwargs.setdefault("prior_records", [DRY_RECORD])
             kwargs.setdefault("live_duplicate_check", self.dup_check)
+            kwargs.setdefault("live_source_check", self.source_check)
         kwargs.update(extra)
         return pc.run(self.inputs() if inputs is None else inputs, dry_run, self.fill_form, self.click_confirm,
                       self.read_back, self.write_record, **kwargs)
@@ -506,7 +513,8 @@ class TestFreshClock(Base):
         h = self.harness()
         result = pc.run(h.inputs(), False, h.fill_form, h.click_confirm, h.read_back, h.write_record,
                         owner_go=True, _production_target_fn=target_ok, prior_records=[DRY_RECORD],
-                        live_duplicate_check=h.dup_check)
+                        live_duplicate_check=h.dup_check,
+                        live_source_check=h.source_check)
         # The fixtures are dated 2026-10-16 12:00 UTC; with the real clock a click only happens if the fresh gate
         # passed, and then the approval was consumed first.
         self.assertEqual(h.counts["click"], 1 if h.consumed() else 0)
@@ -578,8 +586,8 @@ class TestLiveCreate(Base):
         h = self.harness()
         result = h.run(dry_run=False, owner_go=True)
         self.assertEqual(result.outcome, "readback_verified")
-        self.assertEqual(h.counts, {"fill": 1, "click": 1, "readback": 1, "write": 2, "dup": 1})
-        self.assertEqual(h.order, ["fill", "dup", "write", "click", "readback", "write"])
+        self.assertEqual(h.counts, {"fill": 1, "click": 1, "readback": 1, "write": 2, "dup": 1, "src": 1})
+        self.assertEqual(h.order, ["fill", "dup", "src", "write", "click", "readback", "write"])
         self.assertEqual(h.at_click, {"consumed": True, "outcomes": ["attempt_started"]})
         self.assertEqual(h.outcomes, ["attempt_started", "readback_verified"])
         self.assertTrue(h.consumed())
@@ -841,3 +849,36 @@ class TestSourceBoundary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSourceRecheck(Base):
+    def test_drift_or_uuid_or_error_refuses_before_consume_and_click(self):
+        cases = (("r30", False, "approval_revision_drift"), ("r29", True, "salesforce_prior_uuid_present"),
+                 ("", False, "source_recheck_unavailable"), ("r29", None, "source_recheck_unavailable"))
+        for revision, uuid_present, reason in cases:
+            self.setUp()
+            h = self.harness()
+            h.source_result = (revision, uuid_present)
+            result = h.run(dry_run=False, owner_go=True)
+            self.assertEqual((result.outcome, result.reason), ("refused", reason), (revision, uuid_present))
+            self.assertEqual(h.counts["click"], 0)
+            self.assertFalse(h.consumed())
+            self.assertNotIn("attempt_started", h.outcomes)
+
+    def test_exception_and_missing_check_refuse(self):
+        h = self.harness()
+        result = h.run(dry_run=False, owner_go=True, live_source_check=lambda i: 1 / 0)
+        self.assertEqual(result.reason, "source_recheck_unavailable")
+        self.setUp()
+        h = self.harness()
+        result = h.run(dry_run=False, owner_go=True, live_source_check=None)
+        self.assertEqual(result.reason, "live_source_check_missing")
+        self.assertEqual((h.counts["click"], h.consumed()), (0, False))
+
+    def test_a_fresh_clock_is_read_after_the_source_check(self):
+        h = self.harness()
+        times = iter([NOW, NOW + timedelta(days=30)])
+        result = h.run(dry_run=False, owner_go=True, clock=lambda: next(times))
+        self.assertEqual(result.outcome, "refused")
+        self.assertEqual(h.counts["click"], 0)
+        self.assertFalse(h.consumed())

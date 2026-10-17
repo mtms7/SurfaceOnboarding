@@ -58,6 +58,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 from time import monotonic, sleep
 from typing import Any
 import urllib.request
@@ -8960,6 +8961,9 @@ def _pdr_clone_facts(source: Any, now: datetime) -> dict[str, Any]:
     facts["duplicate_found"] = gate["result"] == "duplicate_production_clone_match"
     facts["clone_matches"] = gate["result"] in ("production_clone_no_match", "duplicate_production_clone_match")
     name = " ".join(source.tenant_name.casefold().split())
+    from integration.onboarding import production_create_live as _live
+
+    facts["control"] = _live.clone_search_control(payload.get("tenants") or ())
     facts["live_paid_tenant_count"] = sum(
         1 for tenant in payload.get("tenants") or ()
         if isinstance(tenant, dict) and " ".join(str(tenant.get("account_name") or "").casefold().split()) == name
@@ -9184,7 +9188,8 @@ def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool]) -> dict
 
 
 def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extras: dict[str, Any],
-                         fill_date: Any, date_kept: Any, keep_open: bool = False) -> dict[str, str]:
+                         fill_date: Any, date_kept: Any, keep_open: bool = False,
+                         confirm_preflight: bool = False) -> dict[str, str]:
     """Open the form, check its schema, fill, read the advanced controls, verify by read-back, re-check the session.
 
     Returns ``{field key: "pass" | "fail"}``; raises FormRefusal for a refusal with its own reason. The form is always
@@ -9246,6 +9251,12 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
             raise refusal(session, fields)
         if guard.blocked_api_writes():
             raise refusal("write_request_blocked", fields)
+        if confirm_preflight:  # locate / enabled / scroll / hit-test of Confirm, never clicked: a NOT_CLICKED shows up HERE first
+            from integration.onboarding import production_create_live as _live
+
+            problem = _live.confirm_preflight(page, locate=_locate_confirm_button, wait_enabled=_confirm_enabled)
+            if problem:
+                raise refusal(problem, fields)
         verified_open = keep_open is True
         return fields
     finally:
@@ -9415,7 +9426,8 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
 
             def fill(_inputs: Any) -> dict[str, str]:
                 fields = _pdr_fill_and_verify(page, guard, clicks, intended, extras,
-                                              fill_date or _fill_license_date, date_kept or _license_date_kept)
+                                              fill_date or _fill_license_date, date_kept or _license_date_kept,
+                                              confirm_preflight=True)
                 late = _pdr_end_problem(final, environ, (clock or stamp)())
                 if late:
                     raise production_create.FormRefusal(late, fields)
@@ -9663,9 +9675,17 @@ def main() -> int:
                         help="With --co, --revision and --owner-go: the guarded LIVE production CE-only create (docs/53). Started only by "
                              "the dashboard after the owner's typed confirmation; locked by PRODUCTION_RUNNER_SUPPORTED and "
                              "PRODUCTION_DRY_RUN_SUPPORTED (both False) until a reviewed owner-approved commit.")
+    parser.add_argument("--production-search-probe", action="store_true",
+                        help="One attended READ-ONLY proof that the name and domain-only searches return a known clone tenant "
+                             "(needs SURFACE_ONBOARDING_PRODUCTION_PROBE=1 and _REF; you sign in with MFA; nothing is typed or clicked).")
     parser.add_argument("--owner-go", action="store_true",
                         help="Only with --production-create: the owner's explicit go for this one create (never implied).")
     args = parser.parse_args()
+    if args.production_search_probe:
+        if args.co or args.revision or args.production_create or args.dry_run or args.confirm_write:
+            parser.error("--production-search-probe is a separate read-only run")
+        print(run_production_search_probe())
+        return 0
     if args.owner_go and not args.production_create:
         parser.error("--owner-go is only valid with --production-create")
     if args.production_create:
@@ -9885,24 +9905,41 @@ def _pcr_prior_records(parent: Path, reference: str) -> Any:
         return None
 
 
-def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str) -> str | None:
-    """The live BackOffice duplicate pre-check, right before the click: session, name search, domain search, demo list.
+def _pcr_search(page: Any, value: str) -> Any:
+    from integration.onboarding import production_create_live as live
+
+    return _pdr_evaluate(page, production_dry_run.ACCOUNT_SEARCH_JS, "POST", production_dry_run.ACCOUNTS_PATH,
+                         [production_dry_run.ACCOUNTS_PATH, live.live_search_body(value)])
+
+
+def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str, control: Any = None,
+                                extras: dict[str, Any] | None = None) -> str | None:
+    """The live BackOffice duplicate pre-check, right before the click: session, POSITIVE CONTROL, name search, domain search, demo list.
 
     Read-only page fetches through the request guard. The clone is only a hint: this re-checks BackOffice itself by exact
-    name (with the " - CE Only" suffix) and by primary domain, plus the demo-domain rule. Any match, ambiguity or error
-    refuses (the first reason code).
+    name (with the " - CE Only" suffix) and by primary domain, plus the demo-domain rule. The generic search filter is
+    unproven for domains, so first the SAME two searches are run for a control tenant taken from the fresh clone and must
+    return it (otherwise ``search_unproven``: an empty target result is never a clearance). Any match, ambiguity or error
+    refuses (the first reason code). Only a hash of the control name is recorded.
     """
+    import hashlib
+
     from integration.onboarding import production_create_live as live
 
     session = _pdr_session_problem(page)
     if session:
         return session
-    replies = [_pdr_evaluate(page, production_dry_run.ACCOUNT_SEARCH_JS, "POST", production_dry_run.ACCOUNTS_PATH,
-                             [production_dry_run.ACCOUNTS_PATH, live.live_search_body(value)])
-               for value in (tenant_name, primary_domain)]
+    if isinstance(control, dict) and isinstance(control.get("name"), str) and extras is not None:
+        extras["search_control"] = hashlib.sha256(control["name"].casefold().encode("utf-8")).hexdigest()[:16]
+    if not (isinstance(control, dict) and isinstance(control.get("name"), str) and isinstance(control.get("domain"), str)):
+        control_replies = (None, None)
+    else:
+        control_replies = (_pcr_search(page, control["name"]), _pcr_search(page, control["domain"]))
+    name_reply, domain_reply = _pcr_search(page, tenant_name), _pcr_search(page, primary_domain)
     demo = _pdr_evaluate(page, production_dry_run.DEMO_DOMAINS_JS, "GET", production_dry_run.DEMO_DOMAINS_PATH,
                          [production_dry_run.DEMO_DOMAINS_PATH, [primary_domain]])
-    return live.live_duplicate_problem(replies[0], replies[1], demo, tenant_name, primary_domain)
+    return live.checked_duplicate_problem(control, control_replies, name_reply, domain_reply, demo, tenant_name,
+                                          primary_domain)
 
 
 def _pcr_finish_line(result: Any) -> str:
@@ -9985,6 +10022,19 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     except ValueError as error:
         return refused(str(error))
 
+    # 1b. The dashboard-only gates, enforced HERE: a flag, argument or environment value is never proof. Only a valid
+    #     file-backed one-time launch ticket (bound to this CO, revision and approval, minted for the approval's issuer)
+    #     lets the run continue; it is consumed now whatever happens next.
+    from integration.onboarding import production_create_ui as create_ui
+    from integration.onboarding import production_launch_ticket as launch_ticket
+
+    operator, ticket_reason = launch_ticket.consume(parent, reference, acknowledged_revision, reference_value, now)
+    if operator is None:
+        return refused(ticket_reason)
+    approval_record = production_approval.record_for(approval_file, reference_value)
+    if approval_record is None or not create_ui._owner_ok(operator, approval_record):
+        return refused("operator_not_owner")
+
     # 2. Intended values: the fixed Salesforce reads of the Dev runner; start date = the day of creation.
     day = run_day or _run_day()
     try:
@@ -9992,7 +10042,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         plan = build_ce_only_fill(source, day)
         intended = production_dry_run.map_plan(plan, SELECT_NAMES, EARLY_SELECTS)
         contract_intended = ce_production_intended(source, day)
-        expected_row = production_contract.expected_readback_row(contract_intended)
+        expected_row = production_contract.expected_readback_row(contract_intended, strict=True)
         readback_body = production_contract.build_readback_body(contract_intended["tenant_name"])
     except production_dry_run.MappingError as error:
         return refused(str(error))
@@ -10020,6 +10070,11 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         expected_tenant_name=source.tenant_name, expected_domains=(source.email_domain,),
         plan_summary="Credential Exposure CE-only create")
     prior = _pcr_prior_records(parent, reference)
+    if prior is not None:
+        dry_problem = create_ui.dry_run_problem(prior, reference_value, now)  # the 24 h age and the approval binding
+        if dry_problem is not None:
+            return refused(dry_problem)
+    cleared = bool(prior) and create_ui.review_cleared(prior)  # only an owner-reviewed NOT_CLICKED attempt
 
     def no_fill(_inputs: Any) -> Any:
         raise RuntimeError("production_dry_run_form_not_reached")
@@ -10027,10 +10082,15 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     def no_duplicate_check(_inputs: Any) -> str | None:
         return "duplicate_check_unavailable"
 
+    def source_check(_inputs: Any) -> tuple[str, bool]:
+        """Re-read the CO from Salesforce (the guarded fixed read): current revision and whether an Account UUID exists."""
+        again = (load_source or CE_ROUTE.load_source)(reference)
+        return again.source_revision, bool(again.salesforce_id_present)
+
     def run_live(candidate: Any, fill: Any, click: Any, read: Any, duplicate_check: Any) -> Any:
         return production_create.run(candidate, False, fill, click, read, write_record, owner_go=owner_go is True,
-                                     prior_records=prior, prior_review_cleared_by_owner=False, clock=clock or stamp,
-                                     live_duplicate_check=duplicate_check)
+                                     prior_records=prior, prior_review_cleared_by_owner=cleared, clock=clock or stamp,
+                                     live_duplicate_check=duplicate_check, live_source_check=source_check)
 
     # 3. The ordered gate BEFORE any browser: a refusal here opens nothing.
     if production_create.evaluate_gate(inputs, production_target) is not None:
@@ -10050,7 +10110,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
             worker_problem = production_dry_run.service_worker_verdict(worker)
             if worker_problem:
                 return refused(worker_problem)
-            early = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain)
+            control = facts.get("control")
+            early = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
             session_codes = ("production_session_expired", "production_session_not_ready")
             final = dataclasses.replace(inputs, sessions_ready=early not in session_codes,
                                         duplicate_found=early is not None and early not in session_codes,
@@ -10058,10 +10119,10 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
 
             def fill(_inputs: Any) -> dict[str, str]:
                 return _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
-                                            date_kept or _license_date_kept, keep_open=True)
+                                            date_kept or _license_date_kept, keep_open=True, confirm_preflight=True)
 
             def duplicate_check(_inputs: Any) -> str | None:
-                return _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain)
+                return _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
 
             def click(_inputs: Any) -> str:
                 return live.click_confirm_once(page, guard, clicks, locate=_locate_confirm_button,
@@ -10087,6 +10148,65 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         return refused(_pdr_reason(str(error)))
     except Exception:
         return refused("production_create_crashed")
+
+
+def run_production_search_probe(*, environ: Any | None = None, now: datetime | None = None, report_base: Path | None = None,
+                                clone_facts: Any = None, open_page: Any = None, wait_seconds: float = MAX_WAIT_SECONDS,
+                                load_source: Any = None) -> str:
+    """One attended READ-ONLY proof that the name search and the DOMAIN-only search return a known tenant (docs/53).
+
+    Probe-class gate (SURFACE_ONBOARDING_PRODUCTION_PROBE and _REF). The control tenant is picked deterministically from the
+    fresh Redash clone; the same two searches the live duplicate check relies on must each return it. Nothing is typed,
+    clicked or created; the redacted report keeps pass/fail and a hash of the control name only.
+    """
+    import hashlib
+
+    from integration.onboarding import production_create_live as live
+
+    environ = os.environ if environ is None else environ
+    now = now or datetime.now(timezone.utc)
+    try:
+        probe_reference = production_probe.probe_gate(environ)
+        target = production_probe.probe_target()
+    except (production_probe.ProbeRefused, ValueError):
+        return json.dumps({"result": "production_search_probe_refused", "reason": "gate_missing"}, separators=(",", ":"))
+    outcome: dict[str, Any] = {"result": "production_search_probe_refused", "reason": "search_control_unavailable",
+                               "name_search_proven": False, "domain_search_proven": False}
+    guard = None
+    try:
+        facts = (clone_facts or _pdr_clone_facts)(SimpleNamespace(tenant_name="-", email_domain="-.invalid"), now)
+        control = facts.get("control") if isinstance(facts, dict) else None
+        if control:
+            with (open_page or _pdr_browser_page)(target, wait_seconds) as page:
+                guard = production_probe.RequestGuard()
+                guard.install(page)
+                worker = production_dry_run.service_worker_verdict(page.evaluate(production_dry_run.SERVICE_WORKER_JS))
+                if worker:
+                    outcome["reason"] = worker
+                else:
+                    name_reply, domain_reply = _pcr_search(page, control["name"]), _pcr_search(page, control["domain"])
+                    wanted = live._norm(control["name"])
+                    proven = [any(isinstance(r, dict) and live._norm(r.get("name")) == wanted
+                                  for r in (reply.get("rows") or []) if isinstance(reply, dict))
+                              for reply in (name_reply, domain_reply)]
+                    outcome.update(name_search_proven=proven[0], domain_search_proven=proven[1],
+                                   control_sha=hashlib.sha256(control["name"].casefold().encode("utf-8")).hexdigest()[:16])
+                    ok = all(proven)
+                    outcome.update(result="production_search_probe_complete" if ok else "production_search_probe_refused",
+                                   reason="proven" if ok else "search_unproven")
+    except Exception:
+        outcome.update(result="production_search_probe_refused", reason="probe_crashed")
+    report = {"schema": 1, "kind": "production_search_probe", "reference": probe_reference, "captured_at":
+              now.astimezone(timezone.utc).isoformat(timespec="seconds"), "origin": production_probe.PRODUCTION_ORIGIN,
+              **outcome, "clicks": 0, "api_calls": guard.api_report() if guard is not None else [],
+              "blocked_requests": guard.blocked_report() if guard is not None else []}
+    try:
+        production_contract.write_readback_report(report_base or _probe_report_base(), report, now)
+    except (ValueError, OSError):
+        outcome.update(result="production_search_probe_refused", reason="report_unavailable")
+    line = json.dumps({k: outcome[k] for k in ("result", "reason", "name_search_proven", "domain_search_proven")},
+                      separators=(",", ":"))
+    return line
 
 
 def live_unreached_click(_inputs: Any) -> Any:

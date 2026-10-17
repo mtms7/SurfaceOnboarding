@@ -27,11 +27,11 @@ MAX_LIST_ITEMS = 50
 MAX_DICT_ITEMS = 50
 
 OUTCOMES = ("dry_run_passed", "refused", "created_unverified", "readback_verified", "uncertain_submit",
-            "attempt_started")
+            "attempt_started", "owner_review_cleared")
 EDITABLE_CANDIDATES = ("account_id", "account_uuid", "domains", "plan_summary", "tenant_name")
 
 _SCALAR_FIELDS = ("route", "approval_ref", "refusal_reason", "tenant_name", "account_id", "account_uuid",
-                  "plan_summary", "salesforce_revision")
+                  "plan_summary", "salesforce_revision", "search_control")
 _LIST_FIELDS = ("domains", "response_shape", "readback_mismatches")
 ADVANCED_SECTION_VALUES = ("found", "not_found")
 ADVANCED_CONTROL_STATES = ("on", "off", "absent")

@@ -12,7 +12,7 @@ domain), ``license_end`` (date or ISO text), and optionally ``country_code`` (IS
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -193,10 +193,19 @@ ROW_FLAG_PATHS: dict[str, tuple[str, ...]] = {
     "webAiAttackerEnabled": ("webAiAttackerEnabled",),
     "vodBetaEnabled": ("vodBetaEnabled",),
 }
+# Only the STRICT live comparison uses the last four (docs/53): candidate row paths for values the form sets. A path the row does
+# not carry compares as a mismatch NAME (fail closed), so the first read-only readback shows which path names are real.
+STRICT_ROW_PATHS: dict[str, tuple[str, ...]] = {
+    "licenseStartDate": ("accountLicense.startDate", "startDate", "accountLicense.licenseStartDate"),
+    "licenseExpirationDate": ("accountLicense.expirationDate", "expirationDate", "accountLicense.licenseExpirationDate"),
+    "mfaRequired": ("mfaRequired", "accountSettings.mfaRequired", "accountLicense.mfaRequired"),
+    "organizationEmail": ("organizationEmail", "primaryUser.email"),
+}
 ROW_PATHS: dict[str, tuple[str, ...]] = {
     "reconLevel": ("reconLevel", "accountLicense.reconLevel"),
     "scanningFrequency": ("scanningFrequency", "accountLicense.scanningFrequency"),
     **ROW_FLAG_PATHS,
+    **STRICT_ROW_PATHS,
 }
 READBACK_PICK_PATHS = tuple(dict.fromkeys(
     ["accountUuid", "id", "accountName", "accountDomain", "accountType", "accountCountryCode", "scanningInterval",
@@ -207,8 +216,11 @@ READBACK_PICK_PATHS = tuple(dict.fromkeys(
      *(path for paths in ROW_PATHS.values() for path in paths)]))
 
 
-def expected_readback_row(intended: Mapping[str, Any]) -> dict[str, Any]:
-    """Logical row field name -> expected value for the getAllDetailedAccounts row of the created tenant (docs/49 s.3)."""
+def expected_readback_row(intended: Mapping[str, Any], strict: bool = False) -> dict[str, Any]:
+    """Logical row field name -> expected value for the getAllDetailedAccounts row of the created tenant (docs/49 s.3).
+
+    ``strict`` (the live create) adds the license start/expiration day, MFA and the organization email; only names are reported.
+    """
     name, domain, email_domain = _checked(intended)
     country = intended.get("country_code")
     expected: dict[str, Any] = {
@@ -226,6 +238,44 @@ def expected_readback_row(intended: Mapping[str, Any]) -> dict[str, Any]:
     }
     for flag in ROW_FLAG_PATHS:
         expected[flag] = False
+    if strict:
+        expected.update(strict_row_expectations(intended))
+    return expected
+
+
+def _row_day(value: Any) -> str | None:
+    """The UTC calendar day of a row date given as ISO text or as epoch milliseconds."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value / 1000, tz=timezone.utc).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str) and (m := _ISO_UTC.fullmatch(value)):
+        return m.group(1)
+    return None
+
+
+def _day_shape(days: tuple[str, ...], name: str) -> _Shape:
+    return _Shape(name, lambda v: _row_day(v) in days)
+
+
+def strict_row_expectations(intended: Mapping[str, Any]) -> dict[str, Any]:
+    """The extra readback checks of the live create: license start and expiration day, MFA on, the organization email."""
+    expected: dict[str, Any] = {"mfaRequired": True}
+    end = _day(intended.get("license_end"))
+    expected["licenseExpirationDate"] = _day_shape((end,), "expiration_day_" + end)
+    start = intended.get("license_start")
+    if start is None:
+        raise ValueError("intended_license_start_invalid")
+    first = date.fromisoformat(_day(start))
+    days = tuple((first + timedelta(days=d)).isoformat() for d in (-1, 0, 1))  # the picker time zone may shift one day
+    expected["licenseStartDate"] = _day_shape(days, "start_day_" + days[1])
+    email = intended.get("organization_email")
+    if not isinstance(email, str) or not email.strip() or re.search(r"[\x00-\x1f\x7f]", email):
+        raise ValueError("intended_organization_email_invalid")
+    expected["organizationEmail"] = email
     return expected
 
 

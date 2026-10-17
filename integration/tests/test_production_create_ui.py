@@ -378,7 +378,7 @@ class UuidTests(Base):
         self.rows = [row(), row(Account_UUID__c="f" * 32)]
         self.assertEqual(self.run_confirm(), "write_uncertain")
         code, _ = ui.handle_uuid_review({"reference": CO}, self.inputs(), self.rows[0])
-        self.assertEqual(code, "uuid_write_already_recorded")
+        self.assertEqual(code, "uuid_write_needs_review")
 
     def test_cli_failure_is_uncertain_or_rejected_and_never_retried(self):
         self.rows = [row()]

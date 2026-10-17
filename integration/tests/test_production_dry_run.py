@@ -188,6 +188,16 @@ class Button:
     def is_visible(self):
         return not self.page.form_open if self.name == "Add Account" else True
 
+    def is_enabled(self):
+        return self.page.confirm_enabled if self.name == "Confirm" else True
+
+    def scroll_into_view_if_needed(self):
+        self.page.scrolled += 1
+
+    def evaluate(self, js):
+        assert js == pdr.HIT_TEST_JS
+        return self.page.confirm_hit
+
     def click(self, **kw):
         assert "force" not in kw, "a forced click must never be made"
         self.page.clicks.append(self.name)
@@ -202,6 +212,7 @@ class FakePage:
                  session=None, search=None, demo=None, advanced_button=True, sw_count=0, hit_fail=(),
                  click_fail=(), add_label="Add Account"):
         self.hit_fail, self.click_fail, self.sw_count, self.add_label = set(hit_fail), set(click_fail), sw_count, add_label
+        self.confirm_enabled, self.confirm_hit, self.scrolled = True, True, 0
         self.routed = []
         self.url = ORIGIN + "/backoffice/tenantManagement"
         self.clicks, self.fetches, self.keys, self.routes = [], [], [], []
@@ -1279,6 +1290,30 @@ def _glue_source():
     text = Path(runner.__file__).read_text(encoding="utf-8")
     start = text.index("# --- Production CE-only DRY RUN")
     return text[start:text.index("def main() -> int:")]
+
+
+class ConfirmPreflightTests(unittest.TestCase):
+    """The dry run runs the locate / enabled / scroll / hit-test checks of Confirm (never clicking it) so a NOT_CLICKED after
+    the approval is consumed cannot first appear in the live run."""
+
+    def attempt(self, **flags):
+        h = Harness(self)
+        for key, value in flags.items():
+            setattr(h.page, key, value)
+        return h, h.run()
+
+    def test_a_usable_confirm_passes_and_is_scrolled_into_view_but_never_clicked(self):
+        h, result = self.attempt()
+        self.assertEqual(result["result"], "dry_run_passed")
+        self.assertGreaterEqual(h.page.scrolled, 1)
+        self.assertNotIn("Confirm", h.page.clicks)
+
+    def test_disabled_covered_or_unreadable_confirm_refuses_the_dry_run(self):
+        for flags in ({"confirm_enabled": False}, {"confirm_hit": False}, {"confirm_hit": None}):
+            h, result = self.attempt(**flags)
+            self.assertEqual(result["result"], "confirm_preflight_failed", flags)
+            self.assertNotIn("Confirm", h.page.clicks)
+            self.assertFalse(h.page.form_open)
 
 
 class MainTests(unittest.TestCase):

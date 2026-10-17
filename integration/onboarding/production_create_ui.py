@@ -34,7 +34,7 @@ from html import escape
 from pathlib import Path
 from typing import Any
 
-from . import production_approval, production_create, production_views, salesforce_uuid_writeback
+from . import production_approval, production_create, production_launch_ticket, production_views, salesforce_uuid_writeback
 from . import production_create_record as records
 from . import session_readiness as readiness
 
@@ -96,6 +96,8 @@ GATE_TEXT = {
     "typed_reference_mismatch": "The typed CO reference does not match.",
     "authorization_missing": "The explicit authorization box was not ticked.",
     "launch_failed": "The runner could not be started. Nothing was created.",
+    "uuid_write_needs_review": "An earlier UUID write is uncertain: check Salesforce, then record your review.",
+    "uuid_write_already_recorded": "A UUID write is already recorded for this CO.",
 }
 
 
@@ -103,6 +105,7 @@ UUID_RESULT_TEXT = {
     "written_verified": "The Account UUID is written to Salesforce and was read back.",
     "write_uncertain": "The Salesforce write may or may not have been applied: check the CO in Salesforce. It is not retried.",
     "write_rejected": "Salesforce refused the update. Nothing changed.",
+    "record_write_failed": "The write result could not be recorded. Check the CO in Salesforce; further writes stay blocked until you review.",
 }
 
 
@@ -131,8 +134,36 @@ def load_co_records(parent: Path, co: str) -> list[dict[str, Any]]:
     return [records.load(path) for path in records.list_records(parent, co)]
 
 
+def cleared_attempts(history: list[dict[str, Any]]) -> set[str]:
+    """Approval references of attempts the OWNER cleared by a recorded review. Only an attempt that provably sent nothing
+    (an ``attempt_started`` followed by the ``confirm_not_clicked`` refusal of the same approval) can be cleared: an unknown,
+    mismatched or verified create never can."""
+    refused = {r.get("approval_ref") for r in history if r.get("outcome") == production_create.OUTCOME_REFUSED
+               and r.get("refusal_reason") == "confirm_not_clicked"}
+    owner = {r.get("approval_ref") for r in history if r.get("outcome") == production_create.OUTCOME_OWNER_CLEARED}
+    started = {r.get("approval_ref") for r in history if r.get("outcome") == production_create.OUTCOME_ATTEMPT_STARTED}
+    blocking_others = {r.get("approval_ref") for r in history if r.get("outcome") in production_create._NEEDS_REVIEW
+                       and r.get("outcome") != production_create.OUTCOME_ATTEMPT_STARTED}
+    return {ref for ref in started & refused & owner if ref not in blocking_others}
+
+
+def active_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The records that still count: a cleared attempt's ``attempt_started`` record no longer blocks."""
+    cleared = cleared_attempts(history)
+    return [r for r in history if not (r.get("outcome") == production_create.OUTCOME_ATTEMPT_STARTED
+                                       and r.get("approval_ref") in cleared)]
+
+
+def review_cleared(history: list[dict[str, Any]]) -> bool:
+    """True when something needed review and EVERY such record is an owner-cleared ``confirm_not_clicked`` attempt."""
+    needs = [r for r in history if r.get("outcome") in production_create._NEEDS_REVIEW]
+    left = [r for r in active_history(history) if r.get("outcome") in production_create._NEEDS_REVIEW]
+    return bool(needs) and not left
+
+
 def co_status(history: list[dict[str, Any]]) -> dict[str, Any]:
     """``{"code", "blocking", "uuid"}`` for one CO. A needs-review outcome anywhere blocks; the most final outcome of the attempt wins."""
+    history = active_history(history)
     review = [r for r in history if r.get("outcome") in production_create._NEEDS_REVIEW]
     if review:
         # Rank, not file order: records written in the same second can sort either way, and any later outcome of an
@@ -398,7 +429,8 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
 # --- UUID write (decision D3): its own confirmation step ----------------------------------------------------------------
 
 def _uuid_form_html(inputs: Inputs, status: Mapping[str, Any], state: str | None) -> str:
-    if state in ("written_verified", "write_uncertain", "write_rejected"):
+    if state in ("written_verified", "write_uncertain", "write_rejected", "write_started"):
+        state = "write_uncertain" if state == "write_started" else state
         return "<p class='note'>" + escape(UUID_RESULT_TEXT[state]) + "</p>"
     if salesforce_uuid_writeback.normalise_uuid(status.get("uuid")) is None:
         return ""
@@ -408,27 +440,39 @@ def _uuid_form_html(inputs: Inputs, status: Mapping[str, Any], state: str | None
             "<p class='note'>Opens a separate confirmation. It writes only <code>Account_UUID__c</code> on this CO.</p>")
 
 
-def last_uuid_write(parent: Path, co: str) -> str | None:
-    """The newest recorded UUID write result for one CO (``written_verified``/``write_uncertain``/...) or None."""
+def _uuid_lines(parent: Path, co: str) -> list[dict[str, Any]] | None:
     try:
         lines = (Path(parent) / records.RECORDS_SUBDIR / UUID_WRITES_FILE).read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
-        return None
+        return []
     except OSError:
-        return "write_uncertain"
-    result = None
+        return None
+    items = []
     for line in lines:
         try:
             item = json.loads(line)
         except ValueError:
-            return "write_uncertain"  # an unreadable log is never "no write"
+            return None  # an unreadable log is never "no write"
         if isinstance(item, dict) and item.get("co_reference") == co and isinstance(item.get("result"), str):
-            result = item["result"]
-    return result
+            items.append(item)
+    return items
+
+
+def last_uuid_write(parent: Path, co: str) -> str | None:
+    """The newest UUID write state of one CO: ``write_started`` / ``written_verified`` / ``write_uncertain`` /
+    ``write_rejected``, ``write_uncertain`` for an unreadable log, or None (never written, or cleared by the owner's
+    recorded review after an uncertain write)."""
+    items = _uuid_lines(parent, co)
+    if items is None:
+        return "write_uncertain"
+    state = None
+    for item in items:
+        state = None if item["result"] == "owner_review_cleared" else item["result"]
+    return state
 
 
 def record_uuid_write(parent: Path, co: str, uuid: str, result: str, now: datetime) -> None:
-    """Append one line (never rewritten). The UUID itself is not stored: only its SHA-256."""
+    """Append one line (never rewritten). The UUID itself is not stored: only its SHA-256. Raises on any failure."""
     folder = Path(parent) / records.RECORDS_SUBDIR
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     line = json.dumps({"co_reference": co, "field": salesforce_uuid_writeback.WRITE_FIELD, "result": result,
@@ -472,7 +516,14 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
         return "typed_reference_mismatch"
     if _form(values, "production_create_authorized") != "1":
         return "authorization_missing"
-    started = LAUNCHES.claim(lambda: launch(reference, revision, ctx["env"]))
+    def start() -> Any:
+        try:  # the runner accepts ONLY this file-backed one-time ticket, never a flag or an environment value
+            production_launch_ticket.mint(inputs.records_parent, reference, revision, approval["approval_ref"],
+                                          str(inputs.operator), inputs.now)
+        except (OSError, ValueError):
+            return None
+        return launch(reference, revision, ctx["env"])
+    started = LAUNCHES.claim(start)
     return "launched" if started else "launch_failed"
 
 
@@ -509,6 +560,8 @@ def _uuid_blocker(inputs: Inputs, wb_row: Mapping[str, Any] | None) -> tuple[str
     if uuid is None:
         return "uuid_invalid", "", ""
     prior = last_uuid_write(inputs.records_parent, inputs.reference)
+    if prior in ("write_uncertain", "write_started"):
+        return "uuid_write_needs_review", "", ""
     if prior is not None:
         return "uuid_write_already_recorded", "", ""
     revision = wb_row.get("LastModifiedDate")
@@ -547,12 +600,25 @@ def handle_uuid_confirm(values: Mapping[str, Any], inputs: Inputs, read_row: Cal
     status = co_status(load_co_records(inputs.records_parent, reference))
     result = production_create.CreateResult(production_create.OUTCOME_VERIFIED, "", None, None, uuid,
                                             status.get("revision"), status.get("route"))
-    plan = production_create.writeback_plan_after_verified(result, dict(row or {}), revision, True)
-    co_id = (row or {}).get("Id")
+    # Narrow the plan-to-update gap: read once more; the plan must be identical (same revision, field still empty).
+    try:
+        again = read_row()
+    except Exception:
+        again = None
+    recheck = _uuid_blocker(inputs, again)
+    if recheck[0] is not None or recheck[1:] != (uuid, revision):
+        return recheck[0] or "revision_changed"
+    plan = production_create.writeback_plan_after_verified(result, dict(again or {}), revision, True)
+    co_id = (again or {}).get("Id")
     try:
         argv = salesforce_uuid_writeback.update_argv(plan, co_id, target_org)
     except ValueError:
         return "write_blocked"
+    # Intent line BEFORE the write: if it cannot be recorded nothing is sent; once written it blocks any second write.
+    try:
+        record_uuid_write(inputs.records_parent, reference, uuid, "write_started", inputs.now)
+    except Exception:
+        return "record_write_failed"
     try:
         accepted = run_argv(argv)
     except Exception:
@@ -570,5 +636,5 @@ def handle_uuid_confirm(values: Mapping[str, Any], inputs: Inputs, read_row: Cal
     try:
         record_uuid_write(inputs.records_parent, reference, uuid, outcome, inputs.now)
     except Exception:
-        pass  # the page still reports the result; the Salesforce row is the evidence
+        return "record_write_failed"  # the write_started line keeps blocking any further write
     return outcome

@@ -41,7 +41,9 @@ LIVE_REASONS = frozenset({
     "readback_account_id_mismatch", "readback_uuid_invalid", "uncertain_submit", "attempt_started",
     "approval_consume_failed", "approval_superseded", "approval_locked", "approval_locked_stale",
     "production_dry_run_login_timeout", "production_session_expired", "production_session_not_ready",
-    "intended_unavailable", "production_dry_run_form_not_reached",
+    "dry_run_old", "intended_unavailable", "production_dry_run_form_not_reached", "search_unproven", "search_control_unavailable",
+    "confirm_preflight_failed", "extra_pages_open", "launch_ticket_invalid", "source_recheck_unavailable",
+    "approval_revision_drift", "salesforce_prior_uuid_present", "live_source_check_missing", "service_worker_present", "service_worker_check_failed",
 })
 
 
@@ -79,6 +81,17 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         self.armed = False
         self.create_used = False
         self.create_blocked = 0
+        self.popups = 0
+
+    def install(self, page: Any) -> None:
+        super().install(page)
+        try:
+            page.on("popup", self._on_popup)
+        except Exception:
+            pass
+
+    def _on_popup(self, _page: Any) -> None:
+        self.popups += 1
 
     def arm(self) -> None:
         if not self.create_used:
@@ -140,6 +153,49 @@ class LiveClickLog(production_dry_run.ClickLog):
         self.kinds.append(kind)
 
 
+def pre_arm_problem(page: Any, guard: LiveRequestGuard) -> str | None:
+    """Re-checked immediately before arming: no service worker, no popup opened, no second production page."""
+    try:
+        worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
+    except Exception:
+        worker = None
+    problem = production_dry_run.service_worker_verdict(worker)
+    if problem:
+        return problem
+    if guard.popups:
+        return "extra_pages_open"
+    try:
+        pages = list(page.context.pages)
+    except Exception:
+        return "extra_pages_open"
+    same = [p for p in pages if p is not page and production_probe.url_origin(getattr(p, "url", "")) == production_probe.PRODUCTION_ORIGIN]
+    return "extra_pages_open" if same else None
+
+
+def confirm_preflight(page: Any, *, locate: Callable[[Any], Any] | None = None,
+                      wait_enabled: Callable[[Any, Any], bool] | None = None) -> str | None:
+    """The locate / enabled / scroll / hit-test checks of the Confirm control WITHOUT clicking (also run by the dry run).
+
+    None when the one exact "Confirm" control is present, enabled, visible and is the element under the pointer after
+    scrolling it into view; else ``confirm_preflight_failed``.
+    """
+    try:
+        found = locate(page) if locate is not None else page.get_by_role("button", name=CONFIRM_LABEL, exact=True)
+        if found is None or production_probe._count(found) != 1:
+            return "confirm_preflight_failed"
+        button = found.first
+        if wait_enabled is not None and not wait_enabled(page, found):
+            return "confirm_preflight_failed"
+        if not button.is_visible() or not button.is_enabled():
+            return "confirm_preflight_failed"
+        button.scroll_into_view_if_needed()
+        if button.evaluate(production_dry_run.HIT_TEST_JS) is not True:
+            return "confirm_preflight_failed"
+    except Exception:
+        return "confirm_preflight_failed"
+    return None
+
+
 def click_confirm_once(page: Any, guard: LiveRequestGuard, clicks: LiveClickLog, *, timeout_ms: int = 5_000,
                        locate: Callable[[Any], Any] | None = None,
                        wait_enabled: Callable[[Any, Any], bool] | None = None) -> str:
@@ -161,7 +217,10 @@ def click_confirm_once(page: Any, guard: LiveRequestGuard, clicks: LiveClickLog,
             return NOT_CLICKED
         if not button.is_visible() or not button.is_enabled():
             return NOT_CLICKED
+        button.scroll_into_view_if_needed()  # the hit test must run on the control as the click will see it
         if button.evaluate(production_dry_run.HIT_TEST_JS) is not True:  # the element under the pointer must be Confirm
+            return NOT_CLICKED
+        if pre_arm_problem(page, guard) is not None:
             return NOT_CLICKED
     except Exception:
         return NOT_CLICKED
@@ -216,6 +275,66 @@ def live_duplicate_problem(name_reply: object, domain_reply: object, demo_reply:
     if rows or total != 0:
         return "duplicate_in_production"
     return production_dry_run.demo_verdict(demo_reply)
+
+
+def _norm(value: object) -> str:
+    return " ".join(value.casefold().split()) if isinstance(value, str) else ""
+
+
+def clone_search_control(tenants: object) -> dict[str, str] | None:
+    """Deterministic positive-control tenant from the fresh Redash clone: live (enabled, not deleted), a non-empty name and
+    primary domain, each unique in the clone (so one row is expected back). Smallest SHA-256 of name|domain wins; None if no
+    tenant qualifies. The name itself is never recorded (callers keep a hash)."""
+    import hashlib
+
+    if not isinstance(tenants, (list, tuple)):
+        return None
+    usable = []
+    for tenant in tenants:
+        if (isinstance(tenant, Mapping) and tenant.get("enabled") is True and tenant.get("is_deleted") is not True
+                and isinstance(tenant.get("account_name"), str) and isinstance(tenant.get("account_domain"), str)
+                and tenant["account_name"].strip() and tenant["account_domain"].strip()):
+            usable.append((_norm(tenant["account_name"]), _norm(tenant["account_domain"]), tenant))
+    names = [u[0] for u in usable]
+    domains = [u[1] for u in usable]
+    unique = [u for u in usable if names.count(u[0]) == 1 and domains.count(u[1]) == 1]
+    if not unique:
+        return None
+    best = min(unique, key=lambda u: hashlib.sha256((u[0] + "|" + u[1]).encode("utf-8")).hexdigest())
+    return {"name": best[2]["account_name"].strip(), "domain": best[2]["account_domain"].strip()}
+
+
+def control_problem(control: object, name_reply: object, domain_reply: object) -> str | None:
+    """RUNTIME POSITIVE CONTROL of the two searches, in the same session right before the real checks.
+
+    ``control`` = {"name", "domain"} of a live tenant taken from the fresh Redash clone. The name search for its name and
+    the domain search for its domain must each return a row of THAT tenant; otherwise the search is unproven and the
+    run refuses (``search_control_unavailable`` without a control, ``search_unproven`` when it is not found). An empty
+    reply therefore never counts as a clearance.
+    """
+    if not (isinstance(control, Mapping) and isinstance(control.get("name"), str) and control["name"].strip()
+            and isinstance(control.get("domain"), str) and control["domain"].strip()):
+        return "search_control_unavailable"
+    wanted = _norm(control["name"])
+    for reply in (name_reply, domain_reply):
+        status = production_dry_run._status(reply)
+        if status in (401, 403):
+            return "production_session_expired"
+        rows = reply.get("rows") if isinstance(reply, Mapping) else None
+        if status != 200 or not isinstance(rows, list):
+            return "search_unproven"
+        if not any(isinstance(r, Mapping) and _norm(r.get("name")) == wanted for r in rows):
+            return "search_unproven"
+    return None
+
+
+def checked_duplicate_problem(control: object, control_replies: tuple[object, object], name_reply: object,
+                              domain_reply: object, demo_reply: object, tenant_name: str, primary_domain: str) -> str | None:
+    """The positive control first (it must pass), then ``live_duplicate_problem`` on the real target."""
+    problem = control_problem(control, control_replies[0], control_replies[1])
+    if problem is not None:
+        return problem
+    return live_duplicate_problem(name_reply, domain_reply, demo_reply, tenant_name, primary_domain)
 
 
 # --- Post-create readback ---------------------------------------------------------------------------------------------------

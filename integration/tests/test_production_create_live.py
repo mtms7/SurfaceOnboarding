@@ -55,6 +55,9 @@ class MiniButton:
     def is_enabled(self):
         return self.page.enabled
 
+    def scroll_into_view_if_needed(self):
+        pass
+
     def evaluate(self, js):
         assert js == pdr.HIT_TEST_JS
         return self.page.hit
@@ -77,6 +80,11 @@ class MiniPage:
         self.status, self.posts, self.raise_on_click = status, posts, raise_on_click
         self.clicks = 0
         self.waits = 0
+        self.url = ORIGIN + "/backoffice/tenantManagement"
+        self.context = SimpleNamespace(pages=[self])
+
+    def evaluate(self, script, arg=None):
+        return {"count": 0}
 
     def get_by_role(self, role, name=None, exact=False):
         assert (role, name, exact) == ("button", "Confirm", True)

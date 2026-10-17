@@ -21,6 +21,7 @@ from integration.onboarding import production_create_live as live
 from integration.onboarding import production_create_record as pcr
 from integration.onboarding import production_create_ui as ui
 from integration.onboarding import production_dry_run as pdr
+from integration.onboarding import production_launch_ticket as ticket
 from integration.onboarding import session_readiness
 from integration.tests import test_production_dry_run as dry
 from integration.tests.test_production_create_live import contract_row, reply
@@ -34,8 +35,26 @@ NAME, DOMAIN = SOURCE.tenant_name, SOURCE.email_domain
 DAY = date(2026, 10, 16)
 
 
+ORG_EMAIL = runner.ce_production_intended(SOURCE, DAY)["organization_email"]
+CONTROL = {"name": "Control Holdings", "domain": "control-holdings.example"}
+
+
+def control_row():
+    return {"name": CONTROL["name"], "domain": CONTROL["domain"], "alternates": [], "emails": [], "deleted": False}
+
+
+CONTROL_SEARCH = {CONTROL["name"]: reply([control_row()]), CONTROL["domain"]: reply([control_row()])}
+
+
+def good_clone(source, now):
+    return {**dry.good_clone(source, now), "control": dict(CONTROL)}
+
+
 def good_row(**over):
-    return contract_row(accountName=NAME, accountDomain=DOMAIN, **over)
+    strict = {"accountLicense.startDate": "2026-10-16T09:00:00.000Z", "accountLicense.expirationDate": "2027-05-20T07:00:00.000Z",
+              "mfaRequired": True, "organizationEmail": ORG_EMAIL}
+    strict.update(over)
+    return contract_row(accountName=NAME, accountDomain=DOMAIN, **strict)
 
 
 class ConfirmBtn:
@@ -55,8 +74,14 @@ class ConfirmBtn:
     def is_enabled(self):
         return self.page.confirm_enabled
 
+    def scroll_into_view_if_needed(self):
+        self.page.scrolled += 1
+
     def evaluate(self, js):
         assert js == pdr.HIT_TEST_JS
+        self.page.hit_calls += 1
+        if self.page.hits:
+            return self.page.hits.pop(0)
         return self.page.hit
 
     def click(self, **kw):
@@ -90,13 +115,20 @@ class LivePage(dry.FakePage):
         super().__init__(**kw)
         self.create_status, self.confirm_enabled, self.posts, self.hit = create_status, confirm_enabled, posts, hit
         self.confirm_clicks = 0
+        self.scrolled = self.hit_calls = 0
+        self.hits = []
+        self.extra_pages = []
+        self.context = SimpleNamespace(pages=[self])
         self.readbacks = list(readbacks if readbacks is not None else [reply([good_row()])])
         self.readback_calls = 0
         self.response_handlers = []
+        self.popup_handlers = []
 
     def on(self, event, handler):
         if event == "response":
             self.response_handlers.append(handler)
+        if event == "popup":
+            self.popup_handlers.append(handler)
 
     def get_by_role(self, role, name=None, exact=False):
         if role == "button" and name == "Confirm" and self.form_open:
@@ -115,16 +147,28 @@ class LivePage(dry.FakePage):
 class Harness(dry.Harness):
     def __init__(self, test, **page_kw):
         super().__init__(test)
-        self.page = LivePage(**page_kw)
+        search = page_kw.pop("search", None)
+        search = search if search is not None else {}
+        for key, value in CONTROL_SEARCH.items():
+            search.setdefault(key, value)
+        self.page = LivePage(search=search, **page_kw)
         self.dry_record = True
 
     def seed_dry_run(self):
         pcr.record(self.records, {"co_reference": CO, "approval_ref": REF, "outcome": "dry_run_passed", "route": ROUTE,
                                   "salesforce_revision": REV}, NOW - timedelta(minutes=30))
 
-    def go(self, *, runner_flag=True, dry_flag=True, go=True, revision=REV, clone=dry.good_clone, source=None, dry_run_record=True):
+    def mint(self, revision=REV, operator="milton", when=NOW):
+        return ticket.mint(self.records, CO, revision, REF, operator, when)
+
+    def go(self, *, runner_flag=True, dry_flag=True, go=True, revision=REV, clone=good_clone, source=None, dry_run_record=True,
+           with_ticket=True, operator="milton", ticket_when=NOW, rows=None):
         if dry_run_record:
             self.seed_dry_run()
+        for record in rows or ():
+            pcr.record(self.records, {"co_reference": CO, "route": ROUTE, **record}, NOW)
+        if with_ticket:
+            self.mint(revision, operator, ticket_when)
         env = dict(dry.UNLOCK)
         out = io.StringIO()
         with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", runner_flag), \
@@ -221,10 +265,10 @@ class GateRefusalTests(Base):
 
     def test_stale_or_missing_clone_wrong_co_and_other_gates_refuse_before_the_browser(self):
         cases = {
-            "clone_stale": lambda s, n: {**dry.good_clone(s, n), "collected_at": NOW - timedelta(hours=7)},
-            "clone_missing": lambda s, n: {**dry.good_clone(s, n), "collected_at": None},
-            "duplicate_in_production": lambda s, n: {**dry.good_clone(s, n), "duplicate_found": True},
-            "multiple_live_paid_tenants": lambda s, n: {**dry.good_clone(s, n), "live_paid_tenant_count": 2},
+            "clone_stale": lambda s, n: {**good_clone(s, n), "collected_at": NOW - timedelta(hours=7)},
+            "clone_missing": lambda s, n: {**good_clone(s, n), "collected_at": None},
+            "duplicate_in_production": lambda s, n: {**good_clone(s, n), "duplicate_found": True},
+            "multiple_live_paid_tenants": lambda s, n: {**good_clone(s, n), "live_paid_tenant_count": 2},
         }
         for reason, clone in cases.items():
             h = self.harness()
@@ -372,16 +416,27 @@ class CreateTests(Base):
         self.assertEqual(h.go()["result"], "created_verified")
         self.assertEqual((h.page.confirm_clicks, h.page.readback_calls), (1, 3))
 
-    def test_confirm_that_cannot_be_used_sends_nothing_and_still_blocks_the_co(self):
-        for kw in ({"confirm_enabled": False}, {"hit": False}):
+    def test_a_confirm_that_fails_the_preflight_refuses_before_the_consume(self):
+        for kw in ({"confirm_enabled": False}, {"hit": False}, {"hit": None}):
             h = self.harness(**kw)
-            result = h.go()
-            self.assertEqual(result["result"], "confirm_not_clicked", kw)
+            self.assertEqual(h.go()["result"], "confirm_preflight_failed", kw)
             self.assertEqual(h.page.confirm_clicks, 0, kw)
+            self.assertIsNone(h.approval_unused(), kw)
+            self.assertNotIn("attempt_started", h.outcomes())
+            self.assertFalse(h.page.form_open)
+
+    def test_a_confirm_that_stops_being_usable_after_the_consume_sends_nothing_and_blocks_the_co(self):
+        for hits in ([True, False], [True, None]):
+            h = self.harness()
+            h.page.hits = list(hits)
+            result = h.go()
+            self.assertEqual(result["result"], "confirm_not_clicked", hits)
+            self.assertEqual(h.page.confirm_clicks, 0, hits)
             self.assertEqual(h.approval_unused(), "approval_consumed")
             self.assertEqual(h.outcomes().count("attempt_started"), 1)
             self.assertTrue(ui.co_status(h.loaded_records())["blocking"])
             self.assertFalse(h.page.form_open, "the half-filled form is cancelled")
+            self.assertGreaterEqual(h.page.scrolled, 2, "scrolled into view before every hit test")
 
     def test_the_attempt_is_recorded_before_the_click_and_the_form_values_are_the_production_plan(self):
         h = self.harness()
@@ -403,6 +458,193 @@ class CreateTests(Base):
             text = Path(path).read_text(encoding="utf-8")
             for fragment in ("Bearer", "password", "cookie", "eyJ"):
                 self.assertNotIn(fragment, text)
+
+
+class SearchControlTests(Base):
+    """The generic search filter is unproven for domains: a control tenant from the clone must come back first."""
+
+    def refused(self, h, reason, **kw):
+        result = h.go(**kw)
+        self.assertEqual(result["result"], reason)
+        self.assertEqual((h.page.confirm_clicks, h.page.form_open), (0, False))
+        self.assertIsNone(h.approval_unused())
+        self.assertNotIn("attempt_started", h.outcomes())
+
+    def test_no_control_in_the_clone_refuses(self):
+        h = self.harness()
+        self.refused(h, "search_control_unavailable", clone=dry.good_clone)
+
+    def test_a_control_the_searches_do_not_return_means_the_search_is_unproven(self):
+        for search in ({CONTROL["domain"]: reply([])}, {CONTROL["name"]: reply([])},
+                       {CONTROL["domain"]: reply([{**control_row(), "name": "Somebody Else"}])},
+                       {CONTROL["domain"]: {"status": 500, "total": None, "rows": None}}):
+            h = self.harness(search=dict(search))
+            self.refused(h, "search_unproven")
+
+    def test_empty_result_for_the_target_is_a_clearance_only_after_a_passing_control(self):
+        h = self.harness()
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertIn(CONTROL["domain"], h.page.search.keys())
+        record = [r for r in h.loaded_records() if r["outcome"] == "attempt_started"][0]
+        self.assertEqual(len(record.get("search_control", "x" * 16)), 16)
+
+    def test_control_passes_and_the_target_is_found_refuses(self):
+        row = {"name": "Someone Else", "domain": DOMAIN, "alternates": [], "emails": [], "deleted": False}
+        self.refused(self.harness(search={DOMAIN: reply([row])}), "duplicate_in_production")
+
+    def test_the_control_runs_in_the_same_session_before_the_target_and_is_recorded_only_as_a_hash(self):
+        h = self.harness()
+        h.go()
+        values = [f[1] for f in h.page.fetches if f[0] == "POST"]
+        self.assertGreaterEqual(len(values), 4)
+        refusal = self.harness(search={CONTROL["domain"]: reply([])})
+        refusal.go()
+        text = "".join(Path(p).read_text(encoding="utf-8") for p in pcr.list_records(refusal.records, CO))
+        self.assertNotIn(CONTROL["name"], text)
+        self.assertNotIn(CONTROL["domain"], text)
+
+
+class SourceRecheckTests(Base):
+    def run_with(self, second):
+        h = self.harness()
+        calls = []
+
+        def load(_ref):
+            calls.append(1)
+            if len(calls) == 1:
+                return SOURCE
+            if isinstance(second, Exception):
+                raise second
+            return second
+        h.load_source = load
+        result = h.go()
+        return h, result
+
+    def test_revision_drift_or_a_new_uuid_between_the_form_and_the_click_refuses_before_the_consume(self):
+        for second, reason in ((dry.make_source(source_revision="2026-10-17T00:00:00.000+0000"), "approval_revision_drift"),
+                               (dry.make_source(salesforce_id_present=True), "salesforce_prior_uuid_present"),
+                               (RuntimeError("salesforce_fill_source_unavailable"), "source_recheck_unavailable")):
+            h, result = self.run_with(second)
+            self.assertEqual(result["result"], reason, reason)
+            self.assertEqual(h.page.confirm_clicks, 0)
+            self.assertIsNone(h.approval_unused())
+            self.assertNotIn("attempt_started", h.outcomes())
+            self.assertFalse(h.page.form_open)
+
+
+class LaunchTicketTests(Base):
+    def refused(self, h, reason, **kw):
+        self.assertEqual(h.go(**kw)["result"], reason)
+        self.assertEqual((h.opened, h.page.confirm_clicks), (0, 0))
+        self.assertIsNone(h.approval_unused())
+
+    def test_the_cli_flag_alone_never_launches(self):
+        self.refused(self.harness(), "launch_ticket_invalid", with_ticket=False)
+
+    def test_wrong_binding_expired_or_reused_tickets_refuse(self):
+        h = self.harness()
+        h.mint(revision="other-revision")
+        self.refused(h, "launch_ticket_invalid", with_ticket=False)
+        self.refused(self.harness(), "launch_ticket_invalid", ticket_when=NOW - timedelta(minutes=3))
+        h = self.harness()
+        h.go()
+        h.page.confirm_clicks = 0
+        again = h.go(with_ticket=False, dry_run_record=False)
+        self.assertEqual(again["result"], "launch_ticket_invalid")
+        self.assertEqual(h.page.confirm_clicks, 0)
+
+    def test_the_ticket_must_be_minted_for_the_approval_issuer(self):
+        self.refused(self.harness(), "operator_not_owner", operator="someone.else")
+
+    def test_dry_run_age_is_enforced_by_the_runner(self):
+        h = self.harness()
+        pcr.record(h.records, {"co_reference": CO, "approval_ref": REF, "outcome": "dry_run_passed", "route": ROUTE},
+                   NOW - timedelta(hours=25))
+        self.refused(h, "dry_run_old", dry_run_record=False)
+
+
+class StrictReadbackTests(Base):
+    def test_license_dates_mfa_and_organization_email_are_compared_by_name_only(self):
+        bad = good_row(**{"accountLicense.expirationDate": "2027-06-01T07:00:00.000Z",
+                          "accountLicense.startDate": "2026-12-01T09:00:00.000Z", "mfaRequired": False,
+                          "organizationEmail": "someone.else@pentera.io"})
+        h = self.harness(readbacks=[reply([bad])])
+        self.assertEqual(h.go()["result"], "created_mismatch")
+        record = [r for r in h.loaded_records() if r["outcome"] == "created_unverified"][0]
+        self.assertEqual(sorted(record["readback_mismatches"]),
+                         ["licenseExpirationDate", "licenseStartDate", "mfaRequired", "organizationEmail"])
+        text = "".join(Path(p).read_text(encoding="utf-8") for p in pcr.list_records(h.records, CO))
+        self.assertNotIn(ORG_EMAIL, text)
+        self.assertNotIn("someone.else", text)
+
+    def test_missing_paths_are_mismatches_not_silently_ignored(self):
+        row_ = good_row()
+        for key in ("mfaRequired", "organizationEmail", "accountLicense.startDate", "accountLicense.expirationDate"):
+            del row_[key]
+        h = self.harness(readbacks=[reply([row_])])
+        self.assertEqual(h.go()["result"], "created_mismatch")
+
+    def test_epoch_millisecond_dates_are_accepted(self):
+        row_ = good_row(**{"accountLicense.startDate": 1792141200000, "accountLicense.expirationDate": 1810796400000})
+        h = self.harness(readbacks=[reply([row_])])
+        self.assertEqual(h.go()["result"], "created_verified")
+
+
+class ClearedAttemptTests(Base):
+    OLD = "PROD-CE-0001-20261016"
+
+    def rows(self, *outcomes):
+        table = {"started": {"outcome": "attempt_started", "approval_ref": self.OLD},
+                 "refused": {"outcome": "refused", "refusal_reason": "confirm_not_clicked", "approval_ref": self.OLD},
+                 "cleared": {"outcome": "owner_review_cleared", "approval_ref": self.OLD},
+                 "unknown": {"outcome": "uncertain_submit", "approval_ref": self.OLD}}
+        return [table[o] for o in outcomes]
+
+    def test_a_not_clicked_attempt_blocks_until_the_owner_review_is_recorded(self):
+        h = self.harness()
+        self.assertEqual(h.go(rows=self.rows("started", "refused"))["result"], "prior_attempt_needs_review")
+        h = self.harness()
+        self.assertEqual(h.go(rows=self.rows("started", "refused", "cleared"))["result"], "created_verified")
+        self.assertEqual(h.page.confirm_clicks, 1)
+
+    def test_an_unknown_or_unfinished_attempt_can_never_be_cleared(self):
+        for rows in (("started", "cleared"), ("started", "unknown", "cleared"), ("unknown", "cleared")):
+            h = self.harness()
+            self.assertEqual(h.go(rows=self.rows(*rows))["result"], "prior_attempt_needs_review", rows)
+            self.assertEqual(h.page.confirm_clicks, 0)
+
+
+class SearchProbeTests(Base):
+    ENV = {"SURFACE_ONBOARDING_PRODUCTION_PROBE": "1", "SURFACE_ONBOARDING_PRODUCTION_PROBE_REF": "PROBE-SEARCH-20261017"}
+
+    def probe(self, h, clone=good_clone, env=None):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            line = runner.run_production_search_probe(environ=self.ENV if env is None else env, now=NOW, report_base=h.records,
+                                                      clone_facts=clone, open_page=h.open_page)
+        return json.loads(line)
+
+    def test_proven_when_both_searches_return_the_control_and_nothing_is_clicked(self):
+        h = self.harness()
+        result = self.probe(h)
+        self.assertEqual((result["result"], result["name_search_proven"], result["domain_search_proven"]),
+                         ("production_search_probe_complete", True, True))
+        self.assertEqual((h.page.confirm_clicks, h.page.clicks), (0, []))
+        files = list((h.records / "production-probe").glob("readback-*.json"))
+        self.assertEqual(len(files), 1)
+        self.assertNotIn(CONTROL["name"], files[0].read_text(encoding="utf-8"))
+
+    def test_unproven_domain_search_is_reported(self):
+        h = self.harness(search={CONTROL["domain"]: reply([])})
+        result = self.probe(h)
+        self.assertEqual((result["result"], result["reason"], result["domain_search_proven"]),
+                         ("production_search_probe_refused", "search_unproven", False))
+
+    def test_no_control_or_no_gate(self):
+        self.assertEqual(self.probe(self.harness(), clone=dry.good_clone)["reason"], "search_control_unavailable")
+        h = self.harness()
+        self.assertEqual(self.probe(h, env={})["result"], "production_search_probe_refused")
+        self.assertEqual(h.opened, 0)
 
 
 class GlueHygieneTests(unittest.TestCase):

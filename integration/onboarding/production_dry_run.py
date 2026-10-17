@@ -145,7 +145,7 @@ KNOWN_REASONS = frozenset({
     "unmapped_select", "selects_incomplete", "unmapped_toggle", "toggles_incomplete", "license_dates_invalid",
     "plan_shape_unexpected", "value_has_control_character", "leonardo_profile_unavailable", "browser_cdp_unavailable",
     "browser_tab_unavailable", "production_dry_run_form_not_reached", "dry_run_line_not_redacted",
-    "invalid_co_reference", "unexpected_error", *(f"production_locked_{s}" for s in _LOCKED_SUFFIXES)})
+    "invalid_co_reference", "confirm_preflight_failed", "unexpected_error", *(f"production_locked_{s}" for s in _LOCKED_SUFFIXES)})
 
 
 def known_reason(code: object) -> str:

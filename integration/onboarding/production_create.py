@@ -41,6 +41,7 @@ OUTCOME_CREATED_UNVERIFIED = "created_unverified"
 OUTCOME_VERIFIED = "readback_verified"
 OUTCOME_UNCERTAIN = "uncertain_submit"
 OUTCOME_ATTEMPT_STARTED = "attempt_started"
+OUTCOME_OWNER_CLEARED = "owner_review_cleared"  # recorded by the owner (tools/clear_production_attempt.py)
 RECORD_ERROR = "record_write_failed"
 SESSION_REF_ENV = "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF"
 # Exactly "1" in the run's environment enables the underscore seams of run() (tests only).
@@ -319,6 +320,7 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         prior_records: Any = (), prior_review_cleared_by_owner: bool = False,
         clock: Callable[[], datetime] | None = None,
         live_duplicate_check: Callable[[CreateInputs], str | None] | None = None,
+        live_source_check: Callable[[CreateInputs], tuple[Any, Any]] | None = None,
         _production_target_fn: Callable[[Mapping[str, str], datetime], Any] | None = None,
         _approval_check_fn: Callable[..., str | None] = production_approval.check) -> CreateResult:
     """Run one guarded create attempt. See the module docstring; every path writes at least one record.
@@ -387,6 +389,28 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         duplicate = "duplicate_check_unavailable"
     if duplicate is not None:
         reason = duplicate if isinstance(duplicate, str) and _REASON.fullmatch(duplicate) else "duplicate_check_unavailable"
+        return _refuse(write_record, inputs, reason, checked)
+
+    # Salesforce re-read immediately before the consume and the click: (current revision, Account UUID present). A live
+    # create REQUIRES it; drift, a non-empty UUID, an error or a missing check refuses before anything is consumed.
+    if live_source_check is None:
+        return _refuse(write_record, inputs, "live_source_check_missing", checked)
+    try:
+        fresh_revision, uuid_present = live_source_check(inputs)
+    except Exception:
+        return _refuse(write_record, inputs, "source_recheck_unavailable", checked)
+    if not isinstance(fresh_revision, str) or not fresh_revision or uuid_present is not False:
+        return _refuse(write_record, inputs, "source_recheck_unavailable" if uuid_present is None or not fresh_revision
+                       else "salesforce_prior_uuid_present", checked)
+    try:
+        moment = (clock or _utc_now)()  # a fresh clock for the judgement that precedes the consume
+    except Exception:
+        return _refuse(write_record, inputs, "clock_unavailable", checked)
+    if not _aware(moment):
+        return _refuse(write_record, inputs, "clock_unavailable", checked)
+    inputs = dataclasses.replace(inputs, now=moment, source_revision_now=fresh_revision)
+    reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn)
+    if reason is not None:
         return _refuse(write_record, inputs, reason, checked)
 
     # Intent record first: if it cannot be written nothing is consumed or clicked.
