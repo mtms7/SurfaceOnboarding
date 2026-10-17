@@ -443,6 +443,8 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         found = read_back(inputs)
     except Exception:
         found = None
+    # A readback of None (no row, session or reply problem, or a post-click popup) is recorded as ``created_unverified`` with
+    # reason ``readback_unavailable``; production_create_ui.ui_status shows it as create_outcome_unknown and blocks the CO.
     problem = _compare_readback(inputs, found)
     if problem is not None:
         data = _readback_record(inputs, OUTCOME_CREATED_UNVERIFIED, problem, found)

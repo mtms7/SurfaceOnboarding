@@ -7635,10 +7635,15 @@ LOGIN_REASON_TEXT = {
 # every POST is refused by create_ui.gate before anything is read or started. Desktop only; the VM never renders a control.
 def _harden_ticket_folder(path: Path) -> None:
     """Windows: restrict the launch-ticket folder to the current user (icacls /inheritance:r)."""
+    if os.name != "nt":
+        return
     user = os.environ.get("USERNAME", "")
-    if os.name == "nt" and user:
-        subprocess.run(["icacls.exe", str(path), "/inheritance:r", "/grant:r", user + ":(OI)(CI)F"], capture_output=True,
-                       timeout=20, check=False, stdin=subprocess.DEVNULL)
+    if not user:
+        raise OSError("ticket_folder_not_restricted")
+    done = subprocess.run(["icacls.exe", str(path), "/inheritance:r", "/grant:r", user + ":(OI)(CI)F"], capture_output=True,
+                          timeout=20, check=False, stdin=subprocess.DEVNULL)
+    if done.returncode != 0:  # a non-zero exit is a FAILURE: no ticket is minted (fail closed)
+        raise OSError("ticket_folder_not_restricted")
 
 
 create_ui.production_launch_ticket.HARDEN = _harden_ticket_folder

@@ -187,6 +187,50 @@ class RootAndReplayTests(unittest.TestCase):
         self.assertEqual(ticket.consume(self.dir, CO, REV, REF, NOW)[0], None)
 
 
+class HardeningFailureTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.addCleanup(setattr, ticket, "HARDEN", ticket.HARDEN)
+
+    def test_a_failed_hardening_means_no_ticket_and_it_is_checked_on_every_mint(self):
+        calls = []
+        ticket.HARDEN = lambda path: calls.append(path)
+        ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        self.assertGreaterEqual(len(calls), 2)  # every mint, not only the first key creation
+
+        def failing(path):
+            raise OSError("ticket_folder_not_restricted")
+        ticket.HARDEN = failing
+        ticket.discard(self.dir, CO)
+        with self.assertRaises(ValueError):
+            ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        self.assertFalse((self.dir / ticket.SUBDIR / (CO + ".json")).exists())
+
+    def test_the_dashboard_hook_treats_a_non_zero_icacls_exit_as_failure(self):
+        import tools.serve_attended_open_onboardings_dashboard as dashboard
+        from unittest import mock
+        with mock.patch.object(dashboard.os, "name", "nt"), mock.patch.dict("os.environ", {"USERNAME": "me"}):
+            with mock.patch.object(dashboard.subprocess, "run", return_value=SimpleNamespace(returncode=5)):
+                with self.assertRaises(OSError):
+                    dashboard._harden_ticket_folder(self.dir)
+            with mock.patch.object(dashboard.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
+                dashboard._harden_ticket_folder(self.dir)
+            with mock.patch.object(dashboard.subprocess, "run", side_effect=OSError("x")):
+                with self.assertRaises(OSError):
+                    dashboard._harden_ticket_folder(self.dir)
+        with mock.patch.object(dashboard.os, "name", "nt"), mock.patch.dict("os.environ", {"USERNAME": ""}):
+            with self.assertRaises(OSError):
+                dashboard._harden_ticket_folder(self.dir)
+
+    def test_unc_and_shared_roots_are_refused(self):
+        for bad in (r"\\server\share\x", "//server/share/x"):
+            with self.assertRaises(ticket.TicketRootError, msg=bad):
+                ticket.ticket_root({ticket.ENV_ROOT: bad})
+
+
 class PreArmTests(unittest.TestCase):
     def test_service_worker_popup_and_extra_production_page_refuse(self):
         guard = live.LiveRequestGuard()

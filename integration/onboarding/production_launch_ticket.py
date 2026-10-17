@@ -52,6 +52,22 @@ def _unsafe(path: Path) -> bool:
     return any(part.casefold() == "documents" or "onedrive" in part.casefold() for part in resolved.parts)
 
 
+def _remote(path: Path) -> bool:
+    """True for a UNC / shared / network-drive location (the key and tickets must stay on a LOCAL drive)."""
+    text = str(path)
+    if text.startswith(("\\\\", "//")):
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            drive = os.path.splitdrive(text)[0]
+            return not drive or ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4  # DRIVE_REMOTE
+        except Exception:
+            return True
+    return False
+
+
 def ticket_root(environ: Mapping[str, str] | None = None) -> Path:
     """The ONE folder both the dashboard (mint) and the runner (consume) use. Raises TicketRootError when none is safe."""
     environ = os.environ if environ is None else environ
@@ -67,7 +83,7 @@ def ticket_root(environ: Mapping[str, str] | None = None) -> Path:
         root = Path(base) / "SurfaceOnboarding"
     else:
         root = Path.home() / ".local" / "state" / "surface-onboarding"
-    if _unsafe(root):
+    if _unsafe(root) or _remote(root):
         raise TicketRootError("launch_ticket_root_unsafe")
     return root
 
@@ -78,11 +94,9 @@ HARDEN: Callable[[Path], None] | None = None
 
 
 def _restrict(path: Path) -> None:
+    """Run the hardening hook; any failure raises (fail closed: no ticket is minted in a folder that could not be restricted)."""
     if HARDEN is not None:
-        try:
-            HARDEN(path)
-        except Exception:
-            pass  # best effort: 0700 / 0600 are set at creation
+        HARDEN(path)
 
 
 def _path(parent: Path, co: str) -> Path:
@@ -162,6 +176,10 @@ def mint(parent: Path, co: str, revision: str, approval_ref: str, operator: str,
                             "nonce": secrets.token_hex(16)}
     folder = Path(parent) / SUBDIR
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        _restrict(folder)  # checked on EVERY mint, not only when the key is first created
+    except Exception:
+        raise ValueError("launch_ticket_invalid") from None
     key = _key(parent, True)
     if key is None:
         raise ValueError("launch_ticket_invalid")

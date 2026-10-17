@@ -31,7 +31,10 @@ CO = "CO-0797"
 REV = "2026-10-16T09:00:00.000+0000"
 POISON_NAME = "Zeta Quux Holdings"
 POISON_DOMAIN = "zetaquux.example"
-UNLOCK = {"SURFACE_ONBOARDING_PRODUCTION_SESSIONS": "1", "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF": REF}
+ORG = "00D5g0000012345EAA"
+ORG_PROBE = lambda: [{"Id": ORG}]  # noqa: E731
+UNLOCK = {"SURFACE_ONBOARDING_PRODUCTION_SESSIONS": "1", "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF": REF,
+          "SURFACE_SF_EXPECTED_ORG_ID": ORG}
 
 
 def make_source(**over):
@@ -387,7 +390,8 @@ class Harness:
             line = runner.run_production_dry_run(
                 reference, revision, environ=env, now=NOW, records_parent=self.records, approval_path=self.approval_path,
                 load_source=(lambda _r: source) if source else self.load_source, clone_facts=clone,
-                open_page=self.open_page, fill_date=lambda *_a: True, date_kept=lambda *_a: True, clock=clock)
+                open_page=self.open_page, fill_date=lambda *_a: True, date_kept=lambda *_a: True, clock=clock,
+                org_probe=ORG_PROBE)
         return json.loads(line)
 
     def record(self):
@@ -992,7 +996,7 @@ class FlowTests(unittest.TestCase):
         with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True):
             line = runner.run_production_dry_run(CO, REV, environ=dict(UNLOCK), now=NOW, records_parent=h.records,
                                                  approval_path=h.approval_path, load_source=boom, clone_facts=good_clone,
-                                                 open_page=h.open_page)
+                                                 open_page=h.open_page, org_probe=ORG_PROBE)
         self.assertEqual(json.loads(line)["result"], "ce_route_mismatch")
         self.assertEqual(h.opened, 0)
 
@@ -1240,7 +1244,7 @@ class FlowTests(unittest.TestCase):
         with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True):
             line = runner.run_production_dry_run(CO, REV, environ=dict(UNLOCK), now=NOW, records_parent=h.records,
                                                  approval_path=h.approval_path, load_source=boom, clone_facts=good_clone,
-                                                 open_page=h.open_page)
+                                                 open_page=h.open_page, org_probe=ORG_PROBE)
         self.assertEqual(json.loads(line)["result"], "unexpected_error")
         data, text = h.record()
         self.assertEqual(data["refusal_reason"], "unexpected_error")

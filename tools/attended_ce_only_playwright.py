@@ -9914,10 +9914,17 @@ PINNED_SF_ALIAS = "surface-onboarding"  # production paths never take the alias 
 
 
 def _pcr_org_problem(environ: Any, probe: Any = None) -> str | None:
-    """Pin the Salesforce org by Id when SURFACE_SF_EXPECTED_ORG_ID is configured (the dashboard's own rule, first 15 chars)."""
+    """Pin the Salesforce org by Id (first 15 chars, the dashboard's own rule). The expected Id comes from
+    SURFACE_SF_EXPECTED_ORG_ID, else the launcher's salesforce-expected-org-id.txt; with neither the run REFUSES."""
     expected = str(environ.get("SURFACE_SF_EXPECTED_ORG_ID", "")).strip()
-    if not expected:
-        return None
+    if not expected:  # the repo convention: the launcher's file, read only, never written here
+        base = str(environ.get("LOCALAPPDATA", "")).strip()
+        try:
+            expected = (Path(base) / "SurfaceOnboarding" / "salesforce-expected-org-id.txt").read_text(encoding="ascii").strip() if base else ""
+        except (OSError, ValueError):
+            expected = ""
+    if not re.fullmatch(r"[A-Za-z0-9]{15}(?:[A-Za-z0-9]{3})?", expected):
+        return "salesforce_org_not_pinned"  # no expected org Id (or a malformed one): the runner refuses, never skips the pin
     try:
         rows = (probe or (lambda: _sf_records("SELECT Id FROM Organization LIMIT 1")))()
         org = rows[0].get("Id") if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) else None
@@ -10192,7 +10199,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                                           list(production_contract.READBACK_PICK_PATHS)])
                 found = live.poll_readback(fetch, contract_intended, strict_state["expected"], page.wait_for_timeout)
                 # A popup, new page or service worker that appeared AFTER the click (even after the poll window) means the
-                # outcome cannot be trusted: no verified record, the CO is blocked as create_outcome_unknown.
+                # outcome cannot be trusted: returning None records ``created_unverified`` / ``readback_unavailable``, which the
+                # dashboard shows and treats as create_outcome_unknown (CO blocked, no VERIFIED record).
                 if found is not None and (guard.create_blocked or live.post_click_problem(page, guard) is not None):
                     return None
                 return found

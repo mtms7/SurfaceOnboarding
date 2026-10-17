@@ -194,7 +194,7 @@ class Harness(dry.Harness):
                 CO, revision, owner_go=go, environ=env, now=NOW, records_parent=self.records,
                 approval_path=self.approval_path, load_source=(lambda _r: source) if source else self.load_source,
                 clone_facts=clone, open_page=self.open_page, fill_date=lambda *_a: True, date_kept=lambda *_a: True,
-                run_day=DAY, ticket_parent=self.records)
+                run_day=DAY, ticket_parent=self.records, org_probe=dry.ORG_PROBE)
         self.stdout, self.line = out.getvalue(), line
         return json.loads(line)
 
@@ -666,7 +666,7 @@ class ContextGuardAndCountryTests(Base):
             line = runner.run_production_create(
                 CO, REV, owner_go=True, environ=dict(dry.UNLOCK), now=NOW, records_parent=h.records, approval_path=h.approval_path,
                 load_source=h.load_source, clone_facts=good_clone, open_page=h.open_page, fill_date=lambda *_a: True,
-                date_kept=lambda *_a: True, run_day=DAY, clock=lambda: next(times), ticket_parent=h.records)
+                date_kept=lambda *_a: True, run_day=DAY, clock=lambda: next(times), ticket_parent=h.records, org_probe=dry.ORG_PROBE)
         self.assertEqual(json.loads(line)["result"], "dry_run_old")
         self.assertEqual(h.page.confirm_clicks, 0)
         self.assertIsNone(h.approval_unused())
@@ -685,8 +685,36 @@ class ContextGuardAndCountryTests(Base):
                                                    open_page=h.open_page, ticket_parent=h.records, org_probe=probe)
             self.assertIn(reason, out)
             self.assertEqual((h.opened, h.loaded), (0, 0))
-        self.assertIsNone(runner._pcr_org_problem({}))
+        self.assertEqual(runner._pcr_org_problem({}), "salesforce_org_not_pinned")
         self.assertIsNone(runner._pcr_org_problem(env, lambda: [{"Id": "00D5g0000012345XYZ"}]))
+
+    def test_a_missing_or_malformed_expected_org_id_refuses_the_run_never_skips_the_pin(self):
+        import tempfile
+        probe = lambda: [{"Id": dry.ORG}]  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(runner._pcr_org_problem({"LOCALAPPDATA": tmp}, probe), "salesforce_org_not_pinned")
+            self.assertEqual(runner._pcr_org_problem({}, probe), "salesforce_org_not_pinned")
+            self.assertEqual(runner._pcr_org_problem({"SURFACE_SF_EXPECTED_ORG_ID": "short"}, probe), "salesforce_org_not_pinned")
+            folder = Path(tmp) / "SurfaceOnboarding"
+            folder.mkdir()
+            (folder / "salesforce-expected-org-id.txt").write_text(dry.ORG, encoding="ascii")  # the launcher file
+            self.assertIsNone(runner._pcr_org_problem({"LOCALAPPDATA": tmp}, probe))
+            self.assertEqual(runner._pcr_org_problem({"LOCALAPPDATA": tmp}, lambda: [{"Id": "00D5g0000099999EAA"}]),
+                             "salesforce_org_not_pinned")
+            (folder / "salesforce-expected-org-id.txt").write_text("not an org id", encoding="ascii")
+            self.assertEqual(runner._pcr_org_problem({"LOCALAPPDATA": tmp}, probe), "salesforce_org_not_pinned")
+
+    def test_a_run_without_any_expected_org_refuses_before_any_read(self):
+        h = self.harness()
+        h.seed_dry_run()
+        h.mint()
+        env = {k: v for k, v in dry.UNLOCK.items() if k != "SURFACE_SF_EXPECTED_ORG_ID"}
+        with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True),                 mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True):
+            out = runner.run_production_create(CO, REV, owner_go=True, environ={**env, "LOCALAPPDATA": str(h.records)}, now=NOW,
+                                               records_parent=h.records, approval_path=h.approval_path, load_source=h.load_source,
+                                               open_page=h.open_page, ticket_parent=h.records, org_probe=dry.ORG_PROBE)
+        self.assertIn("salesforce_org_not_pinned", out)
+        self.assertEqual((h.opened, h.loaded), (0, 0))
 
     def test_the_dry_run_also_refuses_an_alias_override(self):
         h = self.harness()
