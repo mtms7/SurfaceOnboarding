@@ -11,6 +11,8 @@ Run once, in your own PowerShell, after `--store-key` and a successful `--probe`
     powershell -File tools\register_redash_inventory_task.ps1 -WhatIf     # preview only
     powershell -File tools\register_redash_inventory_task.ps1             # register
     powershell -File tools\register_redash_inventory_task.ps1 -Remove     # unregister
+Query 253 (v2 inventory): store its own key first (`--store-key --query-id 253`), then register with `-QueryId 253`; the
+same task name is replaced (-Force), so this is also how to switch back (`-QueryId 251`, the default, behaves as before).
 
 Results are one line per run in %LOCALAPPDATA%\SurfaceOnboarding\redash\collector.log (reason codes and counts only).
 Exit codes: 0 = ok, 1 = failed (nothing written), 2 = written but Redash could not refresh (data is older than wanted);
@@ -20,6 +22,7 @@ Task Scheduler shows 1 and 2 as a failed last run.
 param(
     [string]$PythonPath = 'C:\Users\Milton Stevenson\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe',
     [ValidateRange(15, 1440)][int]$IntervalMinutes = 60,
+    [ValidateSet(251, 253)][int]$QueryId = 251,
     [switch]$Remove
 )
 
@@ -27,7 +30,8 @@ $ErrorActionPreference = 'Stop'
 $taskName = 'SurfaceOnboarding-RedashInventory'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $collector = Join-Path $projectRoot 'tools\redash_inventory_collector.py'
-$keyFile = Join-Path $env:LOCALAPPDATA 'SurfaceOnboarding\redash\query-251.key'
+$keyFile = Join-Path $env:LOCALAPPDATA ('SurfaceOnboarding\redash\query-{0}.key' -f $QueryId)
+$queryArgs = if ($QueryId -eq 251) { '' } else { ' --query-id {0}' -f $QueryId }
 
 if ($Remove) {
     if ($PSCmdlet.ShouldProcess($taskName, 'Unregister scheduled task')) {
@@ -42,17 +46,18 @@ if (-not (Test-Path -LiteralPath $PythonPath)) {
 }
 if (-not (Test-Path -LiteralPath $collector)) { throw "Collector not found: $collector" }
 if (-not (Test-Path -LiteralPath $keyFile)) {
-    throw "No Redash key is stored yet. Run: `"$PythonPath`" `"$collector`" --store-key   (then --probe)"
+    throw "No Redash key is stored yet. Run: `"$PythonPath`" `"$collector`" --store-key$queryArgs   (then --probe$queryArgs)"
 }
 
 # A task that cannot work must not be registered: the probe reads the cached result and checks its shape only.
-$probe = (& $PythonPath $collector --probe 2>$null | Select-Object -Last 1 | ConvertFrom-Json)
+$probeArgs = @($collector, '--probe') + @($queryArgs.Trim() -split ' ' | Where-Object { $_ })
+$probe = (& $PythonPath @probeArgs 2>$null | Select-Object -Last 1 | ConvertFrom-Json)
 if ($null -eq $probe -or $probe.normalize -ne 'ok') {
     $why = if ($null -eq $probe) { 'no output' } else { [string]$probe.normalize }
     throw "The Redash probe did not pass ($why). Fix that first; no task was registered."
 }
 
-$action = New-ScheduledTaskAction -Execute $PythonPath -Argument ('"{0}" --collect' -f $collector) -WorkingDirectory $projectRoot
+$action = New-ScheduledTaskAction -Execute $PythonPath -Argument ('"{0}" --collect{1}' -f $collector, $queryArgs) -WorkingDirectory $projectRoot
 $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) `
     -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes) -RepetitionDuration (New-TimeSpan -Days 3650)
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 10) `

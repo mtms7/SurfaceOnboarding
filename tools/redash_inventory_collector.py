@@ -1,4 +1,9 @@
-"""Read-only collector: Redash saved query 251 (production clone) -> local tenant inventory snapshot.
+"""Read-only collector: Redash saved query 251 (or, when selected, 253) (production clone) -> local tenant inventory snapshot.
+
+Query selection: ``--query-id N`` or ``SURFACE_REDASH_QUERY_ID`` (default 251; only ids in
+``redash_inventory.PROFILES`` are accepted). Each query has its own strict column list, its own exact URL paths and its own
+key (``query-<id>.key`` DPAPI blob; on Linux ``SURFACE_REDASH_KEY_FILE`` for 251, ``SURFACE_REDASH_KEY_FILE_<id>`` otherwise).
+Query 253 snapshots carry ``row_schema: v2`` and a flat ``v2`` object per tenant; 251 snapshots are unchanged (v1).
 
 Owner approval 2026-10-05: read-only, automated use of one saved query on the
 Redash data source "Prod (Cloned) - Mgmt". It needs no browser and no MFA, so
@@ -66,15 +71,44 @@ ENVIRONMENT = "prod-clone"
 BASE_URL = inventory.ENVIRONMENTS[ENVIRONMENT].origin
 REDASH_HOST = "redash.pentera.io"
 assert urlsplit(BASE_URL).scheme == "https" and urlsplit(BASE_URL).hostname == REDASH_HOST
-QUERY_ID = redash.QUERY_ID
+QUERY_ID = redash.QUERY_ID  # the default source (query 251); query 253 is selectable, see resolve_query_id
+QUERY_ID_ENV = "SURFACE_REDASH_QUERY_ID"
 RESULTS_PATH = f"/api/queries/{QUERY_ID}/results.json"
 REFRESH_PATH = f"/api/queries/{QUERY_ID}/results"
-ALLOWED_CALLS = (
-    ("GET", re.compile(rf"/api/queries/{QUERY_ID}/results\.json")),
-    ("POST", re.compile(rf"/api/queries/{QUERY_ID}/results")),
-    ("GET", re.compile(r"/api/jobs/[A-Za-z0-9-]{8,64}")),
-    ("GET", re.compile(r"/api/query_results/[0-9]{1,12}\.json")),
-)
+
+
+def results_path(query_id: int = QUERY_ID) -> str:
+    return f"/api/queries/{redash.profile_for(query_id).query_id}/results.json"
+
+
+def refresh_path(query_id: int = QUERY_ID) -> str:
+    return f"/api/queries/{redash.profile_for(query_id).query_id}/results"
+
+
+def allowed_calls(query_id: int = QUERY_ID) -> tuple[tuple[str, re.Pattern[str]], ...]:
+    """The four exact (method, path) pairs for ONE supported query id."""
+    profile = redash.profile_for(query_id)
+    return (
+        ("GET", re.compile(rf"/api/queries/{profile.query_id}/results\.json")),
+        ("POST", re.compile(rf"/api/queries/{profile.query_id}/results")),
+        ("GET", re.compile(r"/api/jobs/[A-Za-z0-9-]{8,64}")),
+        ("GET", re.compile(r"/api/query_results/[0-9]{1,12}\.json")),
+    )
+
+
+ALLOWED_CALLS = allowed_calls(QUERY_ID)
+
+
+def resolve_query_id(argument: int | None = None, environ: Any = None) -> int:
+    """Which saved query to read: the argument, else ``SURFACE_REDASH_QUERY_ID``, else 251. Only supported ids pass."""
+    environ = os.environ if environ is None else environ
+    raw = argument if argument is not None else (environ.get(QUERY_ID_ENV, "").strip() or QUERY_ID)
+    try:
+        query_id = int(raw)
+        redash.profile_for(query_id)
+    except (ValueError, TypeError, inventory.InventoryError):
+        raise CollectorError("redash_query_id_unsupported") from None
+    return query_id
 KEY_PATTERN = re.compile(r"[A-Za-z0-9]{20,64}")
 JOB_ID = re.compile(r"[A-Za-z0-9-]{8,64}")
 DEFAULT_MAX_AGE = timedelta(minutes=60)   # older cached results trigger a refresh
@@ -110,8 +144,8 @@ def state_dir() -> Path:
     return (Path(base) if base else Path.home() / "AppData" / "Local") / "SurfaceOnboarding" / "redash"
 
 
-def key_path() -> Path:
-    return state_dir() / f"query-{QUERY_ID}.key"
+def key_path(query_id: int = QUERY_ID) -> Path:
+    return state_dir() / f"query-{redash.profile_for(query_id).query_id}.key"
 
 
 class _Blob(ctypes.Structure):
@@ -155,11 +189,11 @@ def _dpapi(data: bytes, *, protect: bool) -> bytes:
         ctypes.memset(data_buffer, 0, len(data))  # wipe our copy of the input
 
 
-def store_key(raw_key: str, path: Path | None = None) -> None:
+def store_key(raw_key: str, path: Path | None = None, query_id: int = QUERY_ID) -> None:
     key = raw_key.strip()
     if not KEY_PATTERN.fullmatch(key):
         raise CollectorError("redash_key_format_invalid")
-    target = path or key_path()
+    target = path or key_path(query_id)
     target.parent.mkdir(parents=True, exist_ok=True)
     blob = _dpapi(key.encode("ascii"), protect=True)
     temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
@@ -170,7 +204,11 @@ def store_key(raw_key: str, path: Path | None = None) -> None:
         temporary.unlink(missing_ok=True)
 
 
-KEY_FILE_ENV = "SURFACE_REDASH_KEY_FILE"
+KEY_FILE_ENV = "SURFACE_REDASH_KEY_FILE"  # query 251; any other query N uses SURFACE_REDASH_KEY_FILE_<N>
+
+
+def key_file_env(query_id: int = QUERY_ID) -> str:
+    return KEY_FILE_ENV if query_id == QUERY_ID else f"{KEY_FILE_ENV}_{redash.profile_for(query_id).query_id}"
 
 
 def load_key_file(path: str | os.PathLike[str]) -> str:
@@ -198,12 +236,12 @@ def load_key_file(path: str | os.PathLike[str]) -> str:
     return key
 
 
-def load_key(path: Path | None = None) -> str:
-    configured = os.environ.get(KEY_FILE_ENV, "").strip()
+def load_key(path: Path | None = None, query_id: int = QUERY_ID) -> str:
+    configured = os.environ.get(key_file_env(query_id), "").strip()
     if path is None and configured:
         return load_key_file(configured)
     try:
-        blob = (path or key_path()).read_bytes()
+        blob = (path or key_path(query_id)).read_bytes()
     except OSError:
         raise CollectorError("redash_key_unavailable") from None
     key = _dpapi(blob, protect=False).decode("ascii", "replace")
@@ -212,14 +250,14 @@ def load_key(path: Path | None = None) -> str:
     return key
 
 
-def read_key_hidden() -> str:
+def read_key_hidden(query_id: int = QUERY_ID) -> str:
     """Prompt for the key with echo off, and refuse anywhere a hidden prompt is not guaranteed."""
     if not (sys.stdin and sys.stdin.isatty()):
         raise CollectorError("redash_key_prompt_not_a_console")
     with warnings.catch_warnings():
         warnings.simplefilter("error", getpass.GetPassWarning)
         try:
-            return getpass.getpass("Paste the Redash query API key (input is hidden): ")
+            return getpass.getpass(f"Paste the Redash query {query_id} API key (input is hidden): ")
         except getpass.GetPassWarning:
             raise CollectorError("redash_key_prompt_not_hidden") from None
 
@@ -235,8 +273,13 @@ def build_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(_NoRedirect)
 
 
-def _call(opener: Any, key: str, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-    if not any(method == allowed and pattern.fullmatch(path) for allowed, pattern in ALLOWED_CALLS):
+def _call(opener: Any, key: str, method: str, path: str, body: dict[str, Any] | None = None,
+          query_id: int = QUERY_ID) -> Any:
+    try:
+        calls = allowed_calls(query_id)
+    except inventory.InventoryError:
+        raise CollectorError("redash_query_id_unsupported") from None
+    if not any(method == allowed and pattern.fullmatch(path) for allowed, pattern in calls):
         raise CollectorError("redash_path_not_allowed")
     payload = json.dumps(body).encode("utf-8") if body is not None else None
     headers = {"Authorization": "Key " + key, "Accept": "application/json", "User-Agent": _USER_AGENT}
@@ -279,11 +322,12 @@ def _retrieved_at(result: Any) -> datetime:
         raise CollectorError("redash_schema_unavailable") from None
 
 
-def _refresh(opener: Any, key: str, sleep: Callable[[float], None], clock: Callable[[], float] | None = None) -> Any:
+def _refresh(opener: Any, key: str, sleep: Callable[[float], None], clock: Callable[[], float] | None = None,
+             query_id: int = QUERY_ID) -> Any:
     """Ask Redash to re-run the saved query now (a read on the clone), then wait for its result."""
     clock = clock or time.monotonic
     deadline = clock() + JOB_DEADLINE_SECONDS
-    reply = _call(opener, key, "POST", REFRESH_PATH, {"max_age": 0})
+    reply = _call(opener, key, "POST", refresh_path(query_id), {"max_age": 0}, query_id)
     if isinstance(reply, dict) and isinstance(reply.get("query_result"), dict):
         return {"query_result": reply["query_result"]}
     job = reply.get("job") if isinstance(reply, dict) else None
@@ -291,14 +335,14 @@ def _refresh(opener: Any, key: str, sleep: Callable[[float], None], clock: Calla
     if type(job_id) is not str or not JOB_ID.fullmatch(job_id):
         raise CollectorError("redash_refresh_unexpected")
     for _ in range(MAX_POLLS):
-        status = _call(opener, key, "GET", f"/api/jobs/{job_id}")
+        status = _call(opener, key, "GET", f"/api/jobs/{job_id}", None, query_id)
         info = status.get("job") if isinstance(status, dict) else None
         state = info.get("status") if isinstance(info, dict) else None
         if state == _FINISHED:
             result_id = info.get("query_result_id")
             if type(result_id) is not int or not 1 <= result_id < 10 ** 12:
                 raise CollectorError("redash_refresh_unexpected")
-            return _call(opener, key, "GET", f"/api/query_results/{result_id}.json")
+            return _call(opener, key, "GET", f"/api/query_results/{result_id}.json", None, query_id)
         if state in (_FAILED, _CANCELED):
             raise CollectorError("redash_refresh_failed")
         if clock() >= deadline:
@@ -320,18 +364,18 @@ def refresh_reason_for(error_reason: str) -> str:
 
 def fetch_results(opener: Any, key: str, *, now: datetime, max_age: timedelta, refresh: bool,
                   sleep: Callable[[float], None] = time.sleep,
-                  outcome: dict[str, Any] | None = None) -> tuple[Any, bool, bool]:
+                  outcome: dict[str, Any] | None = None, query_id: int = QUERY_ID) -> tuple[Any, bool, bool]:
     """The newest result, refreshed first when older than ``max_age`` (if allowed).
 
     Returns (result, refreshed, refresh_failed). ``refresh_failed`` is True when a refresh was wanted
     (the cached result was too old) and the data is still older than ``max_age`` afterwards.
     ``outcome``, when given, receives ``refresh_reason`` (a value-free code) if a refresh was attempted and failed.
     """
-    result = _call(opener, key, "GET", RESULTS_PATH)
+    result = _call(opener, key, "GET", results_path(query_id), None, query_id)
     refreshed = False
     if refresh and now - _retrieved_at(result) > max_age:
         try:
-            result, refreshed = _refresh(opener, key, sleep), True
+            result, refreshed = _refresh(opener, key, sleep, None, query_id), True
         except CollectorError as error:
             if outcome is not None:
                 outcome["refresh_reason"] = refresh_reason_for(error.reason)
@@ -348,15 +392,17 @@ def fetch_results(opener: Any, key: str, *, now: datetime, max_age: timedelta, r
 
 def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | None = None,
             max_age: timedelta = DEFAULT_MAX_AGE, refresh: bool = True, write_csv: bool = False,
-            accept_shrink: bool = False, sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
+            accept_shrink: bool = False, sleep: Callable[[float], None] = time.sleep,
+            query_id: int = QUERY_ID) -> dict[str, Any]:
+    redash.profile_for(query_id)
     now = now or datetime.now(timezone.utc)
     root = root or inventory.clone_root()
     outcome: dict[str, Any] = {}
     result, refreshed, refresh_failed = fetch_results(opener, key, now=now, max_age=max_age, refresh=refresh,
-                                                      sleep=sleep, outcome=outcome)
-    normalized = redash.normalize(result)
+                                                      sleep=sleep, outcome=outcome, query_id=query_id)
+    normalized = redash.normalize(result, query_id)
     if normalized.unexpected_columns:
-        raise CollectorError("redash_query_changed")  # someone edited query 251: stop, do not guess
+        raise CollectorError("redash_query_changed")  # someone edited the saved query: stop, do not guess
     assembled = inventory.assemble_rows(normalized.rows)
     if assembled.uuid_missing_count > assembled.total_count * MAX_UUID_MISSING_SHARE:
         raise CollectorError("redash_uuid_missing")
@@ -372,7 +418,8 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
         raise CollectorError("redash_result_shrunk")
     payload = inventory.snapshot_payload(
         environment, assembled, normalized.retrieved_at, acquisition=inventory.REDASH_ACQUISITION,
-        source=redash.source_meta(normalized, now, refreshed=refreshed), expected_paths=redash.EXPECTED_REDASH_PATHS)
+        source=redash.source_meta(normalized, now, refreshed=refreshed), expected_paths=redash.expected_paths(query_id))
+    payload = redash.attach_v2(payload, normalized)  # query 253 only: flat v2 values, row_schema marker, re-hash
     drift = payload["schema_drift"]
     summary = {"environment": environment.name, "environment_label": environment.label,
                "row_count": payload["row_count"], "deleted_count": payload["deleted_count"],
@@ -382,6 +429,9 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
                "data_age_minutes": int((now - normalized.retrieved_at).total_seconds() // 60),
                "schema_drift": {name: len(drift.get(name, [])) for name in ("unknown", "missing", "type_changed")},
                "missing_columns": len(normalized.missing_columns)}
+    if query_id != QUERY_ID:
+        summary["query_id"] = query_id
+        summary["row_schema"] = payload.get("row_schema", redash.ROW_SCHEMA_V1)
     try:  # "unchanged" only when the stored snapshot still verifies (hash, name, counts), not just latest.json
         stored = inventory.load_latest(root, ENVIRONMENT, max_age=timedelta(days=3650), now=now)
     except inventory.InventoryError:
@@ -401,10 +451,10 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
     return {"result": "inventory_collected", "file": target.name, **summary}
 
 
-def probe(opener: Any, key: str, *, now: datetime | None = None) -> dict[str, Any]:
+def probe(opener: Any, key: str, *, now: datetime | None = None, query_id: int = QUERY_ID) -> dict[str, Any]:
     """Shape only: column names, value type names, counts, freshness. No row value is printed."""
     now = now or datetime.now(timezone.utc)
-    result = _call(opener, key, "GET", RESULTS_PATH)
+    result = _call(opener, key, "GET", results_path(query_id), None, query_id)
     data = result.get("query_result", {}).get("data", {}) if isinstance(result, dict) else {}
     columns = [column.get("name") for column in data.get("columns", []) if isinstance(column, dict)]
     rows = [row for row in data.get("rows", []) if isinstance(row, dict)]
@@ -412,9 +462,11 @@ def probe(opener: Any, key: str, *, now: datetime | None = None) -> dict[str, An
              for name in columns if type(name) is str and redash._SAFE_COLUMN.fullmatch(name)}
     report: dict[str, Any] = {"result": "probe", "row_count": len(rows), "columns": types,
                               "data_age_minutes": None, "normalize": "not_run"}
+    if query_id != QUERY_ID:
+        report["query_id"] = query_id
     try:
         report["data_age_minutes"] = int((now - _retrieved_at(result)).total_seconds() // 60)
-        normalized = redash.normalize(result)
+        normalized = redash.normalize(result, query_id)
         inventory.assemble_rows(normalized.rows)
         report["normalize"] = "ok"
         report["unexpected_columns"] = list(normalized.unexpected_columns)
@@ -449,6 +501,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--store-key", action="store_true", help="Store the per-query API key (hidden prompt).")
     mode.add_argument("--probe", action="store_true", help="Read the cached result and print its shape only.")
     mode.add_argument("--collect", action="store_true", help="Refresh if needed and write the local snapshot.")
+    parser.add_argument("--query-id", type=int, default=None,
+                        help="Saved query to read (supported: 251, 253). Default: $SURFACE_REDASH_QUERY_ID, else 251.")
     parser.add_argument("--max-age-minutes", type=int, default=int(DEFAULT_MAX_AGE.total_seconds() // 60))
     parser.add_argument("--no-refresh", action="store_true", help="Never ask Redash to re-run the query.")
     parser.add_argument("--cached-ok", action="store_true",
@@ -458,18 +512,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="Accept a result more than 10%% smaller than the last snapshot (a deliberate clean-up).")
     args = parser.parse_args(argv)
     try:
+        query_id = resolve_query_id(args.query_id)
         if args.store_key:
-            store_key(read_key_hidden())
-            print(json.dumps({"result": "key_stored"}))
+            store_key(read_key_hidden(query_id), query_id=query_id)
+            print(json.dumps({"result": "key_stored", **({"query_id": query_id} if query_id != QUERY_ID else {})}))
             return 0
-        key = load_key()
+        key = load_key() if query_id == QUERY_ID else load_key(query_id=query_id)
         opener = build_opener()
         if args.probe:
-            print(json.dumps(probe(opener, key), sort_keys=True))
+            print(json.dumps(probe(opener, key, query_id=query_id), sort_keys=True))
             return 0
         _log_line("collect started")
         report = collect(opener, key, max_age=timedelta(minutes=max(1, args.max_age_minutes)),
-                         refresh=not args.no_refresh, write_csv=args.csv, accept_shrink=args.accept_shrink)
+                         refresh=not args.no_refresh, write_csv=args.csv, accept_shrink=args.accept_shrink,
+                         query_id=query_id)
     except (CollectorError, inventory.InventoryError) as error:
         report = {"result": error.reason}
         _log_line(json.dumps(report))

@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from integration.onboarding import leonardo_inventory as inventory  # noqa: E402
+from integration.onboarding import redash_inventory as redash  # noqa: E402
 from integration.onboarding import vm_snapshot as vs  # noqa: E402
 from tools import publish_vm_snapshot as publisher  # noqa: E402
 
@@ -44,8 +45,10 @@ def build(key_file: str, out: Path, root: Path | None = None, now: datetime | No
             raise BuildRefused("local_clone_missing")
         try:
             loaded = inventory.load_latest(root, "prod-clone", max_age=MAX_AGE, now=now)
+            redash.validate_row_schema(loaded)  # v1 (unmarked) or a well-formed v2; never sign a malformed one
         except inventory.InventoryError as error:
-            raise BuildRefused(error.reason) from None
+            raise BuildRefused("row_schema_invalid" if error.reason == "inventory_row_schema_invalid"
+                               else error.reason) from None
         vs.write_bundle(out, files, key, PRODUCER, now)
     except vs.SnapshotError as error:
         raise BuildRefused(error.code) from None

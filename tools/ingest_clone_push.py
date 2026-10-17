@@ -38,6 +38,7 @@ from typing import BinaryIO
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory  # noqa: E402
+from integration.onboarding import redash_inventory as redash  # noqa: E402
 from integration.onboarding import state_paths  # noqa: E402
 from integration.onboarding import vm_snapshot as vs  # noqa: E402
 
@@ -116,6 +117,10 @@ def ingest(raw: bytes, key: bytes, state_dir: str | os.PathLike[str], now: datet
         except inventory.InventoryError as error:
             raise PushRefused(error.reason) from None
         payload = {name: value for name, value in staged.items() if name != "age_seconds"}
+        try:  # v1 (unmarked) or v2 (query 253): a v2 row must carry only known, typed v2 keys; v1 must carry none
+            redash.validate_row_schema(payload)
+        except inventory.InventoryError:
+            raise PushRefused("row_schema_invalid") from None
         current = _current(root, now)
         if current is not None and payload["captured_at"] == current["captured_at"] \
                 and payload["rows_sha256"] == current["rows_sha256"]:

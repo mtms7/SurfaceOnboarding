@@ -15,7 +15,7 @@ Leonardo export, so a snapshot from either source has one format.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import re
@@ -23,7 +23,10 @@ from typing import Any, Mapping
 
 from .leonardo_inventory import EXPECTED_PATHS, REDASH_MAX_TOTAL, InventoryError
 
-QUERY_ID = 251
+QUERY_ID = 251  # the live source and default; see PROFILES for the other selectable query
+V2_QUERY_ID = 253  # "Tenant inventory v2 (read-only)": flat, wider projection; used only when selected
+SUPPORTED_QUERY_IDS = (QUERY_ID, V2_QUERY_ID)
+ROW_SCHEMA_V1, ROW_SCHEMA_V2 = "v1", "v2"  # snapshot payload marker ``row_schema``; absent means v1
 MAX_OPERATOR_COUNT = 1000
 
 # Redash column -> row path (Leonardo's own row shape, so minimize_row applies unchanged).
@@ -74,10 +77,127 @@ def _stored_paths() -> frozenset[str]:
     return frozenset(paths)
 
 
+# ----- query 253 (v2): extra columns, strict schema per query ------------------------------------------
+# Column -> kind. Kinds: str, bool, int, interval (str|int), list (list of short strings). Values are stored in
+# ``tenant["v2"]`` (flat snake_case keys, None omitted) next to the unchanged v1 row; no personal data.
+V2_COLUMNS: dict[str, str] = {
+    "accountCountryCode": "str", "userEmailDomains": "list", "enumerationScanningInterval": "interval",
+    "leakedCredentialsScanningInterval": "interval", "operatorCount": "int", "subDomainsCount": "int",
+    "additionalNetworksCount": "int", "pendingValidationAssetsCount": "int", "leakedCredentialsScannedDomains": "list",
+    "staticOutboundIpEnabled": "bool", "fullNucleiScanEnabled": "bool", "aiEnabled": "bool",
+    "webAiAttackerEnabled": "bool", "vodBetaEnabled": "bool", "webDictionaryBruteForceEnabled": "bool",
+    "webDorkingEnabled": "bool", "subDomainsReconEnabled": "bool", "authenticatedTestingEnabled": "bool",
+    "automatedDiscoveryEnabled": "bool", "domainsMultiAttackStackEnabled": "bool",
+    "domainsMultiAttackStackAssetsPerStack": "int", "subDomainsMultiAttackStackEnabled": "bool",
+    "subDomainsMultiAttackStackAssetsPerStack": "int", "primaryUserMfaRequired": "bool",
+    "primaryUserPresent": "bool", "spyCloudEnabled": "bool"}
+# accountLicense columns query 253 adds; they feed the v1 row's license (so ``minimize_row`` keeps them) and nothing else.
+V2_LICENSE_COLUMNS: dict[str, str] = {
+    "accountLicense.reconLevel": "interval", "accountLicense.notificationsAllowed": "bool",
+    "accountLicense.multipleUsersAllowed": "bool", "accountLicense.apiAccessAllowed": "bool",
+    "accountLicense.phishingEnabled": "bool", "accountLicense.provisioningEnabled": "bool",
+    "accountLicense.allowedModules": "list", "accountLicense.elevatedFeaturesEnabled": "bool"}
+_MAX_LIST_ITEMS = 500
+_MAX_TEXT = 512
+
+
+def v2_key(column: str) -> str:
+    """Flat snake_case key for a v2 column (``staticOutboundIpEnabled`` -> ``static_outbound_ip_enabled``)."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).lower()
+
+
+V2_KINDS: dict[str, str] = {v2_key(column): kind for column, kind in V2_COLUMNS.items()}
+KNOWN_COLUMNS_V2 = KNOWN_COLUMNS | frozenset(V2_COLUMNS) | frozenset(V2_LICENSE_COLUMNS)
+
+
+@dataclass(frozen=True, slots=True)
+class QueryProfile:
+    query_id: int
+    known: frozenset[str]
+    row_schema: str
+
+
+PROFILES: dict[int, QueryProfile] = {
+    QUERY_ID: QueryProfile(QUERY_ID, KNOWN_COLUMNS, ROW_SCHEMA_V1),
+    V2_QUERY_ID: QueryProfile(V2_QUERY_ID, KNOWN_COLUMNS_V2, ROW_SCHEMA_V2),
+}
+
+
+def profile_for(query_id: int) -> QueryProfile:
+    profile = PROFILES.get(query_id) if type(query_id) is int else None
+    if profile is None:
+        raise InventoryError("redash_query_id_unsupported")
+    return profile
+
+
+def _v2_value(kind: str, value: Any) -> Any:
+    """One typed, null-safe v2 value; a wrong type fails closed (never guessed)."""
+    if value is None:
+        return None
+    if kind == "bool":
+        if type(value) is bool:
+            return value
+    elif kind == "int":
+        number = _whole_number(value)
+        if number is not None and 0 <= number < 10 ** 12:
+            return number
+    elif kind == "str":
+        if type(value) is str and len(value) <= _MAX_TEXT:
+            return value
+    elif kind == "interval":
+        if type(value) is str and len(value) <= 64:
+            return value
+        if type(value) in (int, float) and value == value and float(value).is_integer() and 0 <= value < 10 ** 12:
+            return int(value)
+    elif kind == "list":
+        items = _domain_list(value)
+        if items is not None and len(items) <= _MAX_LIST_ITEMS \
+                and all(type(item) is str and len(item) <= _MAX_TEXT for item in items):
+            return items
+    raise InventoryError("redash_schema_unavailable")
+
+
+def validate_row_schema(payload: Any) -> str:
+    """The snapshot's row schema ('v1' when unmarked). v2 tenants must carry only known, correctly typed v2 keys; a
+    v1 snapshot must carry none. Raises ``InventoryError('inventory_row_schema_invalid')`` with no value in it."""
+    if not isinstance(payload, dict):
+        raise InventoryError("inventory_row_schema_invalid")
+    schema = payload.get("row_schema", ROW_SCHEMA_V1)
+    tenants = payload.get("tenants")
+    if schema not in (ROW_SCHEMA_V1, ROW_SCHEMA_V2) or type(tenants) is not list:
+        raise InventoryError("inventory_row_schema_invalid")
+    for tenant in tenants:
+        if not isinstance(tenant, dict):
+            raise InventoryError("inventory_row_schema_invalid")
+        if schema == ROW_SCHEMA_V1:
+            if "v2" in tenant:
+                raise InventoryError("inventory_row_schema_invalid")
+            continue
+        extra = tenant.get("v2")
+        if type(extra) is not dict:
+            raise InventoryError("inventory_row_schema_invalid")
+        for key, value in extra.items():
+            kind = V2_KINDS.get(key)
+            try:
+                clean = _v2_value(kind, value) if kind is not None and value is not None else None
+            except InventoryError:
+                clean = None
+            if clean is None or type(clean) is not type(value) or clean != value:
+                raise InventoryError("inventory_row_schema_invalid")
+    return schema
+
+
 # The drift check for this source only compares what the query projects.
 EXPECTED_REDASH_PATHS: dict[str, frozenset[str]] = {
     path: types for path, types in EXPECTED_PATHS.items()
     if path in _stored_paths() and path not in UNREPORTED_COLUMNS}
+# Query 253 also fills these license fields (``accountLicense`` itself is already expected).
+EXPECTED_REDASH_PATHS_V2: dict[str, frozenset[str]] = {
+    **EXPECTED_REDASH_PATHS, **{path: EXPECTED_PATHS[path] for path in V2_LICENSE_COLUMNS}}
+
+
+def expected_paths(query_id: int = QUERY_ID) -> dict[str, frozenset[str]]:
+    return EXPECTED_REDASH_PATHS_V2 if profile_for(query_id).row_schema == ROW_SCHEMA_V2 else EXPECTED_REDASH_PATHS
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +207,8 @@ class NormalizedResult:
     latest_modified: datetime | None
     unexpected_columns: tuple[str, ...]
     missing_columns: tuple[str, ...]
+    query_id: int = QUERY_ID
+    v2_rows: Mapping[str, dict[str, Any]] = field(default_factory=dict)  # tenant id -> v2 values (query 253 only)
 
 
 def parse_timestamp_ms(value: Any) -> int | None:
@@ -166,16 +288,35 @@ def _spycloud_flag(column: str, value: Any) -> bool | None:
     return value if type(value) is bool else None
 
 
-def _build_row(raw: Mapping[str, Any]) -> dict[str, Any]:
+def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(v1 row, v2 values). The v2 values are empty for query 251."""
+    profile = profile or PROFILES[QUERY_ID]
+    v2_profile = profile.row_schema == ROW_SCHEMA_V2
     row: dict[str, Any] = {"accountUuid": None, "accountLicense": None}
     license_: dict[str, Any] = {}
+    v2: dict[str, Any] = {}
     for column, value in _flat(raw).items():
+        if v2_profile and column == "spyCloudEnabled":  # query 253's flat SpyCloud flag: the same single boolean
+            enabled = _spycloud_flag(column, value)
+            if enabled is not None:
+                row["leakedCredentialsSettings"] = {"spyCloudSettings": {"enabled": enabled}}
+                v2[v2_key(column)] = enabled
+            continue
         if column in (SPYCLOUD_OBJECT_COLUMN, SPYCLOUD_COLUMN):
             enabled = _spycloud_flag(column, value)
             if enabled is not None:  # anything but a real boolean stays "unknown", never guessed
                 row["leakedCredentialsSettings"] = {"spyCloudSettings": {"enabled": enabled}}
             continue
-        if column not in KNOWN_COLUMNS or column in IGNORED_COLUMNS:
+        if column not in profile.known or column in IGNORED_COLUMNS:
+            continue
+        if v2_profile and column in V2_COLUMNS:
+            typed = _v2_value(V2_COLUMNS[column], value)
+            if typed is not None:
+                v2[v2_key(column)] = typed
+            if column != "operatorCount":  # operatorCount also keeps feeding the v1 "operator assigned" flag
+                continue
+        if v2_profile and column in V2_LICENSE_COLUMNS:
+            license_[column[len(_LICENSE_PREFIX):]] = _v2_value(V2_LICENSE_COLUMNS[column], value)
             continue
         if column in DATE_COLUMNS:
             value = parse_timestamp_ms(value)
@@ -195,11 +336,15 @@ def _build_row(raw: Mapping[str, Any]) -> dict[str, Any]:
             row[_row_path(column)] = value
     if any(item is not None for item in license_.values()):
         row["accountLicense"] = license_
-    return row
+    return row, v2
 
 
-def normalize(result: Any) -> NormalizedResult:
-    """Turn a Redash ``{"query_result": {"data": {...}, "retrieved_at": ...}}`` reply into tenant rows."""
+def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
+    """Turn a Redash ``{"query_result": {"data": {...}, "retrieved_at": ...}}`` reply into tenant rows.
+
+    ``query_id`` picks the strict column profile (251 by default); unexpected and missing columns are reported per query.
+    """
+    profile = profile_for(query_id)
     query_result = result.get("query_result") if isinstance(result, dict) else None
     data = query_result.get("data") if isinstance(query_result, dict) else None
     columns = data.get("columns") if isinstance(data, dict) else None
@@ -217,10 +362,14 @@ def normalize(result: Any) -> NormalizedResult:
     if retrieved_ms is None:
         raise InventoryError("redash_schema_unavailable")
     rows = []
+    v2_rows: dict[str, dict[str, Any]] = {}
     for raw in table:
         if not isinstance(raw, dict):
             raise InventoryError("redash_schema_unavailable")
-        rows.append(_build_row(raw))
+        row, v2 = _build_row(raw, profile)
+        rows.append(row)
+        if profile.row_schema == ROW_SCHEMA_V2 and type(row.get("id")) is str:
+            v2_rows.setdefault(row["id"], v2)  # a repeated id keeps its first row, as assemble_rows does
     stamps = [row["_modified"] for row in rows if type(row.get("_modified")) is int]
     latest = max(stamps) if stamps else None
     try:
@@ -229,19 +378,34 @@ def normalize(result: Any) -> NormalizedResult:
     except (OverflowError, OSError, ValueError):
         raise InventoryError("redash_date_unparseable") from None
     unexpected = sorted(name if _SAFE_COLUMN.fullmatch(name) else "<column>"
-                        for name in names if name not in KNOWN_COLUMNS)
+                        for name in names if name not in profile.known)
+    optional = profile.known - frozenset(REQUIRED_COLUMNS)
     return NormalizedResult(
         tuple(rows), retrieved_at, latest_modified,
         tuple(unexpected)[:20],
-        tuple(sorted(name for name in OPTIONAL_COLUMNS - IGNORED_COLUMNS - UNREPORTED_COLUMNS
-                     if name not in names)))
+        tuple(sorted(name for name in optional - IGNORED_COLUMNS - UNREPORTED_COLUMNS if name not in names)),
+        profile.query_id, v2_rows)
+
+
+def attach_v2(payload: dict[str, Any], normalized: NormalizedResult) -> dict[str, Any]:
+    """Query 253 only: add each tenant's flat ``v2`` values, mark ``row_schema: v2`` and re-hash. Query 251: unchanged."""
+    from . import leonardo_inventory as inventory
+
+    if profile_for(normalized.query_id).row_schema != ROW_SCHEMA_V2:
+        return payload
+    for tenant in payload["tenants"]:
+        tenant["v2"] = dict(normalized.v2_rows.get(tenant["id"], {}))
+    payload["row_schema"] = ROW_SCHEMA_V2
+    payload["rows_sha256"] = inventory._rows_sha256(payload["tenants"])  # noqa: SLF001 - the inventory's own digest
+    validate_row_schema(payload)
+    return payload
 
 
 def source_meta(normalized: NormalizedResult, collected_at: datetime, *, refreshed: bool) -> dict[str, Any]:
     """Provenance stored in the snapshot (no row data): which query, how old the data is, what drifted."""
     stamp = "%Y-%m-%dT%H:%M:%SZ"
     return {
-        "kind": "redash", "query_id": QUERY_ID, "data_source": "Prod (Cloned) - Mgmt",
+        "kind": "redash", "query_id": normalized.query_id, "data_source": "Prod (Cloned) - Mgmt",
         "retrieved_at": normalized.retrieved_at.strftime(stamp),
         "collected_at": collected_at.astimezone(timezone.utc).strftime(stamp),
         "data_latest_modified": normalized.latest_modified.strftime(stamp) if normalized.latest_modified else None,
