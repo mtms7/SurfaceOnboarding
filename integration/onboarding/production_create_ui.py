@@ -536,13 +536,13 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
         return "authorization_missing"
     def start() -> Any:
         try:  # the runner accepts ONLY this file-backed one-time ticket, never a flag or an environment value
-            production_launch_ticket.mint(inputs.records_parent, reference, revision, approval["approval_ref"],
-                                          str(inputs.operator), inputs.now)
-        except (OSError, ValueError):
+            root = production_launch_ticket.ticket_root()  # the SAME helper the runner uses; never the repository
+            production_launch_ticket.mint(root, reference, revision, approval["approval_ref"], str(inputs.operator), inputs.now)
+        except (OSError, ValueError, production_launch_ticket.TicketRootError):
             return None
         handle = launch(reference, revision, ctx["env"])
         if handle is None:
-            production_launch_ticket.discard(inputs.records_parent, reference)  # a failed launch leaves no usable ticket
+            production_launch_ticket.discard(root, reference)  # a failed launch leaves no usable ticket
         return handle
     started = LAUNCHES.claim(start)
     return "launched" if started else "launch_failed"

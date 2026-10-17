@@ -124,6 +124,7 @@ class LivePage(dry.FakePage):
         self.extra_pages = []
         self.popups_after_click = 0
         self.workers_after_click = 0
+        self.popup_on_readback = False
         self.context = SimpleNamespace(pages=[self], route=lambda pattern, handler: self.routes.append((pattern, handler)),
                                        on=self._context_on)
         self.country_value = "CL"
@@ -151,6 +152,9 @@ class LivePage(dry.FakePage):
     def evaluate(self, script, arg=None):
         if script == contract.READBACK_JS:
             self.readback_calls += 1
+            if self.popup_on_readback and self.readback_calls > 1:  # a page opens AFTER the click, once the poll has begun
+                for handler in self.popup_handlers:
+                    handler(None)
             if self.fire("POST", ORIGIN + arg[0]) == "aborted":
                 return {"status": 0, "total": None, "rows": None}
             return self.readbacks.pop(0) if self.readbacks else reply([])
@@ -190,7 +194,7 @@ class Harness(dry.Harness):
                 CO, revision, owner_go=go, environ=env, now=NOW, records_parent=self.records,
                 approval_path=self.approval_path, load_source=(lambda _r: source) if source else self.load_source,
                 clone_facts=clone, open_page=self.open_page, fill_date=lambda *_a: True, date_kept=lambda *_a: True,
-                run_day=DAY)
+                run_day=DAY, ticket_parent=self.records)
         self.stdout, self.line = out.getvalue(), line
         return json.loads(line)
 
@@ -614,6 +618,15 @@ class ContextGuardAndCountryTests(Base):
         self.assertTrue(ui.co_status(h.loaded_records())["blocking"])
         self.assertTrue(h.page.routes)
 
+    def test_a_popup_after_the_poll_window_turns_a_matching_readback_into_unknown(self):
+        h = self.harness(readbacks=[reply([]), reply([good_row()])])
+        h.page.popup_on_readback = True
+        result = h.go()
+        self.assertEqual(result["result"], "create_outcome_unknown")
+        self.assertNotIn("readback_verified", h.outcomes())
+        self.assertEqual(h.page.confirm_clicks, 1)
+        self.assertTrue(ui.co_status(h.loaded_records())["blocking"])
+
     def test_a_service_worker_appearing_after_the_click_is_unknown(self):
         h = self.harness()
         h.page.workers_after_click = 1
@@ -653,10 +666,35 @@ class ContextGuardAndCountryTests(Base):
             line = runner.run_production_create(
                 CO, REV, owner_go=True, environ=dict(dry.UNLOCK), now=NOW, records_parent=h.records, approval_path=h.approval_path,
                 load_source=h.load_source, clone_facts=good_clone, open_page=h.open_page, fill_date=lambda *_a: True,
-                date_kept=lambda *_a: True, run_day=DAY, clock=lambda: next(times))
+                date_kept=lambda *_a: True, run_day=DAY, clock=lambda: next(times), ticket_parent=h.records)
         self.assertEqual(json.loads(line)["result"], "dry_run_old")
         self.assertEqual(h.page.confirm_clicks, 0)
         self.assertIsNone(h.approval_unused())
+
+    def test_org_is_pinned_by_id_when_an_expected_org_is_configured(self):
+        env = {**dry.UNLOCK, "SURFACE_SF_EXPECTED_ORG_ID": "00D5g0000012345EAA"}
+        for probe, reason in ((lambda: [{"Id": "00D5g0000099999EAA"}], "salesforce_org_not_pinned"),
+                              (lambda: [], "salesforce_org_not_pinned"), (lambda: 1 / 0, "salesforce_org_not_pinned")):
+            h = self.harness()
+            h.seed_dry_run()
+            h.mint()
+            with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True), \
+                    mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True):
+                out = runner.run_production_create(CO, REV, owner_go=True, environ=env, now=NOW, records_parent=h.records,
+                                                   approval_path=h.approval_path, load_source=h.load_source,
+                                                   open_page=h.open_page, ticket_parent=h.records, org_probe=probe)
+            self.assertIn(reason, out)
+            self.assertEqual((h.opened, h.loaded), (0, 0))
+        self.assertIsNone(runner._pcr_org_problem({}))
+        self.assertIsNone(runner._pcr_org_problem(env, lambda: [{"Id": "00D5g0000012345XYZ"}]))
+
+    def test_the_dry_run_also_refuses_an_alias_override(self):
+        h = self.harness()
+        line = runner.run_production_dry_run(CO, REV, environ={**dry.UNLOCK, "SURFACE_SF_TARGET_ORG": "other"}, now=NOW,
+                                             records_parent=h.records, approval_path=h.approval_path,
+                                             load_source=h.load_source, open_page=h.open_page)
+        self.assertIn("salesforce_alias_not_pinned", line)
+        self.no_external_activity(h)
 
     def test_an_alias_override_in_the_environment_refuses(self):
         h = self.harness()

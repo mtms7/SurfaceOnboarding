@@ -86,6 +86,107 @@ def mini_page(guard, *, sw=0, pages=None):
     return page
 
 
+class KeyHardeningTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.key = self.dir / ticket.SUBDIR / ticket.KEY_NAME
+
+    def test_only_a_32_byte_hex_key_is_accepted_everything_else_is_missing(self):
+        ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        good = self.key.read_text(encoding="ascii")
+        self.assertEqual(len(good), 64)
+        for bad in ("", "ab" * 15, "ab" * 33, "xyz" + "0" * 61, "a" * 63, "ab" * 32 + "00"):
+            self.key.write_text(bad, encoding="ascii")
+            self.assertIsNone(ticket._read_key(self.dir), repr(bad))
+            self.assertEqual(ticket.consume(self.dir, CO, REV, REF, NOW)[0], None, repr(bad))
+            ticket.mint(self.dir, CO, REV, REF, "milton", NOW)  # minting replaces an invalid key atomically
+            self.assertEqual(len(self.key.read_text(encoding="ascii")), 64, repr(bad))
+
+    def test_a_ticket_is_never_signed_with_an_empty_key(self):
+        self.key.parent.mkdir(parents=True)
+        self.key.write_text("", encoding="ascii")  # crash between create and write left a 0-byte key
+        path = ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        self.assertEqual(len(self.key.read_text(encoding="ascii")), 64)
+        self.assertEqual(ticket.consume(self.dir, CO, REV, REF, NOW + timedelta(seconds=1)), ("milton", ""))
+        self.assertFalse(path.exists())
+
+    def test_a_crash_after_the_temp_write_leaves_no_half_written_key_to_read(self):
+        original = ticket.os.link
+        ticket.os.link = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("crash"))
+        try:
+            with self.assertRaises(RuntimeError):
+                ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        finally:
+            ticket.os.link = original
+        self.assertIsNone(ticket._read_key(self.dir))  # nothing partial is ever at the key path
+        self.assertEqual([p.name for p in (self.dir / ticket.SUBDIR).glob(".key.*")], [])
+        ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        self.assertIsNotNone(ticket._read_key(self.dir))
+
+    def test_a_second_mint_reuses_the_existing_valid_key(self):
+        ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        first = self.key.read_text(encoding="ascii")
+        ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        self.assertEqual(first, self.key.read_text(encoding="ascii"))
+
+
+class RootAndReplayTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+
+    def test_one_shared_root_for_mint_and_consume_and_never_the_repo(self):
+        env = {ticket.ENV_ROOT: str(self.dir / "r")}
+        self.assertEqual(ticket.ticket_root(env), ticket.ticket_root(env))
+        repo = Path(ticket.__file__).resolve().parents[2]
+        for bad in (str(repo), str(repo / "integration"), "relative/dir", str(Path.home() / "OneDrive" / "x"),
+                    str(Path.home() / "Documents" / "x")):
+            with self.assertRaises(ticket.TicketRootError, msg=bad):
+                ticket.ticket_root({ticket.ENV_ROOT: bad})
+        with self.assertRaises(ValueError):
+            ticket.mint(repo, CO, REV, REF, "milton", NOW)
+        self.assertEqual(ticket.consume(repo, CO, REV, REF, NOW)[0], None)
+        self.assertFalse((repo / ticket.SUBDIR).exists())
+
+    def test_default_root_is_outside_the_repo_and_never_falls_back(self):
+        root = ticket.ticket_root({"LOCALAPPDATA": str(self.dir)} if ticket.os.name == "nt" else {})
+        self.assertNotIn(Path(ticket.__file__).resolve().parents[2], root.resolve().parents)
+        if ticket.os.name == "nt":
+            with self.assertRaises(ticket.TicketRootError):
+                ticket.ticket_root({})
+
+    def test_runner_and_dashboard_resolve_the_same_parent(self):
+        import tools.attended_ce_only_playwright as runner
+        env = {ticket.ENV_ROOT: str(self.dir / "shared")}
+        from unittest import mock
+        with mock.patch.dict("os.environ", env):
+            self.assertEqual(ticket.ticket_root(), self.dir / "shared")
+            ticket.mint(ticket.ticket_root(), CO, REV, REF, "milton", NOW)
+            self.assertEqual(ticket.consume(ticket.ticket_root(), CO, REV, REF, NOW + timedelta(seconds=1)), ("milton", ""))
+        self.assertTrue(hasattr(runner, "run_production_create"))
+
+    def test_a_copied_ticket_cannot_be_replayed_inside_the_ttl(self):
+        path = ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        copy = path.read_text(encoding="utf-8")
+        self.assertEqual(ticket.consume(self.dir, CO, REV, REF, NOW + timedelta(seconds=1)), ("milton", ""))
+        path.write_text(copy, encoding="utf-8")  # the attacker puts the copy back
+        self.assertEqual(ticket.consume(self.dir, CO, REV, REF, NOW + timedelta(seconds=2))[0], None)
+        self.assertEqual(len((self.dir / ticket.SUBDIR / ticket.USED_NAME).read_text().split()), 1)
+
+    def test_non_object_json_and_unreadable_used_log_refuse_cleanly(self):
+        path = ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        for junk in ("[]", "[1,2]", "null", "\"x\"", "7"):
+            path.write_text(junk, encoding="utf-8")
+            self.assertEqual(ticket.consume(self.dir, CO, REV, REF, NOW), (None, "launch_ticket_invalid"), junk)
+            ticket.mint(self.dir, CO, REV, REF, "milton", NOW)
+        used = self.dir / ticket.SUBDIR / ticket.USED_NAME
+        used.mkdir()  # an unreadable nonce log must fail closed
+        self.assertEqual(ticket.consume(self.dir, CO, REV, REF, NOW)[0], None)
+
+
 class PreArmTests(unittest.TestCase):
     def test_service_worker_popup_and_extra_production_page_refuse(self):
         guard = live.LiveRequestGuard()
@@ -324,7 +425,7 @@ class CreatePostTicketTests(tu.PostTests):
     def test_a_launch_mints_a_ticket_bound_to_the_operator_and_a_mint_failure_launches_nothing(self):
         values = self.values()
         self.assertEqual(ui.handle_create_post(values, self.inputs(), self.launch), "launched")
-        body = json.loads((self.dir / ticket.SUBDIR / (tu.CO + ".json")).read_text(encoding="utf-8"))
+        body = json.loads((self.ticket_root / ticket.SUBDIR / (tu.CO + ".json")).read_text(encoding="utf-8"))
         self.assertEqual((body["operator"], body["revision"], body["approval_ref"]), (tu.OWNER, tu.REV, tu.REF))
         self.setUp()
         self.unlocked()
@@ -340,7 +441,7 @@ class CreatePostTicketTests(tu.PostTests):
 
     def test_a_failed_launch_deletes_the_minted_ticket(self):
         self.assertEqual(ui.handle_create_post(self.values(), self.inputs(), lambda *_a: None), "launch_failed")
-        self.assertFalse((self.dir / ticket.SUBDIR / (tu.CO + ".json")).exists())
+        self.assertFalse((self.ticket_root / ticket.SUBDIR / (tu.CO + ".json")).exists())
 
 
 if __name__ == "__main__":

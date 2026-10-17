@@ -139,7 +139,7 @@ KNOWN_REASONS = frozenset({
     "production_session_not_ready", "duplicate_ambiguous", "duplicate_check_unavailable", "demo_domain_conflict",
     "write_request_blocked", "form_left_open", "service_worker_present", "service_worker_check_failed",
     "toggle_click_failed", "approval_expired_during_run", "clone_stale_during_run", "production_locked_during_run",
-    "production_dry_run_click_not_allowed", "production_dry_run_login_timeout", "playwright_runtime_unavailable",
+    "production_dry_run_click_not_allowed", "production_dry_run_login_timeout", "playwright_runtime_unavailable", "salesforce_alias_not_pinned", "salesforce_org_not_pinned",
     "production_dry_run_page_unavailable", "production_dry_run_crashed", "salesforce_fill_source_unavailable",
     "ce_route_mismatch", "ce_license_dates_unavailable", "unmapped_text_label", "text_labels_incomplete",
     "unmapped_select", "selects_incomplete", "unmapped_toggle", "toggles_incomplete", "license_dates_invalid",

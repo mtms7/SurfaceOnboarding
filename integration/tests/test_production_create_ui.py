@@ -47,7 +47,9 @@ class Base(unittest.TestCase):
         self.approvals = self.dir / "approvals.json"
         approval.issue(self.approvals, REF, CO, ROUTE, REV, OWNER, frozenset({OWNER}), NOW - timedelta(hours=1))
         self.record(outcome="dry_run_passed", when=NOW - timedelta(hours=2))
-        for patch in (mock.patch.object(ui, "TOKENS", ui.OneTimeTokens()), mock.patch.object(ui, "LAUNCHES", ui.LaunchRegistry())):
+        self.ticket_root = self.dir / "ticket-root"
+        for patch in (mock.patch.object(ui, "TOKENS", ui.OneTimeTokens()), mock.patch.object(ui, "LAUNCHES", ui.LaunchRegistry()),
+                      mock.patch.dict("os.environ", {"SURFACE_ONBOARDING_TICKET_ROOT": str(self.ticket_root)})):
             patch.start()
             self.addCleanup(patch.stop)
 

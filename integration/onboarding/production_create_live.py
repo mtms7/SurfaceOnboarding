@@ -41,7 +41,7 @@ LIVE_REASONS = frozenset({
     "readback_account_id_mismatch", "readback_uuid_invalid", "uncertain_submit", "attempt_started",
     "approval_consume_failed", "approval_superseded", "approval_locked", "approval_locked_stale",
     "production_dry_run_login_timeout", "production_session_expired", "production_session_not_ready",
-    "dry_run_old", "country_code_unavailable", "salesforce_alias_not_pinned", "intended_unavailable", "production_dry_run_form_not_reached", "search_unproven", "search_control_unavailable",
+    "dry_run_old", "salesforce_org_not_pinned", "country_code_unavailable", "salesforce_alias_not_pinned", "intended_unavailable", "production_dry_run_form_not_reached", "search_unproven", "search_control_unavailable",
     "confirm_preflight_failed", "extra_pages_open", "launch_ticket_invalid", "source_recheck_unavailable",
     "approval_revision_drift", "salesforce_prior_uuid_present", "live_source_check_missing", "service_worker_present", "service_worker_check_failed",
 })

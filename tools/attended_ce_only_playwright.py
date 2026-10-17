@@ -9303,7 +9303,7 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
                            now: datetime | None = None, records_parent: Path | None = None,
                            approval_path: Path | None = None, wait_seconds: float = MAX_WAIT_SECONDS,
                            load_source: Any = None, clone_facts: Any = None, open_page: Any = None,
-                           fill_date: Any = None, date_kept: Any = None, clock: Any = None) -> str:
+                           fill_date: Any = None, date_kept: Any = None, clock: Any = None, org_probe: Any = None) -> str:
     """One attended production DRY RUN for one CE-only New CO. Returns the printed line; never creates anything.
 
     Every external step is injectable (tests): ``load_source`` (the fixed Salesforce read), ``clone_facts`` (the Redash
@@ -9319,6 +9319,8 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
     if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference)
             or not production_dry_run.revision_ok(acknowledged_revision)):
         return _pdr_line("production_dry_run_arguments_invalid")
+    if environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", PINNED_SF_ALIAS):  # the env override is ignored: refuse
+        return _pdr_line("salesforce_alias_not_pinned")
     parent = records_parent or _pdr_records_parent()
     approval_file = approval_path or _pdr_approval_path()
     extras: dict[str, Any] = {}
@@ -9360,6 +9362,9 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
         return refused(f"production_locked_{locked.reason}")
     except ValueError as error:
         return refused(str(error))
+    org_problem = _pcr_org_problem(environ, org_probe)  # pinned by Id when SURFACE_SF_EXPECTED_ORG_ID is configured
+    if org_problem:
+        return refused(org_problem)
 
     # 2. Source of the intended values: the fixed Salesforce reads of the Dev runner (no new query).
     try:
@@ -9908,6 +9913,19 @@ def _pcr_prior_records(parent: Path, reference: str) -> Any:
 PINNED_SF_ALIAS = "surface-onboarding"  # production paths never take the alias from the environment
 
 
+def _pcr_org_problem(environ: Any, probe: Any = None) -> str | None:
+    """Pin the Salesforce org by Id when SURFACE_SF_EXPECTED_ORG_ID is configured (the dashboard's own rule, first 15 chars)."""
+    expected = str(environ.get("SURFACE_SF_EXPECTED_ORG_ID", "")).strip()
+    if not expected:
+        return None
+    try:
+        rows = (probe or (lambda: _sf_records("SELECT Id FROM Organization LIMIT 1")))()
+        org = rows[0].get("Id") if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) else None
+    except Exception:
+        return "salesforce_org_not_pinned"
+    return None if isinstance(org, str) and len(org) >= 15 and org[:15] == expected[:15] else "salesforce_org_not_pinned"
+
+
 def _pcr_selected_country_code(page: Any) -> str | None:
     """The ISO-2 value of the selected Country option (what the form submits), else None."""
     try:
@@ -9972,7 +9990,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                           approval_path: Path | None = None, wait_seconds: float = MAX_WAIT_SECONDS,
                           load_source: Any = None, clone_facts: Any = None, open_page: Any = None,
                           fill_date: Any = None, date_kept: Any = None, clock: Any = None,
-                          run_day: date | None = None) -> str:
+                          run_day: date | None = None, ticket_parent: Path | None = None, org_probe: Any = None) -> str:
     """One guarded LIVE production CE-only create for one CO. Returns the printed line (result word, record name only).
 
     Order: arguments; the dry-run constant; the live production target (runner constant, sessions flag, approval
@@ -10043,9 +10061,16 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     from integration.onboarding import production_create_ui as create_ui
     from integration.onboarding import production_launch_ticket as launch_ticket
 
-    operator, ticket_reason = launch_ticket.consume(parent, reference, acknowledged_revision, reference_value, now)
+    try:
+        ticket_folder = ticket_parent or launch_ticket.ticket_root()  # the dashboard mints under the SAME helper
+    except launch_ticket.TicketRootError:
+        return refused("launch_ticket_invalid")
+    operator, ticket_reason = launch_ticket.consume(ticket_folder, reference, acknowledged_revision, reference_value, now)
     if operator is None:
         return refused(ticket_reason)
+    org_problem = _pcr_org_problem(environ, org_probe)
+    if org_problem:
+        return refused(org_problem)
     approval_record = production_approval.record_for(approval_file, reference_value)
     if approval_record is None or not create_ui._owner_ok(operator, approval_record):
         return refused("operator_not_owner")
@@ -10165,7 +10190,12 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                     return _pdr_evaluate(page, production_contract.READBACK_JS, "POST", production_contract.ACCOUNTS_PATH,
                                          [production_contract.ACCOUNTS_PATH, readback_body,
                                           list(production_contract.READBACK_PICK_PATHS)])
-                return live.poll_readback(fetch, contract_intended, strict_state["expected"], page.wait_for_timeout)
+                found = live.poll_readback(fetch, contract_intended, strict_state["expected"], page.wait_for_timeout)
+                # A popup, new page or service worker that appeared AFTER the click (even after the poll window) means the
+                # outcome cannot be trusted: no verified record, the CO is blocked as create_outcome_unknown.
+                if found is not None and (guard.create_blocked or live.post_click_problem(page, guard) is not None):
+                    return None
+                return found
 
             result = run_live(final, fill, click, read, duplicate_check)
             if clicks.confirm_clicks == 0 and production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds:

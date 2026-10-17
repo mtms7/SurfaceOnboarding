@@ -7633,6 +7633,17 @@ LOGIN_REASON_TEXT = {
 # ---- Guarded production create (docs/53) -------------------------------------------------------------------------------------
 # Everything below is unreachable while either hard-coded lock constant is False: the card is empty (no form, no button) and
 # every POST is refused by create_ui.gate before anything is read or started. Desktop only; the VM never renders a control.
+def _harden_ticket_folder(path: Path) -> None:
+    """Windows: restrict the launch-ticket folder to the current user (icacls /inheritance:r)."""
+    user = os.environ.get("USERNAME", "")
+    if os.name == "nt" and user:
+        subprocess.run(["icacls.exe", str(path), "/inheritance:r", "/grant:r", user + ":(OI)(CI)F"], capture_output=True,
+                       timeout=20, check=False, stdin=subprocess.DEVNULL)
+
+
+create_ui.production_launch_ticket.HARDEN = _harden_ticket_folder
+
+
 def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operator: str | None = None) -> create_ui.Inputs:
     """The plain facts for the create gate. A POST passes a row read inside that very request; a page shows the display read."""
     try:
