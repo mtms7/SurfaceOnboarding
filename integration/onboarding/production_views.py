@@ -543,6 +543,8 @@ def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clo
     uuid_state = co.get("uuid_state")
     if _uuid_disagrees(co, match):
         items.append(chip("Account UUID", "blocked", "UUID sources disagree (the snapshot holds one, the read shows none)"))
+    elif uuid_state == "set" and production_check(match)["code"] == "onboarded":
+        items.append(chip("Account UUID", "ok", "Set (matches tenant)"))
     else:
         items.append(chip("Account UUID", "ok" if uuid_state == "empty" else "blocked" if uuid_state == "set" else "unavailable",
                           {"empty": "Empty", "set": "Already set"}.get(uuid_state, "Not read")))
@@ -614,7 +616,13 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
         except (ValueError, TypeError):
             tenant = alias = None
     check_code = production_check(match)["code"]
-    reason = ("account_uuid_set" if co.get("uuid_state") == "set"
+    onboarded = check_code == "onboarded" and co.get("uuid_state") == "set"
+    if check_code == "onboarded" and isinstance(match, dict):
+        review = match.get("review") if isinstance(match.get("review"), dict) else {}
+        base["onboarded"] = {"line": _text(review.get("line") or "Onboarded - tenant found in production."),
+                             "warnings": [str(code) for code in review.get("warnings") or ()]}
+    reason = ("already_onboarded" if onboarded
+              else "account_uuid_set" if co.get("uuid_state") == "set"
               else "account_uuid_unread" if co.get("uuid_state") != "empty"
               else "uuid_sources_disagree" if _uuid_disagrees(co, match)
               else "approval_not_approved" if co.get("approval_status") != "Approved"
@@ -732,13 +740,22 @@ def production_co_guide(sheet: dict[str, Any], *, clone: dict[str, Any] | None,
     """
     state = sheet.get("state")
     items = {item.get("key"): item for item in sheet.get("eligibility") or [] if isinstance(item, dict)}
-    checks = [{"label": label, "status": items[key]["status"], "detail": items[key]["detail"]}
-              for key, label in GUIDE_KEYS if key in items]
+    onboarded = sheet.get("onboarded") if isinstance(sheet.get("onboarded"), dict) else None
+    checks = [{"label": "Account UUID" if onboarded and key == "uuid" else label, "status": items[key]["status"],
+               "detail": items[key]["detail"]} for key, label in GUIDE_KEYS if key in items]
     out: dict[str, Any] = {"state": state, "verdict": "blocked", "headline": "", "checks": checks, "rows": [], "leave": "",
                            "after": [], "closing": GUIDE_CLOSING, "as_of": sheet.get("as_of") or "",
                            "recorded_duplicates": recorded_duplicates}
     if state == "not_applicable":
         out["headline"] = "Not applicable: this CO is not a CE-only New Product Onboarding."
+        return out
+    if state == "refused" and sheet.get("reason") == "already_onboarded" and onboarded:
+        # Neutral, not an error: the create stays blocked (no rows, no after-steps), but the CO is simply done.
+        body = onboarded["line"].split(" - ", 1)[-1].rstrip(".")
+        if onboarded["warnings"]:
+            out["verdict"], out["headline"] = "onboarded_review", "Onboarded: review - tenant found in production; " + body + "."
+        else:
+            out["verdict"], out["headline"] = "onboarded", "Onboarded: tenant found in production, " + body.replace("tenant enabled, ", "enabled, ")
         return out
     if state == "refused":
         out["headline"] = "Blocked: " + SHEET_REFUSALS.get(sheet.get("reason"), "The values cannot be derived.")

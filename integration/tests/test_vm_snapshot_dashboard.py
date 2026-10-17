@@ -670,3 +670,21 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
     def test_the_desktop_match_says_the_uuid_check_runs_on_the_vm(self):
         with patch.dict(os.environ, {"SURFACE_ONBOARDING_RUNTIME": "desktop"}):
             self.assertIsNone(runner._snapshot_account_uuid("CO-0001"))
+
+    def test_an_onboarded_co_has_no_overdue_chip_and_a_neutral_page(self):
+        self.publish({"CO-0001": self.item()}, uuid=self.UUID)
+        self.push_clone()
+        with patch.object(dashboard, "queue_start_dates", return_value={"CO-0001": "2026-05-01", "CO-0002": "2026-05-01"}):
+            _, _, body = self.get("/", email=OWNER)
+        self.assertIn("overdue", body.casefold())  # the other CO (not onboarded) still shows it
+        row = body[body.index(">CO-0001<") - 600:body.index("</tr>", body.index(">CO-0001<"))]
+        self.assertIn(">done<", row)
+        self.assertNotIn("overdue", row.casefold())
+        status, _, page = self.get("/co/CO-0001?env=prod", email=OWNER)
+        self.assertEqual(status, 200)
+        self.assertIn("banner banner-ok", page)
+        self.assertIn("Onboarded: tenant found in production, enabled, license active until 2027-10-18", page)
+        self.assertNotIn("Enter in BackOffice", page)
+        self.assertNotIn("Salesforce already holds an Account UUID", page)
+        self.assertIn("tenant clone is separate and is ", page)
+        self.assertNotIn("<form method='post'", page)

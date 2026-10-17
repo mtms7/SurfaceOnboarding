@@ -6322,6 +6322,13 @@ def _age_words(seconds: int) -> str:
     return (str(hours) + " h " + str(minutes) + " min") if hours else (str(minutes) + " min")
 
 
+def _data_age_note(as_of: str, info: dict[str, Any]) -> str:
+    """Which side is how old: the published Salesforce data and the (separate) tenant clone. Escaped HTML."""
+    clone = (("is " + _age_words(info["age_seconds"]) + " old") if isinstance(info.get("age_seconds"), int)
+             else "could not be read (" + str(info.get("reason") or "unknown") + ")")
+    published = ("Salesforce data (approval, UUID, domains) was published at " + escape(as_of) + "; " if as_of else "")
+    return published + "the tenant clone is separate and " + escape(clone) + "."
+
 def _clone_line(info: dict[str, Any]) -> str:
     if "reason" in info:
         return ("Production clone unusable: <code>" + escape(info["reason"]) + "</code>. Refresh it with "
@@ -6798,7 +6805,9 @@ def _guide_matches(match: dict[str, Any]) -> str:
 def _production_guide_html(guide: dict[str, Any], match: dict[str, Any]) -> str:
     """Everything below the header of the production CO page: verdict, strip, details, one flat table, steps, footer."""
     ready = guide["verdict"] == "ready"
-    verdict = ("<div class='banner " + ("banner-ok" if ready else "banner-bad") + "' role='status'><strong>"
+    tone = ("banner-ok" if ready or guide["verdict"] == "onboarded" else "banner-warn" if guide["verdict"] == "onboarded_review"
+            else "banner-bad")
+    verdict = ("<div class='banner " + tone + "' role='status'><strong>"
                + escape(guide["headline"]) + "</strong></div>")
     strip = ""
     if guide["checks"]:
@@ -6824,10 +6833,9 @@ def _production_guide_html(guide: dict[str, Any], match: dict[str, Any]) -> str:
                  + escape(guide["leave"]) + "</p></section>")
         after = ("<section class='card' aria-labelledby='co-after-title'><h2 id='co-after-title' class='pill'>After you click "
                  "Confirm</h2><ol>" + "".join("<li>" + escape(text) + "</li>" for text in guide["after"]) + "</ol></section>")
-    age = _clone_line(_clone_info())
-    snapshot = (" &middot; Salesforce data as of " + escape(guide["as_of"]) if guide["as_of"] else "")
-    footer = ("<p class='note'>" + escape(guide["closing"]) + "</p><p class='note'>" + age + snapshot
-              + ". A missing match is never a clearance.</p>")
+    info = _clone_info()
+    footer = ("<p class='note'>" + escape(guide["closing"]) + "</p><p class='note'>" + _clone_line(info) + "</p><p class='note'>"
+              + _data_age_note(guide["as_of"], info) + " A missing match is never a clearance.</p>")
     recorded = ""
     if guide.get("recorded_duplicates") is not None:
         items = "".join("<li>" + escape(str(m.get("name") or "-")) + " &middot; <code>" + escape(str(m.get("id") or "-"))
@@ -7055,7 +7063,8 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             approval_cell = create_cell = "<span class='muted'>—</span>"
             onboarding = "<span class='co'>" + escape(ref) + "</span>"
         body += ("<tr" + ("" if item["supported"] else " class='locked'") + "><td class='c-start'>"
-                 + (_prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='stick'>"
+                 + ("<span class='muted'>done</span>" if check and check["code"] == "onboarded"
+                    else _prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='stick'>"
                  + onboarding + "</td><td>" + escape(str(row.get("Account__r.Name") or "Account unavailable")) + "</td><td>"
                  + escape(_PRODUCT_SHORT.get(product or "", product or "—")) + "<span class='sub'>"
                  + escape(_TYPE_SHORT.get(kind or "", kind or "—")) + "</span></td><td>" + checks + "</td><td>" + approval_cell
@@ -7410,7 +7419,7 @@ def _onboarding_sheet_card(reference: str, row: dict[str, str | None] | None, *,
         return head + "<p class='note'>Not applicable: this CO is not a CE-only New Product Onboarding.</p></section>"
     if state == "unavailable":
         return head + "<p class='note'>The sheet is " + escape(production_views.UNAVAILABLE_ON_SERVER) + ".</p></section>"
-    snapshot = ("<p class='note'>Snapshot: Salesforce data as of " + escape(sheet["as_of"]) + ".</p>" if sheet["as_of"] else "")
+    snapshot = ("<p class='note'>" + _data_age_note(sheet["as_of"], _clone_info()) + "</p>" if sheet["as_of"] else "")
     stale_note = ("<p><strong>Warning:</strong> " + escape(sheet["stale_warning"]) + "</p>" if sheet["stale_warning"] else "")
     before = snapshot + stale_note + "<h3 class='sub-h'>1. Before you start</h3><ul class='checks'>" + "".join(
         _check_item(item["label"], escape(item["detail"]), _chip(*SHEET_CHECK_CHIPS[item["status"]])) for item in sheet["eligibility"]

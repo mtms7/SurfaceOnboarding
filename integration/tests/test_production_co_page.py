@@ -124,7 +124,7 @@ class TableTests(PageBase):
         self.assertEqual(main.count("Unavailable</span>"), 0)
         self.assertNotIn("Ready to onboard", main)   # a key row that cannot be read never reads as ready
         self.assertIn("Blocked: Country unavailable", main)
-        self.assertIn("Salesforce data as of 2026-10-16 09:50 UTC", main)
+        self.assertIn("Salesforce data (approval, UUID, domains) was published at 2026-10-16 09:50 UTC", main)
         self.assertIn("<code>2027-10-17</code>", main)
         self.assertEqual(base.controls(page), [])
 

@@ -471,7 +471,7 @@ class VmModeTests(PageBase):
             with patch.object(dashboard, "_snapshot_as_of", return_value=("2026-10-16 09:50 UTC", stale)):
                 for name, page in self.pages(row=self.VM_ROW, vm=True, country=None).items():
                     card = self.card(page)
-                    self.assertIn("Snapshot: Salesforce data as of 2026-10-16 09:50 UTC.", card, name)
+                    self.assertIn("Salesforce data (approval, UUID, domains) was published at 2026-10-16 09:50 UTC; the tenant clone is separate and", card, name)
                     self.assertEqual(card.count("(as of 2026-10-16 09:50 UTC)"), 3, name)
                     self.assertEqual("Salesforce data may be out of date: re-check the CO in Salesforce before you start." in card,
                                      stale, name)
@@ -594,3 +594,35 @@ class OnboardedAndUnverifiedMatchTests(unittest.TestCase):
         items = {i["key"]: i for i in views.onboard_checklist(match={"status": "not_in_production", "candidates": [],
                                                                       "co_uuid_set": True}, **base)}
         self.assertEqual(items["data"]["status"], "blocked")
+
+
+class OnboardedGuideTests(unittest.TestCase):
+    ONBOARDED = {"status": "onboarded", "reason": "x", "candidates": [], "tenants_checked": 5,
+                 "review": {"line": "Onboarded - tenant enabled, license active until 2027-10-18 (matches DealHub end rule: expected 2027-10-18).",
+                            "warnings": []}}
+
+    def guide(self, match, **over):
+        return views.production_co_guide(sheet(match=match, uuid_state="set", **over), clone={"state": "fresh", "age_seconds": 600})
+
+    def test_onboarded_is_a_neutral_headline_with_nothing_to_enter_and_the_create_still_blocked(self):
+        result = self.guide(self.ONBOARDED)
+        self.assertEqual(result["verdict"], "onboarded")
+        self.assertTrue(result["headline"].startswith("Onboarded: tenant found in production, enabled, license active until 2027-10-18"))
+        self.assertNotIn("Blocked", result["headline"])
+        self.assertEqual((result["rows"], result["after"]), ([], []))
+        uuid_check = next(item for item in result["checks"] if item["detail"] == "Set (matches tenant)")
+        self.assertEqual((uuid_check["status"], uuid_check["label"]), ("ok", "Account UUID"))
+
+    def test_onboarded_with_warnings_is_amber_review(self):
+        match = {**self.ONBOARDED, "review": {"line": "Onboarded - check: SpyCloud off or unknown.", "warnings": ["spycloud_off"]}}
+        result = self.guide(match)
+        self.assertEqual(result["verdict"], "onboarded_review")
+        self.assertTrue(result["headline"].startswith("Onboarded: review"))
+        self.assertEqual(sheet(match=match, uuid_state="set")["rows"], [])
+
+    def test_a_uuid_with_no_or_a_different_tenant_stays_red_blocked(self):
+        for status in ("uuid_not_in_clone", "exists_matches", "not_in_production"):
+            result = self.guide({"status": status, "reason": "", "candidates": [], "tenants_checked": 5})
+            self.assertEqual(result["verdict"], "blocked", status)
+            self.assertTrue(result["headline"].startswith("Blocked"), status)
+            self.assertEqual([i["status"] for i in result["checks"] if i["label"].startswith("Account UUID")], ["blocked"], status)
