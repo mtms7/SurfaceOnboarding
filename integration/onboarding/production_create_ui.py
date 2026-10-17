@@ -47,6 +47,7 @@ DRY_RUN_MAX_AGE = timedelta(hours=24)
 SALESFORCE_FRESH_SECONDS = 15 * 60
 SESSIONS_ENV = "SURFACE_ONBOARDING_PRODUCTION_SESSIONS"
 UUID_WRITES_FILE = "production-uuid-writes.jsonl"
+PINNED_SF_ALIAS = "surface-onboarding"  # production paths never take the Salesforce alias from the environment
 CO_PATTERN = re.compile(r"CO-[0-9]{4,10}")
 
 # UI result words (the record outcomes keep their existing names; this is how the page and the runbook name them).
@@ -134,24 +135,39 @@ def load_co_records(parent: Path, co: str) -> list[dict[str, Any]]:
     return [records.load(path) for path in records.list_records(parent, co)]
 
 
-def cleared_attempts(history: list[dict[str, Any]]) -> set[str]:
-    """Approval references of attempts the OWNER cleared by a recorded review. Only an attempt that provably sent nothing
-    (an ``attempt_started`` followed by the ``confirm_not_clicked`` refusal of the same approval) can be cleared: an unknown,
-    mismatched or verified create never can."""
-    refused = {r.get("approval_ref") for r in history if r.get("outcome") == production_create.OUTCOME_REFUSED
-               and r.get("refusal_reason") == "confirm_not_clicked"}
-    owner = {r.get("approval_ref") for r in history if r.get("outcome") == production_create.OUTCOME_OWNER_CLEARED}
-    started = {r.get("approval_ref") for r in history if r.get("outcome") == production_create.OUTCOME_ATTEMPT_STARTED}
-    blocking_others = {r.get("approval_ref") for r in history if r.get("outcome") in production_create._NEEDS_REVIEW
-                       and r.get("outcome") != production_create.OUTCOME_ATTEMPT_STARTED}
-    return {ref for ref in started & refused & owner if ref not in blocking_others}
+def _key(record: dict[str, Any]) -> tuple[Any, Any]:
+    return record.get("approval_ref"), record.get("salesforce_revision")
+
+
+def cleared_attempts(history: list[dict[str, Any]]) -> set[tuple[Any, Any]]:
+    """(approval ref, Salesforce revision) pairs of attempts the OWNER cleared by a recorded review (history is one CO).
+
+    Only an attempt that provably sent nothing can be cleared: every ``attempt_started`` of the pair is matched by a
+    ``confirm_not_clicked`` refusal AND an ``owner_review_cleared`` record (counts, not mere presence, so a later crashed
+    attempt under a reset or reused reference is never hidden), and no unknown, mismatched or verified outcome shares the pair.
+    """
+    started: dict[tuple[Any, Any], int] = {}
+    refused: dict[tuple[Any, Any], int] = {}
+    owner: dict[tuple[Any, Any], int] = {}
+    others: set[tuple[Any, Any]] = set()
+    for r in history:
+        key, outcome = _key(r), r.get("outcome")
+        if outcome == production_create.OUTCOME_ATTEMPT_STARTED:
+            started[key] = started.get(key, 0) + 1
+        elif outcome == production_create.OUTCOME_REFUSED and r.get("refusal_reason") == "confirm_not_clicked":
+            refused[key] = refused.get(key, 0) + 1
+        elif outcome == production_create.OUTCOME_OWNER_CLEARED:
+            owner[key] = owner.get(key, 0) + 1
+        elif outcome in production_create._NEEDS_REVIEW:
+            others.add(key)
+    return {k for k, n in started.items() if refused.get(k, 0) >= n and owner.get(k, 0) >= n and k not in others}
 
 
 def active_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The records that still count: a cleared attempt's ``attempt_started`` record no longer blocks."""
+    """The records that still count: a cleared attempt's ``attempt_started`` records no longer block."""
     cleared = cleared_attempts(history)
     return [r for r in history if not (r.get("outcome") == production_create.OUTCOME_ATTEMPT_STARTED
-                                       and r.get("approval_ref") in cleared)]
+                                       and _key(r) in cleared)]
 
 
 def review_cleared(history: list[dict[str, Any]]) -> bool:
@@ -471,12 +487,14 @@ def last_uuid_write(parent: Path, co: str) -> str | None:
     return state
 
 
-def record_uuid_write(parent: Path, co: str, uuid: str, result: str, now: datetime) -> None:
+def record_uuid_write(parent: Path, co: str, uuid: str, result: str, now: datetime, operator: str = "",
+                      reason: str = "") -> None:
     """Append one line (never rewritten). The UUID itself is not stored: only its SHA-256. Raises on any failure."""
     folder = Path(parent) / records.RECORDS_SUBDIR
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     line = json.dumps({"co_reference": co, "field": salesforce_uuid_writeback.WRITE_FIELD, "result": result,
                        "value_sha256": hashlib.sha256(uuid.encode("utf-8")).hexdigest(),
+                       "operator": operator, "reason": reason,
                        "recorded_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, sort_keys=True)
     fd = os.open(folder / UUID_WRITES_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as handle:
@@ -522,7 +540,10 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
                                           str(inputs.operator), inputs.now)
         except (OSError, ValueError):
             return None
-        return launch(reference, revision, ctx["env"])
+        handle = launch(reference, revision, ctx["env"])
+        if handle is None:
+            production_launch_ticket.discard(inputs.records_parent, reference)  # a failed launch leaves no usable ticket
+        return handle
     started = LAUNCHES.claim(start)
     return "launched" if started else "launch_failed"
 

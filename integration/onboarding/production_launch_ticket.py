@@ -8,6 +8,8 @@ atomic rename, so two runners cannot both use one ticket. Opens no connection; t
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -26,6 +28,42 @@ def _path(parent: Path, co: str) -> Path:
     return Path(parent) / SUBDIR / (co + ".json")
 
 
+KEY_NAME = ".ticket.key"
+
+
+def _key(parent: Path, create: bool) -> bytes | None:
+    """The MAC key: 32 random bytes in a 0600 file of the state folder (never the repository). Created by the minting
+    dashboard; the runner only reads it. Same-user trust limit: a process of the same Windows user can read it."""
+    path = Path(parent) / SUBDIR / KEY_NAME
+    try:
+        return bytes.fromhex(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        pass
+    if not create:
+        return None
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return _key(parent, False)
+    with os.fdopen(fd, "w", encoding="ascii") as handle:
+        handle.write(secrets.token_hex(32))
+    return _key(parent, False)
+
+
+def _mac(key: bytes, body: dict[str, Any]) -> str:
+    canonical = json.dumps({k: v for k, v in body.items() if k != "mac"}, sort_keys=True, separators=(",", ":"))
+    return hmac.new(key, canonical.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def discard(parent: Path, co: str) -> None:
+    """Delete an unused ticket (the dashboard calls this when the launch failed)."""
+    try:
+        _path(parent, co).unlink()
+    except OSError:
+        pass
+
+
 def _aware(moment: Any) -> bool:
     return isinstance(moment, datetime) and moment.tzinfo is not None and moment.utcoffset() is not None
 
@@ -42,6 +80,10 @@ def mint(parent: Path, co: str, revision: str, approval_ref: str, operator: str,
             "nonce": secrets.token_hex(16)}
     folder = Path(parent) / SUBDIR
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    key = _key(parent, True)
+    if key is None:
+        raise ValueError("launch_ticket_invalid")
+    body["mac"] = _mac(key, body)
     target = _path(parent, co)
     temp = folder / (co + "." + secrets.token_hex(4) + ".tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -65,6 +107,11 @@ def consume(parent: Path, co: str, revision: str, approval_ref: str, now: dateti
         return None, "launch_ticket_invalid"
     try:
         body = json.loads(used.read_text(encoding="utf-8"))
+        key = _key(parent, False)
+        nonce = body.get("nonce")
+        if (key is None or not isinstance(nonce, str) or len(nonce) != 32 or not isinstance(body.get("mac"), str)
+                or not hmac.compare_digest(body["mac"], _mac(key, body))):
+            return None, "launch_ticket_invalid"  # forged, edited or unsigned: the operator field is only trusted via the MAC
         expires = datetime.strptime(body["expires_at"], _STAMP).replace(tzinfo=timezone.utc)
         issued = datetime.strptime(body["issued_at"], _STAMP).replace(tzinfo=timezone.utc)
         ok = (body["co_reference"] == co and body["revision"] == revision and body["approval_ref"] == approval_ref

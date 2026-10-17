@@ -7672,8 +7672,8 @@ def _launch_production_create(reference: str, revision: str, env: dict[str, str]
 
 def _read_production_writeback_row(reference: str) -> dict[str, str | None] | None:
     """Fresh fixed-field read of the one CO row for the guarded UUID write (None on any problem)."""
-    if not REFERENCE.fullmatch(reference):
-        return None
+    if not REFERENCE.fullmatch(reference) or os.environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", create_ui.PINNED_SF_ALIAS):
+        return None  # a production path ignores the alias override: it refuses instead
     try:
         response = sf_json(["data", "query", "--query", "SELECT Id, Name, LastModifiedDate, Onboarding_Product__c, "
                             "Onboarding_Type__c, Account_UUID__c FROM Customer_Onboarding__c WHERE Name = '" + reference
@@ -8632,7 +8632,7 @@ class Handler(BaseHTTPRequestHandler):
                                                      "<section class='card'>" + body + "</section>", active="prod_onboarding", env="prod"))
             return
         code = create_ui.handle_uuid_confirm(values, inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
-                                             salesforce_target_org())
+                                             create_ui.PINNED_SF_ALIAS)
         if code in create_ui.UUID_RESULT_TEXT:
             self.send_page(HTTPStatus.OK, "<!doctype html><title>Salesforce UUID write</title><p><strong>"
                            + escape(create_ui.UUID_RESULT_TEXT[code]) + "</strong></p>" + back)

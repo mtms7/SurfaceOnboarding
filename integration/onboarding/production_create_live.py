@@ -41,7 +41,7 @@ LIVE_REASONS = frozenset({
     "readback_account_id_mismatch", "readback_uuid_invalid", "uncertain_submit", "attempt_started",
     "approval_consume_failed", "approval_superseded", "approval_locked", "approval_locked_stale",
     "production_dry_run_login_timeout", "production_session_expired", "production_session_not_ready",
-    "dry_run_old", "intended_unavailable", "production_dry_run_form_not_reached", "search_unproven", "search_control_unavailable",
+    "dry_run_old", "country_code_unavailable", "salesforce_alias_not_pinned", "intended_unavailable", "production_dry_run_form_not_reached", "search_unproven", "search_control_unavailable",
     "confirm_preflight_failed", "extra_pages_open", "launch_ticket_invalid", "source_recheck_unavailable",
     "approval_revision_drift", "salesforce_prior_uuid_present", "live_source_check_missing", "service_worker_present", "service_worker_check_failed",
 })
@@ -84,11 +84,18 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         self.popups = 0
 
     def install(self, page: Any) -> None:
-        super().install(page)
-        try:
-            page.on("popup", self._on_popup)
-        except Exception:
-            pass
+        """Route at CONTEXT level (``page.route`` does not cover popups or new pages) and count every popup / new page.
+
+        Raises when the context cannot be routed: the live create must not run with a guard that misses a page.
+        """
+        context = page.context
+        context.route("**/*", self.handle)
+        for target, event, handler in ((context, "response", self.on_response), (page, "response", self.on_response),
+                                       (context, "page", self._on_popup), (page, "popup", self._on_popup)):
+            try:
+                target.on(event, handler)
+            except Exception:
+                pass
 
     def _on_popup(self, _page: Any) -> None:
         self.popups += 1
@@ -172,6 +179,11 @@ def pre_arm_problem(page: Any, guard: LiveRequestGuard) -> str | None:
     return "extra_pages_open" if same else None
 
 
+def post_click_problem(page: Any, guard: LiveRequestGuard) -> str | None:
+    """After the click: ANY popup, new page or service worker (before or after the click) makes the outcome unknown."""
+    return pre_arm_problem(page, guard)
+
+
 def confirm_preflight(page: Any, *, locate: Callable[[Any], Any] | None = None,
                       wait_enabled: Callable[[Any, Any], bool] | None = None) -> str | None:
     """The locate / enabled / scroll / hit-test checks of the Confirm control WITHOUT clicking (also run by the dry run).
@@ -244,6 +256,8 @@ def click_confirm_once(page: Any, guard: LiveRequestGuard, clicks: LiveClickLog,
         guard.disarm()
     if guard.create_blocked or guard.create_requests() != 1 or guard.create_statuses() != [200]:
         return UNCERTAIN
+    if post_click_problem(page, guard) is not None:
+        return UNCERTAIN  # a page opened or a worker appeared around the click: never SUBMITTED-clean
     return SUBMITTED
 
 
@@ -290,14 +304,27 @@ def clone_search_control(tenants: object) -> dict[str, str] | None:
     if not isinstance(tenants, (list, tuple)):
         return None
     usable = []
+    owners: dict[str, int] = {}  # how many clone tenants claim a domain (primary or alternate, deleted ones included)
+    for tenant in tenants:
+        if not isinstance(tenant, Mapping):
+            continue
+        claimed = {_norm(tenant.get("account_domain")), *(_norm(d) for d in (tenant.get("alternate_domains") or ())
+                                                          if isinstance(d, str))}
+        for domain in claimed - {""}:
+            owners[domain] = owners.get(domain, 0) + 1
     for tenant in tenants:
         if (isinstance(tenant, Mapping) and tenant.get("enabled") is True and tenant.get("is_deleted") is not True
                 and isinstance(tenant.get("account_name"), str) and isinstance(tenant.get("account_domain"), str)
                 and tenant["account_name"].strip() and tenant["account_domain"].strip()):
             usable.append((_norm(tenant["account_name"]), _norm(tenant["account_domain"]), tenant))
     names = [u[0] for u in usable]
-    domains = [u[1] for u in usable]
-    unique = [u for u in usable if names.count(u[0]) == 1 and domains.count(u[1]) == 1]
+
+    def leaks(name: str, domain: str) -> bool:
+        # A name that contains the domain (or its first label) would let the DOMAIN control pass through the name field.
+        label = domain.split(".", 1)[0].strip()
+        return domain in name or (bool(label) and label in name)
+
+    unique = [u for u in usable if names.count(u[0]) == 1 and owners.get(u[1]) == 1 and not leaks(u[0], u[1])]
     if not unique:
         return None
     best = min(unique, key=lambda u: hashlib.sha256((u[0] + "|" + u[1]).encode("utf-8")).hexdigest())

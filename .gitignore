@@ -74,3 +74,6 @@ integration/onboarding_review_approvals.json
 integration/production_create_approvals.json
 production-create-records/
 integration/production-create-records/
+
+# Production create state (launch tickets and their MAC key)
+production-launch-tickets/

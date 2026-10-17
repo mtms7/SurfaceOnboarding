@@ -94,6 +94,10 @@ class ConfirmBtn:
                     handler(SimpleNamespace(request=SimpleNamespace(method="POST"), url=ORIGIN + live.CREATE_PATH,
                                             status=self.page.create_status))
         self.page.form_open = False
+        for _ in range(self.page.popups_after_click):
+            for handler in self.page.popup_handlers:
+                handler(None)
+        self.page.sw_count += self.page.workers_after_click
 
 
 class Flip(dict):
@@ -118,11 +122,20 @@ class LivePage(dry.FakePage):
         self.scrolled = self.hit_calls = 0
         self.hits = []
         self.extra_pages = []
-        self.context = SimpleNamespace(pages=[self])
+        self.popups_after_click = 0
+        self.workers_after_click = 0
+        self.context = SimpleNamespace(pages=[self], route=lambda pattern, handler: self.routes.append((pattern, handler)),
+                                       on=self._context_on)
+        self.country_value = "CL"
+        country, original = self.selects["accountCountry"], self.selects["accountCountry"].evaluate
+        country.evaluate = lambda js: self.country_value if "el.value" in str(js) else original(js)
         self.readbacks = list(readbacks if readbacks is not None else [reply([good_row()])])
         self.readback_calls = 0
         self.response_handlers = []
         self.popup_handlers = []
+
+    def _context_on(self, event, handler):
+        self.on("popup" if event == "page" else event, handler)
 
     def on(self, event, handler):
         if event == "response":
@@ -590,14 +603,80 @@ class StrictReadbackTests(Base):
         self.assertEqual(h.go()["result"], "created_verified")
 
 
+class ContextGuardAndCountryTests(Base):
+    def test_the_guard_is_installed_at_context_level_and_a_popup_after_the_click_is_unknown(self):
+        h = self.harness()
+        h.page.popups_after_click = 1
+        result = h.go()
+        self.assertEqual(result["result"], "create_outcome_unknown")
+        self.assertEqual((h.page.confirm_clicks, h.page.readback_calls), (1, 0))
+        self.assertEqual(h.approval_unused(), "approval_consumed")
+        self.assertTrue(ui.co_status(h.loaded_records())["blocking"])
+        self.assertTrue(h.page.routes)
+
+    def test_a_service_worker_appearing_after_the_click_is_unknown(self):
+        h = self.harness()
+        h.page.workers_after_click = 1
+        self.assertEqual(h.go()["result"], "create_outcome_unknown")
+        self.assertEqual(h.page.readback_calls, 0)
+
+    def test_an_unroutable_context_stops_the_run_before_any_form_work(self):
+        h = self.harness()
+        h.page.context = SimpleNamespace(pages=[h.page])  # no route(): cannot guard popups
+        result = h.go()
+        self.assertEqual(result["result"], "production_create_crashed")
+        self.assertEqual(h.page.confirm_clicks, 0)
+
+    def test_country_is_compared_exactly_with_the_value_the_form_submits(self):
+        h = self.harness(readbacks=[reply([good_row(accountCountryCode="US")])])
+        self.assertEqual(h.go()["result"], "created_mismatch")
+        record = [r for r in h.loaded_records() if r["outcome"] == "created_unverified"][0]
+        self.assertIn("accountCountryCode", record["readback_mismatches"])
+
+    def test_an_unreadable_country_value_refuses_before_the_consume(self):
+        for value in (None, "Chile", "cl"):
+            h = self.harness()
+            h.page.country_value = value
+            self.assertEqual(h.go()["result"], "country_code_unavailable", value)
+            self.assertEqual(h.page.confirm_clicks, 0)
+            self.assertIsNone(h.approval_unused())
+            self.assertFalse(h.page.form_open)
+
+    def test_the_dry_run_age_is_rechecked_at_click_time(self):
+        h = self.harness()
+        times = iter([NOW, NOW + timedelta(hours=25)])
+        # stamp() is fixed in the harness; use the runner's own clock hook to move time forward for the late check
+        h.seed_dry_run()
+        h.mint()
+        with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True), \
+                mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True), contextlib.redirect_stdout(io.StringIO()):
+            line = runner.run_production_create(
+                CO, REV, owner_go=True, environ=dict(dry.UNLOCK), now=NOW, records_parent=h.records, approval_path=h.approval_path,
+                load_source=h.load_source, clone_facts=good_clone, open_page=h.open_page, fill_date=lambda *_a: True,
+                date_kept=lambda *_a: True, run_day=DAY, clock=lambda: next(times))
+        self.assertEqual(json.loads(line)["result"], "dry_run_old")
+        self.assertEqual(h.page.confirm_clicks, 0)
+        self.assertIsNone(h.approval_unused())
+
+    def test_an_alias_override_in_the_environment_refuses(self):
+        h = self.harness()
+        with mock.patch.dict("os.environ", {}, clear=False):
+            out = runner.run_production_create(CO, REV, owner_go=True, environ={**dry.UNLOCK, "SURFACE_SF_TARGET_ORG": "other"},
+                                               now=NOW, records_parent=h.records, approval_path=h.approval_path,
+                                               load_source=h.load_source, open_page=h.open_page)
+        self.assertIn("salesforce_alias_not_pinned", out)
+        self.no_external_activity(h)
+
+
 class ClearedAttemptTests(Base):
     OLD = "PROD-CE-0001-20261016"
 
     def rows(self, *outcomes):
-        table = {"started": {"outcome": "attempt_started", "approval_ref": self.OLD},
-                 "refused": {"outcome": "refused", "refusal_reason": "confirm_not_clicked", "approval_ref": self.OLD},
-                 "cleared": {"outcome": "owner_review_cleared", "approval_ref": self.OLD},
-                 "unknown": {"outcome": "uncertain_submit", "approval_ref": self.OLD}}
+        rev = {"approval_ref": self.OLD, "salesforce_revision": REV}
+        table = {"started": {"outcome": "attempt_started", **rev},
+                 "refused": {"outcome": "refused", "refusal_reason": "confirm_not_clicked", **rev},
+                 "cleared": {"outcome": "owner_review_cleared", **rev},
+                 "unknown": {"outcome": "uncertain_submit", **rev}}
         return [table[o] for o in outcomes]
 
     def test_a_not_clicked_attempt_blocks_until_the_owner_review_is_recorded(self):

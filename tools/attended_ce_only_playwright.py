@@ -9905,6 +9905,19 @@ def _pcr_prior_records(parent: Path, reference: str) -> Any:
         return None
 
 
+PINNED_SF_ALIAS = "surface-onboarding"  # production paths never take the alias from the environment
+
+
+def _pcr_selected_country_code(page: Any) -> str | None:
+    """The ISO-2 value of the selected Country option (what the form submits), else None."""
+    try:
+        control = page.locator('select[name="accountCountry"]')
+        value = control.first.evaluate("(el) => el.value") if control.count() == 1 else None
+    except Exception:
+        return None
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Z]{2}", value) else None
+
+
 def _pcr_search(page: Any, value: str) -> Any:
     from integration.onboarding import production_create_live as live
 
@@ -9978,6 +9991,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference)
             or not production_dry_run.revision_ok(acknowledged_revision)):
         return _pcr_line("production_create_arguments_invalid")
+    if environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", PINNED_SF_ALIAS):  # the env override is ignored: refuse instead
+        return _pcr_line("salesforce_alias_not_pinned")
     parent = records_parent or _pdr_records_parent()
     approval_file = approval_path or _pdr_approval_path()
     extras: dict[str, Any] = {}
@@ -10042,7 +10057,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         plan = build_ce_only_fill(source, day)
         intended = production_dry_run.map_plan(plan, SELECT_NAMES, EARLY_SELECTS)
         contract_intended = ce_production_intended(source, day)
-        expected_row = production_contract.expected_readback_row(contract_intended, strict=True)
+        production_contract.expected_readback_row(contract_intended)  # validates the intended values; the STRICT row (exact
+        # country code read from the filled form) is built after the fill
         readback_body = production_contract.build_readback_body(contract_intended["tenant_name"])
     except production_dry_run.MappingError as error:
         return refused(str(error))
@@ -10117,12 +10133,28 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                                         duplicate_found=early is not None and early not in session_codes,
                                         precheck_reason=early or "")
 
+            strict_state: dict[str, Any] = {"expected": None}
+
             def fill(_inputs: Any) -> dict[str, str]:
-                return _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
-                                            date_kept or _license_date_kept, keep_open=True, confirm_preflight=True)
+                fields = _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
+                                              date_kept or _license_date_kept, keep_open=True, confirm_preflight=True)
+                code = _pcr_selected_country_code(page)  # the exact value the form submits, compared exactly in the readback
+                try:
+                    strict_state["expected"] = production_contract.expected_readback_row(
+                        {**contract_intended, "country_code": code}, strict=True)
+                except ValueError:
+                    raise production_create.FormRefusal("country_code_unavailable", fields) from None
+                return fields
 
             def duplicate_check(_inputs: Any) -> str | None:
-                return _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
+                problem = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
+                if problem is not None:
+                    return problem
+                # The 24 h dry-run age is judged again here, right before the consume and the click.
+                again = _pcr_prior_records(parent, reference)
+                if again is None:
+                    return "prior_records_invalid"
+                return create_ui.dry_run_problem(again, reference_value, (clock or stamp)())
 
             def click(_inputs: Any) -> str:
                 return live.click_confirm_once(page, guard, clicks, locate=_locate_confirm_button,
@@ -10133,7 +10165,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                     return _pdr_evaluate(page, production_contract.READBACK_JS, "POST", production_contract.ACCOUNTS_PATH,
                                          [production_contract.ACCOUNTS_PATH, readback_body,
                                           list(production_contract.READBACK_PICK_PATHS)])
-                return live.poll_readback(fetch, contract_intended, expected_row, page.wait_for_timeout)
+                return live.poll_readback(fetch, contract_intended, strict_state["expected"], page.wait_for_timeout)
 
             result = run_live(final, fill, click, read, duplicate_check)
             if clicks.confirm_clicks == 0 and production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds:
