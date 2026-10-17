@@ -5117,6 +5117,8 @@ PENTERA_CSS = (
     ".checks li:last-child{border-bottom:0}.checks .what{flex:1;min-width:0;overflow-wrap:anywhere}"
     ".checks .what small{display:block;color:var(--muted);font-size:12px}.checks .chip{flex:none}"
     ".locked{opacity:.75}"
+    ".banner-ok{background:var(--ok-bg)}.guide td code{user-select:all}.guide td.num{color:var(--muted);width:2em}"
+    ".guide tr.key td{background:var(--warn-bg);font-weight:600}.guide td.note{color:var(--muted);font-size:12px}"
     "@media(max-width:760px){.checks li{flex-wrap:wrap}}"
     ".seg{display:inline-flex;gap:8px;margin:0 0 14px}.seg a{display:inline-flex;align-items:center;gap:8px;background:#fff;"
     "color:var(--primary);border:1px solid var(--primary);border-radius:6px;padding:6px 14px;font-weight:600}"
@@ -6137,14 +6139,6 @@ ENGINE_LABELS = {CE_ENGINE: "CE-only", SURFACE_ENGINE: "Surface-only", CASE3_ENG
                  "case_6_renew_both": "Case 6 renewal"}
 DEV_STATUS_CHIPS = {"onboarded": ("chip-ok", "Onboarded"), "mirror": ("chip-info", "Dev mirror"),
                     "none": ("chip-neutral", "Not onboarded")}
-BEFORE_MIGRATION = (
-    "The production match shows Matches or Not in production, with no unresolved duplicate (Other tenants only and "
-    "Ambiguous block the migration).",
-    "The production clone is fresh: collected within the last 6 hours (" + PRODUCTION_COLLECT_HINT + ").",
-    "A separate, explicit owner approval exists for any production BackOffice write; this dashboard never writes there.",
-    "The Salesforce account id is not checked yet (the Redash accounts query is pending); compare it by hand.",
-    "On the move to production, ask the owner again: Salesforce Onboarding Stage must then be updated.",
-)
 
 
 def _evidence_for(reference: str, state: dict, readbacks: dict, outcomes: dict, mirrors: frozenset[str]) -> list[dict[str, Any]]:
@@ -6702,32 +6696,84 @@ def _candidates_table(candidates: list[dict[str, Any]]) -> str:
             + "</tbody></table></div>")
 
 
+def _recorded_duplicates(reference: str) -> list[dict[str, Any]] | None:
+    """The tenants of a recorded production-duplicate stop for this CO (any recorded start-gate check), else None."""
+    try:
+        mark = _production_mark(load_check_state().get(reference))
+    except ValueError:
+        return None
+    return mark[1] if mark is not None and mark[0] == "duplicate_production_clone_match" else None
+
+
+def _guide_matches(match: dict[str, Any]) -> str:
+    """Match details, shown only when the clone holds a tenant for this CO (blocking): the tenants and the differing fields."""
+    if not match.get("candidates") and match.get("status") not in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
+        return ""
+    html = "<section class='card' aria-labelledby='co-match-title'><h2 id='co-match-title' class='pill'>Production match details</h2>"
+    if match.get("reason"):
+        html += "<p class='note'>" + escape(str(match["reason"])) + "</p>"
+    if match.get("status") in ("exists_matches", "exists_differs") and match.get("fields"):
+        html += _field_table(match["fields"])
+    if match.get("candidates"):
+        html += "<h3 class='sub-h'>Matched production tenants</h3>" + _candidates_table(match["candidates"])
+    return html + "</section>"
+
+
+def _production_guide_html(guide: dict[str, Any], match: dict[str, Any]) -> str:
+    """Everything below the header of the production CO page: verdict, strip, details, one flat table, steps, footer."""
+    ready = guide["verdict"] == "ready"
+    verdict = ("<div class='banner " + ("banner-ok" if ready else "banner-bad") + "' role='status'><strong>"
+               + escape(guide["headline"]) + "</strong></div>")
+    strip = ""
+    if guide["checks"]:
+        strip = ("<section class='card' aria-labelledby='co-before-title'><h2 id='co-before-title' class='pill'>Before you start</h2>"
+                 "<ul class='checks'>" + "".join(
+                     _check_item(item["label"], escape(item["detail"]), _chip(*SHEET_CHECK_CHIPS[item["status"]]))
+                     for item in guide["checks"]) + "</ul></section>")
+    if not guide["checks"]:  # no strip (not CE-only, or no guide): the clone match stays visible as ONE short line
+        strip = ("<p class='note'>Production match: " + _match_chip(match["status"])
+                 + (" " + escape(str(match["reason"])) if match.get("reason") else "") + "</p>")
+    table = after = ""
+    if guide["rows"]:
+        key_rows = frozenset({"Country", "Expiration date"})
+        body = "".join(
+            "<tr" + (" class='key'" if item["label"] in key_rows else "") + "><td class='num'>" + str(number) + "</td><td>"
+            + escape(item["label"]) + "</td><td><code>" + escape(item["value"]) + "</code></td><td class='note'>"
+            + escape(item["note"]) + "</td></tr>" for number, item in enumerate(guide["rows"], 1))
+        table = ("<section class='card guide' aria-labelledby='co-enter-title'><h2 id='co-enter-title' class='pill'>"
+                 "Enter in BackOffice &gt; Add Account</h2><p class='note'>BackOffice: <code>"
+                 + escape(production_views.SHEET_BACKOFFICE) + "</code>, Tenant Management, Add Account. Type exactly these "
+                 "values, in this order.</p><table class='dense'><thead><tr><th scope='col'>#</th><th scope='col'>Field</th>"
+                 "<th scope='col'>Value</th><th scope='col'>Note</th></tr></thead><tbody>" + body + "</tbody></table><p class='note'>"
+                 + escape(guide["leave"]) + "</p></section>")
+        after = ("<section class='card' aria-labelledby='co-after-title'><h2 id='co-after-title' class='pill'>After you click "
+                 "Confirm</h2><ol>" + "".join("<li>" + escape(text) + "</li>" for text in guide["after"]) + "</ol></section>")
+    age = _clone_line(_clone_info())
+    snapshot = (" &middot; Salesforce data as of " + escape(guide["as_of"]) if guide["as_of"] else "")
+    footer = ("<p class='note'>" + escape(guide["closing"]) + "</p><p class='note'>" + age + snapshot
+              + ". A missing match is never a clearance.</p>")
+    recorded = ""
+    if guide.get("recorded_duplicates") is not None:
+        items = "".join("<li>" + escape(str(m.get("name") or "-")) + " &middot; <code>" + escape(str(m.get("id") or "-"))
+                        + "</code> &middot; created " + escape(_created_date(m.get("created"))) + "</li>"
+                        for m in guide["recorded_duplicates"])
+        recorded = ("<div class='banner banner-warn'><span class='chip chip-bad'>Already in production</span> A duplicate in "
+                    "production was recorded for this CO. A fresh clone does not clear it.<ul>" + items + "</ul></div>")
+    return verdict + recorded + strip + _guide_matches(match) + table + after + footer
+
+
 def page_detail_production(reference: str, row: dict[str, str | None], match: dict[str, Any], country: str | None = None) -> str:
-    """The Production view of a CO page (GET only: no form, no button, no write)."""
+    """The production view of a CO page (GET only: no form, no button, no write): one verdict, one table (docs/50)."""
     account = row.get("Account_Name__c")
     case = renewal_case(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
     route_chip = ("<span class='chip chip-info'>" + escape(case[1]) + "</span>" if case is not None else _route_chip(row))
     header = ("<div class='page-head'><h1>" + escape(reference) + "</h1>"
               + ("<span class='acct'>" + escape(account) + "</span>" if account else "") + route_chip + "</div>")
-    seg = _env_segment(reference, "prod", _dev_status_chip(dev_evidence_for(reference)), _match_chip(match["status"]))
-    reason = ("<p class='note'>" + escape(str(match.get("reason") or "")) + "</p>") if match.get("reason") else ""
-    status = ("<section class='card'><div class='card-head'><h2 class='pill'>Production match</h2>" + _match_chip(match["status"])
-              + "</div>" + reason)
-    if match["status"] in ("exists_matches", "exists_differs"):
-        status += _field_table(match["fields"])
-    if match.get("candidates"):
-        status += "<h3 class='sub-h'>Matched production tenants</h3>" + _candidates_table(match["candidates"])
-    status += "</section>"
-    source = ("<p class='note'>" + _clone_line(_clone_info()) + " · Source: Redash saved query on the cloned production "
-              "database, personal data removed. A missing match is never a clearance.</p>")
-    checklist = ("<section class='card'><div class='card-head'><h2 class='pill'>Before migration</h2></div><ul>"
-                 + "".join("<li>" + escape(text) + "</li>" for text in BEFORE_MIGRATION) + "</ul></section>")
-    onboard = _co_onboard_card(reference, row, match=match, domain_count=_domain_count_of(row), start_iso=_prod_view_start(reference),
-                               ce_route=route_for(row) == CE_ENGINE)
-    sheet = _onboarding_sheet_card(reference, row, match=match, ce_route=route_for(row) == CE_ENGINE,
-                                   start_iso=_prod_view_start(reference), country=country)
-    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + seg + onboard + sheet + _lock_banner()
-                 + _production_marker_for(reference) + status + source + checklist)
+    ce_route = route_for(row) == CE_ENGINE
+    clone = _clone_status()
+    sheet = _sheet_result(row, match=match, ce_route=ce_route, start_iso=_prod_view_start(reference), country=country, clone=clone)
+    guide = production_views.production_co_guide(sheet, clone=clone, recorded_duplicates=_recorded_duplicates(reference))
+    main_html = "<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_guide_html(guide, match)
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod")
 
 
@@ -7146,15 +7192,9 @@ def _dev_start_state(reference: str, row: dict[str, str | None] | None) -> tuple
     return False, " ".join(_STEP_TAGS.sub(" ", step).split())
 
 
-def _domain_count_of(row: dict[str, str | None] | None) -> int | None:
-    if row is None or "Email_Domains__c" not in row:
-        return None
-    return len([item for item in re.split(r"[,;\s]+", str(row.get("Email_Domains__c") or "").strip()) if item])
-
-
 def _co_onboard_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None,
                      domain_count: int | None, start_iso: str | None, ce_route: bool) -> str:
-    """The "Onboard" card at the top of both production CO pages. Read-only: the production row is a checklist, never a control.
+    """The "Onboard" card at the top of the review page (/onboard/CO-x). Read-only: the production row is a checklist, never a control.
 
     The only link is the existing Dev "Review & start" route, on the desktop, when the CO is Dev-startable.
     """
@@ -7254,13 +7294,9 @@ SHEET_ROW_CHIPS = {"enter": ("chip-info", "Enter"), "leave": ("chip-neutral", "L
 SHEET_CHECK_CHIPS = {"ok": ("chip-ok", "OK"), "blocked": ("chip-bad", "Blocked"), "unavailable": ("chip-warn", "Unavailable")}
 
 
-def _onboarding_sheet_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None, ce_route: bool,
-                           start_iso: str | None, country: str | None = None) -> str:
-    """The read-only "Production onboarding sheet" card of both production CO pages: what to type in BackOffice Add Account.
-
-    Guidance only: no form, button, link or script, and nothing is written. Every value is escaped; a value that cannot
-    be derived shows as unavailable on this server for that row only.
-    """
+def _sheet_result(row: dict[str, str | None] | None, *, match: dict[str, Any] | None, ce_route: bool,
+                  start_iso: str | None, country: str | None, clone: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The pure sheet of one CO (``production_views.onboarding_sheet``); a failure is ``{"state": "unavailable"}``."""
     vm = vm_mode()
     fields = row or {}
     uuid_state = "unread" if row is None or "Account_UUID__c" not in fields else "set" if fields.get("Account_UUID__c") else "empty"
@@ -7270,11 +7306,21 @@ def _onboarding_sheet_card(reference: str, row: dict[str, str | None] | None, *,
           "start_iso": start_iso}
     as_of, stale = _snapshot_as_of() if vm else (None, False)
     try:
-        sheet = production_views.onboarding_sheet(co, rules=_sheet_rules(), today=production_now().date(),
-                                                  days_before=ONBOARD_DAYS_BEFORE_START, vm=vm, clone=_clone_status(), match=match,
-                                                  as_of=as_of, stale=stale)
+        return production_views.onboarding_sheet(co, rules=_sheet_rules(), today=production_now().date(),
+                                                  days_before=ONBOARD_DAYS_BEFORE_START, vm=vm, clone=clone if clone is not None else _clone_status(),
+                                                  match=match, as_of=as_of, stale=stale)
     except Exception:  # noqa: BLE001 - fail closed: no sheet rather than a guessed one
-        sheet = {"state": "unavailable"}
+        return {"state": "unavailable"}
+
+
+def _onboarding_sheet_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None, ce_route: bool,
+                           start_iso: str | None, country: str | None = None) -> str:
+    """The read-only "Production onboarding sheet" card of the review page (/onboard/CO-x): what to type in BackOffice Add Account.
+
+    Guidance only: no form, button, link or script, and nothing is written. Every value is escaped; a value that cannot
+    be derived shows as unavailable on this server for that row only.
+    """
+    sheet = _sheet_result(row, match=match, ce_route=ce_route, start_iso=start_iso, country=country)
     head = ("<section class='card sheet-card' aria-labelledby='co-sheet-title'><div class='card-head'>"
             "<h2 id='co-sheet-title' class='pill'>Production onboarding sheet</h2></div>")
     state = sheet["state"]

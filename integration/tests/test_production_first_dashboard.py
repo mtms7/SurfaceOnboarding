@@ -750,11 +750,11 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
                 self.assertIn("envpill prod", page)
                 self.assertIn("class='active'>Onboarding</a>", page)
 
-    def test_the_co_production_view_carries_the_lock_banner(self):
+    def test_the_co_production_view_carries_the_lock_footer(self):
         row = areas_module.layout.row_for(areas_module.layout.SURFACE)
         with areas_module.areas(), patch.object(dashboard, "production_now", return_value=NOW):
             page = dashboard.page_detail_production("CO-0702", row, areas_module.MATCHES["CO-0702"])
-        self.assertIn("<strong>Production create is locked.</strong>", page)
+        self.assertIn("Production create is locked in the dashboard: this page is guidance only.", page)
         self.assertEqual(controls(page), [])
 
 

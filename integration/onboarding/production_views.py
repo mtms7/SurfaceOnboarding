@@ -473,6 +473,8 @@ SHEET_REFUSALS = {
 }
 SHEET_STALE_WARNING = "Salesforce data may be out of date: re-check the CO in Salesforce before you start."
 SHEET_SOFT_WARNING = "The clone check or the timing window is not clear for this CO: check BackOffice yourself."
+SHEET_CHECK_KEYS = {"Route": "route", "Salesforce approval": "approval", "Email domain": "domain", "Account UUID": "uuid",
+                    "Clone and production match": "clone", "Timing window": "timing"}
 SHEET_SALESFORCE_CHIPS = ("Salesforce approval", "Email domain", "Account UUID")
 
 
@@ -489,7 +491,7 @@ def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clo
                        match: dict[str, Any] | None, domain_ok: bool, as_of: str | None = None) -> list[dict[str, str]]:
     """The "before you start" chips: ``{"label", "status": ok | blocked | unavailable, "detail"}``."""
     def chip(label: str, status: str, detail: str) -> dict[str, str]:
-        return {"label": label, "status": status, "detail": _text(detail)}
+        return {"key": SHEET_CHECK_KEYS[label], "label": label, "status": status, "detail": _text(detail)}
     items = [chip("Route", "ok", "CE-only, New Product Onboarding")]
     approval = co.get("approval_status")
     items.append(chip("Salesforce approval", "ok" if approval == "Approved" else "blocked" if approval else "unavailable",
@@ -642,3 +644,77 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
         "one-field write), then move the Onboarding Stage yourself.",
     ]
     return base
+
+
+# --- Production CO page guide (docs/50): one verdict, a short strip, one flat table, numbered after-steps ------------------
+# Pure view model over ``onboarding_sheet``: nothing is read or written here. The gates are shown once (the strip) and the
+# verdict names only the single most important blocker. A missing match is never a clearance.
+
+GUIDE_KEYS = (("route", "Route"), ("approval", "Approved in Salesforce"), ("domain", "One email domain"),
+              ("uuid", "Account UUID empty"), ("clone", "Duplicate check"))
+GUIDE_LEAVE_SENTENCE = ("Also set exactly: Alternate Domains, SubDomains and Networks empty; Operator Account None; Scanning interval "
+                        "None; MFA required on; Scan now, Notifications, Multiple users, API access and Phishing off; every "
+                        "Advanced switch off. Touch nothing else.")
+GUIDE_CLOSING = "Production create is locked in the dashboard: this page is guidance only."
+GUIDE_CHECK_FIRST = "check BackOffice yourself for a duplicate before creating"
+
+
+def _guide_after(tenant: str) -> list[str]:
+    return ["Click Confirm in BackOffice yourself.",
+            "Search the new tenant by its exact name: " + _text(tenant) + ".",
+            "Open Edit once to confirm the Advanced switches are off and SpyCloud is on. Change nothing there.",
+            "Copy the Account UUID from the tenant (32 hex characters).",
+            "Write it into Salesforce Account_UUID__c for this CO, then move the Onboarding Stage yourself."]
+
+
+def production_co_guide(sheet: dict[str, Any], *, clone: dict[str, Any] | None,
+                        recorded_duplicates: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The simplified production CO page model from an ``onboarding_sheet`` result.
+
+    ``{"state", "verdict": "ready" | "blocked", "headline", "checks", "rows", "leave", "after", "closing", "as_of",
+    "recorded_duplicates"}``. ``rows`` keep only fields to type or select (the "leave" rows collapse into ``leave``). Fail
+    closed: Ready needs a clone item and a timing item that are both ok, no unavailable row and no recorded production
+    duplicate (``recorded_duplicates``: the tenants of a recorded duplicate stop, or None).
+    """
+    state = sheet.get("state")
+    items = {item.get("key"): item for item in sheet.get("eligibility") or [] if isinstance(item, dict)}
+    checks = [{"label": label, "status": items[key]["status"], "detail": items[key]["detail"]}
+              for key, label in GUIDE_KEYS if key in items]
+    out: dict[str, Any] = {"state": state, "verdict": "blocked", "headline": "", "checks": checks, "rows": [], "leave": "",
+                           "after": [], "closing": GUIDE_CLOSING, "as_of": sheet.get("as_of") or "",
+                           "recorded_duplicates": recorded_duplicates}
+    if state == "not_applicable":
+        out["headline"] = "Not applicable: this CO is not a CE-only New Product Onboarding."
+        return out
+    if state == "refused":
+        out["headline"] = "Blocked: " + SHEET_REFUSALS.get(sheet.get("reason"), "The values cannot be derived.")
+        return out
+    if state != "ready":
+        out["headline"] = "Blocked: the guide is " + UNAVAILABLE_ON_SERVER + "."
+        return out
+    out["rows"] = [item for item in sheet["rows"] if item["status"] != "leave"]
+    out["leave"] = GUIDE_LEAVE_SENTENCE
+    out["after"] = _guide_after(sheet.get("tenant_name") or "")
+    clone_item, timing = items.get("clone"), items.get("timing")
+    unavailable = [item["label"] for item in out["rows"] if item["status"] == "unavailable"]
+    if recorded_duplicates is not None:
+        out["headline"] = "Blocked: a duplicate in production was recorded for this CO: " + GUIDE_CHECK_FIRST + "."
+    elif clone_item is None or clone_item["status"] != "ok":
+        age = age_words(clone.get("age_seconds")) if isinstance(clone, dict) else "unknown"
+        if clone_item is None:
+            out["headline"] = "Blocked: the clone check is missing: " + GUIDE_CHECK_FIRST + "."
+        elif isinstance(clone, dict) and clone.get("state") == "stale":
+            out["headline"] = "Blocked: the production clone is " + age + " old (limit 6 h): " + GUIDE_CHECK_FIRST + "."
+        else:
+            out["headline"] = "Blocked: " + _text(clone_item["detail"]).rstrip(".") + ": " + GUIDE_CHECK_FIRST + "."
+    elif sheet.get("stale_warning"):
+        out["headline"] = "Blocked: the Salesforce snapshot is older than 6 h: re-check the CO in Salesforce before you start."
+    elif unavailable:
+        out["headline"] = "Blocked: " + ", ".join(unavailable) + " unavailable: take it from the Salesforce Account before you start."
+    elif timing is None:
+        out["headline"] = "Blocked: the timing window is missing."
+    elif timing["status"] != "ok":
+        out["headline"] = "Blocked: " + _text(timing["detail"]).rstrip(".") + "."
+    else:
+        out["verdict"], out["headline"] = "ready", "Ready to onboard"
+    return out

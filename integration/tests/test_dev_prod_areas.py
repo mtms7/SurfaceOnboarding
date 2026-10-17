@@ -191,7 +191,7 @@ class NavigationTests(unittest.TestCase):
             self.assertIn("envpill prod", dashboard.page_history(None, failed=True))  # History moved under Production
             self.assertIn("envpill dev", dashboard.page_queue(ROWS))
 
-    def test_co_page_dev_and_production_views_have_their_pill_bar_and_segmented_control(self):
+    def test_co_page_dev_and_production_views_have_their_pill_bar_and_only_dev_has_the_segmented_control(self):
         row = layout.row_for(layout.SURFACE)
         with areas():
             dev = layout.render(row)
@@ -200,14 +200,17 @@ class NavigationTests(unittest.TestCase):
         self.assertIn("envbar dev", dev)
         self.assertIn("envpill prod", prod)
         self.assertIn("envbar prod", prod)
-        for page, on in ((dev, "dev"), (prod, "prod")):
-            seg = page[page.index("<div class='seg'"):page.index("</div>", page.index("<div class='seg'"))]
-            self.assertIn("href='/co/CO-0702?env=dev'", seg)
-            self.assertIn("href='/co/CO-0702?env=prod'", seg)
-            self.assertEqual(seg.count("aria-current='page'"), 1)
-            self.assertIn("href='/co/CO-0702?env=" + on + "' class='on'", seg)
+        seg = dev[dev.index("<div class='seg'"):dev.index("</div>", dev.index("<div class='seg'"))]
+        self.assertIn("href='/co/CO-0702?env=dev'", seg)
+        self.assertIn("href='/co/CO-0702?env=prod'", seg)
+        self.assertEqual(seg.count("aria-current='page'"), 1)
+        self.assertIn("href='/co/CO-0702?env=dev' class='on'", seg)
+        # docs/50: the production CO page has no Dev tab or segmented control any more
+        self.assertNotIn("<div class='seg'", prod)
+        self.assertNotIn("?env=dev", prod)
+        for page in (dev, prod):
             self.assertNotIn("<script", page)
-            self.assertNotIn("<button", seg)
+        self.assertNotIn("<button", seg)
 
 
 class RedirectAndRouteTests(unittest.TestCase):
@@ -516,7 +519,8 @@ class ProductionCoViewTests(unittest.TestCase):
 
     def test_it_shows_the_status_the_comparison_and_the_matched_tenants(self):
         page = self.view()
-        self.assertIn("<h2 class='pill'>Production match</h2><span class='chip chip-warn'>Differs</span>", page)
+        self.assertIn("Production match details", page)
+        self.assertNotIn("<h2 class='pill'>Production match</h2>", page)   # docs/50: no separate Production match card
         for header in ("Field", "Salesforce / DealHub (expected)", "Production (clone)", "Result"):
             self.assertIn(">" + header + "</th>", page)
         self.assertIn("<td>Licence end</td><td>2027-10-19</td><td>2027-10-18</td><td><span class='chip chip-warn'>Differs</span>", page)
@@ -527,16 +531,15 @@ class ProductionCoViewTests(unittest.TestCase):
         self.assertIn("Not checked", page)  # Salesforce account id
         self.assertIn("Matched production tenants", page)
         self.assertIn("<span class='chip chip-ok'>Live, paid</span>", page)
-        self.assertIn("Redash saved query", page)
         self.assertIn("never a clearance", page)
 
-    def test_it_has_the_before_migration_checklist_as_text(self):
+    def test_it_no_longer_has_the_before_migration_card_or_the_dev_text(self):
         page = self.view()
-        self.assertIn("Before migration", page)
-        # The Onboard card (nine checklist items) now sits above this card: count only the Before migration list.
-        self.assertEqual(page[page.index("Before migration"):].count("<li>"), len(dashboard.BEFORE_MIGRATION))
-        self.assertIn("Onboarding Stage", page)
-        self.assertIn("redash_inventory_collector.py --collect", page)
+        main = page[page.index("<main"):]
+        for text in ("Before migration", "Production match</h2>", "Onboard</h2>", "Dev - ", "Not onboarded", "Leonardo Development (test)",
+                     "env=dev", "Clone unavailable"):
+            self.assertNotIn(text, main)
+        self.assertIn("never a clearance", main)
 
     def test_unavailable_and_blocked_states_explain_themselves(self):
         gone = self.view(canned("clone_unavailable", reason="inventory_snapshot_stale"))
@@ -549,16 +552,16 @@ class ProductionCoViewTests(unittest.TestCase):
         self.assertIn("<span class='chip chip-bad'>Deleted</span>", other)
         self.assertIn("2025-10-05", other)
 
-    def test_the_recorded_start_gate_marker_is_reused(self):
+    def test_a_recorded_production_duplicate_marker_blocks_the_production_page(self):
         checks = {"CO-0702": {"kind": "production_duplicate", "result": "duplicate_production_clone_match",
                               "detail": '{"matches": [{"name": "Acme", "id": "x", "created": 1759622400000}]}'}}
-        self.assertIn("This CO already has a tenant in production.", self.view(checks=checks))
-
-    def test_dev_chip_in_the_segment_uses_local_evidence_and_the_prod_chip_the_match(self):
-        page = self.view()
-        seg = page[page.index("<div class='seg'"):page.index("</div>", page.index("<div class='seg'"))]
-        self.assertIn(">Dev <span class='chip chip-ok'>Onboarded</span></a>", seg)  # CO-0702 is onboarded on Dev
-        self.assertIn(">Production <span class='chip chip-warn'>Differs</span></a>", seg)
+        page = self.view(checks=checks)
+        self.assertIn("A duplicate in production was recorded for this CO.", page)
+        self.assertIn("Already in production", page)
+        self.assertIn("Acme", page)
+        self.assertNotIn("Nothing was created in Leonardo", page)   # the Dev start-gate wording stays off this page
+        unavailable = {"CO-0702": {"kind": "production_duplicate", "result": "production_clone_unavailable", "detail": "{}"}}
+        self.assertNotIn("A duplicate in production was recorded", self.view(checks=unavailable))
 
     def test_dev_view_peeks_only_and_never_reads_production(self):
         row = layout.row_for(layout.SURFACE)

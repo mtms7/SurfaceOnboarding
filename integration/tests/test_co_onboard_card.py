@@ -1,4 +1,6 @@
-"""The "Onboard" card at the top of the CO page (/onboard/CO-x and /co/CO-x?env=prod).
+"""The "Onboard" card at the top of the review page (/onboard/CO-x).
+
+The production CO page (/co/CO-x?env=prod) no longer carries this card (docs/50): see test_production_co_page.py.
 
 Hermetic: no Salesforce, Leonardo, Redash or network. The card is read-only: the production row is a checklist with a
 status chip per item and never a control; the only link is the existing Dev "Review & start" route, and only on the
@@ -130,15 +132,8 @@ class CardBase(unittest.TestCase):
                 patch.object(dashboard, "load_runner_state", return_value=runner if runner is not None else {}):
             return dashboard.page_onboard_review(base.summary_for(), base.EXTRAS, "", row=row)
 
-    def prod_view(self, row=ROW_READY, vm=False, runner=None, **kwargs):
-        match = base.match()
-        with base.patched(self.env, unavailable=vm, **kwargs), \
-                patch.object(dashboard, "vm_mode", return_value=vm), \
-                patch.object(dashboard, "load_runner_state", return_value=runner if runner is not None else {}):
-            return dashboard.page_detail_production("CO-0780", row, match)
-
     def pages(self, **kwargs):
-        return {"review": self.review(**kwargs), "prod": self.prod_view(**kwargs)}
+        return {"review": self.review(**kwargs)}
 
     @staticmethod
     def card(page):
@@ -337,7 +332,8 @@ class HandlerRouteTests(CardBase):
                 patch.object(dashboard, "load_runner_state", return_value={}):
             prod = areas_module.get("/co/CO-0780?env=prod").pages[0]
         self.assertEqual(prod[0], 200)
-        self.assertIn("co-onboard-title", prod[1])
+        self.assertNotIn("co-onboard-title", prod[1])   # docs/50: the simplified page has no Onboard card
+        self.assertIn("co-before-title", prod[1])
 
     def test_the_card_adds_no_post_route_and_the_lock_holds(self):
         self.assertIs(dashboard.readiness.PRODUCTION_RUNNER_SUPPORTED, False)

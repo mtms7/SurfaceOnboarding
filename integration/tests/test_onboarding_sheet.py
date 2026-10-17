@@ -1,7 +1,7 @@
 """The read-only "Production onboarding sheet" (assisted manual CE-only create in BackOffice).
 
 Hermetic: no Salesforce, BackOffice, VM or network. The pure derivation (``production_views.onboarding_sheet``) and the card
-on both production CO pages (``/onboard/CO-x`` and ``/co/CO-x?env=prod``) are tested; the card is guidance only: no
+on the review page (``/onboard/CO-x``) are tested; the card is guidance only: no
 form, button, link or script, and no route writes anything.
 """
 from __future__ import annotations
@@ -327,7 +327,8 @@ class PageBase(unittest.TestCase):
             return dashboard.page_detail_production("CO-0780", row, base.match(), country=country)
 
     def pages(self, **kwargs):
-        return {"review": self.review(**kwargs), "prod": self.prod(**kwargs)}
+        # the production CO page (/co/CO-x?env=prod) uses the simplified guide of docs/50: see test_production_co_page.py
+        return {"review": self.review(**kwargs)}
 
     @staticmethod
     def card(page):
@@ -429,10 +430,6 @@ class CardTests(PageBase):
         surface = base.summary_for(route=dashboard.SURFACE_ENGINE)
         card = self.card(self.review(summary=surface))
         self.assertIn("Not applicable: this CO is not a CE-only New Product Onboarding.", card)
-        self.assertNotIn("<table", card)
-        other = {**ROW, "Onboarding_Product__c": "Surface", "Onboarding_Type__c": "New Product Onboarding"}
-        card = self.card(self.prod(row=other))
-        self.assertIn("Not applicable", card)
         self.assertNotIn("<table", card)
 
     def test_sheet_failure_fails_closed(self):
