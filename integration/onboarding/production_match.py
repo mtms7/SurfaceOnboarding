@@ -4,7 +4,12 @@ Owner decisions 2026-10-06 / 2026-10-07. Read-only and informational: it reads o
 (Redash) that ``leonardo_inventory.load_latest`` already verifies (same 6 h age and tamper rules as the Start gate),
 never writes, and a "no tenant found" is never a clearance. First hit wins:
 
-  clone_unavailable  snapshot missing / older than 6 h / tampered / no alternate-domain data, or the CO source unreadable
+  clone_unavailable  snapshot missing / older than 6 h / tampered / no alternate-domain data
+  not_checked        the clone is fine but the CO's inputs (names, domains, plan) are not available for this CO
+  onboarded          the CO's own Account UUID (Salesforce) equals exactly one clone tenant's accountUuid: the tenant is
+                     reviewed (enabled, licence, SpyCloud, counts, name suffix); deviations are warnings, not a gate
+  uuid_not_in_clone  the CO holds an Account UUID but no clone tenant has it and nothing else matches (blocks; the clone may
+                     be older than the create)
   not_in_production  no candidate (same name key, or a primary / alternate domain equal to a CO domain)
   exists_other       candidates exist, but none is a live, paid tenant with the CO's EXACT name (BLOCKS migration)
   ambiguous          more than one live, paid tenant with the exact name
@@ -22,11 +27,12 @@ from datetime import date, datetime, timedelta, timezone
 import re
 from typing import Any
 
+from integration.onboarding.production_contract import LICENSE_COUNT, LICENSE_TYPE, NAME_SUFFIX
 from integration.onboarding.leonardo_inventory import (
     PRODUCTION_GATE_MAX_AGE, InventoryError, _name_key, canonical_domain, duplicate_precheck, is_live_paid_tenant,
     load_latest)
 
-STATUSES = ("clone_unavailable", "not_in_production", "exists_other", "ambiguous", "exists_matches", "exists_differs")
+STATUSES = ("clone_unavailable", "not_checked", "onboarded", "uuid_not_in_clone", "not_in_production", "exists_other", "ambiguous", "exists_matches", "exists_differs")
 REQUIRED_FIELDS = ("tenant_name", "primary_domain", "alternate_domains", "license_type", "license_end")
 NOT_A_CLEARANCE = "No tenant found. This is not a clearance: the clone can lag up to a day."
 MAX_LISTED = 8
@@ -160,16 +166,99 @@ def compare_fields(tenant: Mapping[str, Any], plan: Mapping[str, Any], tenant_na
     return rows
 
 
+_UUID_KEY = re.compile(r"[0-9a-f]{32}")
+NOT_IN_QUERY_251 = "Not in query 251, so not checked: country, user email domains, Advanced flags, MFA."
+WARNING_TEXT = {
+    "tenant_disabled": "tenant disabled", "tenant_deleted": "tenant deleted", "license_not_enabled": "licence not enabled",
+    "license_expired": "licence expired", "license_end_unknown": "licence end unknown", "expiry_differs": "licence end differs from the DealHub rule",
+    "license_counts_differ": "licence counts are not 1/1/1", "spycloud_off": "SpyCloud off or unknown",
+    "leaked_credentials_off": "leaked credentials not allowed or unknown", "name_suffix_missing": "name lacks the ' - CE Only' suffix",
+    "identity_mismatch": "IDENTITY MISMATCH: the tenant that owns this UUID has a different name or primary domain",
+    "license_type_differs": "licence type is not the expected prepaid annual subscription",
+    "alternate_domains_differ": "alternate domains differ from the plan"}
+
+
+def uuid_key(value: Any) -> str | None:
+    """A normalised Account UUID (hyphens stripped, lower case, 32 hex) or None. Never shown or logged."""
+    if not isinstance(value, str):
+        return None
+    key = value.strip().replace("-", "").casefold()
+    return key if _UUID_KEY.fullmatch(key) else None
+
+
+def review_onboarded(tenant: Mapping[str, Any], plan: Mapping[str, Any], *, ce_only: bool, today: date,
+                     names: Any = ()) -> dict[str, Any]:
+    """Owner review of a tenant the CO already owns (warnings only; never a create gate). Uses only clone fields.
+
+    The UUID owner is not trusted blindly: a name or primary-domain mismatch is ``identity_mismatch`` (the label becomes
+    "Onboarded: review"), and every required field that differs from the plan becomes a visible warning."""
+    lic = tenant.get("license") if isinstance(tenant.get("license"), dict) else {}
+    plan = plan if isinstance(plan, Mapping) else {}
+    warnings: list[str] = []
+
+    def warn(code: str) -> None:
+        if code not in warnings:
+            warnings.append(code)
+
+    for row in compare_fields(tenant, plan, names):
+        if not row["required"] or row["result"] == "match":
+            continue
+        if row["code"] in ("tenant_name", "primary_domain"):
+            warn("identity_mismatch")
+        elif row["code"] == "license_type":
+            warn("license_type_differs")
+        elif row["code"] == "alternate_domains" and row["result"] == "differs":
+            warn("alternate_domains_differ")
+    if tenant.get("enabled") is not True:
+        warn("tenant_disabled")
+    if tenant.get("is_deleted") is True:
+        warn("tenant_deleted")
+    if lic.get("enabled") is not True:
+        warn("license_not_enabled")
+    ends = _tenant_dates(lic.get("expiration_date"))
+    expected = _iso(plan.get("license_end"))
+    if not ends:
+        warn("license_end_unknown")
+    else:
+        if max(ends) < today.isoformat():
+            warn("license_expired")
+        if expected and expected not in ends:
+            warn("expiry_differs")
+    if ce_only:
+        if _enum(lic.get("type")) != _enum(LICENSE_TYPE):
+            warn("license_type_differs")
+        if any(lic.get(key) != LICENSE_COUNT or isinstance(lic.get(key), bool)
+               for key in ("assets_number", "domains_number", "subdomains_number")):
+            warn("license_counts_differ")
+        if tenant.get("spycloud_enabled") is not True:
+            warn("spycloud_off")
+        if lic.get("leaked_credentials_allowed") is not True:
+            warn("leaked_credentials_off")
+        if not str(tenant.get("account_name") or "").endswith(NAME_SUFFIX):
+            warn("name_suffix_missing")
+    shown = _shown_date(lic.get("expiration_date")) if ends else "unknown"
+    if warnings:
+        line = "Onboarded - check: " + "; ".join(WARNING_TEXT[code] for code in warnings) + "."
+    elif expected:
+        line = ("Onboarded - tenant enabled, license active until " + shown + " (matches DealHub end rule: expected "
+                + expected + ").")
+    else:
+        line = "Onboarded - tenant enabled, license active until " + shown + " (expiry not verified: DealHub end unknown)."
+    return {"line": line, "warnings": warnings, "not_in_query": NOT_IN_QUERY_251}
+
+
 def _result(status: str, reason: str = "", **extra: Any) -> dict[str, Any]:
     return {"status": status, "reason": reason, "fields": [], "differs": [], "candidates": [], "target": None,
             "captured_at": None, "age_seconds": None, "tenants_checked": 0, **extra}
 
 
 def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any] | None,
-                     snapshot: Mapping[str, Any] | str | None) -> dict[str, Any]:
+                     snapshot: Mapping[str, Any] | str | None, *, account_uuid: Any = None, ce_only: bool = False,
+                     today: date | None = None) -> dict[str, Any]:
     """``co_source``: {"tenant_names": (...), "domains": (...)}; ``plan``: see ``compare_fields`` (primary_domain,
     alternate_domains, license_type, license_end, license_start, spycloud_shown); ``snapshot``: the verified clone
-    payload, or a reason string / None when it cannot be used. Pure; never raises on bad data (fails closed)."""
+    payload, or a reason string / None when it cannot be used. ``account_uuid`` is the CO's own Salesforce Account UUID (never
+    stored or shown). Pure; never raises on bad data (fails closed)."""
     if not isinstance(snapshot, Mapping):
         return _result("clone_unavailable", snapshot if isinstance(snapshot, str) and snapshot else "inventory_snapshot_missing")
     tenants = [tenant for tenant in snapshot.get("tenants") or () if isinstance(tenant, dict)]
@@ -180,13 +269,33 @@ def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any
     names = [name for name in (co_source or {}).get("tenant_names") or () if isinstance(name, str) and _name_key(name)]
     domains = [domain for domain in (co_source or {}).get("domains") or () if canonical_domain(domain)]
     if not isinstance(co_source, Mapping) or not isinstance(plan, Mapping) or not names or not domains:
-        return _result("clone_unavailable", "co_source_unreadable", **base)
+        return _result("not_checked", "co_source_unreadable", **base)
     keys = {_name_key(name) for name in names}
     candidates = []
     for tenant in tenants:
         hit = duplicate_precheck({"tenants": [tenant]}, names[0], domains)["matches"]
         if hit or _name_key(tenant.get("account_name")) in keys:
             candidates.append(tenant)
+    uuid_set = isinstance(account_uuid, str) and bool(account_uuid.strip())
+    if uuid_set:
+        wanted = uuid_key(account_uuid)
+        owned = [tenant for tenant in tenants if wanted is not None and uuid_key(tenant.get("account_uuid")) == wanted]
+        if len(owned) > 1:
+            return _result("ambiguous", "More than one tenant carries this CO's Account UUID.",
+                           candidates=[_summary(tenant) for tenant in owned], **base)
+        if owned:
+            rivals = [tenant for tenant in candidates if tenant is not owned[0] and is_live_paid_tenant(tenant)]
+            if rivals:  # a candidate matches the CO by name or domain: another live paid tenant is a duplicate of the owner
+                return _result("ambiguous", "Another live, paid tenant matches this CO by name or domain besides the tenant "
+                               "that owns its Account UUID.",
+                               candidates=[_summary(tenant) for tenant in [owned[0], *rivals]], **base)
+            review = review_onboarded(owned[0], plan, ce_only=ce_only, today=today or datetime.now(timezone.utc).date(),
+                                     names=names)
+            return _result("onboarded", review["line"], fields=compare_fields(owned[0], plan, names), candidates=[_summary(owned[0])],
+                           target=_summary(owned[0]), review=review, **base)
+        if not candidates:
+            return _result("uuid_not_in_clone", "UUID set but tenant not found in clone (the clone may be older than the create).",
+                           **base)
     if not candidates:
         return _result("not_in_production", NOT_A_CLEARANCE, **base)
     listed = [_summary(tenant) for tenant in candidates]

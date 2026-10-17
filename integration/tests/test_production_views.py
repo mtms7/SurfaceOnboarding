@@ -229,19 +229,47 @@ class ProductionCheckTests(unittest.TestCase):
     def test_chips(self):
         self.assertEqual((self.check("not_in_production")["label"], self.check("not_in_production")["blocked"]), ("Clear", False))
         self.assertEqual(self.check("exists_matches")["label"], "Duplicate")
-        self.assertEqual(self.check("exists_other")["label"], "Duplicate")
+        self.assertEqual(self.check("exists_other")["label"], "Other tenants only")
+        self.assertEqual(self.check("exists_other")["code"], "other_tenants")
         live = [{"live_paid": True}, {"live_paid": True}, {"live_paid": False}]
         self.assertEqual(self.check("ambiguous", candidates=live)["label"], "Live paid x 2")
         self.assertEqual(self.check("exists_differs", candidates=live)["label"], "Live paid x 2")
         self.assertEqual(self.check("clone_unavailable", reason="inventory_snapshot_stale")["label"], "Clone stale")
         self.assertEqual(self.check("clone_unavailable", reason="inventory_snapshot_missing")["label"], "Clone unavailable")
 
+    def test_onboarded_is_not_a_duplicate_and_warns_on_deviations(self):
+        clean = self.check("onboarded", review={"warnings": []})
+        self.assertEqual((clean["label"], clean["code"], clean["css"], clean["blocked"]), ("Onboarded", "onboarded", "chip-ok", False))
+        warned = self.check("onboarded", review={"warnings": ["spycloud_off"]})
+        self.assertEqual((warned["label"], warned["css"], warned["blocked"]), ("Onboarded", "chip-warn", False))
+
+    def test_identity_mismatch_relabels_onboarded_and_twins_do_not_claim_live_paid(self):
+        chip = self.check("onboarded", review={"warnings": ["identity_mismatch"]})
+        self.assertEqual((chip["label"], chip["css"]), ("Onboarded: review", "chip-warn"))
+        twins = [{"live_paid": False}, {"live_paid": False}]
+        chip = self.check("ambiguous", candidates=twins)
+        self.assertEqual((chip["label"], chip["code"], chip["blocked"]), ("Ambiguous", "ambiguous", True))
+        self.assertEqual(self.check("ambiguous", candidates=[{"live_paid": True}, {"live_paid": True}])["label"], "Live paid x 2")
+
+    def test_a_duplicate_says_the_uuid_check_did_not_run_when_it_did_not(self):
+        chip = self.check("exists_matches", uuid_checked=False)
+        self.assertIn("UUID check runs on the VM dashboard", chip["reason"])
+        self.assertNotIn("UUID check", self.check("exists_matches", uuid_checked=True)["reason"])
+
+    def test_uuid_not_in_clone_and_not_checked_are_blocked_and_never_say_clone_unavailable(self):
+        self.assertTrue(self.check("uuid_not_in_clone")["blocked"])
+        self.assertEqual(self.check("uuid_not_in_clone")["label"], "UUID set, not in clone")
+        chip = self.check("not_checked", reason="production_inputs_not_prepared")
+        self.assertEqual((chip["label"], chip["blocked"]), ("Not checked", True))
+        self.assertIn("only prepared for CE-only", chip["reason"])
+        self.assertNotIn("Clone", chip["label"] + chip["reason"].split("clone itself")[0])
+
     def test_anything_unexpected_is_blocked_never_clear(self):
         for bad in (None, {}, {"status": "bogus"}, "x", {"status": None}):
             chip = views.production_check(bad)
             self.assertTrue(chip["blocked"], bad)
             self.assertNotEqual(chip["label"], "Clear")
-        for status in ("exists_matches", "exists_differs", "exists_other", "ambiguous", "clone_unavailable"):
+        for status in ("exists_matches", "exists_differs", "exists_other", "ambiguous", "clone_unavailable", "not_checked", "uuid_not_in_clone"):
             self.assertTrue(self.check(status)["blocked"])
 
 

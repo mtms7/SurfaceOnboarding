@@ -1150,6 +1150,23 @@ _display_reads: contextvars.ContextVar[bool] = contextvars.ContextVar("display_r
 _display_read_times: contextvars.ContextVar[list[float] | None] = contextvars.ContextVar("display_read_times", default=None)
 _display_cache: dict[tuple[object, ...], tuple[float, float, Future]] = {}
 _display_cache_lock = Lock()
+DISPLAY_CACHE_MAX_ENTRIES = 512
+# Reads whose LAST argument is a data stamp: a new stamp supersedes (drops) the older entries of the same other arguments.
+_STAMPED_READS = frozenset({"production_match_display"})
+
+
+def _evict_display_cache(now: float, key: tuple[object, ...]) -> None:
+    """Bound the cache (caller holds the lock): drop expired entries, superseded stamps, then the oldest over the cap."""
+    for old in [k for k, entry in _display_cache.items() if entry[0] <= now and entry[2].done()]:
+        del _display_cache[old]
+    if key and key[0] in _STAMPED_READS:
+        for old in [k for k in _display_cache if k[0] == key[0] and k[:-1] == key[:-1] and k != key]:
+            del _display_cache[old]
+    while len(_display_cache) > DISPLAY_CACHE_MAX_ENTRIES:
+        oldest = min((k for k, entry in _display_cache.items() if entry[2].done()), key=lambda k: _display_cache[k][0], default=None)
+        if oldest is None:
+            break
+        del _display_cache[oldest]
 _display_prefetch_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="display-read")
 
 
@@ -1177,6 +1194,7 @@ def _display_cached(fn: Any) -> Any:
             if stale:
                 entry = (now + DISPLAY_READ_TTL_SECONDS, datetime.now().timestamp(), Future())
                 _display_cache[key] = entry
+                _evict_display_cache(now, key)
         _expires, read_at, future = entry
         if stale:
             try:
@@ -3738,8 +3756,8 @@ def page_detail(reference: str, row: dict[str, str | None], notification: str = 
               "<form method='get' action='/co/" + escape(reference) + "'><input type='hidden' name='refresh' value='1'>"
               "<button class='ghost' type='submit'>Refresh</button></form></div></div>")
     # Segmented control (owner 2026-10-07): the Production chip only peeks at the display cache (never reads Salesforce).
-    cached_match = peek_display_cache("production_match_display", reference, row.get("Onboarding_Product__c") or "",
-                                      row.get("Onboarding_Type__c") or "")
+    cached_match = _fresh_match(peek_display_cache("production_match_display", reference, row.get("Onboarding_Product__c") or "",
+                                                   row.get("Onboarding_Type__c") or "", _match_stamp()))
     seg = _env_segment(reference, "dev", _dev_status_chip(dev_evidence_for(reference)),
                        _match_chip(cached_match["status"]) if isinstance(cached_match, dict) and "status" in cached_match
                        else "<span class='chip chip-neutral'>Not checked</span>")
@@ -6125,12 +6143,17 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
 PROD_ACTION_REFRESH = "Refresh clone: "
 MATCH_CHIPS = {"exists_matches": ("chip-ok", "Matches"), "exists_differs": ("chip-warn", "Differs"),
                "not_in_production": ("chip-neutral", "Not in production"), "exists_other": ("chip-bad", "Other tenants only"),
-               "ambiguous": ("chip-bad", "Ambiguous"), "clone_unavailable": ("chip-warn", "Clone unavailable")}
-MATCH_FILTERS = {"matches": ("exists_matches",), "differs": ("exists_differs",), "not_in_production": ("not_in_production",),
-                 "blocked": ("exists_other", "ambiguous"), "clone_unavailable": ("clone_unavailable",)}
-MATCH_FILTER_LABELS = (("matches", "Matches"), ("differs", "Differs"), ("not_in_production", "Not in production"),
-                       ("blocked", "Blocked"), ("clone_unavailable", "Clone unavailable"))
-MATCH_STATUS_ORDER = ("exists_other", "ambiguous", "exists_differs", "clone_unavailable", "not_in_production", "exists_matches")
+               "ambiguous": ("chip-bad", "Ambiguous"), "clone_unavailable": ("chip-warn", "Clone unavailable"),
+               "onboarded": ("chip-ok", "Onboarded"), "uuid_not_in_clone": ("chip-warn", "UUID set, not in clone"),
+               "not_checked": ("chip-neutral", "Not checked")}
+MATCH_FILTERS = {"matches": ("exists_matches",), "onboarded": ("onboarded",), "differs": ("exists_differs",), "not_in_production": ("not_in_production",),
+                 "blocked": ("exists_other", "ambiguous"), "uuid_not_in_clone": ("uuid_not_in_clone",),
+                 "not_checked": ("not_checked",), "clone_unavailable": ("clone_unavailable",)}
+MATCH_FILTER_LABELS = (("matches", "Matches"), ("onboarded", "Onboarded"), ("differs", "Differs"), ("not_in_production", "Not in production"),
+                       ("blocked", "Blocked"), ("uuid_not_in_clone", "UUID not in clone"), ("not_checked", "Not checked"),
+                       ("clone_unavailable", "Clone unavailable"))
+MATCH_STATUS_ORDER = ("exists_other", "ambiguous", "exists_differs", "clone_unavailable", "uuid_not_in_clone", "not_checked",
+                      "not_in_production", "exists_matches", "onboarded")
 FIELD_RESULT_CHIPS = {"match": ("chip-ok", "Match"), "differs": ("chip-warn", "Differs"), "unknown": ("chip-warn", "Unknown"),
                       "info": ("chip-neutral", "Info"), "na": ("chip-neutral", "Not required"),
                       "not_checked": ("chip-neutral", "Not checked")}
@@ -6177,9 +6200,29 @@ def dev_onboarded_refs(evidence: dict[str, list[dict[str, Any]]] | None = None) 
     return [ref for ref, items in evidence.items() if dev_status(items) == "onboarded"]
 
 
+def _match_stamp() -> str:
+    """What the cached production matches were computed from: the served clone's capture time and row digest plus the
+    published snapshot's name. A new clone push or snapshot changes it, so a cached match is never replayed over fresher data
+    (the 5 min display cache only bounds repeated reads of the SAME inputs). Unreadable inputs give a distinct stamp."""
+    parts = []
+    try:
+        latest = json.loads((clone_root() / "prod-clone" / "latest.json").read_text(encoding="utf-8"))
+        parts += [str(latest.get("captured_at")), str(latest.get("rows_sha256"))]
+    except (OSError, ValueError, AttributeError):
+        parts.append("clone-unreadable")
+    try:
+        root = snapshot_root()
+        parts.append(str(vm_snapshot.current_name(root)) if root is not None else "")
+    except Exception:  # noqa: BLE001 - a stamp never breaks a page
+        parts.append("snapshot-unreadable")
+    return "|".join(parts)
+
+
 @_display_cached
-def production_match_display(reference: str, product: str = "", onboarding_type: str = "") -> dict[str, Any]:
-    """The production match of one CO as a cached display read (read-only Salesforce source + clone snapshot)."""
+def production_match_display(reference: str, product: str = "", onboarding_type: str = "", stamp: str = "") -> dict[str, Any]:
+    """The production match of one CO as a cached display read (read-only Salesforce source + clone snapshot).
+
+    ``stamp`` (see ``_match_stamp``) is only a cache key: it makes a new clone or snapshot miss the cache."""
     return production_match_for(reference, product or None, onboarding_type or None)
 
 
@@ -6188,9 +6231,26 @@ def _unreadable_match(reason: str = "co_source_unreadable") -> dict[str, Any]:
             "captured_at": None, "age_seconds": None, "tenants_checked": 0, "route": None}
 
 
+def _fresh_match(match: Any, now: datetime | None = None) -> Any:
+    """Re-check the clone age at READ time: a cached match computed inside the 6 h limit is never replayed as usable once the
+    clone has passed it. The age is the age at compute time plus the time since (``computed_at``); a match without those
+    fields (canned or legacy) is returned as is, a malformed one fails closed."""
+    if not isinstance(match, dict) or match.get("status") in ("clone_unavailable", "not_checked") or "computed_at" not in match:
+        return match
+    try:
+        computed = datetime.fromisoformat(str(match["computed_at"]))
+        age = float(match["age_seconds"]) + ((now or datetime.now(timezone.utc)) - computed).total_seconds()
+    except (TypeError, ValueError, KeyError):
+        age = float("inf")
+    if age > inventory.PRODUCTION_GATE_MAX_AGE.total_seconds():
+        return {**_unreadable_match("inventory_snapshot_stale"), "captured_at": match.get("captured_at"),
+                "age_seconds": int(age) if age != float("inf") else None}
+    return {**match, "age_seconds": max(0, int(age))}
+
+
 def _match_of(reference: str, product: str | None, onboarding_type: str | None) -> dict[str, Any]:
     try:
-        return production_match_display(reference, product or "", onboarding_type or "")
+        return _fresh_match(production_match_display(reference, product or "", onboarding_type or "", _match_stamp()))
     except Exception:  # noqa: BLE001 - a failed read never clears a CO: it shows as unavailable
         return _unreadable_match()
 
@@ -6207,6 +6267,12 @@ def _dev_status_chip(items: list[dict[str, Any]]) -> str:
 
 def _prod_action(result: dict[str, Any]) -> str:
     status, reason = result["status"], str(result.get("reason") or "")
+    if status == "onboarded":
+        return "Review warnings" if (result.get("review") or {}).get("warnings") else "None"
+    if status == "uuid_not_in_clone":
+        return "Wait for the next clone"
+    if status == "not_checked":
+        return "Check CO source data"
     if status == "exists_differs":
         return "Review fields"
     if status in ("exists_other", "ambiguous"):
@@ -6290,7 +6356,7 @@ def _prod_scope(all_open: bool) -> tuple[list[tuple[str, dict[str, str | None] |
 def _prod_results(scope: list[tuple[str, dict[str, str | None] | None]]) -> list[tuple[str, dict[str, str | None] | None, dict[str, Any]]]:
     for ref, row in scope:  # overlap the read-only source reads (shared, cached display reads)
         prefetch_display_read(production_match_display, ref, (row or {}).get("Onboarding_Product__c") or "",
-                              (row or {}).get("Onboarding_Type__c") or "")
+                              (row or {}).get("Onboarding_Type__c") or "", _match_stamp())
     return [(ref, row, _match_of(ref, (row or {}).get("Onboarding_Product__c"), (row or {}).get("Onboarding_Type__c")))
             for ref, row in scope]
 
@@ -6359,6 +6425,9 @@ REVIEW_BLOCKER_TEXT = {
     "production_exists_other": "Only trial, evaluation, POV, disabled or deleted production tenants match: the owner must resolve it.",
     "production_ambiguous": "More than one live paid production tenant has this exact name.",
     "production_clone_unavailable": "The production clone could not be used (missing, stale or unreadable data).",
+    "production_onboarded": "A production tenant already carries this CO's Account UUID: this CO is already onboarded.",
+    "production_uuid_not_in_clone": "The CO holds an Account UUID but no clone tenant has it yet (the clone may be older than the create).",
+    "production_not_checked": "The production inputs for this CO are not available, so no match was computed.",
 }
 
 
@@ -6415,6 +6484,8 @@ def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]
         "status": status, "reason": str(match.get("reason") or ""), "tenants_checked": int(match.get("tenants_checked") or 0),
         "candidates": [{key: item.get(key) for key in ("name", "domain", "live_paid", "deleted", "enabled", "license_type")}
                        for item in match.get("candidates") or () if isinstance(item, dict)]}
+    if isinstance(match.get("review"), dict):
+        summary["production_check"]["review"] = {key: match["review"].get(key) for key in ("line", "warnings", "not_in_query")}
     extras = {"captured_at": match.get("captured_at"), "age_seconds": match.get("age_seconds")}
     if status != "not_in_production":
         blockers.append("production_" + status)
@@ -6507,7 +6578,7 @@ def render_dev_onboarded() -> str:
         rows, note = {}, "The open queue could not be read from Salesforce; account names are not shown."
     for ref in onboarded:
         prefetch_display_read(production_match_display, ref, (rows.get(ref) or {}).get("Onboarding_Product__c") or "",
-                              (rows.get(ref) or {}).get("Onboarding_Type__c") or "")
+                              (rows.get(ref) or {}).get("Onboarding_Type__c") or "", _match_stamp())
     body = ""
     for ref in onboarded:
         row, record, outcome = rows.get(ref), state.get(ref), outcomes.get(ref)
@@ -6901,7 +6972,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
     for row in rows:
         if route_for(row) == CE_ENGINE or route_for(row) in SURFACE_ROUTES:
             prefetch_display_read(production_match_display, str(row["Name"]), row.get("Onboarding_Product__c") or "",
-                                  row.get("Onboarding_Type__c") or "")
+                                  row.get("Onboarding_Type__c") or "", _match_stamp())
     items = []
     for row in rows:
         ref = str(row["Name"])
@@ -6911,7 +6982,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                  if supported else None)
         approval = production_views.pick_approval(approvals, ref)
         create = production_views.create_state(records, ref, locked=locked)
-        created = create["code"] in production_views.CREATED_OUTCOMES
+        created = create["code"] in production_views.CREATED_OUTCOMES or bool(check and check["code"] == "onboarded")
         items.append({"row": row, "ref": ref, "supported": supported, "check": check, "approval": approval, "create": create,
                       "flags": {"blocked": supported and bool(check and check["blocked"]),
                                 "ready": supported and bool(check) and not check["blocked"] and not created,
@@ -6969,7 +7040,8 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         start = (starts or {}).get(ref) if starts is not None else None
         if item["supported"]:
             checks = (_chip(check["css"], check["label"])
-                      + ("<span class='sub'>" + escape(check["reason"]) + "</span>" if check["blocked"] and check["reason"] else ""))
+                      + ("<span class='sub'>" + escape(check["reason"]) + "</span>"
+                         if (check["blocked"] or check["code"] == "onboarded") and check["reason"] else ""))
             approval_cell = _create_approval_chip(item["approval"])
             create_cell = _chip(item["create"]["css"], item["create"]["label"])
             onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
@@ -7021,7 +7093,12 @@ def _duplicate_items(check: dict[str, Any], values: dict[str, Any]) -> tuple[str
         {"status": check["status"], "candidates": check["candidates"], "tenants_checked": check["tenants_checked"]},
         [str(item) for item in values.get("tenant_names") or []], [str(item) for item in values.get("domains") or []])
     status = str(check["status"])
-    status_css = "chip-ok" if status == "not_in_production" else "chip-warn" if status in ("clone_unavailable", "not_checked") else "chip-bad"
+    if status == "onboarded":
+        warnings = (check.get("review") or {}).get("warnings")
+        return _check_item("Result", escape(check["reason"]) + " " + escape(str((check.get("review") or {}).get("not_in_query") or "")),
+                           _chip("chip-warn" if warnings else "chip-ok", "onboarded")), 0
+    status_css = ("chip-ok" if status == "not_in_production" else "chip-warn"
+                  if status in ("clone_unavailable", "not_checked", "uuid_not_in_clone") else "chip-bad")
     result_small = escape(check["reason"]) + (" " if check["reason"] else "") + "Tenants checked: " + str(int(check["tenants_checked"] or 0))
     items = _check_item("Result", result_small, _chip(status_css, status.replace("_", " ")))
     if not dup["available"]:

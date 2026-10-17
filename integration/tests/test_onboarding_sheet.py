@@ -238,7 +238,7 @@ class EligibilityTests(unittest.TestCase):
                  ("duplicate_in_production", dict(match=self.DUP)),
                  ("duplicate_in_production", dict(match=self.OTHER)),
                  ("live_paid_in_production", dict(match=self.TWO_LIVE)),
-                 ("live_paid_in_production", dict(match=self.AMBIGUOUS)))
+                 ("duplicate_in_production", dict(match=self.AMBIGUOUS)))
         for reason, over in cases:
             result = sheet(**over)
             self.assertEqual((result["state"], result["reason"], result["rows"], result["after"]), ("refused", reason, [], []), over)

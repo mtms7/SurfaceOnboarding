@@ -502,3 +502,166 @@ class VmProductionFirstPagesTests(SnapshotDashboardCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
+    """The VM computes the per-CO match from the FRESH pushed clone (<state>/clone-inventory), never from a replayed result;
+    a CO that already owns a clone tenant (its Account UUID) is Onboarded, not a duplicate (owner 2026-10-17)."""
+
+    PRODUCT, KIND = "Credential Exposure", "New Product Onboarding"
+    UUID = f"{2:032x}"  # the accountUuid of tenant row 2 of test_clone_push.row
+    NAME, DOMAIN = "Acme Snapshot Customer - CE Only", "snapshot-customer.example"
+
+    def item(self, **over):
+        value = {"engine": runner.CE_ENGINE, "product": self.PRODUCT, "type": self.KIND,
+                 "co_source": {"tenant_names": [self.NAME], "domains": [self.DOMAIN]},
+                 "plan": {"primary_domain": self.DOMAIN, "alternate_domains": [], "license_type": "Prepaid annual subscription",
+                          "license_end": "2027-10-18", "license_start": "2026-10-01", "spycloud_shown": True}}
+        value.update(over)
+        return value
+
+    def publish(self, inputs, uuid=None):
+        refs = ("CO-0001", "CO-0002")
+        details = {ref: {**detail(ref, "Credential Exposure" if ref == "CO-0001" else "Surface", "New Product Onboarding"),
+                         "Account_UUID__c": uuid if ref == "CO-0001" else None} for ref in refs}
+        files = {**FILES, vs.CO_DETAILS_FILE: json.dumps({"details": details}).encode(),
+                 vs.PRODUCTION_INPUTS_FILE: json.dumps({"inputs": inputs}).encode()}
+        vs.ingest_bundle(vs.build_bundle(files, KEY, "desktop", datetime.now(timezone.utc)), KEY, self.state)
+        dashboard.clear_display_cache()
+
+    def push_clone(self, name=None, domain=None, age=timedelta(minutes=50), **tenant_fields):
+        from integration.onboarding import leonardo_inventory as inv, redash_inventory as redash
+        from integration.tests import test_clone_push as cp
+        rows = [cp.row(1), {**cp.row(2), "accountName": name or self.NAME, "accountDomain": domain or self.DOMAIN,
+                            "alternateDomains": [], "accountLicense.licenseType": "Prepaid annual subscription",
+                            "accountLicense.expirationDate": 1823817600000, "accountLicense.assetsNumber": 1,
+                            "accountLicense.domainsNumber": 1, "accountLicense.subDomainsNumber": 1, **tenant_fields}]
+        retrieved = (datetime.now(timezone.utc) - age).strftime("%Y-%m-%dT%H:%M:%S")
+        normalized = redash.normalize({"query_result": {"retrieved_at": retrieved, "data": {
+            "columns": [{"name": key, "type": "string"} for key in rows[0]], "rows": rows}}})
+        payload = inv.snapshot_payload(inv.require_environment("prod-clone"), inv.assemble_rows(normalized.rows),
+                                       normalized.retrieved_at, acquisition=inv.REDASH_ACQUISITION,
+                                       expected_paths=redash.EXPECTED_REDASH_PATHS)
+        inv.write_snapshot(payload, self.state / state_paths.CLONE_SUBDIR, keep=4)
+
+    def match(self, reference="CO-0001"):
+        return runner.production_match_for(reference, self.PRODUCT, self.KIND)
+
+    def test_the_match_uses_the_fresh_pushed_clone_unpatched(self):
+        self.publish({"CO-0001": self.item()})
+        self.push_clone()
+        self.assertIn(self.match()["status"], ("exists_matches", "exists_differs"))
+        self.push_clone("Other Co", "other.example")
+        self.assertEqual(self.match()["status"], "not_in_production")
+
+    def test_a_stale_pushed_clone_still_fails_closed(self):
+        self.publish({"CO-0001": self.item()})
+        self.push_clone(age=timedelta(hours=7))
+        self.assertEqual((self.match()["status"], self.match()["reason"]), ("clone_unavailable", "inventory_snapshot_stale"))
+
+    def test_a_new_push_is_reflected_at_once_not_after_the_display_cache_expires(self):
+        self.publish({"CO-0001": self.item()})
+        self.push_clone("Other Co", "other.example")
+        token = dashboard._display_reads.set(True)  # the display cache is only active inside a display GET
+        self.addCleanup(dashboard._display_reads.reset, token)
+        self.assertEqual(dashboard._match_of("CO-0001", self.PRODUCT, self.KIND)["status"], "not_in_production")
+        self.push_clone()  # the tenant appears in the next push; no cache clearing in between
+        self.assertIn(dashboard._match_of("CO-0001", self.PRODUCT, self.KIND)["status"], ("exists_matches", "exists_differs"))
+
+    def test_a_co_that_owns_the_clone_tenant_is_onboarded_not_duplicate(self):
+        self.publish({"CO-0001": self.item()}, uuid=self.UUID)
+        self.push_clone()
+        found = self.match()
+        self.assertEqual(found["status"], "onboarded")
+        self.assertEqual(found["review"]["warnings"], [])
+        status, _, body = self.get("/", email=OWNER)
+        row = body[body.index(">CO-0001<"):body.index("</tr>", body.index(">CO-0001<"))]
+        self.assertIn("Onboarded", row)
+        self.assertIn("license active until 2027-10-18", row)
+        self.assertNotIn(">Duplicate<", row)
+        self.assertNotIn(self.UUID, body)
+        self.assertNotIn("<form method='post'", body)
+
+    def test_the_onboarded_status_line_carries_each_deviation_as_a_warning(self):
+        self.publish({"CO-0001": self.item()}, uuid=self.UUID)
+        self.push_clone(**{"enabled": False})
+        found = self.match()
+        self.assertEqual(found["status"], "onboarded")
+        self.assertIn("tenant_disabled", found["review"]["warnings"])
+        _, _, body = self.get("/", email=OWNER)
+        self.assertIn("tenant disabled", body)
+
+    def test_uuid_set_but_not_in_the_clone_is_not_onboarded_and_not_clear(self):
+        self.publish({"CO-0001": self.item()}, uuid=f"{99:032x}")
+        self.push_clone("Other Co", "other.example")
+        self.assertEqual(self.match()["status"], "uuid_not_in_clone")
+        _, _, body = self.get("/", email=OWNER)
+        self.assertIn("UUID set, not in clone", body)
+
+    def test_a_different_uuid_on_the_matching_tenant_stays_a_blocking_duplicate(self):
+        self.publish({"CO-0001": self.item()}, uuid=f"{99:032x}")
+        self.push_clone()
+        self.assertIn(self.match()["status"], ("exists_matches", "exists_differs"))
+        _, _, body = self.get("/", email=OWNER)
+        self.assertIn(">Duplicate<", body)
+
+    def test_a_co_without_prepared_inputs_is_not_checked_and_does_not_blame_the_clone(self):
+        self.publish({"CO-0001": self.item()})
+        self.push_clone()
+        found = self.match("CO-0002")
+        self.assertEqual((found["status"], found["reason"]), ("not_checked", "production_inputs_not_prepared"))
+        _, _, body = self.get("/", email=OWNER)
+        row = body[body.index(">CO-0002<"):body.index("</tr>", body.index(">CO-0002<"))]
+        self.assertIn("Not checked", row)
+        self.assertNotIn("Clone unavailable", row)
+        self.assertNotIn("Clone stale", row)
+
+    def test_only_inactive_tenants_show_other_tenants_only(self):
+        self.publish({"CO-0001": self.item()})
+        self.push_clone(**{"enabled": False})
+        _, _, body = self.get("/", email=OWNER)
+        row = body[body.index(">CO-0001<"):body.index("</tr>", body.index(">CO-0001<"))]
+        self.assertIn("Other tenants only", row)
+
+    def test_cache_is_bounded_and_a_new_stamp_supersedes_the_old_entry(self):
+        token = dashboard._display_reads.set(True)
+        self.addCleanup(dashboard._display_reads.reset, token)
+        with patch.object(dashboard, "production_match_for", return_value={"status": "not_in_production", "reason": ""}):
+            dashboard.production_match_display("CO-0001", "p", "t", "stamp-1")
+            dashboard.production_match_display("CO-0001", "p", "t", "stamp-2")
+            keys = [k for k in dashboard._display_cache if k[0] == "production_match_display"]
+            self.assertEqual(keys, [("production_match_display", "CO-0001", "p", "t", "stamp-2")])
+            with patch.object(dashboard, "DISPLAY_CACHE_MAX_ENTRIES", 5):
+                for index in range(20):
+                    dashboard.production_match_display(f"CO-{index:04d}", "p", "t", "s")
+            self.assertLessEqual(len(dashboard._display_cache), 5)
+
+    def test_a_cached_match_is_re_aged_at_read_time_and_fails_closed_after_6_hours(self):
+        now = datetime.now(timezone.utc)
+        cached = {"status": "onboarded", "reason": "x", "captured_at": "2026-10-17T10:00:00Z", "age_seconds": 5 * 3600 + 59 * 60,
+                  "computed_at": now.isoformat(), "review": {"warnings": []}}
+        self.assertEqual(dashboard._fresh_match(cached, now + timedelta(seconds=30))["status"], "onboarded")
+        later = dashboard._fresh_match(cached, now + timedelta(minutes=2))
+        self.assertEqual((later["status"], later["reason"]), ("clone_unavailable", "inventory_snapshot_stale"))
+        self.assertEqual(dashboard._fresh_match({**cached, "computed_at": "garbage"}, now)["status"], "clone_unavailable")
+        self.assertEqual(dashboard._fresh_match({"status": "not_in_production"})["status"], "not_in_production")  # canned: untouched
+
+    def test_two_deleted_uuid_twins_read_ambiguous_not_live_paid(self):
+        self.publish({"CO-0001": self.item()}, uuid=self.UUID)
+        self.push_clone(**{"isDeleted": True})
+        from integration.onboarding import production_views as pv
+        match = {"status": "ambiguous", "reason": "", "candidates": [{"live_paid": False}, {"live_paid": False}]}
+        self.assertEqual(pv.production_check(match)["label"], "Ambiguous")
+
+    def test_filters_keep_uuid_and_not_checked_out_of_clone_unavailable(self):
+        self.assertEqual(dashboard.MATCH_FILTERS["clone_unavailable"], ("clone_unavailable",))
+        self.assertEqual(dashboard.MATCH_FILTERS["uuid_not_in_clone"], ("uuid_not_in_clone",))
+        self.assertEqual(dashboard.MATCH_FILTERS["not_checked"], ("not_checked",))
+        self.assertEqual(dashboard.MATCH_FILTERS["onboarded"], ("onboarded",))
+        self.assertNotIn("onboarded", dashboard.MATCH_FILTERS["matches"])
+        self.assertEqual({key for key, _ in dashboard.MATCH_FILTER_LABELS}, set(dashboard.MATCH_FILTERS))
+
+    def test_the_desktop_match_says_the_uuid_check_runs_on_the_vm(self):
+        with patch.dict(os.environ, {"SURFACE_ONBOARDING_RUNTIME": "desktop"}):
+            self.assertIsNone(runner._snapshot_account_uuid("CO-0001"))

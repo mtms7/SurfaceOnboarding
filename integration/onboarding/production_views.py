@@ -238,6 +238,14 @@ def create_state(records: dict[str, Any], co_reference: str, *, locked: bool) ->
 
 # --- Production checks chip -----------------------------------------------------------------------------------------
 
+NOT_CHECKED_TEXT = {
+    "production_inputs_not_prepared": "Production inputs are only prepared for CE-only COs; the clone itself is fine.",
+    "co_source_unreadable": "The CO's name or domains could not be read; the clone itself is fine."}
+
+
+UUID_NOTE = "UUID check runs on the VM dashboard."
+
+
 def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
     """One chip for a per-CO production match: Clear, Duplicate, Live paid x N, Clone stale or Clone unavailable.
 
@@ -256,11 +264,27 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
         if reason == "inventory_snapshot_stale":
             return {**base, "code": "clone_stale", "css": "chip-warn", "label": "Clone stale"}
         return {**base, "code": "unavailable", "css": "chip-warn", "label": "Clone unavailable"}
+    if match.get("uuid_checked") is False and status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
+        base["reason"] = (reason + " " + UUID_NOTE).strip()
+    if status == "not_checked":
+        return {**base, "code": "not_checked", "css": "chip-neutral", "label": "Not checked",
+                "reason": NOT_CHECKED_TEXT.get(reason, reason)}
+    if status == "onboarded":
+        warnings = (match.get("review") or {}).get("warnings") if isinstance(match.get("review"), dict) else None
+        label = "Onboarded: review" if "identity_mismatch" in (warnings or []) else "Onboarded"
+        return {**base, "code": "onboarded", "css": "chip-warn" if warnings else "chip-ok", "label": label,
+                "blocked": False, "warnings": list(warnings or [])}
+    if status == "uuid_not_in_clone":
+        return {**base, "code": "uuid_not_in_clone", "css": "chip-warn", "label": "UUID set, not in clone"}
     if status == "not_in_production":
         return {**base, "code": "clear", "css": "chip-ok", "label": "Clear", "blocked": False}
     if status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
-        if live > 1 or status == "ambiguous":
-            return {**base, "code": "live_paid", "css": "chip-bad", "label": "Live paid x " + str(max(live, 2))}
+        if live > 1:
+            return {**base, "code": "live_paid", "css": "chip-bad", "label": "Live paid x " + str(live)}
+        if status == "ambiguous":  # e.g. two tenants carry the CO's UUID, but fewer than two are live and paid
+            return {**base, "code": "ambiguous", "css": "chip-bad", "label": "Ambiguous"}
+        if status == "exists_other":
+            return {**base, "code": "other_tenants", "css": "chip-bad", "label": "Other tenants only"}
         return {**base, "code": "duplicate", "css": "chip-bad", "label": "Duplicate"}
     return unusable
 
@@ -399,8 +423,11 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, sessio
     if check["code"] == "clear":
         items.append(_item("duplicate", "ready", "No match in the production clone (" + str(int((match or {}).get("tenants_checked") or 0))
                            + " tenants checked)."))
-    elif check["code"] in ("duplicate", "live_paid"):
-        items.append(_item("duplicate", "blocked", check["label"] + " in the production clone."))
+    elif check["code"] == "onboarded":
+        items.append(_item("duplicate", "ready", check["reason"] or "Already onboarded: tenant found in production (UUID matches the CO)."))
+    elif check["code"] in ("duplicate", "live_paid", "other_tenants", "ambiguous"):
+        items.append(_item("duplicate", "blocked", check["label"] + " in the production clone."
+                           + (" " + UUID_NOTE if (match or {}).get("uuid_checked") is False else "")))
     else:
         items.append(_item("duplicate", "unavailable", check["label"] + ". A missing match is never a clearance."))
     # 5 Salesforce data
@@ -509,8 +536,11 @@ def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clo
         items.append(chip(label, "ok", "Not in production; clone " + age + " old, limit 6 h"))
     elif clone_state == "stale":
         items.append(chip(label, "blocked", "Clone " + age + " old: older than 6 h, not trusted"))
-    elif check["code"] in ("duplicate", "live_paid"):
-        items.append(chip(label, "blocked", check["label"] + " in the production clone"))
+    elif check["code"] == "onboarded":
+        items.append(chip(label, "ok", "Already onboarded: tenant found in production (UUID matches the CO)"))
+    elif check["code"] in ("duplicate", "live_paid", "other_tenants", "ambiguous"):
+        items.append(chip(label, "blocked", check["label"] + " in the production clone"
+                          + (". " + UUID_NOTE if (match or {}).get("uuid_checked") is False else "")))
     else:
         items.append(chip(label, "unavailable", check["label"] + ": " + UNAVAILABLE_ON_SERVER))
     window = timing_window(co.get("start_iso"), today, days_before)
@@ -568,7 +598,7 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
               else "account_uuid_unread" if co.get("uuid_state") != "empty"
               else "approval_not_approved" if co.get("approval_status") != "Approved"
               else "live_paid_in_production" if check_code == "live_paid"
-              else "duplicate_in_production" if check_code == "duplicate"
+              else "duplicate_in_production" if check_code in ("duplicate", "other_tenants", "ambiguous")
               else "one_email_domain_required" if len(tokens) != 1
               else "email_domain_invalid" if domain is None
               else "account_name_unavailable" if tenant is None else "")

@@ -58,7 +58,7 @@ class StateMachineTests(unittest.TestCase):
         for bad_co, bad_plan in ((None, PLAN), (CO, None), ({"tenant_names": (), "domains": ("a.example",)}, PLAN),
                                  ({"tenant_names": ("Acme",), "domains": ()}, PLAN)):
             found = pm.production_match(bad_co, bad_plan, snapshot(tenant(**GOOD)))
-            self.assertEqual((found["status"], found["reason"]), ("clone_unavailable", "co_source_unreadable"))
+            self.assertEqual((found["status"], found["reason"]), ("not_checked", "co_source_unreadable"))
 
     def test_no_candidate_is_not_in_production_and_says_it_is_not_a_clearance(self):
         found = match(tenant("Other Corp", "other.example", ("x.other.example",)))
@@ -264,14 +264,14 @@ class RunnerGlueTests(unittest.TestCase):
             found = runner.production_match_for("CO-0801", "Credential Exposure", "New Product Onboarding")
         self.assertEqual((found["status"], found["reason"]), ("clone_unavailable", "inventory_snapshot_missing"))
 
-    def test_an_unreadable_co_source_is_clone_unavailable_never_a_clearance(self):
+    def test_an_unreadable_co_source_is_not_checked_never_a_clearance(self):
         self.collect(row(1))
         for error in (RuntimeError("salesforce_fill_source_unavailable"), ValueError(), KeyError("x")):
             with self.subTest(error=error), patch.object(runner, "_production_expectation", side_effect=error), self.clock():
                 found = runner.production_match_for("CO-0801", "Credential Exposure", "New Product Onboarding")
-                self.assertEqual((found["status"], found["reason"]), ("clone_unavailable", "co_source_unreadable"))
+                self.assertEqual((found["status"], found["reason"]), ("not_checked", "production_inputs_not_prepared"))
         with self.clock():
-            self.assertEqual(runner.production_match_for("not-a-co")["reason"], "co_source_unreadable")
+            self.assertEqual(runner.production_match_for("not-a-co")["reason"], "production_inputs_not_prepared")
 
     def test_the_expectation_comes_from_the_co_and_passes_to_the_match(self):
         self.collect(row(1, accountName="Acme - CE Only", accountDomain="mail.example", alternateDomains=[],
@@ -344,3 +344,121 @@ class RunnerGlueTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+UUID = "0123456789abcdef0123456789abcdef"
+OTHER_UUID = "fedcba9876543210fedcba9876543210"
+TODAY = date(2026, 10, 17)
+CE_NAME = "Acme - CE Only"
+CE_CO = {"tenant_names": (CE_NAME,), "domains": ("acme.example",)}
+CE_PLAN = {**PLAN, "alternate_domains": ()}
+
+
+def ce_tenant(**over):
+    base = tenant(CE_NAME, "acme.example", kind="Prepaid annual subscription", spycloud=True)
+    base["account_uuid"] = over.pop("uuid", UUID)
+    base["license"] = {"type": "Prepaid annual subscription", "start_date": 1790812800000, "expiration_date": END_MS, "enabled": True,
+                       "assets_number": 1, "domains_number": 1, "subdomains_number": 1, "leaked_credentials_allowed": True,
+                       **over.pop("license", {})}
+    base.update(over)
+    return base
+
+
+def owned(*tenants, uuid=UUID, **kwargs):
+    return pm.production_match(CE_CO, CE_PLAN, snapshot(*tenants), account_uuid=uuid, ce_only=True, today=TODAY, **kwargs)
+
+
+class OnboardedByUuidTests(unittest.TestCase):
+    """The CO's own Account UUID equals a clone tenant's accountUuid: onboarded, not a duplicate (owner 2026-10-17)."""
+
+    def test_matching_uuid_is_onboarded_with_a_clean_status_line(self):
+        found = owned(ce_tenant())
+        self.assertEqual(found["status"], "onboarded")
+        self.assertEqual(found["review"]["warnings"], [])
+        self.assertIn("tenant enabled, license active until 2027-10-18 (matches DealHub end rule: expected 2027-10-18)", found["reason"])
+        self.assertIn("Not in query 251", found["review"]["not_in_query"])
+        self.assertNotIn(UUID, json.dumps(found))
+
+    def test_uuid_is_compared_case_and_hyphen_insensitively(self):
+        dashed = "-".join((UUID[:8], UUID[8:12], UUID[12:16], UUID[16:20], UUID[20:])).upper()
+        self.assertEqual(owned(ce_tenant(), uuid=dashed)["status"], "onboarded")
+
+    def test_uuid_set_but_no_tenant_and_no_candidate_is_not_clearance(self):
+        found = owned(tenant("Other", "other.example"))
+        self.assertEqual(found["status"], "uuid_not_in_clone")
+        self.assertIn("UUID set but tenant not found in clone", found["reason"])
+
+    def test_different_uuid_on_the_matching_tenant_is_still_a_duplicate(self):
+        found = owned(ce_tenant(uuid=OTHER_UUID))
+        self.assertIn(found["status"], ("exists_matches", "exists_differs"))
+
+    def test_malformed_uuid_never_matches(self):
+        self.assertEqual(owned(ce_tenant(), uuid="not-a-uuid")["status"], "exists_matches")  # falls to the name/domain rules
+
+    def test_second_live_paid_tenant_with_the_name_is_ambiguous(self):
+        rival = ce_tenant(uuid=OTHER_UUID)
+        rival["id"] = "id-rival"
+        self.assertEqual(owned(ce_tenant(), rival)["status"], "ambiguous")
+
+    def test_two_tenants_with_the_uuid_are_ambiguous(self):
+        twin = ce_tenant()
+        twin["id"] = "id-twin"
+        self.assertEqual(owned(ce_tenant(), twin)["status"], "ambiguous")
+
+    def test_without_a_uuid_the_old_behaviour_is_unchanged(self):
+        self.assertIn(owned(ce_tenant(), uuid=None)["status"], ("exists_matches", "exists_differs"))
+
+    def test_each_deviation_is_a_warning_not_a_block(self):
+        cases = {
+            "tenant_disabled": dict(enabled=False), "tenant_deleted": dict(is_deleted=True),
+            "license_not_enabled": dict(license={"enabled": False}), "license_expired": dict(license={"expiration_date": 1700000000000}),
+            "expiry_differs": dict(license={"expiration_date": 1824000000000}),
+            "license_end_unknown": dict(license={"expiration_date": None}),
+            "license_counts_differ": dict(license={"domains_number": 2}), "spycloud_off": dict(spycloud_enabled=False),
+            "leaked_credentials_off": dict(license={"leaked_credentials_allowed": False}),
+            "name_suffix_missing": dict(account_name="Acme"),
+        }
+        for code, over in cases.items():
+            with self.subTest(code):
+                found = owned(ce_tenant(**over))
+                self.assertEqual(found["status"], "onboarded")
+                self.assertIn(code, found["review"]["warnings"])
+                self.assertTrue(found["reason"].startswith("Onboarded - check:"))
+
+    def test_ce_only_checks_are_skipped_for_other_routes(self):
+        found = pm.production_match(CE_CO, CE_PLAN, snapshot(ce_tenant(spycloud_enabled=False, account_name="Acme")),
+                                    account_uuid=UUID, ce_only=False, today=TODAY)
+        self.assertEqual(found["review"]["warnings"], ["identity_mismatch"])  # only the identity check; no CE-only warnings
+
+    def test_missing_inputs_are_not_checked_and_not_a_clone_problem(self):
+        found = pm.production_match(None, None, snapshot(ce_tenant()), account_uuid=UUID)
+        self.assertEqual((found["status"], found["reason"]), ("not_checked", "co_source_unreadable"))
+        self.assertEqual(pm.production_match(CE_CO, CE_PLAN, "inventory_snapshot_stale")["status"], "clone_unavailable")
+
+    def test_uuid_owner_with_a_different_name_or_domain_is_flagged_not_clean(self):
+        for over in (dict(account_name="Totally Different Co - CE Only"), dict(account_domain="elsewhere.example")):
+            with self.subTest(over):
+                found = owned(ce_tenant(**over))
+                self.assertEqual(found["status"], "onboarded")
+                self.assertIn("identity_mismatch", found["review"]["warnings"])
+                self.assertIn("IDENTITY MISMATCH", found["reason"])
+
+    def test_a_live_paid_rival_by_domain_is_a_blocking_ambiguity(self):
+        rival = tenant("Unrelated Name", "acme.example", kind="Prepaid annual subscription")
+        self.assertEqual(owned(ce_tenant(account_name="Mismatch"), rival)["status"], "ambiguous")
+        self.assertEqual(owned(ce_tenant(), rival)["status"], "ambiguous")
+
+    def test_a_deleted_or_trial_tenant_on_the_domain_is_not_a_rival(self):
+        self.assertEqual(owned(ce_tenant(), tenant("Old", "acme.example", deleted=True))["status"], "onboarded")
+        self.assertEqual(owned(ce_tenant(), tenant("Old2", "acme.example", kind="TRIAL"))["status"], "onboarded")
+
+    def test_a_non_prepaid_licence_type_is_a_warning(self):
+        found = owned(ce_tenant(license={"type": "Trial"}))
+        self.assertIn("license_type_differs", found["review"]["warnings"])
+
+    def test_a_missing_dealhub_end_says_the_expiry_is_not_verified(self):
+        plan = {**CE_PLAN, "license_end": None}
+        found = pm.production_match(CE_CO, plan, snapshot(ce_tenant()), account_uuid=UUID, ce_only=True, today=TODAY)
+        self.assertEqual(found["status"], "onboarded")
+        self.assertIn("expiry not verified: DealHub end unknown", found["reason"])
+        self.assertNotIn("expected unknown", found["reason"])

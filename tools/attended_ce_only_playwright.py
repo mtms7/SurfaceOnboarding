@@ -8037,11 +8037,30 @@ def production_review_inputs(reference: str, product: Any = None, onboarding_typ
     return {"engine": engine, "co_source": co_source, "plan": plan}
 
 
+def _snapshot_account_uuid(reference: str) -> str | None:
+    """VM mode: the CO's own Salesforce Account UUID from the published co_details.json (never shown or logged).
+
+    ``None`` = the UUID check cannot run (desktop, or no readable detail); ``""`` = read, and the field is empty."""
+    from integration.onboarding import state_paths, vm_snapshot
+
+    folder = state_paths.state_dir()
+    if folder is None or not state_paths.vm_mode():
+        return None
+    try:
+        value = vm_snapshot.load_current_json(vm_snapshot.snapshots_root(folder), vm_snapshot.CO_DETAILS_FILE)["details"][
+            reference]["Account_UUID__c"]
+    except (vm_snapshot.SnapshotError, KeyError, TypeError, AttributeError):
+        return None
+    return value.strip() if isinstance(value, str) else ""
+
+
 def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
     """Read-only production match of one CO (see ``integration.onboarding.production_match``).
 
     The clone snapshot is read first (an unusable clone needs no Salesforce read); then one read-only source/plan
-    read. Any failure fails closed as ``clone_unavailable`` with a reason. No Leonardo, browser or write.
+    read. A CO whose inputs cannot be built is ``not_checked`` (the clone itself may be fine); an unusable clone is
+    ``clone_unavailable``. No Leonardo, browser or write. VM mode also passes the CO's own Account UUID so a tenant it
+    already owns shows as ``onboarded`` instead of a duplicate.
     """
     from integration.onboarding import production_match as match
 
@@ -8054,7 +8073,12 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
             engine, co_source, plan = _production_expectation(reference, product, onboarding_type)
         except (RuntimeError, ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.SubprocessError):
             co_source = plan = None
-    result = match.production_match(co_source, plan, snapshot)
+    uuid_value = _snapshot_account_uuid(reference)
+    result = match.production_match(co_source, plan, snapshot, account_uuid=uuid_value or None, ce_only=engine == CE_ENGINE)
+    result["uuid_checked"] = uuid_value is not None
+    result["computed_at"] = datetime.now(timezone.utc).isoformat()  # lets a cached match be re-aged at read time
+    if result["status"] == "not_checked" and result["reason"] == "co_source_unreadable":
+        result["reason"] = "production_inputs_not_prepared"
     result["route"] = engine
     return result
 
