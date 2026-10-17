@@ -245,6 +245,7 @@ class Harness:
     def __init__(self, state_dir, approval_path, click="submitted", readback=None, fill=None):
         self.state_dir, self.approval_path = state_dir, approval_path
         self.counts = {"fill": 0, "click": 0, "readback": 0, "write": 0}
+        self.dup_result = None
         self.order = []
         self._click, self._fill, self._readback = click, fill, readback
         self.clock_state = {"now": NOW}
@@ -282,7 +283,12 @@ class Harness:
         if self._readback is not None:
             return self._readback
         return {"tenant_name": "Grupo Patio", "domains": ["patio.cl"], "account_id": "a" * 24, "account_uuid": UUID,
-                "response_shape": ["id", "uuid", "access_token"]}
+                "response_shape": ["id", "uuid", "access_token"], "contract_mismatches": []}
+
+    def dup_check(self, inputs):
+        self.counts["dup"] = self.counts.get("dup", 0) + 1
+        self.order.append("dup")
+        return self.dup_result
 
     def write_record(self, data):
         self.counts["write"] += 1
@@ -302,6 +308,7 @@ class Harness:
             kwargs["_approval_check_fn"] = check
         if not dry_run:
             kwargs.setdefault("prior_records", [DRY_RECORD])
+            kwargs.setdefault("live_duplicate_check", self.dup_check)
         kwargs.update(extra)
         return pc.run(self.inputs() if inputs is None else inputs, dry_run, self.fill_form, self.click_confirm,
                       self.read_back, self.write_record, **kwargs)
@@ -498,7 +505,8 @@ class TestFreshClock(Base):
     def test_default_clock_is_the_real_utc_time(self):
         h = self.harness()
         result = pc.run(h.inputs(), False, h.fill_form, h.click_confirm, h.read_back, h.write_record,
-                        owner_go=True, _production_target_fn=target_ok, prior_records=[DRY_RECORD])
+                        owner_go=True, _production_target_fn=target_ok, prior_records=[DRY_RECORD],
+                        live_duplicate_check=h.dup_check)
         # The fixtures are dated 2026-10-16 12:00 UTC; with the real clock a click only happens if the fresh gate
         # passed, and then the approval was consumed first.
         self.assertEqual(h.counts["click"], 1 if h.consumed() else 0)
@@ -570,8 +578,8 @@ class TestLiveCreate(Base):
         h = self.harness()
         result = h.run(dry_run=False, owner_go=True)
         self.assertEqual(result.outcome, "readback_verified")
-        self.assertEqual(h.counts, {"fill": 1, "click": 1, "readback": 1, "write": 2})
-        self.assertEqual(h.order, ["fill", "write", "click", "readback", "write"])
+        self.assertEqual(h.counts, {"fill": 1, "click": 1, "readback": 1, "write": 2, "dup": 1})
+        self.assertEqual(h.order, ["fill", "dup", "write", "click", "readback", "write"])
         self.assertEqual(h.at_click, {"consumed": True, "outcomes": ["attempt_started"]})
         self.assertEqual(h.outcomes, ["attempt_started", "readback_verified"])
         self.assertTrue(h.consumed())
@@ -704,7 +712,7 @@ class TestLiveCreate(Base):
 
     def test_domain_compare_is_case_and_order_insensitive(self):
         rb = {"tenant_name": "Grupo Patio", "domains": ["B.COM", " a.com "], "account_id": "a" * 24,
-              "account_uuid": UUID.upper()}
+              "account_uuid": UUID.upper(), "contract_mismatches": []}
         h = self.harness(readback=rb)
         inputs = h.inputs(expected_domains=("A.com", "b.com"))
         self.assertEqual(h.run(inputs, dry_run=False, owner_go=True).outcome, "readback_verified")

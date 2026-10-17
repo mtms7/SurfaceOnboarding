@@ -710,7 +710,10 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
 
     def test_production_pages_have_no_post_route_and_the_runner_stays_locked(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        for route in dashboard.POST_ROUTES:
+        # The guarded create/UUID routes (docs/53) are the ONLY allowed exception: they exist as POST routes but refuse
+        # every request while a lock constant is False (tests/test_production_create_ui.py proves it).
+        from integration.onboarding import production_create_ui as create_ui
+        for route in dashboard.POST_ROUTES - create_ui.POST_PATHS:
             self.assertNotRegex(route, r"production-create|create-production|uuid-writeback")
         self.assertFalse([route for route in dashboard.POST_ROUTES if route.startswith(("/prod", "/dev", "/onboard"))])
         for path in ("/", "/onboard", "/prod/approvals", "/onboard/CO-0780"):

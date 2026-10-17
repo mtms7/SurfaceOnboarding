@@ -32,7 +32,7 @@ EDITABLE_CANDIDATES = ("account_id", "account_uuid", "domains", "plan_summary", 
 
 _SCALAR_FIELDS = ("route", "approval_ref", "refusal_reason", "tenant_name", "account_id", "account_uuid",
                   "plan_summary", "salesforce_revision")
-_LIST_FIELDS = ("domains", "response_shape")
+_LIST_FIELDS = ("domains", "response_shape", "readback_mismatches")
 ADVANCED_SECTION_VALUES = ("found", "not_found")
 ADVANCED_CONTROL_STATES = ("on", "off", "absent")
 _ALLOWED = frozenset({"co_reference", "outcome", "recorded_at", "redactions", "form_fields_checked",
@@ -110,7 +110,7 @@ def _sanitize(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
     for name in _LIST_FIELDS:
         value = data.get(name)
         if isinstance(value, (list, tuple)):
-            clean_item = _clean_name if name == "response_shape" else _clean_free
+            clean_item = _clean_name if name in ("response_shape", "readback_mismatches") else _clean_free
             items = [clean_item(v, counter) for v in list(value)[:MAX_LIST_ITEMS]]
             out[name] = [i for i in items if i is not None]
     checked = data.get("form_fields_checked")

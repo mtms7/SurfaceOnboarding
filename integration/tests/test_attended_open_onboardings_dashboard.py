@@ -1322,7 +1322,10 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         import re as _re
         source = inspect.getsource(dashboard.Handler.do_POST)
         routed = set(_re.findall(r'"(/attended/[a-z0-9-]+)"', source))
-        self.assertEqual(routed, set(dashboard.POST_ROUTES))
+        # The guarded production create routes (docs/53) are dispatched as a set (create_ui.POST_PATHS), not by literal.
+        from integration.onboarding import production_create_ui as _create_ui
+        self.assertEqual(routed | set(_create_ui.POST_PATHS), set(dashboard.POST_ROUTES))
+        self.assertIn("create_ui.POST_PATHS", source)
 
     def test_removed_check_routes_launch_nothing(self):
         # Called on a fake request (no socket): an unknown route must return

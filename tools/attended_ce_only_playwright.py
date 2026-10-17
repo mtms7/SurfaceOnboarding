@@ -9184,13 +9184,16 @@ def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool]) -> dict
 
 
 def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extras: dict[str, Any],
-                         fill_date: Any, date_kept: Any) -> dict[str, str]:
+                         fill_date: Any, date_kept: Any, keep_open: bool = False) -> dict[str, str]:
     """Open the form, check its schema, fill, read the advanced controls, verify by read-back, re-check the session.
 
     Returns ``{field key: "pass" | "fail"}``; raises FormRefusal for a refusal with its own reason. The form is always
     cancelled (never confirmed) before this returns or raises; ``extras["form_cancelled"] = False`` when it did not close.
+    ``keep_open`` (the live create only, docs/53) leaves the verified form open on SUCCESS for the one Confirm click; any
+    refusal or error still cancels it.
     """
     refusal = production_create.FormRefusal
+    verified_open = False
     try:
         form = _pdr_open_form(page, clicks)
         problem = production_dry_run.schema_problem(form)
@@ -9243,9 +9246,12 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
             raise refusal(session, fields)
         if guard.blocked_api_writes():
             raise refusal("write_request_blocked", fields)
+        verified_open = keep_open is True
         return fields
     finally:
-        if production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds and not _pdr_close_form(page, clicks):
+        if verified_open:
+            pass
+        elif production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds and not _pdr_close_form(page, clicks):
             extras["form_cancelled"] = False
             print("FORM LEFT OPEN: close the Add Account window in the production browser yourself (Cancel). "
                   "Nothing was submitted.", flush=True)
@@ -9653,7 +9659,23 @@ def main() -> int:
                         help="With --co: one attended READ-ONLY BackOffice production readback of a created CE-only tenant (docs/42 section 6.3): "
                              "needs SURFACE_ONBOARDING_PRODUCTION_PROBE=1 and SURFACE_ONBOARDING_PRODUCTION_PROBE_REF; you sign in with MFA; "
                              "nothing is typed, clicked, filled, submitted or created.")
+    parser.add_argument("--production-create", action="store_true",
+                        help="With --co, --revision and --owner-go: the guarded LIVE production CE-only create (docs/53). Started only by "
+                             "the dashboard after the owner's typed confirmation; locked by PRODUCTION_RUNNER_SUPPORTED and "
+                             "PRODUCTION_DRY_RUN_SUPPORTED (both False) until a reviewed owner-approved commit.")
+    parser.add_argument("--owner-go", action="store_true",
+                        help="Only with --production-create: the owner's explicit go for this one create (never implied).")
     args = parser.parse_args()
+    if args.owner_go and not args.production_create:
+        parser.error("--owner-go is only valid with --production-create")
+    if args.production_create:
+        if not args.co or not args.revision:
+            parser.error("--co and --revision are required with --production-create")
+        if (args.dry_run or args.confirm_write or args.production_probe or args.production_dry_run
+                or args.production_readback or args.diagnose_confirm or args.readback_only or args.route != CE_ENGINE):
+            parser.error("--production-create is a separate run (CE-only route; no other run flag)")
+        print(run_production_create(args.co, args.revision, owner_go=args.owner_go))
+        return 0
     if args.production_readback:
         if not args.co:
             parser.error("--co is required with --production-readback")
@@ -9843,6 +9865,236 @@ def main() -> int:
         result = run(args.co, args.revision, dry_run=args.dry_run, route=args.route, diagnose=args.diagnose_confirm)
     print(json.dumps({"result": result, "salesforce_writeback": "not_performed"}, separators=(",", ":")))
     return 0
+
+
+# --- Production CE-only LIVE CREATE (docs/53, docs/45 D1-D3) -----------------------------------------------------------
+# The guarded live create. Unreachable while EITHER hard-coded constant (PRODUCTION_RUNNER_SUPPORTED,
+# PRODUCTION_DRY_RUN_SUPPORTED) is False: its first steps are the dry-run flag check and the live production target, before
+# any Salesforce read, browser or network call. Started only by the dashboard after the owner's typed confirmation
+# (``--owner-go``). One create click, no retry; the approval is consumed by the create; the result is a redacted record.
+# It never writes Salesforce: the separate UUID write is a dashboard step with its own confirmation (decision D3).
+def _pcr_line(result: str, **extra: Any) -> str:
+    return json.dumps({"result": result, **extra, "salesforce_writeback": "not_performed"}, separators=(",", ":"))
+
+
+def _pcr_prior_records(parent: Path, reference: str) -> Any:
+    """Every record of this CO, or None when any record cannot be read (run() then refuses: prior_records_invalid)."""
+    try:
+        return [production_create_record.load(path) for path in production_create_record.list_records(parent, reference)]
+    except Exception:
+        return None
+
+
+def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str) -> str | None:
+    """The live BackOffice duplicate pre-check, right before the click: session, name search, domain search, demo list.
+
+    Read-only page fetches through the request guard. The clone is only a hint: this re-checks BackOffice itself by exact
+    name (with the " - CE Only" suffix) and by primary domain, plus the demo-domain rule. Any match, ambiguity or error
+    refuses (the first reason code).
+    """
+    from integration.onboarding import production_create_live as live
+
+    session = _pdr_session_problem(page)
+    if session:
+        return session
+    replies = [_pdr_evaluate(page, production_dry_run.ACCOUNT_SEARCH_JS, "POST", production_dry_run.ACCOUNTS_PATH,
+                             [production_dry_run.ACCOUNTS_PATH, live.live_search_body(value)])
+               for value in (tenant_name, primary_domain)]
+    demo = _pdr_evaluate(page, production_dry_run.DEMO_DOMAINS_JS, "GET", production_dry_run.DEMO_DOMAINS_PATH,
+                         [production_dry_run.DEMO_DOMAINS_PATH, [primary_domain]])
+    return live.live_duplicate_problem(replies[0], replies[1], demo, tenant_name, primary_domain)
+
+
+def _pcr_finish_line(result: Any) -> str:
+    """The one printed line of a live run: a result word or reason from the fixed enums and a record name only."""
+    from integration.onboarding import production_create_live as live
+    from integration.onboarding import production_create_ui as create_ui
+
+    name = result.record_path.name if result.record_path else None
+    word = create_ui.ui_status(result.outcome, result.reason)
+    shown = word if word and word != create_ui.DRY_RUN_PASSED else live.live_known_reason(result.reason or "unexpected_error")
+    line = _pcr_line(shown, outcome=result.outcome, record=name, record_error=result.record_error)
+    return line if production_dry_run.line_problem(line) is None else _pcr_line("dry_run_line_not_redacted")
+
+
+def run_production_create(reference: str, acknowledged_revision: str, *, owner_go: bool = False,
+                          environ: Any | None = None, now: datetime | None = None, records_parent: Path | None = None,
+                          approval_path: Path | None = None, wait_seconds: float = MAX_WAIT_SECONDS,
+                          load_source: Any = None, clone_facts: Any = None, open_page: Any = None,
+                          fill_date: Any = None, date_kept: Any = None, clock: Any = None,
+                          run_day: date | None = None) -> str:
+    """One guarded LIVE production CE-only create for one CO. Returns the printed line (result word, record name only).
+
+    Order: arguments; the dry-run constant; the live production target (runner constant, sessions flag, approval
+    reference, exact origin); Salesforce source and clone; the ordered gate (approval bound to CO, route and the CURRENT
+    revision) before any browser; then in the signed-in page the service-worker check, the session check, the early live
+    duplicate check, the form fill and verification (the form stays open), and ``production_create.run`` live: owner go, prior dry
+    run, no unreviewed attempt, fresh gate, the LIVE duplicate pre-check, the intent record, the approval consume, ONE
+    Confirm click, the bounded readback and the compare against docs/49. Every external step is injectable (tests).
+    """
+    from integration.onboarding import production_create_live as live
+    from integration.onboarding import session_readiness as readiness
+
+    environ = dict(os.environ if environ is None else environ)
+    given_now = now
+    now = now or datetime.now(timezone.utc)
+    if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference)
+            or not production_dry_run.revision_ok(acknowledged_revision)):
+        return _pcr_line("production_create_arguments_invalid")
+    parent = records_parent or _pdr_records_parent()
+    approval_file = approval_path or _pdr_approval_path()
+    extras: dict[str, Any] = {}
+    reference_value = environ.get(production_create.SESSION_REF_ENV, "")
+
+    def stamp() -> datetime:
+        return given_now or datetime.now(timezone.utc)
+
+    def write_record(data: dict[str, Any]) -> Path:
+        merged = {**data, **extras}
+        if "refusal_reason" in merged:
+            merged["refusal_reason"] = live.live_known_reason(str(merged["refusal_reason"]).replace(":", "_"))
+        return production_create_record.record(parent, merged, stamp())
+
+    def refused(reason: str) -> str:
+        data = {"co_reference": reference, "route": CE_ENGINE, "outcome": production_create.OUTCOME_REFUSED,
+                "refusal_reason": live.live_known_reason(str(reason).replace(":", "_")),
+                "salesforce_revision": acknowledged_revision}
+        if production_approval.REFERENCE_PATTERN.fullmatch(reference_value):
+            data["approval_ref"] = reference_value
+        try:
+            name = write_record(data).name
+        except Exception:
+            name = None
+        return _pcr_line(data["refusal_reason"], outcome="refused", record=name)
+
+    # 1. Both locks first: while either constant is False nothing below runs (no read, no browser, no network).
+    if readiness.PRODUCTION_DRY_RUN_SUPPORTED is not True:
+        return refused("production_locked_production_dry_run_not_supported")
+    if reference_value and not (environ.get(PDR_ENV_ISSUED) and environ.get(PDR_ENV_EXPIRES)):
+        record = production_approval.record_for(approval_file, reference_value)
+        if record is not None:
+            try:
+                for key, value in production_approval.unlock_environ(record).items():
+                    environ.setdefault(key, value)
+            except production_approval.ApprovalRefused:
+                pass
+    try:
+        production_target(environ, now)
+    except ProductionLocked as locked:
+        return refused(f"production_locked_{locked.reason}")
+    except ValueError as error:
+        return refused(str(error))
+
+    # 2. Intended values: the fixed Salesforce reads of the Dev runner; start date = the day of creation.
+    day = run_day or _run_day()
+    try:
+        source = (load_source or CE_ROUTE.load_source)(reference)
+        plan = build_ce_only_fill(source, day)
+        intended = production_dry_run.map_plan(plan, SELECT_NAMES, EARLY_SELECTS)
+        contract_intended = ce_production_intended(source, day)
+        expected_row = production_contract.expected_readback_row(contract_intended)
+        readback_body = production_contract.build_readback_body(contract_intended["tenant_name"])
+    except production_dry_run.MappingError as error:
+        return refused(str(error))
+    except ValueError as error:
+        return refused(str(error) if str(error) in production_dry_run.KNOWN_REASONS else "intended_unavailable")
+    except RuntimeError as error:
+        return refused(_pdr_reason(str(error)))
+    except Exception:
+        return refused("salesforce_fill_source_unavailable")
+    try:
+        facts = (clone_facts or _pdr_clone_facts)(source, now)
+    except Exception:
+        facts = {}
+    facts = facts if isinstance(facts, dict) else {}
+    inputs = production_create.CreateInputs(
+        co_reference=reference, route=CE_ENGINE, approval_ref=reference_value, approval_path=approval_file,
+        source_revision=acknowledged_revision, source_revision_now=source.source_revision, now=now, environ=environ,
+        sf_email_domains=(source.email_domain,), sf_source_consistent=True,
+        prior_account_uuid="present" if source.salesforce_id_present else None,
+        clone_collected_at=facts.get("collected_at"), clone_matches=facts.get("clone_matches") is True,
+        duplicate_found=facts.get("duplicate_found") is not False,
+        live_paid_tenant_count=facts.get("live_paid_tenant_count", 99),
+        timing_allowed=onboarding_allowed_now(source.subscription_start, now.date(), environment="prod"),
+        csm_request_recorded=False, sessions_ready=True, schema_ok=True,
+        expected_tenant_name=source.tenant_name, expected_domains=(source.email_domain,),
+        plan_summary="Credential Exposure CE-only create")
+    prior = _pcr_prior_records(parent, reference)
+
+    def no_fill(_inputs: Any) -> Any:
+        raise RuntimeError("production_dry_run_form_not_reached")
+
+    def no_duplicate_check(_inputs: Any) -> str | None:
+        return "duplicate_check_unavailable"
+
+    def run_live(candidate: Any, fill: Any, click: Any, read: Any, duplicate_check: Any) -> Any:
+        return production_create.run(candidate, False, fill, click, read, write_record, owner_go=owner_go is True,
+                                     prior_records=prior, prior_review_cleared_by_owner=False, clock=clock or stamp,
+                                     live_duplicate_check=duplicate_check)
+
+    # 3. The ordered gate BEFORE any browser: a refusal here opens nothing.
+    if production_create.evaluate_gate(inputs, production_target) is not None:
+        return _pcr_finish_line(run_live(inputs, no_fill, live_unreached_click, live_unreached_readback, no_duplicate_check))
+
+    # 4. The browser. ``clicks`` counts the Confirm click; ``guard`` allows exactly one armed create POST.
+    try:
+        target = production_target(environ, now)
+        with (open_page or _pdr_browser_page)(target, wait_seconds) as page:
+            guard = live.LiveRequestGuard()
+            guard.install(page)
+            clicks = live.LiveClickLog()
+            try:
+                worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
+            except Exception:
+                worker = None
+            worker_problem = production_dry_run.service_worker_verdict(worker)
+            if worker_problem:
+                return refused(worker_problem)
+            early = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain)
+            session_codes = ("production_session_expired", "production_session_not_ready")
+            final = dataclasses.replace(inputs, sessions_ready=early not in session_codes,
+                                        duplicate_found=early is not None and early not in session_codes,
+                                        precheck_reason=early or "")
+
+            def fill(_inputs: Any) -> dict[str, str]:
+                return _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
+                                            date_kept or _license_date_kept, keep_open=True)
+
+            def duplicate_check(_inputs: Any) -> str | None:
+                return _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain)
+
+            def click(_inputs: Any) -> str:
+                return live.click_confirm_once(page, guard, clicks, locate=_locate_confirm_button,
+                                               wait_enabled=_confirm_enabled)
+
+            def read(_inputs: Any) -> Any:
+                def fetch() -> Any:
+                    return _pdr_evaluate(page, production_contract.READBACK_JS, "POST", production_contract.ACCOUNTS_PATH,
+                                         [production_contract.ACCOUNTS_PATH, readback_body,
+                                          list(production_contract.READBACK_PICK_PATHS)])
+                return live.poll_readback(fetch, contract_intended, expected_row, page.wait_for_timeout)
+
+            result = run_live(final, fill, click, read, duplicate_check)
+            if clicks.confirm_clicks == 0 and production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds:
+                # Nothing was confirmed: leave no half-filled form behind (Cancel, never Confirm).
+                if not _pdr_close_form(page, clicks):
+                    print("FORM LEFT OPEN: close the Add Account window in the production browser yourself (Cancel). "
+                          "Nothing was submitted.", flush=True)
+            return _pcr_finish_line(result)
+    except production_dry_run.ClickRefused:
+        return refused("production_create_click_not_allowed")
+    except RuntimeError as error:
+        return refused(_pdr_reason(str(error)))
+    except Exception:
+        return refused("production_create_crashed")
+
+
+def live_unreached_click(_inputs: Any) -> Any:
+    raise RuntimeError("production_dry_run_form_not_reached")
+
+
+def live_unreached_readback(_inputs: Any) -> Any:
+    raise RuntimeError("production_dry_run_form_not_reached")
 
 
 def _autopublish_vm_snapshot() -> None:

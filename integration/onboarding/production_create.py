@@ -31,6 +31,9 @@ from .run_target import ProductionLocked, production_dry_run_target, production_
 CLONE_MAX_AGE = timedelta(hours=6)
 SUBMITTED = "submitted"
 UNCERTAIN = "uncertain"
+# ``click_confirm`` returns this when it provably sent nothing (control missing, disabled or covered). The approval is
+# already consumed by then, so the attempt stays blocked for the owner's review (``attempt_started`` is on record).
+NOT_CLICKED = "not_clicked"
 
 OUTCOME_REFUSED = "refused"
 OUTCOME_DRY_RUN = "dry_run_passed"
@@ -261,6 +264,13 @@ def _compare_readback(inputs: CreateInputs, found: Any) -> str | None:
         return "readback_account_id_mismatch"
     if salesforce_uuid_writeback.normalise_uuid(found.get("account_uuid")) is None:
         return "readback_uuid_invalid"
+    # docs/49 contract comparison (production_contract.compare_readback): zero mismatching field names are required, and
+    # a readback that was never compared against the contract can never verify.
+    mismatches = found.get("contract_mismatches")
+    if not isinstance(mismatches, (list, tuple)) or not all(isinstance(m, str) for m in mismatches):
+        return "readback_contract_unchecked"
+    if mismatches:
+        return "readback_contract_mismatch"
     return None
 
 
@@ -275,6 +285,8 @@ def _readback_record(inputs: CreateInputs, outcome: str, reason: str, found: Any
             data["domains"] = list(found["domains"])
         if isinstance(found.get("response_shape"), (list, tuple)):
             data["response_shape"] = list(found["response_shape"])
+        if isinstance(found.get("contract_mismatches"), (list, tuple)):
+            data["readback_mismatches"] = [m for m in found["contract_mismatches"] if isinstance(m, str)]
     return data
 
 
@@ -306,6 +318,7 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         write_record: Callable[[dict[str, Any]], Any], *, owner_go: bool = False,
         prior_records: Any = (), prior_review_cleared_by_owner: bool = False,
         clock: Callable[[], datetime] | None = None,
+        live_duplicate_check: Callable[[CreateInputs], str | None] | None = None,
         _production_target_fn: Callable[[Mapping[str, str], datetime], Any] | None = None,
         _approval_check_fn: Callable[..., str | None] = production_approval.check) -> CreateResult:
     """Run one guarded create attempt. See the module docstring; every path writes at least one record.
@@ -314,7 +327,10 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     ``click_confirm``, ``read_back`` and ``write_record`` are the only external side effects (adapters or fakes).
     ``_production_target_fn`` and ``_approval_check_fn`` are test-only seams for the two gate inputs that read the
     process environment and the approval file; production callers never pass them. ``clock`` supplies the fresh time
-    used just before the approval is consumed (default: real UTC now). ``prior_records`` are loaded
+    used just before the approval is consumed (default: real UTC now). A live create REQUIRES ``live_duplicate_check``:
+    called after the final gate and right before the intent record, it re-checks BackOffice itself (the clone is only a
+    hint) and returns a reason code or None; a missing check, an exception or any reason refuses, nothing consumed or
+    clicked. ``prior_records`` are loaded
     production_create_record dicts; ``prior_review_cleared_by_owner=True`` waives only the unreviewed-attempt refusal.
     """
     # The underscore gate seams exist for tests only: without SURFACE_ONBOARDING_TEST_HOOKS == "1" in the run's
@@ -362,6 +378,17 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     if reason is not None:
         return _refuse(write_record, inputs, reason, checked)
 
+    # Live duplicate pre-check against BackOffice itself, as close to the click as the order allows. Fail closed.
+    if live_duplicate_check is None:
+        return _refuse(write_record, inputs, "live_duplicate_check_missing", checked)
+    try:
+        duplicate = live_duplicate_check(inputs)
+    except Exception:
+        duplicate = "duplicate_check_unavailable"
+    if duplicate is not None:
+        reason = duplicate if isinstance(duplicate, str) and _REASON.fullmatch(duplicate) else "duplicate_check_unavailable"
+        return _refuse(write_record, inputs, reason, checked)
+
     # Intent record first: if it cannot be written nothing is consumed or clicked.
     intent = {**_base_record(inputs, OUTCOME_ATTEMPT_STARTED), **_expected_details(inputs),
               "form_fields_checked": checked}
@@ -381,6 +408,8 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         clicked = click_confirm(inputs)
     except Exception:
         clicked = UNCERTAIN
+    if clicked == NOT_CLICKED:
+        return _refuse(write_record, inputs, "confirm_not_clicked", checked)
     if clicked != SUBMITTED:
         data = {**_base_record(inputs, OUTCOME_UNCERTAIN, "uncertain_submit"), **_expected_details(inputs),
                 "form_fields_checked": checked}

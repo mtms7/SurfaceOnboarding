@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import state_paths
 from integration.onboarding import production_views
+from integration.onboarding import production_create_ui as create_ui
 from integration.onboarding import review_approval
 from integration.onboarding import run_progress
 from integration.onboarding import users_file
@@ -6857,7 +6858,8 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     clone = _clone_status()
     sheet = _sheet_result(row, match=match, ce_route=ce_route, start_iso=_prod_view_start(reference), country=country, clone=clone)
     guide = production_views.production_co_guide(sheet, clone=clone, recorded_duplicates=_recorded_duplicates(reference))
-    main_html = "<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_guide_html(guide, match)
+    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
+                 + _production_guide_html(guide, match))
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod")
 
 
@@ -7535,7 +7537,7 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
                                start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE)
     sheet = _onboarding_sheet_card(ref, row, match=check, ce_route=summary["route"] == CE_ENGINE,
                                    start_iso=str(plan.get("license_start") or ""), country=country)
-    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + onboard + sheet + _lock_banner() + blocked
+    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + onboard + sheet + _lock_banner() + _production_create_html(ref, row) + blocked
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
             + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + approval_card + create_card + record_card
             + writeback_card)
@@ -7626,6 +7628,75 @@ LOGIN_REASON_TEXT = {
     "desktop_runtime_required": "Sign-in is only available on the attended Windows desktop.",
     "run_in_progress": "An attended run is in progress. Sign out after it finishes.",
 }
+
+
+# ---- Guarded production create (docs/53) -------------------------------------------------------------------------------------
+# Everything below is unreachable while either hard-coded lock constant is False: the card is empty (no form, no button) and
+# every POST is refused by create_ui.gate before anything is read or started. Desktop only; the VM never renders a control.
+def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operator: str | None = None) -> create_ui.Inputs:
+    """The plain facts for the create gate. A POST passes a row read inside that very request; a page shows the display read."""
+    try:
+        sf_ready = readiness.effective(session_statuses()["salesforce"], readiness_now(),
+                                       readiness.START_SALESFORCE_TTL).state is SessionState.READY
+    except Exception:  # noqa: BLE001 - fail closed
+        sf_ready = False
+    return create_ui.Inputs(
+        reference=reference, row=row, now=production_now(), environ=os.environ,
+        operator=operator if operator is not None else (_current_operator.get() or None), vm=vm_mode(),
+        approvals_path=PRODUCTION_APPROVAL_PATH, records_parent=production_records_parent(), clone=_clone_status(),
+        sf_ready=sf_ready, row_fresh=bool(row))
+
+
+def _production_create_html(reference: str, row: dict[str, str | None] | None) -> str:
+    """The create section of a production CO page ("" while locked and no record; any failure shows nothing)."""
+    try:
+        inputs = _create_ui_inputs(reference, row)
+        return create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
+    except Exception:  # noqa: BLE001 - fail closed: no control
+        return ""
+
+
+def _launch_production_create(reference: str, revision: str, env: dict[str, str]) -> Any:
+    """Start the one visible production runner process (desktop only); None when it cannot be started."""
+    if (not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
+            or not ATTENDED_CE_ONLY_RUNNER.is_file()):
+        return None
+    child = {**os.environ, **{k: v for k, v in env.items() if k.startswith("SURFACE_ONBOARDING_PRODUCTION_")}}
+    try:
+        return subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-create", "--co", reference,
+                                 "--revision", revision, "--owner-go"], env=child, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+
+def _read_production_writeback_row(reference: str) -> dict[str, str | None] | None:
+    """Fresh fixed-field read of the one CO row for the guarded UUID write (None on any problem)."""
+    if not REFERENCE.fullmatch(reference):
+        return None
+    try:
+        response = sf_json(["data", "query", "--query", "SELECT Id, Name, LastModifiedDate, Onboarding_Product__c, "
+                            "Onboarding_Type__c, Account_UUID__c FROM Customer_Onboarding__c WHERE Name = '" + reference
+                            + "' LIMIT 2", "--json"])
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:  # type: ignore[index]
+            return None
+        record = records[0]
+        if record.get("Name") != reference:
+            return None
+        return {key: (value if isinstance(value, str) else None) for key, value in record.items() if key != "attributes"}
+    except (ReadUnavailable, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _run_sf_argv(argv: list[str]) -> bool | None:
+    """Run the fixed Salesforce CLI argument list from salesforce_uuid_writeback (no shell). True only on exit code 0."""
+    try:
+        done = subprocess.run([salesforce_cli_command(), *argv[1:]], capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=35, check=False, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return True if done.returncode == 0 else None
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -8154,6 +8225,7 @@ POST_ROUTES = frozenset({
     "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
     "/attended/review-approve",
+    *sorted(create_ui.POST_PATHS),
 })
 
 
@@ -8520,6 +8592,53 @@ class Handler(BaseHTTPRequestHandler):
                            "recorded. Nothing was started.</p><p><a href='/onboard/" + escape(reference) + "'>Return</a></p>"); return
         self.send_redirect("/onboard/" + reference + "?notice=approved")
 
+    def _post_production_create(self, path: str, reference: str, form: Any) -> None:
+        """The guarded production create and UUID write posts (docs/53). Each re-checks every gate with a fresh CO read."""
+        back = "<p><a href='/onboard/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>"
+
+        def refuse(code: str) -> None:
+            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not done</title><p><strong>Not done.</strong> "
+                           + escape(create_ui.gate_text(code)) + " Nothing was sent.</p><p>Code: <code>" + escape(code)
+                           + "</code></p>" + back)
+
+        try:
+            row = detail_row(reference)
+        except ReadUnavailable:
+            self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
+        inputs = _create_ui_inputs(reference, row, self.request_operator())
+        values = form or {}
+        if path == create_ui.CREATE_PATH:
+            code = create_ui.handle_create_post(values, inputs, _launch_production_create)
+            if code != "launched":
+                refuse(code); return
+            self.send_page(HTTPStatus.OK, "<!doctype html><title>Production create started</title><p><strong>Started.</strong> "
+                           "The production runner window is opening for " + escape(reference) + ". Sign in with SSO and MFA "
+                           "there if asked and leave the window open. It checks BackOffice for duplicates, fills the form, "
+                           "clicks Confirm once and reads the tenant back. Do not start another run.</p>" + back)
+            return
+        if path == create_ui.UUID_REVIEW_PATH:
+            code, view = create_ui.handle_uuid_review(values, inputs, _read_production_writeback_row(reference))
+            if code != "ready":
+                refuse(code); return
+            body = ("<h2>Write the Account UUID to Salesforce</h2><dl><dt>CO</dt><dd>" + escape(reference) + "</dd>"
+                    "<dt>Salesforce field</dt><dd><code>" + escape(view["field"]) + "</code> (currently empty)</dd>"
+                    "<dt>Value (from the verified production readback)</dt><dd>ends with <code>" + escape(view["tail"])
+                    + "</code></dd></dl><p class='note'>Confirming updates only this field, then reads it back. No stage, comment "
+                    "or other field changes. The confirmation expires in 10 minutes and any change to the CO invalidates it.</p>"
+                    "<form method='post' action='" + create_ui.UUID_CONFIRM_PATH + "'><input type='hidden' name='reference' "
+                    "value='" + escape(reference) + "'><input type='hidden' name='nonce' value='" + escape(view["token"])
+                    + "'><button type='submit'>Confirm write to Salesforce</button></form>" + back)
+            self.send_page(HTTPStatus.OK, _app_shell(reference + " Salesforce UUID",
+                                                     "<section class='card'>" + body + "</section>", active="prod_onboarding", env="prod"))
+            return
+        code = create_ui.handle_uuid_confirm(values, inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
+                                             salesforce_target_org())
+        if code in create_ui.UUID_RESULT_TEXT:
+            self.send_page(HTTPStatus.OK, "<!doctype html><title>Salesforce UUID write</title><p><strong>"
+                           + escape(create_ui.UUID_RESULT_TEXT[code]) + "</strong></p>" + back)
+            return
+        refuse(code)
+
     def do_POST(self) -> None:
         # Any action may change Salesforce or local state; later pages read fresh.
         clear_display_cache()
@@ -8655,6 +8774,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/attended/review-approve":
             self._post_review_approve(reference, form); return
+        if path in create_ui.POST_PATHS:
+            self._post_production_create(path, reference, form); return
         gated_action = SESSION_GATED_ROUTES.get(path)
         if gated_action is not None:
             # Fresh, verified sessions before any runner launch (2026-10-03).
