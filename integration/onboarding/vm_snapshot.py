@@ -51,6 +51,7 @@ CURRENT_LINK = "current"
 CURRENT_MARKER = "CURRENT"
 INVENTORY_SUBDIR = "leonardo-inventory"
 
+CLONE_PUSH_PRODUCER = "desktop-clone-push"  # clone-only bundles (docs/51): never a full snapshot
 PRODUCER_VM_READER = "vm-salesforce-reader"  # the VM refreshed queue.json / co_details.json itself (docs/43 part A)
 QUEUE_FILE = "queue.json"
 CO_DETAILS_FILE = "co_details.json"
@@ -486,6 +487,8 @@ def ingest_bundle(source: str | os.PathLike[str] | bytes, key: bytes, state_dir:
     if type(keep) is not int or keep < 1:
         raise SnapshotError("bad_keep")
     bundle = verify_bundle(source, key)
+    if bundle.manifest.get("producer") == CLONE_PUSH_PRODUCER:
+        raise SnapshotError("clone_push_bundle_not_a_snapshot")
     root = snapshots_root(state_dir)
     incoming = root / INCOMING_DIR
     try:
