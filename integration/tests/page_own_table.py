@@ -3,7 +3,7 @@
 The page under test never fetches anything itself: a trigger (sort-header click, dispatched click, reload, goto) makes the
 FAKE PAGE send its OWN table request (a fixed default body, as the real Accounts page would), routed through every
 registered handler exactly like Playwright does (last registered first, ``fallback`` passes the possibly rewritten request
-on, ``continue_`` / ``abort`` end the chain). A served request answers through ``_serve_table(value, projection)``, a hook
+on, ``continue_`` / ``abort`` end the chain). A served request answers through ``_serve_table(value)``, a hook
 of the host fake page, and emits ``response`` events. Passive GETs (getAuthorities, accountInfo, demoAccountDomains) are
 emitted on every document load (reload / goto), like the real application's start-up calls.
 No browser, no network.
@@ -139,8 +139,11 @@ def inverse_row(row: Any) -> Any:
             "primaryUser": {"email": SECRET}}
 
 
-def reply_payload(reply: Any, readback: bool) -> tuple[int, Any] | None:
-    """(status, body) the server answers for a reduced test reply, or None for no response at all."""
+def reply_payload(reply: Any) -> tuple[int, Any] | None:
+    """(status, body) the server answers for a test reply, or None for no response at all.
+
+    A reduced search row (name, domain, ...) becomes a FULL server row (no projection is ever sent); a row that already
+    carries ``accountName`` (a readback row) is answered as it is."""
     if not isinstance(reply, dict) or not reply.get("status"):
         return None
     status = reply["status"]
@@ -149,7 +152,7 @@ def reply_payload(reply: Any, readback: bool) -> tuple[int, Any] | None:
     rows, total = reply.get("rows"), reply.get("total")
     if rows is None or total is None:
         return 200, {"unexpected": SECRET}
-    table = list(rows) if readback else [inverse_row(r) for r in rows]
+    table = [inverse_row(r) for r in rows]
     return 200, {"pagination_response": {"total_count": total, "table_data": table}}
 
 
@@ -175,7 +178,7 @@ def demo_payload(reply: Any, domain: str) -> tuple[int, Any] | None:
 
 
 class PageOwnTable:
-    """Mixin for a fake page. The host defines ``form_open`` and ``_serve_table(value, projection)`` (a reduced reply)."""
+    """Mixin for a fake page. The host defines ``form_open`` and ``_serve_table(value)`` (a reply)."""
 
     def _init_table(self, *, header: bool = True, passive: dict[str, Any] | None = None, demo: Any = None,
                     demo_domain: str = "") -> None:
@@ -230,10 +233,9 @@ class PageOwnTable:
         body = json.loads(request.post_data)
         self.table_bodies.append(body)
         value = search_value(body)
-        projection = body["tableServerData"].get("projection")
         self.table_values.append(value)
         self.fetches.append(("POST", TABLE_PATH))
-        answer = reply_payload(self._serve_table(value, projection), projection == list(contract.READBACK_PICK_PATHS))
+        answer = reply_payload(self._serve_table(value))
         if answer is None:
             return
         response = FakeResponse("POST", TABLE_URL, answer[0], answer[1], request=request)

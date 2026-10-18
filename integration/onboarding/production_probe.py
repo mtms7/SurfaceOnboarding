@@ -270,13 +270,27 @@ def _names_ok(names: object, limit: int) -> bool:
             and all(isinstance(n, str) and _PATH_LIKE.fullmatch(n) is not None for n in names))
 
 
-def read_body_problem(raw: object) -> str | None:
+STRICT_UNIQUE_FIELDS = ("accountName", "accountDomain")
+# How the runner rewrites the page's own table request. STRICT is the only mode of every create / dry-run / duplicate / readback
+# read: unique_fields override and NO projection (live 2026-10-18: a dotted projection made the server drop the compared paths,
+# so rows come back FULL and are reduced in Python). The other mode exists for the read-only readback diagnostic only.
+REWRITE_STRICT = "strict"
+REWRITE_PAGE_UNIQUE = "page_unique_no_projection"  # diagnostic variant A: the page's own unique_fields stay
+REWRITE_MODES = (REWRITE_STRICT, REWRITE_PAGE_UNIQUE)
+
+
+def read_body_problem(raw: object, *, strict: bool = False) -> str | None:
     """None only when ``raw`` (JSON text or bytes) is exactly one bounded read-only table search; else a short reason.
 
     Top level: ``tableServerData`` and nothing else. Inside: only the HAR keys; ``offset`` 0; ``items_per_page`` an int
     from 1 to TABLE_ROW_LIMIT; ``filters`` one ``search`` clause or the verified ``or`` variant (non-empty bounded
     values, optional field path); optional ``sort`` {direction, key}, ``unique_fields`` and ``projection`` (path-like
     names only). Any other key, a missing body, junk or an oversized body is refused.
+
+    ``strict`` (create / dry-run / duplicate / readback reads) additionally requires the name + domain ``unique_fields``
+    override and NO ``projection`` key: rows collapsed by the page's own unique_fields could hide a duplicate, and a
+    projection of dotted paths made the server omit the compared paths (docs/53, 2026-10-18). The default grammar still
+    tolerates a projection (the page's own loads send one for other lists) but strict reads never may.
     """
     if isinstance(raw, (bytes, bytearray)):
         try:
@@ -307,22 +321,35 @@ def read_body_problem(raw: object) -> str | None:
         return "unique_fields"
     if "projection" in server and not _names_ok(server["projection"], 80):
         return "projection"
+    if strict and (server.get("unique_fields") != list(STRICT_UNIQUE_FIELDS) or "projection" in server):
+        return "not_strict"
     return None
 
 
-def table_rewrite_fields(value: str, projection: tuple[str, ...] | list[str]) -> dict[str, Any]:
+def table_rewrite_fields(value: str, mode: str = REWRITE_STRICT) -> dict[str, Any]:
     """The ``tableServerData`` fields the runner overwrites on the page's own request; nothing else is ever changed.
 
     ``unique_fields`` is name + domain on purpose: the page's own load request collapses rows by account type, license
     type and first name (docs/48), which would hide tenants from a duplicate check. The sort the page sent is kept.
+    No ``projection`` is ever sent (see ``table_rewrite_drops``). The default (strict) mode is the only one of any create /
+    dry-run / duplicate / readback read; ``REWRITE_PAGE_UNIQUE`` (diagnostic variant A) leaves the page's own unique_fields.
     """
+    if mode not in REWRITE_MODES:
+        raise ValueError("rewrite_mode_invalid")
     if not _value_ok(value):
         raise ValueError("search_value_invalid")
-    names = list(projection)
-    if not names or not _names_ok(names, 80):
-        raise ValueError("projection_invalid")
-    return {"offset": 0, "items_per_page": TABLE_ROW_LIMIT, "filters": {"and": [{"method": "search", "value": value}]},
-            "unique_fields": ["accountName", "accountDomain"], "projection": names}
+    fields: dict[str, Any] = {"offset": 0, "items_per_page": TABLE_ROW_LIMIT,
+                              "filters": {"and": [{"method": "search", "value": value}]}}
+    if mode == REWRITE_STRICT:
+        fields["unique_fields"] = list(STRICT_UNIQUE_FIELDS)
+    return fields
+
+
+def table_rewrite_drops(mode: str = REWRITE_STRICT) -> tuple[str, ...]:
+    """The page-sent ``tableServerData`` keys every rewrite removes: the page's own ``projection`` (rows come back full)."""
+    if mode not in REWRITE_MODES:
+        raise ValueError("rewrite_mode_invalid")
+    return ("projection",)
 
 
 def request_decision(method: str, url: str) -> tuple[bool, str]:

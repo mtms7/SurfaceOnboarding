@@ -52,7 +52,7 @@ def good_clone(source, now):
 
 def good_row(**over):
     strict = {"accountLicense.startDate": "2026-10-16T09:00:00.000Z", "accountLicense.expirationDate": "2027-05-20T07:00:00.000Z",
-              "primaryUser.isMfaRequired": True, "organizationEmail": ORG_EMAIL,
+              "primaryUser.isMfaRequired": True, "primaryUser.email": ORG_EMAIL,
               "campaignExecutionSettings.domainsMultiAttackStackSettings.enabled": False}
     strict.update(over)
     return contract_row(accountName=NAME, accountDomain=DOMAIN, **strict)
@@ -178,14 +178,14 @@ class LivePage(dry.FakePage):
             return ConfirmBtn(self)
         return super().get_by_role(role, name, exact)
 
-    def _serve_table(self, value, projection):
-        if projection == list(contract.READBACK_PICK_PATHS):  # the post-click readback: the page's own rewritten request
+    def _serve_table(self, value):
+        if self.confirm_clicks:  # after the Confirm click every table read is the post-click readback (identical bodies)
             self.readback_calls += 1
             if self.popup_on_readback and self.readback_calls > 1:  # a page opens AFTER the click, once the poll has begun
                 for handler in self.popup_handlers:
                     handler(None)
             return self.readbacks.pop(0) if self.readbacks else reply([])
-        return super()._serve_table(value, projection)
+        return super()._serve_table(value)
 
 
 class Harness(dry.Harness):
@@ -452,7 +452,7 @@ class CreateTests(Base):
         self.assertEqual([r.outcome for r in sent], ["continued", "aborted"])
 
     def test_readback_mismatch_stops_records_and_never_retries(self):
-        h = self.harness(readbacks=[reply([good_row(scanningInterval="DAILY", reconLevel="X")])])
+        h = self.harness(readbacks=[reply([good_row(scanningInterval="DAILY", **{"accountLicense.reconLevel": "X"})])])
         result = h.go()
         self.assertEqual(result["result"], "created_mismatch")
         self.assertEqual(h.page.confirm_clicks, 1)
@@ -678,7 +678,7 @@ class StrictReadbackTests(Base):
     def test_license_dates_mfa_and_organization_email_are_compared_by_name_only(self):
         bad = good_row(**{"accountLicense.expirationDate": "2027-06-01T07:00:00.000Z",
                           "accountLicense.startDate": "2026-12-01T09:00:00.000Z", "primaryUser.isMfaRequired": False,
-                          "organizationEmail": "someone.else@pentera.io"})
+                          "primaryUser.email": "someone.else@pentera.io"})
         h = self.harness(readbacks=[reply([bad])])
         self.assertEqual(h.go()["result"], "created_mismatch")
         record = [r for r in h.loaded_records() if r["outcome"] == "created_unverified"][0]
@@ -690,7 +690,7 @@ class StrictReadbackTests(Base):
 
     def test_missing_paths_are_mismatches_not_silently_ignored(self):
         row_ = good_row()
-        for key in ("primaryUser.isMfaRequired", "organizationEmail", "accountLicense.startDate", "accountLicense.expirationDate"):
+        for key in ("primaryUser.isMfaRequired", "primaryUser.email", "accountLicense.startDate", "accountLicense.expirationDate"):
             del row_[key]
         h = self.harness(readbacks=[reply([row_])])
         self.assertEqual(h.go()["result"], "created_mismatch")

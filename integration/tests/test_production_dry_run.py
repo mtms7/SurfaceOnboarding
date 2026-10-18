@@ -275,7 +275,7 @@ class FakePage(pot.PageOwnTable):
             return {"count": self.sw_count}
         raise AssertionError("unexpected evaluate: a production read never evaluates a script in the page")
 
-    def _serve_table(self, value, _projection):
+    def _serve_table(self, value):
         return self.search.get(value, {"status": 200, "total": 0, "rows": []})
 
     def get_by_role(self, role, name=None, exact=False):

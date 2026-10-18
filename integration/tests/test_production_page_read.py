@@ -23,10 +23,9 @@ ADD_URL = ORIGIN + live.CREATE_PATH
 
 
 def body(value="Acme - CE Only", **over):
-    """A valid rewritten read body."""
+    """A valid rewritten read body: name + domain unique_fields, NO projection (docs/53 2026-10-18)."""
     server = {"offset": 0, "items_per_page": 100, "sort": {"direction": "desc", "key": "lastReconScan"},
-              "filters": {"and": [{"method": "search", "value": value}]}, "unique_fields": ["accountName", "accountDomain"],
-              "projection": ["accountName", "accountDomain"]}
+              "filters": {"and": [{"method": "search", "value": value}]}, "unique_fields": ["accountName", "accountDomain"]}
     server.update(over)
     return {"tableServerData": server}
 
@@ -50,9 +49,9 @@ class Page(PageOwnTable):
                          {pdr.AUTHORITIES_PATH: {"status": 200}, pdr.ACCOUNT_INFO_PATH: {"status": 200}},
                          demo=demo, demo_domain="zetaquux.example")
 
-    def _serve_table(self, value, projection):
-        if projection == list(contract.READBACK_PICK_PATHS):
-            return self.readbacks.pop(0) if self.readbacks else {"status": 200, "total": 0, "rows": []}
+    def _serve_table(self, value):
+        if value not in self.search and self.readbacks:  # a read the test queued as a readback (the bodies are identical)
+            return self.readbacks.pop(0)
         return self.search.get(value, {"status": 200, "total": 0, "rows": []})
 
     def evaluate(self, script, arg=None):
@@ -121,25 +120,31 @@ class ReadBodyGrammarTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertIsNotNone(probe.read_body_problem(raw))
 
-    def test_rewrite_fields_carry_exactly_the_search_grammar(self):
-        fields = probe.table_rewrite_fields("Acme - CE Only", ("accountName", "accountDomain"))
+    def test_rewrite_fields_carry_exactly_the_search_grammar_and_no_projection(self):
+        fields = probe.table_rewrite_fields("Acme - CE Only")
         self.assertEqual(fields, {"offset": 0, "items_per_page": probe.TABLE_ROW_LIMIT,
                                   "filters": {"and": [{"method": "search", "value": "Acme - CE Only"}]},
-                                  "unique_fields": ["accountName", "accountDomain"],
-                                  "projection": ["accountName", "accountDomain"]})
+                                  "unique_fields": ["accountName", "accountDomain"]})
+        self.assertNotIn("projection", fields)
+        self.assertEqual(probe.table_rewrite_drops(), ("projection",))  # the page's own projection is removed from its body
         self.assertEqual(probe.TABLE_ROW_LIMIT, 100)
         self.assertEqual(contract.SEARCH_PAGE_SIZE, probe.TABLE_ROW_LIMIT)
         for value in ("", "  ", None, 5, "a\nb", "x" * 201):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                probe.table_rewrite_fields(value, ("accountName",))
-        for projection in ((), ("bad name;",), ("a" * 81,)):
-            with self.subTest(projection=projection), self.assertRaises(ValueError):
-                probe.table_rewrite_fields("x", projection)
+                probe.table_rewrite_fields(value)
 
-    def test_rewrite_fields_always_validate_as_a_read_body(self):
-        for projection in (runner.PDR_SEARCH_PROJECTION, contract.READBACK_PICK_PATHS):
-            server = {"sort": {"direction": "asc", "key": "x"}, **probe.table_rewrite_fields("v", projection)}
-            self.assertIsNone(probe.read_body_problem(json.dumps({"tableServerData": server})))
+    def test_rewrite_fields_always_validate_as_a_strict_read_body(self):
+        server = {"sort": {"direction": "asc", "key": "x"}, **probe.table_rewrite_fields("v")}
+        self.assertIsNone(probe.read_body_problem(json.dumps({"tableServerData": server}), strict=True))
+
+    def test_a_strict_body_with_a_projection_is_refused_but_the_base_grammar_tolerates_it(self):
+        with_projection = text(projection=["accountName", "accountDomain"])
+        self.assertEqual(probe.read_body_problem(with_projection, strict=True), "not_strict")
+        self.assertIsNone(probe.read_body_problem(with_projection))  # the page's own loads send one for other lists
+        self.assertIsNone(probe.read_body_problem(text(), strict=True))
+
+    def test_no_projection_constant_is_left_in_the_runner(self):
+        self.assertFalse(hasattr(runner, "PDR_SEARCH_PROJECTION"))
 
 
 class GuardBodyTests(unittest.TestCase):
@@ -228,6 +233,53 @@ class ReducerTests(unittest.TestCase):
                                                                       "emails": ["e.example"], "deleted": True}]})
         self.assertNotIn(fake.SECRET, json.dumps(out))
 
+    def test_full_rows_without_a_projection_feed_the_duplicate_verdicts(self):
+        """The server now answers FULL rows (no projection): the reducer picks name, domains, flag in Python."""
+        def full(**over):
+            row = {"accountName": "Other Co", "accountDomain": "other.example", "alternateDomains": [], "userEmailDomains": [],
+                   "isDeleted": False, "id": "i" * 24, "accountUuid": "u" * 32, "token": fake.SECRET,
+                   "accountLicense": {"assetsNumber": 1, "startDate": "2026-10-16T00:00:00.000Z"},
+                   "primaryUser": {"email": fake.SECRET, "isMfaRequired": True}, "blob": ["x" * 200] * 400}
+            row.update(over)
+            return row
+
+        def reduced(*rows):
+            return pdr.search_reply(200, {"pagination_response": {"total_count": len(rows), "table_data": list(rows)}})
+
+        target, domains, demo = "Acme - CE Only", ("acme.example", "mail.acme.example"), {"status": 200, "hit": False, "count": 1}
+        clear = reduced(full())
+        self.assertEqual(set(clear["rows"][0]), {"name", "domain", "alternates", "emails", "deleted"})
+        self.assertNotIn(fake.SECRET, json.dumps(clear))
+        self.assertLess(len(json.dumps(clear)), 400)  # the large unrelated row content is never retained
+        self.assertIsNone(pdr.duplicate_verdict([clear, clear], demo, target, domains))
+        for label, row in (("name", full(accountName="acme - ce  only")), ("primary_domain", full(accountDomain="ACME.example.")),
+                           ("alternate_domain", full(alternateDomains=["x.example", "Acme.example"])),
+                           ("email_domain", full(userEmailDomains=["pentera.io", "mail.acme.example"])),
+                           ("deleted_row_still_counts", full(accountName=target, isDeleted=True))):
+            with self.subTest(label):
+                self.assertEqual(pdr.duplicate_verdict([reduced(row)], demo, target, domains), "duplicate_in_production")
+        self.assertTrue(reduced(full(isDeleted=True))["rows"][0]["deleted"])
+        self.assertEqual(pdr.duplicate_verdict([reduced(full(), full(), full(), full())], demo, target, domains), None)
+        big = pdr.search_reply(200, {"pagination_response": {"total_count": 100, "table_data": [full() for _ in range(100)]}})
+        self.assertEqual((len(big["rows"]), big["total"]), (100, 100))
+        self.assertLess(len(json.dumps(big)), 20_000)
+
+    def test_a_full_row_through_the_page_own_request_reaches_the_live_checked_verdict(self):
+        row = {"accountName": "Held Co", "accountDomain": "held.example", "alternateDomains": ["Target.example"],
+               "userEmailDomains": ["mail.example"], "isDeleted": False, "token": fake.SECRET}
+        page = Page(search={"Target Co": {"status": 200, "total": 0, "rows": []}, "target.example": {"status": 200, "total": 1, "rows": [row]},
+                            "Held Co": {"status": 200, "total": 1, "rows": [row]}, "held.example": {"status": 200, "total": 1, "rows": [row]}})
+        r = reader(page)
+        replies = [r.search(v) for v in ("Held Co", "held.example", "Target Co", "target.example")]
+        self.assertEqual(replies[3]["rows"], [{"name": "Held Co", "domain": "held.example", "alternates": ["Target.example"],
+                                               "emails": ["mail.example"], "deleted": False}])
+        self.assertEqual(live.checked_duplicate_problem({"name": "Held Co", "domain": "held.example"}, (replies[0], replies[1]),
+                                                        replies[3], replies[2], {"status": 200, "hit": False, "count": 1},
+                                                        "Target Co", "target.example"), "duplicate_in_production")  # via the ALTERNATE domain of a full row
+        for body_ in page.table_bodies:
+            self.assertNotIn("projection", body_["tableServerData"])
+        self.assertNotIn(fake.SECRET, json.dumps(replies))
+
     def test_search_reply_fails_closed_on_every_odd_shape(self):
         unexpected = {"status": 200, "total": None, "rows": None}
         good = {"pagination_response": {"total_count": 0, "table_data": []}}
@@ -293,7 +345,7 @@ class SessionVerdictTests(unittest.TestCase):
 class RewriteTests(unittest.TestCase):
     def test_only_the_table_server_data_fields_change(self):
         page = Page()
-        status, payload = reader(page).table("Acme - CE Only", runner.PDR_SEARCH_PROJECTION)
+        status, payload = reader(page).table("Acme - CE Only")
         self.assertEqual(status, 200)
         self.assertIsNotNone(payload)
         sent = page.table_bodies[-1]
@@ -304,13 +356,13 @@ class RewriteTests(unittest.TestCase):
         self.assertEqual((server["offset"], server["items_per_page"]), (0, probe.TABLE_ROW_LIMIT))
         self.assertEqual(server["filters"], {"and": [{"method": "search", "value": "Acme - CE Only"}]})
         self.assertEqual(server["unique_fields"], ["accountName", "accountDomain"])
-        self.assertEqual(server["projection"], list(runner.PDR_SEARCH_PROJECTION))
-        self.assertEqual(set(server), set(page_own["tableServerData"]))  # the same key set the page sent
+        self.assertNotIn("projection", server)  # the page's own projection is dropped: a dotted projection hid compared paths live
+        self.assertEqual(set(server), set(page_own["tableServerData"]) - {"projection"})
 
     def test_the_rewrite_goes_through_the_guard_not_around_it(self):
         page, guard = Page(), pdr.DryRunRequestGuard()
         guard.install(page)
-        reader(page).table("x", runner.PDR_SEARCH_PROJECTION)
+        reader(page).table("x")
         route = page.routed[-1]
         self.assertTrue(route.fell_back and not route.abort_called)  # fallback hands the rewritten request to the guard
         self.assertEqual(guard.api_calls[("POST", contract.ACCOUNTS_PATH)]["count"], 1)
@@ -326,7 +378,7 @@ class RewriteTests(unittest.TestCase):
         patterns = []
         original = page.route
         page.route = lambda pattern, handler: (patterns.append(pattern), original(pattern, handler))
-        reader(page).table("x", runner.PDR_SEARCH_PROJECTION)
+        reader(page).table("x")
         self.assertEqual(page.routes, [])
         self.assertEqual(len(patterns), 1)
         self.assertTrue(patterns[0].search(TABLE_URL))
@@ -342,7 +394,7 @@ class RewriteTests(unittest.TestCase):
                 original = fake.PAGE_DEFAULT_BODY
                 try:
                     fake.PAGE_DEFAULT_BODY = raw
-                    self.assertEqual(reader(page).table("x", runner.PDR_SEARCH_PROJECTION), (None, None))
+                    self.assertEqual(reader(page).table("x"), (None, None))
                 finally:
                     fake.PAGE_DEFAULT_BODY = original
 
@@ -355,14 +407,14 @@ class RewriteTests(unittest.TestCase):
             calls.append(page.fire("GET", TABLE_URL))
             original()
         page._table_request = with_get
-        self.assertEqual(reader(page).table("x", runner.PDR_SEARCH_PROJECTION)[0], 200)
+        self.assertEqual(reader(page).table("x")[0], 200)
         self.assertEqual(calls, [None])  # the GET fell through the rewrite handler untouched
         self.assertEqual(len(page.table_bodies), 1)
 
     def test_a_page_that_never_answers_gives_none(self):
         page = Page()
         page.skip_table_response = True
-        self.assertEqual(reader(page).table("x", runner.PDR_SEARCH_PROJECTION), (None, None))
+        self.assertEqual(reader(page).table("x"), (None, None))
 
     def test_a_reply_to_some_other_request_does_not_count(self):
         page = Page()
@@ -374,7 +426,7 @@ class RewriteTests(unittest.TestCase):
             page.skip_table_response = True
             original()
         page._table_request = only_stray
-        self.assertEqual(reader(page).table("x", runner.PDR_SEARCH_PROJECTION), (None, None))
+        self.assertEqual(reader(page).table("x"), (None, None))
 
     def test_headers_and_cookies_are_never_read(self):
         page = Page(search={"x": {"status": 200, "total": 0, "rows": []}})
@@ -396,16 +448,16 @@ class TriggerTests(unittest.TestCase):
     def test_first_trigger_is_a_reload_then_the_in_app_sort(self):
         page = Page()
         r = reader(page)
-        r.table("a", runner.PDR_SEARCH_PROJECTION)
+        r.table("a")
         self.assertEqual((page.reloads, page.header_clicks), (1, 0))
-        r.table("b", runner.PDR_SEARCH_PROJECTION)
+        r.table("b")
         self.assertEqual((page.reloads, page.header_clicks), (1, 1))
 
     def test_in_app_sort_is_a_logged_click(self):
         page, clicks = Page(), pdr.ClickLog()
         r = reader(page, click_log=clicks)
-        r.table("a", runner.PDR_SEARCH_PROJECTION)
-        r.table("b", runner.PDR_SEARCH_PROJECTION)
+        r.table("a")
+        r.table("b")
         self.assertEqual(clicks.kinds, [pdr.CLICK_SORT_HEADER])
         self.assertIn(pdr.CLICK_SORT_HEADER, pdr.ALLOWED_CLICKS)
 
@@ -413,30 +465,30 @@ class TriggerTests(unittest.TestCase):
         page = Page(header=False)
         r = reader(page)
         for value in ("a", "b", "c"):
-            self.assertEqual(r.table(value, runner.PDR_SEARCH_PROJECTION)[0], 200)
+            self.assertEqual(r.table(value)[0], 200)
         self.assertEqual((page.reloads, page.header_clicks), (3, 0))
 
     def test_read_only_commands_never_click_and_always_reload(self):
         page = Page()
         r = reader(page, in_app=False)
         for value in ("a", "b"):
-            r.table(value, runner.PDR_SEARCH_PROJECTION)
+            r.table(value)
         self.assertEqual((page.reloads, page.header_clicks, page.dispatches), (2, 0, 0))
 
     def test_with_the_form_open_only_a_dispatched_click_is_used_never_a_reload(self):
         page = Page()
         r = reader(page)
-        r.table("warm", runner.PDR_SEARCH_PROJECTION)  # the first read reloads (form closed)
+        r.table("warm")  # the first read reloads (form closed)
         page.form_open = True
         reloads = page.reloads
-        status, _ = r.table("b", runner.PDR_SEARCH_PROJECTION, form_open=True)
+        status, _ = r.table("b", form_open=True)
         self.assertEqual(status, 200)
         self.assertEqual((page.reloads, page.dispatches, page.header_clicks), (reloads, 1, 0))
 
     def test_with_the_form_open_and_no_header_it_fails_closed_without_reloading(self):
         page = Page(header=False)
         page.form_open = True
-        self.assertEqual(reader(page).table("x", runner.PDR_SEARCH_PROJECTION, form_open=True), (None, None))
+        self.assertEqual(reader(page).table("x", form_open=True), (None, None))
         self.assertEqual((page.reloads, page.gotos), (0, 0))
 
     def test_a_timed_out_reload_is_retried_once_by_navigation(self):
@@ -451,7 +503,7 @@ class TriggerTests(unittest.TestCase):
                 page.skip_table_response = False
             original()
         page._table_request = flaky
-        status, _ = reader(page).table("x", runner.PDR_SEARCH_PROJECTION)
+        status, _ = reader(page).table("x")
         self.assertEqual(status, 200)
         self.assertEqual((page.reloads, page.gotos), (1, 1))
 

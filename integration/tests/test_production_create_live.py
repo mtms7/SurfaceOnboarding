@@ -296,23 +296,22 @@ class DuplicateTests(unittest.TestCase):
         self.assertEqual(self.verdict(domain_reply={"status": 403, "total": None, "rows": None}), "production_session_expired")
         self.assertEqual(self.verdict(name_reply=reply([row()], total=5)), "duplicate_ambiguous")
 
-    def test_search_projection_keeps_the_domain_fields_so_domains_come_back(self):
+    def test_search_sends_no_projection_so_full_rows_bring_the_domain_fields(self):
         from integration.onboarding import production_probe
-        import tools.attended_ce_only_playwright as runner
 
-        fields = production_probe.table_rewrite_fields(NAME, runner.PDR_SEARCH_PROJECTION)
-        for name in ("accountName", "accountDomain", "alternateDomains", "userEmailDomains", "isDeleted"):
-            self.assertIn(name, fields["projection"])
+        fields = production_probe.table_rewrite_fields(NAME)
+        self.assertNotIn("projection", fields)
+        self.assertEqual(fields["unique_fields"], ["accountName", "accountDomain"])
         self.assertEqual(fields["filters"], {"and": [{"method": "search", "value": NAME}]})
         with self.assertRaises(ValueError):
-            production_probe.table_rewrite_fields(" ", runner.PDR_SEARCH_PROJECTION)
+            production_probe.table_rewrite_fields(" ")
 
 
 def contract_row(**over):
     flat = {
         "accountName": NAME, "accountDomain": DOMAIN, "accountType": "Customer", "accountCountryCode": "CL",
-        "accountUuid": UUID, "id": ROW_ID, "scanningInterval": "NO_SCHEDULE", "scanningFrequency": "NO_SCHEDULE",
-        "leakedCredentialsScanningInterval": "WEEKLY", "reconLevel": "ALL_ASSETS", "userEmailDomains": ["pentera.io"],
+        "accountUuid": UUID, "id": ROW_ID, "scanningInterval": "NO_SCHEDULE", "accountLicense.scanningFrequency": "NO_SCHEDULE",
+        "leakedCredentialsScanningInterval": "WEEKLY", "accountLicense.reconLevel": "ALL_ASSETS", "userEmailDomains": ["pentera.io"],
         "accountLicense.assetsNumber": 1, "accountLicense.domainsNumber": 1, "accountLicense.subDomainsNumber": 1,
         "accountLicense.leakedCredentialsAllowed": True, "accountLicense.provisioningEnabled": True,
         "accountLicense.notificationsAllowed": False, "accountLicense.multipleUsersAllowed": False,
@@ -341,10 +340,11 @@ class ReadbackTests(unittest.TestCase):
 
     def test_each_wrong_field_is_named(self):
         for key, bad in (("scanningInterval", "DAILY"), ("accountLicense.assetsNumber", "1"), ("accountType", "customer"),
-                         ("leakedCredentialsSettings.spyCloudSettings.enabled", False), ("reconLevel", "SOME")):
+                         ("leakedCredentialsSettings.spyCloudSettings.enabled", False), ("accountLicense.reconLevel", "SOME")):
             state, found = self.analyse([contract_row(**{key: bad})])
             self.assertEqual(state, "found")
-            self.assertIn(key if key != "accountLicense.assetsNumber" else key, found["contract_mismatches"], key)
+            logical = "reconLevel" if key == "accountLicense.reconLevel" else key  # mismatches carry the logical field name
+            self.assertIn(logical, found["contract_mismatches"], key)
 
     def test_a_missing_or_malformed_uuid_adds_account_uuid(self):
         for bad in (None, "xyz", UUID.upper(), UUID[:-1]):

@@ -183,8 +183,9 @@ def compare_payload(expected: Mapping[str, Any], observed: Any) -> list[str]:
 
 # --- (3) The readback row ----------------------------------------------------------------------------------------------
 # Flags of the create (all false) -> candidate row paths (first present wins). Names follow the Dev validation paths.
+# Live finding 2026-10-18 (full rows, no projection): the real paths below; the earlier fallback candidates were proven absent.
 ROW_FLAG_PATHS: dict[str, tuple[str, ...]] = {
-    "automatedDiscoveryEnabled": ("accountSettings.reconSettings.automatedDiscoveryEnabled", "automatedDiscoveryEnabled"),
+    "automatedDiscoveryEnabled": ("accountSettings.reconSettings.automatedDiscoveryEnabled",),
     "subDomainsReconEnabled": ("subDomainsReconEnabled",),
     "webDictionaryBruteForceEnabled": ("webDictionaryBruteForceEnabled",),
     "webDorkingEnabled": ("webDorkingEnabled",),
@@ -193,19 +194,20 @@ ROW_FLAG_PATHS: dict[str, tuple[str, ...]] = {
     "webAiAttackerEnabled": ("webAiAttackerEnabled",),
     "vodBetaEnabled": ("vodBetaEnabled",),
 }
-# Only the STRICT live comparison uses the last four (docs/53): candidate row paths for values the form sets. A path the row does
-# not carry compares as a mismatch NAME (fail closed), so the first read-only readback shows which path names are real.
+# Only the STRICT live comparison uses these (docs/53): row paths for values the form sets, all seen on the live full row
+# (2026-10-18) and in the Dev schema (leonardo_inventory.py). A path the row does not carry compares as a mismatch NAME (fail
+# closed). ``primaryUser.email`` is compared in memory only; it is never logged, recorded or printed.
 STRICT_ROW_PATHS: dict[str, tuple[str, ...]] = {
-    "licenseStartDate": ("accountLicense.startDate", "startDate", "accountLicense.licenseStartDate"),
-    "licenseExpirationDate": ("accountLicense.expirationDate", "expirationDate", "accountLicense.licenseExpirationDate"),
-    "mfaRequired": ("primaryUser.isMfaRequired",),  # the one path the Dev schema probe verified (leonardo_inventory.py)
-    "organizationEmail": ("organizationEmail", "primaryUser.email"),
+    "licenseStartDate": ("accountLicense.startDate",),
+    "licenseExpirationDate": ("accountLicense.expirationDate",),
+    "mfaRequired": ("primaryUser.isMfaRequired",),
+    "organizationEmail": ("primaryUser.email",),
     # Dev-verified path (VALIDATION_TOGGLE_PATHS); the create body sets it False, so the row carries a boolean.
     "multipleAttackStacksEnabled": ("campaignExecutionSettings.domainsMultiAttackStackSettings.enabled",),
 }
 ROW_PATHS: dict[str, tuple[str, ...]] = {
-    "reconLevel": ("reconLevel", "accountLicense.reconLevel"),
-    "scanningFrequency": ("scanningFrequency", "accountLicense.scanningFrequency"),
+    "reconLevel": ("accountLicense.reconLevel",),
+    "scanningFrequency": ("accountLicense.scanningFrequency",),
     **ROW_FLAG_PATHS,
     **STRICT_ROW_PATHS,
 }
@@ -377,7 +379,7 @@ def select_unique_row(rows: Any, name: str, domain: str) -> tuple[Mapping[str, A
 
 # --- The read-only page call --------------------------------------------------------------------------------------------
 def build_readback_body(name: str) -> dict[str, Any]:
-    """Exact-name search body (Dev grammar, docs/49 s.3). No projection (docs/48: omit it or list every compared field).
+    """Exact-name search body (Dev grammar, docs/49 s.3). No projection: rows come back full (docs/53, 2026-10-18).
 
     ``unique_fields`` is name + domain so two tenants that share a name are not collapsed into one row (unverified
     against the server: a non-200 or odd reply refuses the run).
@@ -420,6 +422,75 @@ def readback_reply(status: Any, body: Any) -> dict[str, Any]:
                 out[key] = value
         picked.append(out)
     return {"status": 200, "total": total, "rows": picked}
+
+
+# --- Readback diagnostic (docs/53 note 2026-10-18): which page-own read variant returns the compared paths -------------
+# NAMES ONLY: a fixed result word, two bounded counts and sorted READBACK_PICK_PATHS names; never a value or a row body.
+VARIANT_NAMES = ("A", "B")  # A: page's unique_fields, no projection; B: the strict read (unique_fields override, no projection)
+VARIANT_RESULTS = ("ok", "unavailable", "session_expired", "not_found", "ambiguous")
+_VARIANT_COUNT_CAP = 1000
+
+
+def _bounded_count(value: Any) -> int | None:
+    return min(value, _VARIANT_COUNT_CAP) if type(value) is int and value >= 0 else None
+
+
+def variant_summary(reply: Any, tenant_name: str, domain: str) -> dict[str, Any]:
+    """Reduce one variant's ``readback_reply`` to {result, rows, total, present, absent} (names only; never a value).
+
+    ``present`` / ``absent`` split READBACK_PICK_PATHS by whether the single matched row (exact name AND domain) carries
+    the path; both are empty unless ``result`` is ``ok``. Anything unexpected is ``unavailable`` (fail closed).
+    """
+    empty: dict[str, Any] = {"result": "unavailable", "rows": None, "total": None, "present": [], "absent": []}
+    if not isinstance(reply, Mapping):
+        return empty
+    status, rows, total = reply.get("status"), reply.get("rows"), reply.get("total")
+    if status in (401, 403):
+        return {**empty, "result": "session_expired"}
+    if status != 200 or not isinstance(rows, list) or type(total) is not int or total < 0:
+        return empty
+    counts = {"rows": _bounded_count(len(rows)), "total": _bounded_count(total)}
+    if total > len(rows):
+        return {**empty, **counts, "result": "ambiguous"}
+    row, code = select_unique_row(rows, tenant_name, domain)
+    if row is None:
+        return {**empty, **counts, "result": "not_found" if code == "no_match" else "ambiguous"}
+    present = sorted(path for path in READBACK_PICK_PATHS if _lookup(row, path) is not _MISSING)
+    return {"result": "ok", **counts, "present": present, "absent": sorted(set(READBACK_PICK_PATHS) - set(present))}
+
+
+def variant_line_fields(summaries: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """The part of the printed line: result word and absent path names per variant (A, B), nothing else."""
+    return {"variant_result": {name: summaries[name]["result"] for name in VARIANT_NAMES},
+            "variant_absent": {name: list(summaries[name]["absent"]) for name in VARIANT_NAMES}}
+
+
+def variant_line_problem(fields: Any) -> str | None:
+    """None only when ``fields`` is exactly the fixed-enum shape of ``variant_line_fields``: result words from
+    VARIANT_RESULTS and sorted, unique READBACK_PICK_PATHS names, per variant A, B. No free text can pass."""
+    bad = "variant_line_not_fixed_enum"
+    if not isinstance(fields, dict) or set(fields) != {"variant_result", "variant_absent"}:
+        return bad
+    results, absent = fields["variant_result"], fields["variant_absent"]
+    if not isinstance(results, dict) or set(results) != set(VARIANT_NAMES):
+        return bad
+    if not isinstance(absent, dict) or set(absent) != set(VARIANT_NAMES):
+        return bad
+    if not all(isinstance(word, str) and word in VARIANT_RESULTS for word in results.values()):
+        return bad
+    allowed = set(READBACK_PICK_PATHS)
+    for names in absent.values():
+        if not isinstance(names, list) or len(names) > len(allowed):
+            return bad
+        if not all(isinstance(n, str) and n in allowed for n in names) or names != sorted(set(names)):
+            return bad
+    return None
+
+
+def variant_report(summaries: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """The report's ``variants`` section: per variant the result word, bounded counts and present / absent names."""
+    return {name: {key: summaries[name][key] for key in ("result", "rows", "total", "present", "absent")}
+            for name in VARIANT_NAMES}
 
 
 # --- Redacted report -----------------------------------------------------------------------------------------------------

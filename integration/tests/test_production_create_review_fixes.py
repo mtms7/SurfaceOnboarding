@@ -323,7 +323,7 @@ class StrictContractTests(unittest.TestCase):
     def row(self, **over):
         base = tl.contract_row(**{"accountLicense.startDate": "2026-10-16T09:00:00.000Z",
                                   "accountLicense.expirationDate": "2027-05-20T07:00:00.000Z", "primaryUser.isMfaRequired": True,
-                                  "organizationEmail": "m+x@pentera.io",
+                                  "primaryUser.email": "m+x@pentera.io",
                                   "campaignExecutionSettings.domainsMultiAttackStackSettings.enabled": False})
         base.update(over)
         return base
@@ -331,7 +331,7 @@ class StrictContractTests(unittest.TestCase):
     def test_exact_row_passes_and_each_deviation_is_named(self):
         expected = contract.expected_readback_row(self.INTENDED, strict=True)
         self.assertEqual(contract.compare_readback(expected, self.row())[0], [])
-        for key, bad, name in (("primaryUser.isMfaRequired", False, "mfaRequired"), ("organizationEmail", "x@pentera.io", "organizationEmail"),
+        for key, bad, name in (("primaryUser.isMfaRequired", False, "mfaRequired"), ("primaryUser.email", "x@pentera.io", "organizationEmail"),
                                ("accountLicense.expirationDate", "2027-05-21T07:00:00.000Z", "licenseExpirationDate"),
                                ("accountLicense.startDate", "2026-10-20T09:00:00.000Z", "licenseStartDate")):
             self.assertEqual(contract.compare_readback(expected, self.row(**{key: bad}))[0], [name], key)

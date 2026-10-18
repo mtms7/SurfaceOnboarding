@@ -8916,8 +8916,9 @@ def _pdr_approval_path() -> Path:
 # ``route.fallback`` so the request guard judges the REWRITTEN body; the page's own reply is parsed in Python.
 PDR_TABLE_ROUTE = re.compile(re.escape(production_probe.PRODUCTION_ORIGIN + production_probe.TABLE_READ_PATH) + r"(?:\?.*)?$")
 PDR_NAVIGATE_URL = production_probe.PRODUCTION_ORIGIN + production_probe.PROBE_START_PATH
-# Asked for by every duplicate search: the fields the verdicts compare (the page's own projection is replaced).
-PDR_SEARCH_PROJECTION = ("accountName", "accountDomain", "alternateDomains", "userEmailDomains", "isDeleted")
+# No projection is ever sent (live 2026-10-18: a dotted projection made the server drop the compared paths). Rows come back
+# FULL; ``production_dry_run.search_reply`` / ``production_contract.readback_reply`` pick the needed fields in Python and keep
+# nothing else.
 PDR_SESSION_CHECK_VALUE = "session-check"  # matches no tenant: the session check reads (almost) no rows
 PDR_IN_APP_TRIGGERS = ("in_app", "in_app_dispatch")
 
@@ -8997,16 +8998,20 @@ class ProductionPageReader:
         else:
             header.click(timeout=FIELD_TIMEOUT_MS)
 
-    def table(self, value: str, projection: Any, *, form_open: bool = False) -> tuple[int | None, Any]:
+    def table(self, value: str, *, form_open: bool = False,
+              mode: str = production_probe.REWRITE_STRICT) -> tuple[int | None, Any]:
         """One read-only table search for ``value`` through the page's own request; ``(status, JSON body | None)``.
 
-        ``(None, None)``: nothing was rewritten, no reply arrived in time, or the value or projection is invalid. A status
-        that is not 2xx (401 and 403 included) comes back with no body.
+        ``(None, None)``: nothing was rewritten, no reply arrived in time, or the value is invalid. A status that is not
+        2xx (401 and 403 included) comes back with no body. ``mode`` is strict (name + domain override, the page's own
+        projection removed, validated with the strict grammar) for every read except the readback diagnostic variant A.
         """
         try:
-            fields = production_probe.table_rewrite_fields(value, projection)
+            fields = production_probe.table_rewrite_fields(value, mode)
+            drops = production_probe.table_rewrite_drops(mode)
         except ValueError:
             return None, None
+        strict = mode == production_probe.REWRITE_STRICT
         rewritten: list[Any] = []
 
         def rewrite(route: Any) -> None:
@@ -9017,8 +9022,10 @@ class ProductionPageReader:
                     return
                 body = json.loads(request.post_data or "")
                 body["tableServerData"].update(fields)
+                for key in drops:
+                    body["tableServerData"].pop(key, None)
                 text = json.dumps(body)
-                if production_probe.read_body_problem(text) is not None:
+                if production_probe.read_body_problem(text, strict=strict) is not None:
                     route.fallback()  # unchanged: the guard aborts it and the missing rewrite fails the read closed
                     return
                 rewritten.append(request)
@@ -9082,16 +9089,24 @@ class ProductionPageReader:
             return status, None
 
     def search(self, value: str, *, form_open: bool = False) -> dict[str, Any]:
-        status, body = self.table(value, PDR_SEARCH_PROJECTION, form_open=form_open)
+        status, body = self.table(value, form_open=form_open)
         return production_dry_run.search_reply(status, body)
 
-    def readback(self, value: str) -> dict[str, Any]:
-        status, body = self.table(value, production_contract.READBACK_PICK_PATHS)
+    def readback(self, value: str, *, mode: str = production_probe.REWRITE_STRICT) -> dict[str, Any]:
+        status, body = self.table(value, mode=mode)
         return production_contract.readback_reply(status, body)
+
+    def readback_diagnostic(self, value: str) -> dict[str, dict[str, Any]]:
+        """Readback probe class ONLY (docs/53 note 2026-10-18): variant A, one reload.
+
+        A keeps the page's own unique_fields and sends no projection. A read that did not happen is the status-0 reply
+        (unavailable). Variant B is the strict ``readback`` (override, no projection) the caller already did.
+        """
+        return {"A": self.readback(value, mode=production_probe.REWRITE_PAGE_UNIQUE)}
 
     def session_problem(self, *, form_open: bool = False) -> str | None:
         """Signed in? From the page's own table reply status plus the statuses of its own start-up calls; nothing else."""
-        status, _body = self.table(PDR_SESSION_CHECK_VALUE, ("accountName",), form_open=form_open)
+        status, _body = self.table(PDR_SESSION_CHECK_VALUE, form_open=form_open)
         return production_dry_run.session_verdict(status, dict(self.observed))
 
     def demo_reply(self, domains: Any) -> dict[str, Any]:
@@ -9703,6 +9718,28 @@ def _readback_blocked_writes(guard: production_probe.RequestGuard) -> int:
     return sum(count for (method, _where), count in guard.blocked.items() if method not in production_probe.SAFE_METHODS)
 
 
+def readback_variants(reader: ProductionPageReader, primary: Any, tenant_name: str, domain: str) -> dict[str, dict[str, Any]]:
+    """Names-only diagnostic summaries for variants A and B (docs/53 note 2026-10-18). Never raises.
+
+    B is the primary strict read already made (unique_fields override, no projection). A is one more page-own reload, only
+    when the primary read answered 200; a failed, skipped or crashing variant is ``unavailable``.
+    """
+    replies: dict[str, Any] = {"B": primary}
+    status = primary.get("status") if isinstance(primary, dict) else None
+    if status == 200:
+        try:
+            replies.update(reader.readback_diagnostic(tenant_name))
+        except Exception:
+            pass
+    summaries = {}
+    for name in production_contract.VARIANT_NAMES:
+        try:
+            summaries[name] = production_contract.variant_summary(replies.get(name), tenant_name, domain)
+        except Exception:
+            summaries[name] = production_contract.variant_summary(None, tenant_name, domain)
+    return summaries
+
+
 def run_production_readback(reference: str, *, environ: Any | None = None, now: datetime | None = None,
                             wait_seconds: float = MAX_WAIT_SECONDS, report_base: Path | None = None,
                             load_source: Any = None, open_page: Any = None) -> str:
@@ -9726,6 +9763,7 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
     except ValueError:
         return json.dumps(_readback_refused("origin_not_approved"), separators=(",", ":"))
     guard: production_probe.RequestGuard | None = None
+    variants: dict[str, dict[str, Any]] | None = None
     try:
         try:
             source = (load_source or CE_ROUTE.load_source)(reference)
@@ -9750,9 +9788,12 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
                 worker_problem = production_dry_run.service_worker_verdict(worker)
                 if worker_problem:
                     raise _ReadbackStop(worker_problem)
-                reply = _pdr_reader(page, in_app=False).readback(intended["tenant_name"])  # reload only: zero clicks
+                reader = _pdr_reader(page, in_app=False)
+                reply = reader.readback(intended["tenant_name"])  # reload only: zero clicks
                 outcome = readback_analyse(reply, intended["tenant_name"], intended["primary_domain"], expected_row,
                                            getattr(source, "salesforce_account_uuid", "") or "")
+                # Diagnostic (docs/53 note 2026-10-18): which read variant returns the compared paths; names only, verdict untouched.
+                variants = readback_variants(reader, reply, intended["tenant_name"], intended["primary_domain"])
                 if _readback_blocked_writes(guard):
                     outcome = _readback_refused("write_request_blocked", tenant_found=outcome["tenant_found"],
                                                 mismatches=outcome["mismatches"], uuid_ok=outcome["uuid_ok"],
@@ -9765,19 +9806,24 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
             raise _ReadbackStop("readback_crashed") from None
     except _ReadbackStop as stop:
         outcome = _readback_refused(stop.reason)
+    variant_fields = production_contract.variant_line_fields(variants) if variants is not None else {}
     report = {"schema": 1, "kind": "production_readonly_readback", "reference": probe_reference, "co_reference": reference,
               "captured_at": now.astimezone(timezone.utc).isoformat(timespec="seconds"),
-              "origin": production_probe.PRODUCTION_ORIGIN, "profile": target.profile_dir_name, **outcome,
+              "origin": production_probe.PRODUCTION_ORIGIN, "profile": target.profile_dir_name, **outcome, **variant_fields,
               "clicks": 0,
               "api_calls": guard.api_report() if guard is not None else [],
               "blocked_requests": guard.blocked_report() if guard is not None else []}
+    if variants is not None:
+        report["variants"] = production_contract.variant_report(variants)
     try:
         production_contract.write_readback_report(report_base or _probe_report_base(), report, now)
     except (ValueError, OSError):
         outcome = _readback_refused("report_unavailable", tenant_found=outcome["tenant_found"],
                                     mismatches=outcome["mismatches"], uuid_ok=outcome["uuid_ok"],
                                     sf_match=outcome["salesforce_uuid_matches"])
-    line = json.dumps(outcome, separators=(",", ":"))
+    if variant_fields and production_contract.variant_line_problem(variant_fields) is not None:
+        return json.dumps(_readback_refused("line_not_redacted"), separators=(",", ":"))
+    line = json.dumps({**outcome, **variant_fields}, separators=(",", ":"))
     return line if production_dry_run.line_problem(line) is None else json.dumps(
         _readback_refused("line_not_redacted"), separators=(",", ":"))
 

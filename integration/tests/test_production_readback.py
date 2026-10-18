@@ -62,8 +62,8 @@ class FakePage(pot.PageOwnTable):
             return {"count": self.workers}
         raise AssertionError("unexpected evaluate: the readback evaluates nothing but the service-worker count")
 
-    def _serve_table(self, value, projection):
-        self.search_argument = (value, projection)
+    def _serve_table(self, value):
+        self.search_argument = value
         if self.attempt_write:
             self.fire("POST", ADD_URL, "{}")
             self.fire("PUT", ORIGIN + "/api/v1/backoffice/account/" + "a" * 24 + "/edit", "{}")
@@ -127,8 +127,9 @@ class Harness:
         return json.loads(files[0].read_text(encoding="utf-8")), files[0].read_text(encoding="utf-8"), files[0]
 
 
-LINE_KEYS = {"result", "reason", "tenant_found", "mismatches", "uuid_ok", "salesforce_uuid_matches",
-             "production_write", "salesforce_writeback"}
+BASE_LINE_KEYS = {"result", "reason", "tenant_found", "mismatches", "uuid_ok", "salesforce_uuid_matches",
+                  "production_write", "salesforce_writeback"}
+LINE_KEYS = BASE_LINE_KEYS | {"variant_result", "variant_absent"}  # the readback diagnostic (names only)
 
 
 class GateTests(unittest.TestCase):
@@ -204,9 +205,13 @@ class ReadbackRunTests(unittest.TestCase):
         h = Harness(self)
         line, text = h.run()
         self.assertEqual(set(line), LINE_KEYS)
-        self.assertEqual(line, {"result": "production_readback_complete", "reason": "compared", "tenant_found": True,
-                                "mismatches": [], "uuid_ok": True, "salesforce_uuid_matches": True,
-                                "production_write": "not_performed", "salesforce_writeback": "not_performed"})
+        absent = sorted(set(contract.READBACK_PICK_PATHS) - set(good_row()))  # candidate paths the good row does not carry
+        self.assertEqual({k: line[k] for k in BASE_LINE_KEYS},
+                         {"result": "production_readback_complete", "reason": "compared", "tenant_found": True,
+                          "mismatches": [], "uuid_ok": True, "salesforce_uuid_matches": True,
+                          "production_write": "not_performed", "salesforce_writeback": "not_performed"})
+        self.assertEqual(line["variant_result"], {"A": "ok", "B": "ok"})
+        self.assertEqual(line["variant_absent"], {"A": absent, "B": absent})
         report, report_text, path = h.report()
         self.assertEqual(path.name, "readback-20261016T120000Z.json")
         for key in LINE_KEYS:
@@ -229,16 +234,17 @@ class ReadbackRunTests(unittest.TestCase):
         h.run()
         self.assertEqual(h.page.routes[0][0], "**/*")
         self.assertEqual(h.page.evaluated[0], runner.production_dry_run.SERVICE_WORKER_JS)
-        value, picks = h.page.search_argument
-        self.assertEqual((value, picks), (fx.NAME, list(contract.READBACK_PICK_PATHS)))
-        self.assertIn("accountUuid", picks)
-        server = h.page.table_bodies[0]["tableServerData"]  # the page's own request with ONLY these fields rewritten
+        server = h.page.table_bodies[0]["tableServerData"]  # the primary read
+        self.assertEqual(h.page.table_values[0], fx.NAME)
+        self.assertNotIn("projection", server)  # full rows: the picker reduces them in Python (docs/53 2026-10-18)
+        self.assertIn("accountUuid", contract.READBACK_PICK_PATHS)  # the page's own request with ONLY these fields rewritten
         self.assertEqual(server["filters"], {"and": [{"method": "search", "value": fx.NAME}]})
         self.assertEqual((server["offset"], server["items_per_page"]), (0, contract.SEARCH_PAGE_SIZE))
         self.assertEqual(server["unique_fields"], ["accountName", "accountDomain"])
         self.assertEqual(server["sort"], json.loads(pot.PAGE_DEFAULT_BODY)["tableServerData"]["sort"])  # kept as the page sent it
-        self.assertEqual(h.page.triples(), [("POST", SEARCH_URL, "continued")])
-        self.assertEqual((h.page.reloads, h.page.gotos), (1, 0))
+        # the primary (strict) read, then the diagnostic variant A (docs/53 note 2026-10-18): two reloads, nothing else
+        self.assertEqual(h.page.triples(), [("POST", SEARCH_URL, "continued")] * 2)
+        self.assertEqual((h.page.reloads, h.page.gotos), (2, 0))
 
     def test_mismatches_are_field_names_only(self):
         row = good_row(accountType="customer", **{"accountLicense.assetsNumber": "1"})
@@ -314,8 +320,8 @@ class ReadbackRunTests(unittest.TestCase):
         self.assertEqual(h.page.triples()[0], ("POST", SEARCH_URL, "continued"))
         report, _, _ = h.report()
         blocked = {(item["method"], item["path"]): item["count"] for item in report["blocked_requests"]}
-        self.assertEqual(blocked[("POST", "/api/v1/backoffice/account/add")], 1)
-        self.assertEqual(sum(blocked.values()), 2)
+        self.assertEqual(blocked[("POST", "/api/v1/backoffice/account/add")], 2)  # one per read: primary (B) + diagnostic A
+        self.assertEqual(sum(blocked.values()), 4)
         self.assertEqual(h.page.clicks, [])
         self.assertEqual(line["production_write"], "not_performed")
 

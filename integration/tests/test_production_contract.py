@@ -68,8 +68,8 @@ def create_flat():
 def row_flat(**over):
     flat = {
         "accountName": NAME, "accountDomain": DOMAIN, "accountType": "Customer", "accountCountryCode": "CL",
-        "accountUuid": UUID, "id": ROW_ID, "scanningInterval": "NO_SCHEDULE", "scanningFrequency": "NO_SCHEDULE",
-        "leakedCredentialsScanningInterval": "WEEKLY", "reconLevel": "ALL_ASSETS", "userEmailDomains": [INTERNAL],
+        "accountUuid": UUID, "id": ROW_ID, "scanningInterval": "NO_SCHEDULE", "accountLicense.scanningFrequency": "NO_SCHEDULE",
+        "leakedCredentialsScanningInterval": "WEEKLY", "accountLicense.reconLevel": "ALL_ASSETS", "userEmailDomains": [INTERNAL],
         "accountLicense.assetsNumber": 1, "accountLicense.domainsNumber": 1, "accountLicense.subDomainsNumber": 1,
         "accountLicense.leakedCredentialsAllowed": True, "accountLicense.provisioningEnabled": True,
         "accountLicense.notificationsAllowed": False, "accountLicense.multipleUsersAllowed": False,
@@ -245,7 +245,7 @@ class ReadbackTests(unittest.TestCase):
         self.assertEqual(mismatches, ["accountLicense.assetsNumber"])
 
     def test_wrong_values_named(self):
-        row = row_flat(accountType="customer", reconLevel="NONE", **{"accountLicense.phishingEnabled": True,
+        row = row_flat(accountType="customer", **{"accountLicense.reconLevel": "NONE", "accountLicense.phishingEnabled": True,
                                                                      "leakedCredentialsSettings.spyCloudSettings.enabled": False})
         mismatches, _ = contract.compare_readback(self.expected, row)
         self.assertEqual(sorted(mismatches), ["accountLicense.phishingEnabled", "accountType",
@@ -258,7 +258,7 @@ class ReadbackTests(unittest.TestCase):
 
     def test_missing_field_is_a_mismatch(self):
         row = row_flat()
-        del row["scanningFrequency"]
+        del row["accountLicense.scanningFrequency"]
         self.assertEqual(contract.compare_readback(self.expected, row)[0], ["scanningFrequency"])
 
     def test_name_domain_and_email_domains_exact(self):
@@ -396,6 +396,86 @@ class SearchBodyAndScriptTests(unittest.TestCase):
         self.assertFalse(hasattr(contract, "READBACK_JS"))  # no script is evaluated in the page any more
         self.assertEqual(contract.ACCOUNTS_PATH, "/api/v1/backoffice/getAllDetailedAccounts")
         self.assertIn("accountUuid", contract.READBACK_PICK_PATHS)
+
+
+class RealRowPathTests(unittest.TestCase):
+    """Live finding 2026-10-18: the server's full rows carry these paths; the proven-absent fallback names are gone."""
+
+    REAL = {
+        "licenseStartDate": ("accountLicense.startDate",), "licenseExpirationDate": ("accountLicense.expirationDate",),
+        "reconLevel": ("accountLicense.reconLevel",), "scanningFrequency": ("accountLicense.scanningFrequency",),
+        "automatedDiscoveryEnabled": ("accountSettings.reconSettings.automatedDiscoveryEnabled",),
+        "mfaRequired": ("primaryUser.isMfaRequired",), "organizationEmail": ("primaryUser.email",),
+    }
+    GONE = ("startDate", "expirationDate", "organizationEmail", "reconLevel", "scanningFrequency", "automatedDiscoveryEnabled",
+            "accountLicense.licenseStartDate", "accountLicense.licenseExpirationDate")
+
+    def full_row(self):
+        row = unflatten({k: v for k, v in row_flat().items() if k != "accountSettings.reconSettings.automatedDiscoveryEnabled"})
+        row.update({"accountLicense": {**row["accountLicense"], "startDate": "2026-10-16T09:00:00.000Z",
+                                       "expirationDate": "2027-05-20T07:00:00.000Z", "reconLevel": "ALL_ASSETS",
+                                       "scanningFrequency": "NO_SCHEDULE"},
+                    "accountSettings": {"reconSettings": {"automatedDiscoveryEnabled": False}},
+                    "primaryUser": {"isMfaRequired": True, "email": "test.user+acme@" + INTERNAL},
+                    "campaignExecutionSettings": {"domainsMultiAttackStackSettings": {"enabled": False}}})
+        return row
+
+    def test_candidate_lists_hold_only_the_real_paths(self):
+        for logical, paths in self.REAL.items():
+            self.assertEqual(contract.ROW_PATHS[logical], paths, logical)
+        for name in self.GONE:
+            self.assertNotIn(name, contract.READBACK_PICK_PATHS)
+        self.assertNotIn("organizationEmail", contract.STRICT_ROW_PATHS["organizationEmail"])
+
+    def test_a_full_nested_row_compares_clean_with_the_real_paths(self):
+        expected = contract.expected_readback_row(intended(), strict=True)
+        self.assertEqual(contract.compare_readback(expected, self.full_row())[0], [])
+        reduced = contract.readback_reply(200, {"pagination_response": {"total_count": 1, "table_data": [self.full_row()]}})
+        self.assertEqual(contract.compare_readback(expected, reduced["rows"][0])[0], [])
+
+    def test_a_removed_fallback_name_never_satisfies_a_compared_field_and_absent_paths_fail_closed(self):
+        expected = contract.expected_readback_row(intended(), strict=True)
+        row = self.full_row()
+        for nested, flat_key, logical in (("accountLicense", "startDate", "licenseStartDate"),
+                                          ("accountLicense", "expirationDate", "licenseExpirationDate"),
+                                          ("accountLicense", "reconLevel", "reconLevel"),
+                                          ("accountLicense", "scanningFrequency", "scanningFrequency"),
+                                          ("primaryUser", "email", "organizationEmail")):
+            moved = json.loads(json.dumps(row))
+            value = moved[nested].pop(flat_key)
+            moved[flat_key if nested == "accountLicense" else "organizationEmail"] = value  # the old top-level fallback name
+            self.assertEqual(contract.compare_readback(expected, moved)[0], [logical], logical)
+        moved = json.loads(json.dumps(row))
+        moved["accountSettings"]["reconSettings"].pop("automatedDiscoveryEnabled")
+        moved["automatedDiscoveryEnabled"] = False
+        self.assertEqual(contract.compare_readback(expected, moved)[0], ["automatedDiscoveryEnabled"])
+        self.assertEqual(sorted(contract.compare_readback(expected, {"accountName": NAME})[0]),
+                         sorted(n for n in expected if n != "accountName"))
+
+    def test_license_counts_are_numbers_and_the_picked_email_is_compared_but_never_reported(self):
+        expected = contract.expected_readback_row(intended(), strict=True)
+        row = self.full_row()
+        row["accountLicense"]["assetsNumber"] = "1"
+        self.assertEqual(contract.compare_readback(expected, row)[0], ["accountLicense.assetsNumber"])
+        row = self.full_row()
+        row["primaryUser"]["email"] = "someone.else@" + INTERNAL
+        out = contract.compare_readback(expected, row)
+        self.assertEqual(out[0], ["organizationEmail"])
+        self.assertNotIn("someone.else", json.dumps(out))
+
+    def test_the_picker_keeps_no_unrelated_content_and_handles_large_rows(self):
+        row = self.full_row()
+        row.update({"token": "SECRET-TOKEN-VALUE", "notes": "n" * 100_000, "operatorAccounts": [{"email": "op@x.example"}],
+                    "primaryUser": {**row["primaryUser"], "phoneNumber": "+10000000", "firstName": "Zed"},
+                    "blob": [{"k": "v" * 50}] * 5000})
+        out = contract.readback_reply(200, {"pagination_response": {"total_count": 100, "table_data": [row] * 100}})
+        self.assertEqual(len(out["rows"]), 100)
+        text = json.dumps(out)
+        for needle in ("SECRET-TOKEN-VALUE", "op@x.example", "+10000000", "Zed", "n" * 50, "blob", "notes", "firstName"):
+            self.assertNotIn(needle, text)
+        self.assertLess(len(text), 100 * 1500)
+        self.assertTrue(set(out["rows"][0]) <= set(contract.READBACK_PICK_PATHS))
+        self.assertLessEqual(production_probe.TABLE_ROW_LIMIT, 100)
 
 
 class ReportTests(unittest.TestCase):
