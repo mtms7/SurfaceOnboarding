@@ -526,17 +526,24 @@ class CreateTests(Base):
 
 
 class AdvancedMismatchTests(Base):
-    def test_an_advanced_control_not_off_refuses_before_the_consume_and_the_click(self):
+    def test_an_advanced_control_that_cannot_be_set_off_refuses_before_the_consume_and_the_click(self):
         states = {n: False for n in dry.pdr.ADVANCED_NAMES}
         states["fullNucleiScanEnabled"] = True
-        h = self.harness(advanced=states)
-        self.assertEqual(h.go()["result"], "advanced_mismatch")
+        h = self.harness(advanced=states, sticky={"fullNucleiScanEnabled"})
+        self.assertEqual(h.go()["result"], "toggle_click_failed")
         self.assertEqual((h.page.confirm_clicks, h.page.form_open), (0, False))
         self.assertIsNone(h.approval_unused())
         self.assertNotIn("attempt_started", h.outcomes())
         record = [r for r in h.loaded_records() if r["outcome"] == "refused"][0]
-        self.assertEqual(record["refusal_reason"], "advanced_mismatch")
-        self.assertEqual(record["advanced_mismatches"], ["fullNucleiScanEnabled"])
+        self.assertEqual(record["refusal_reason"], "toggle_click_failed")
+
+    def test_advanced_controls_on_by_default_are_set_off_and_the_create_proceeds(self):
+        expected = self.harness().go()["result"]
+        states = {n: False for n in dry.pdr.ADVANCED_NAMES}
+        states.update(automatedDiscoveryEnabled=True, subDomainsReconEnabled=True, webDictionaryBruteForceEnabled=True)
+        h = self.harness(advanced=states)
+        self.assertEqual(h.go()["result"], expected)
+        self.assertFalse(any(h.page.advanced_state.values()))
 
 
 class CreateBodyTests(Base):
@@ -650,6 +657,19 @@ class FormRecheckTests(Base):
     def test_spycloud_flipped_during_the_duplicate_reads_refuses_before_consume_and_click(self):
         h = self.harness()
         h.page.on_read[NAME] = lambda: setattr(h.page, "spy_state", False)
+        self.changed(h)
+
+    def test_spycloud_absent_at_the_fill_and_at_the_recheck_is_stable(self):
+        # Live 2026-10-18 (CO-0798 dry run #2): the production Add form has no SpyCloud switch ("absent"); the readback
+        # still requires leakedCredentialsSettings.spyCloudSettings.enabled = True (the server default).
+        h = self.harness()
+        h.page.spy_state = None
+        self.assertEqual(h.go()["result"], "created_verified")
+
+    def test_spycloud_appearing_during_the_duplicate_reads_refuses(self):
+        h = self.harness()
+        h.page.spy_state = None
+        h.page.on_read[NAME] = lambda: setattr(h.page, "spy_state", True)
         self.changed(h)
 
     def test_an_unknown_extra_control_appearing_during_the_reads_refuses(self):

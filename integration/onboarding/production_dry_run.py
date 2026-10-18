@@ -475,8 +475,9 @@ def advanced_report(section_found: bool, states: Mapping[str, Any], targets: Map
 def advanced_problem(report: Mapping[str, Any]) -> str | None:
     """Refuse when Dev sets a control that production does not have, or one that is not in its Dev target state.
 
-    The create never clicks an advanced control, so a control that is already on (or off where Dev wants it on) would be
-    submitted as found: ``advanced_mismatch`` refuses before any Confirm. The record keeps the control NAMES only.
+    The fill sets each advanced control to its target first (owner go 2026-10-18; plain, hit-tested clicks only) and this
+    check reads the result: a control that did not end in its target state would be submitted as found, so
+    ``advanced_mismatch`` refuses before any Confirm. The record keeps the control NAMES only.
     """
     controls = report.get("advanced_controls") or {}
     if any(controls.get(name) == "absent" for name in ADVANCED_NAMES):

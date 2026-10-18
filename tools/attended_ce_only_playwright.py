@@ -9415,8 +9415,14 @@ def _pdr_read_checked(page: Any, key: str) -> bool | None:
         return None
 
 
-def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool]) -> dict[str, Any]:
-    """Expand the Advanced section if one exists and READ (never change) the advanced controls by name."""
+def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool], set_targets: bool = False) -> dict[str, Any]:
+    """Expand the Advanced section if one exists, optionally SET each advanced control to its target, then READ them.
+
+    Owner go 2026-10-18 (live CO-0798 dry run #2: production defaults three advanced switches ON, the CE-only target is
+    OFF): with ``set_targets`` each present control in ``targets`` goes through ``_pdr_set_toggle`` (scroll, hit test,
+    plain click, verified; never forced; FormRefusal toggle_click_failed with its stage otherwise). The informational
+    SpyCloud control is never changed. The states are always read afterwards, so ``advanced_problem`` stays the gate.
+    """
     first = production_dry_run.ADVANCED_NAMES[0]
     found = _locate_checkbox(page, first) is not None
     if not found:
@@ -9434,6 +9440,10 @@ def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool]) -> dict
             raise
         except Exception:
             pass
+    if set_targets:
+        for name in production_dry_run.ADVANCED_NAMES:
+            if name in targets and isinstance(targets[name], bool):
+                _pdr_set_toggle(page, clicks, name, targets[name])  # absent: False, then read as absent -> refusal
     states: dict[str, Any] = {}
     for name in (*production_dry_run.ADVANCED_NAMES, *production_dry_run.INFO_ADVANCED_NAMES):
         control = _locate_checkbox(page, name)
@@ -9545,7 +9555,7 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
         for key, value in intended.dates:
             if not fill_date(page, key, value):
                 raise refusal("fill_form_schema_unavailable")
-        extras.update(_pdr_read_advanced(page, clicks, dict(intended.advanced_targets)))
+        extras.update(_pdr_read_advanced(page, clicks, dict(intended.advanced_targets), set_targets=True))
         after = production_probe.sanitize_form(page.evaluate(production_probe.FORM_JS))
         problem = production_dry_run.schema_problem(after, after_advanced=True) or production_dry_run.advanced_problem(extras)
         if problem:

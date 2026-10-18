@@ -108,6 +108,7 @@ class Ctl:
     def __init__(self, page, kind, key, value="", checked=False, options=None, mangle=None, enabled=True):
         self.page, self.kind, self.key = page, kind, key
         self.hit = key not in page.hit_fail
+        self.adv = kind == "checkbox" and key in page.advanced_state  # an advanced switch: its state lives on the page
         self.scrolled = False  # a control below the fold is hit-testable only after it was scrolled into view
         self.value, self.checked, self.options, self.mangle, self.enabled = value, checked, options or [], mangle, enabled
 
@@ -122,15 +123,17 @@ class Ctl:
         return self.enabled
 
     def is_checked(self):
-        return self.checked
+        return self.page.advanced_state[self.key] if self.adv else self.checked
 
     def click(self, **kw):
         assert "force" not in kw, "a forced click must never be made"
         if self.key in self.page.click_fail:
             raise RuntimeError("element intercepts pointer events")
         self.page.clicks.append(self.key)
-        if self.kind == "checkbox":
-            self.checked = not self.checked
+        if self.kind == "checkbox" and self.key not in self.page.sticky:  # a sticky switch ignores the click
+            self.checked = not self.is_checked()
+            if self.adv:
+                self.page.advanced_state[self.key] = self.checked
 
     def fill(self, value, **_kw):
         assert "\n" not in value and "\r" not in value, "no newline may ever be typed"
@@ -208,9 +211,9 @@ class FakePage(pot.PageOwnTable):
 
     def __init__(self, *, advanced=None, form_fields=None, text_labels=None, mangle=None, write_on_select=False,
                  session=None, search=None, demo=None, advanced_button=True, sw_count=0, hit_fail=(),
-                 click_fail=(), add_label="Add Account", header=True, below_fold=()):
+                 click_fail=(), add_label="Add Account", header=True, below_fold=(), sticky=()):
         self.hit_fail, self.click_fail, self.sw_count, self.add_label = set(hit_fail), set(click_fail), sw_count, add_label
-        self.below_fold = set(below_fold)
+        self.below_fold, self.sticky = set(below_fold), set(sticky)
         self.confirm_enabled, self.confirm_hit, self.scrolled = True, True, 0
         self.url = ORIGIN + "/backoffice/tenantManagement"
         self.clicks, self.keys = [], []
@@ -220,7 +223,7 @@ class FakePage(pot.PageOwnTable):
         self.form_fields = form_fields if form_fields is not None else PROBE_FIELDS
         self.advanced = advanced if advanced is not None else {n: False for n in pdr.ADVANCED_NAMES}
         self.advanced_state = dict(self.advanced)
-        self.spy_state = True  # the informational SpyCloud box (ON is the server default)
+        self.spy_state = True  # the informational SpyCloud box (ON is the server default); None = absent (live 2026-10-18)
         self.extra_fields = []  # controls that appear in the expanded form after the fill (a re-render)
         self.session = session or {pdr.AUTHORITIES_PATH: {"status": 200}, pdr.ACCOUNT_INFO_PATH: {"status": 200}}
         self.search = search if search is not None else {}
@@ -276,7 +279,7 @@ class FakePage(pot.PageOwnTable):
             fields = list(self.form_fields)
             if self.expanded:
                 fields += [(n, "", "checkbox", None, "") for n in list(self.advanced_state) + ["spyCloudEnabled"]
-                           if n in self.advanced_state or n == "spyCloudEnabled"]
+                           if n in self.advanced_state or (n == "spyCloudEnabled" and self.spy_state is not None)]
             return form_of(fields + list(self.extra_fields))
         if script == pdr.SERVICE_WORKER_JS:
             return {"count": self.sw_count}
@@ -321,7 +324,7 @@ class FakePage(pot.PageOwnTable):
             if self.expanded and key in self.advanced_state:
                 box = self._advanced_boxes()[key]
                 return box
-            if self.expanded and key == "spyCloudEnabled":
+            if self.expanded and key == "spyCloudEnabled" and self.spy_state is not None:
                 return Ctl(self, "checkbox", key, checked=self.spy_state)
             return Missing()
         if selector == runner.OPERATOR_ACCOUNT_INPUT_SELECTOR:
@@ -1013,21 +1016,42 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(h.page.clicks[-1], "Cancel")
         self.assertNotIn("Confirm", h.page.clicks)
 
-    def test_advanced_absence_and_state_difference_both_refuse(self):
+    def test_advanced_switches_that_are_on_are_set_off_by_a_plain_click(self):
+        # Live 2026-10-18 (CO-0798 dry run #2): production defaults three advanced switches ON; the CE-only target is OFF.
+        expected = Harness(self).run()["result"]
         states = {n: False for n in pdr.ADVANCED_NAMES}
-        states.update(aiEnabled=True, webDorkingEnabled=True)
+        states.update(automatedDiscoveryEnabled=True, subDomainsReconEnabled=True, webDictionaryBruteForceEnabled=True)
         h = Harness(self, advanced=states)
         out = h.run()
-        self.assertEqual(out["result"], "advanced_mismatch")
+        self.assertEqual(out["result"], expected)
         data, _ = h.record()
-        self.assertEqual(data["outcome"], "refused")
-        self.assertEqual(data["refusal_reason"], "advanced_mismatch")
-        self.assertEqual(sorted(data["advanced_mismatches"]), ["aiEnabled", "webDorkingEnabled"])
-        self.assertEqual(data["advanced_controls"]["aiEnabled"], "on")
-        self.assertNotIn("aiEnabled", h.page.clicks)  # read, never changed
-        self.assertTrue(h.page.advanced_state["aiEnabled"])
-        self.assertEqual(h.page.clicks[-1], "Cancel")
+        self.assertEqual(data["advanced_mismatches"], [])
+        self.assertEqual(set(data["advanced_controls"][n] for n in pdr.ADVANCED_NAMES), {"off"})
+        self.assertEqual(sorted(c for c in h.page.clicks if c in pdr.ADVANCED_NAMES),
+                         ["automatedDiscoveryEnabled", "subDomainsReconEnabled", "webDictionaryBruteForceEnabled"])
+        self.assertNotIn("spyCloudEnabled", h.page.clicks)  # informational: never changed
         self.assertNotIn("Confirm", h.page.clicks)
+
+    def test_advanced_switches_already_off_are_not_clicked(self):
+        h = Harness(self)
+        h.run()
+        self.assertFalse([c for c in h.page.clicks if c in pdr.ADVANCED_NAMES or c == "spyCloudEnabled"])
+
+    def test_an_advanced_switch_that_cannot_be_set_refuses_with_its_stage(self):
+        on = {**{n: False for n in pdr.ADVANCED_NAMES}, "automatedDiscoveryEnabled": True}
+        for kwargs, stage in ((dict(sticky={"automatedDiscoveryEnabled"}), "state"),
+                              (dict(hit_fail={"automatedDiscoveryEnabled"}), "hit_test")):
+            with self.subTest(stage=stage):
+                h = Harness(self, advanced=on, **kwargs)
+                self.assertEqual(h.run()["result"], "toggle_click_failed")
+                fields = h.record()[0]["form_fields_checked"]
+                self.assertEqual(fields.get(f"toggle.automatedDiscoveryEnabled.stage_{stage}"), "fail")
+                self.assertEqual(h.page.clicks[-1], "Cancel")
+                self.assertNotIn("Confirm", h.page.clicks)
+                if stage == "hit_test":
+                    self.assertNotIn("automatedDiscoveryEnabled", h.page.clicks)  # never clicked when covered
+
+    def test_advanced_absence_refuses(self):
 
         missing = Harness(self, advanced={n: False for n in pdr.ADVANCED_NAMES if n != "fullNucleiScanEnabled"})
         out = missing.run()
