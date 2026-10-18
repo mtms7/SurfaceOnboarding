@@ -316,6 +316,40 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(live.checked_duplicate_problem(control, (ok, ok), tl.reply([]), tl.reply([row]), clear_demo,
                                                          tl.NAME, tl.DOMAIN), "duplicate_in_production")
 
+    def test_control_problem_needs_untruncated_replies_and_exact_name_and_domain(self):
+        control = {"name": "A Co", "domain": "A.Example."}
+        row = {"name": "a  co", "domain": "a.example"}
+        ok = tl.reply([row])
+        self.assertIsNone(live.control_problem(control, ok, ok))  # case, spacing and a trailing dot are normalised
+        ignored = tl.reply([row], total=500)  # the server ignored the filter: more matches than rows came back
+        self.assertEqual(live.control_problem(control, ignored, ok), "search_unproven")
+        self.assertEqual(live.control_problem(control, ok, ignored), "search_unproven")
+        for bad_total in (None, "1", True, -1):
+            self.assertEqual(live.control_problem(control, ok, {"status": 200, "total": bad_total, "rows": [row]}),
+                             "search_unproven", bad_total)
+            self.assertEqual(live.control_problem(control, {"status": 200, "total": bad_total, "rows": [row]}, ok),
+                             "search_unproven", bad_total)
+        other_domain = tl.reply([{"name": "a co", "domain": "b.example"}])
+        self.assertEqual(live.control_problem(control, ok, other_domain), "search_unproven")  # right name, wrong domain
+        self.assertEqual(live.control_problem(control, ok, tl.reply([{"name": "a co", "domain": None}])), "search_unproven")
+        self.assertEqual(live.control_problem(control, ok, tl.reply([{"name": "someone else", "domain": "a.example"}])),
+                         "search_unproven")
+        self.assertEqual(live.control_problem(control, tl.reply([{"name": "someone else", "domain": "a.example"}]), ok),
+                         "search_unproven")
+        padded = tl.reply([{"name": "zzz", "domain": "z.example"}, row])  # the control sits among other rows: fine
+        self.assertIsNone(live.control_problem(control, padded, padded))
+
+    def test_the_live_pre_check_control_step_applies_the_same_rule(self):
+        control = {"name": "A Co", "domain": "a.example"}
+        row = {"name": "a co", "domain": "a.example"}
+        ok, ignored = tl.reply([row]), tl.reply([row], total=9)
+        clear_demo = tl.CLEAR_DEMO
+        self.assertEqual(live.checked_duplicate_problem(control, (ignored, ok), tl.reply([]), tl.reply([]), clear_demo,
+                                                         tl.NAME, tl.DOMAIN), "search_unproven")
+        self.assertEqual(live.checked_duplicate_problem(control, (ok, tl.reply([{"name": "a co", "domain": "x.example"}])),
+                                                         tl.reply([]), tl.reply([]), clear_demo, tl.NAME, tl.DOMAIN),
+                         "search_unproven")
+
 
 class StrictContractTests(unittest.TestCase):
     INTENDED = {**tl.INTENDED, "license_start": date(2026, 10, 16), "organization_email": "m+x@pentera.io"}

@@ -84,8 +84,11 @@ class FakeResponse:
 
 
 class FakeHeaderControl:
-    def __init__(self, page):
-        self.page = page
+    """One sortable header button. ``in_dialog`` marks a button inside an open dialog / the Add Account form: the runner
+    must never click or dispatch on it (a click there could change the form the Confirm click then submits)."""
+
+    def __init__(self, page, in_dialog=False):
+        self.page, self.in_dialog = page, in_dialog
 
     def count(self):
         return 1
@@ -94,7 +97,17 @@ class FakeHeaderControl:
     def first(self):
         return self
 
+    def nth(self, _index):
+        return self
+
+    def evaluate(self, js, *_a):
+        assert "closest" in str(js)  # the runner asks the DOM whether the button sits inside a dialog
+        return not self.in_dialog
+
     def click(self, **_kw):
+        if self.in_dialog:
+            self.page.dialog_header_clicks += 1
+            return
         if self.page.form_open:
             raise TimeoutError("element intercepts pointer events")  # the modal covers the table
         self.page.header_clicks += 1
@@ -102,8 +115,28 @@ class FakeHeaderControl:
 
     def dispatch_event(self, name, *_a, **_k):
         assert name == "click"
+        if self.in_dialog:
+            self.page.dialog_header_clicks += 1
+            return
         self.page.dispatches += 1
         self.page._table_request()
+
+
+class FakeHeaders:
+    """The ``thead th button`` locator: every match in DOM order (a dialog's button may come first)."""
+
+    def __init__(self, controls):
+        self.controls = controls
+
+    def count(self):
+        return len(self.controls)
+
+    @property
+    def first(self):
+        return self.controls[0]
+
+    def nth(self, index):
+        return self.controls[index]
 
 
 class _Expect:
@@ -184,7 +217,8 @@ class PageOwnTable:
                     demo_domain: str = "") -> None:
         self.routes, self.routed, self.handlers = [], [], {}
         self.header_present = header
-        self.header_clicks = self.dispatches = self.reloads = self.gotos = 0
+        self.header_clicks = self.dispatches = self.reloads = self.gotos = self.dialog_header_clicks = 0
+        self.dialog_header = False
         self.responses, self.fetches, self.table_values = [], [], []
         self.table_bodies = []
         self.passive = passive if passive is not None else {}
@@ -259,4 +293,9 @@ class PageOwnTable:
         return _Expect(self, predicate)
 
     def _header(self):
-        return FakeHeaderControl(self) if self.header_present else None
+        controls = []
+        if getattr(self, "dialog_header", False):  # a sortable header inside the open dialog, listed BEFORE the table's
+            controls.append(FakeHeaderControl(self, in_dialog=True))
+        if self.header_present:
+            controls.append(FakeHeaderControl(self))
+        return FakeHeaders(controls) if controls else None

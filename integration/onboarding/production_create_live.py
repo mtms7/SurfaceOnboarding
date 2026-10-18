@@ -45,7 +45,7 @@ LIVE_REASONS = frozenset({
     "dry_run_old", "salesforce_org_not_pinned", "country_code_unavailable", "salesforce_alias_not_pinned", "intended_unavailable", "production_dry_run_form_not_reached", "search_unproven", "search_control_unavailable",
     "confirm_preflight_failed", "extra_pages_open", "launch_ticket_invalid", "source_recheck_unavailable",
     "approval_revision_drift", "salesforce_prior_uuid_present", "live_source_check_missing", "service_worker_present", "service_worker_check_failed",
-    "readback_payload_mismatch", "readback_payload_unchecked",
+    "readback_payload_mismatch", "readback_payload_unchecked", "form_changed_during_checks", "form_recheck_missing",
 })
 
 
@@ -432,17 +432,38 @@ def control_problem(control: object, name_reply: object, domain_reply: object) -
     if not (isinstance(control, Mapping) and isinstance(control.get("name"), str) and control["name"].strip()
             and isinstance(control.get("domain"), str) and control["domain"].strip()):
         return "search_control_unavailable"
-    wanted = _norm(control["name"])
-    for reply in (name_reply, domain_reply):
-        status = production_dry_run._status(reply)
-        if status in (401, 403):
-            return "production_session_expired"
-        rows = reply.get("rows") if isinstance(reply, Mapping) else None
-        if status != 200 or not isinstance(rows, list):
-            return "search_unproven"
-        if not any(isinstance(r, Mapping) and _norm(r.get("name")) == wanted for r in rows):
-            return "search_unproven"
+    for reply, field in ((name_reply, "name"), (domain_reply, "domain")):
+        problem = control_reply_problem(reply, control, field)
+        if problem is not None:
+            return problem
     return None
+
+
+def control_reply_problem(reply: object, control: Mapping[str, Any], field: str) -> str | None:
+    """None only when ``reply`` PROVES the ``field`` search ("name" or "domain") for ``control``; else a reason code.
+
+    The reply must be a readable 200 whose ``total`` is an int not larger than the rows returned (a server that ignored the
+    filter reports more matches than rows: truncated, never a proof), and it must hold the control's own row: the exact
+    normalised name for the name search, and for the domain search a row with the exact normalised primary domain AND the
+    control's name (so a lookalike or an unfiltered page of rows cannot pass).
+    """
+    status = production_dry_run._status(reply)
+    if status in (401, 403):
+        return "production_session_expired"
+    rows = reply.get("rows") if isinstance(reply, Mapping) else None
+    total = reply.get("total") if isinstance(reply, Mapping) else None
+    if status != 200 or not isinstance(rows, list) or type(total) is not int or total < 0 or total > len(rows):
+        return "search_unproven"
+    name = _norm(control.get("name"))
+    domain = production_dry_run._norm_domain(control.get("domain"))
+    if not name or not domain:
+        return "search_unproven"
+    for row in rows:
+        if not isinstance(row, Mapping) or _norm(row.get("name")) != name:
+            continue
+        if field == "name" or production_dry_run._norm_domain(row.get("domain")) == domain:
+            return None
+    return "search_unproven"
 
 
 def checked_duplicate_problem(control: object, control_replies: tuple[object, object], name_reply: object,

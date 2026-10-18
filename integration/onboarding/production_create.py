@@ -329,6 +329,7 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         clock: Callable[[], datetime] | None = None,
         live_duplicate_check: Callable[[CreateInputs], str | None] | None = None,
         live_source_check: Callable[[CreateInputs], tuple[Any, Any]] | None = None,
+        live_form_recheck: Callable[[CreateInputs], Any] | None = None,
         _production_target_fn: Callable[[Mapping[str, str], datetime], Any] | None = None,
         _approval_check_fn: Callable[..., str | None] = production_approval.check) -> CreateResult:
     """Run one guarded create attempt. See the module docstring; every path writes at least one record.
@@ -340,7 +341,9 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     used just before the approval is consumed (default: real UTC now). A live create REQUIRES ``live_duplicate_check``:
     called after the final gate and right before the intent record, it re-checks BackOffice itself (the clone is only a
     hint) and returns a reason code or None; a missing check, an exception or any reason refuses, nothing consumed or
-    clicked. ``prior_records`` are loaded
+    clicked. A live create also REQUIRES ``live_form_recheck``: it re-reads and re-compares every verified form control
+    (read only) after the live reads and right before the intent record, so a form changed meanwhile refuses with the
+    approval unconsumed. ``prior_records`` are loaded
     production_create_record dicts; ``prior_review_cleared_by_owner=True`` waives only the unreviewed-attempt refusal.
     """
     # The underscore gate seams exist for tests only: without SURFACE_ONBOARDING_TEST_HOOKS == "1" in the run's
@@ -420,6 +423,18 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn)
     if reason is not None:
         return _refuse(write_record, inputs, reason, checked)
+
+    # The live reads ran with the verified form open: compare every control again, right before anything is armed or consumed.
+    if live_form_recheck is None:
+        return _refuse(write_record, inputs, "form_recheck_missing", checked)
+    try:
+        rechecked = live_form_recheck(inputs)
+    except Exception:
+        rechecked = None
+    if not _form_verified(rechecked):
+        return _refuse(write_record, inputs, "form_changed_during_checks",
+                       {k: v for k, v in rechecked.items() if isinstance(k, str) and isinstance(v, str)}
+                       if isinstance(rechecked, Mapping) else checked)
 
     # Intent record first: if it cannot be written nothing is consumed or clicked.
     intent = {**_base_record(inputs, OUTCOME_ATTEMPT_STARTED), **_expected_details(inputs),

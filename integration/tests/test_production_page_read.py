@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from integration.onboarding import production_contract as contract
 from integration.onboarding import production_create_live as live
@@ -428,6 +429,61 @@ class RewriteTests(unittest.TestCase):
         page._table_request = only_stray
         self.assertEqual(reader(page).table("x"), (None, None))
 
+    def test_a_rewrite_whose_fallback_raises_is_not_recorded_and_fails_closed(self):
+        page = Page()
+        original = fake.FakeRoute.fallback
+        calls = []
+
+        def broken(route, **kw):
+            calls.append(sorted(kw))
+            if "post_data" in kw:
+                raise RuntimeError("route already handled")
+            return original(route, **kw)
+        with mock.patch.object(fake.FakeRoute, "fallback", broken):
+            self.assertEqual(reader(page).table("x"), (None, None))  # the page's own unchanged body must not be trusted
+        self.assertGreaterEqual(len(calls), 2)  # every failed rewrite attempt (reload, navigation retry) was passed on unchanged
+        self.assertEqual(calls[0::2], [["post_data"]] * (len(calls) // 2))
+        self.assertEqual(calls[1::2], [[]] * (len(calls) // 2))
+
+    def test_a_reply_to_a_request_whose_body_was_not_rewritten_does_not_count(self):
+        page = Page()
+        original = fake.FakeRoute.fallback
+
+        def ignores_override(route, **kw):  # fallback returns normally but the body stays the page's own
+            return original(route)
+        with mock.patch.object(fake.FakeRoute, "fallback", ignores_override):
+            self.assertEqual(reader(page).table("x"), (None, None))
+
+    def test_a_reply_to_a_request_with_a_different_search_value_does_not_count(self):
+        page = Page()
+        original = fake.FakeRoute.fallback
+
+        def other_value(route, **kw):
+            if "post_data" in kw:
+                other = json.loads(kw["post_data"])
+                other["tableServerData"]["filters"] = {"and": [{"method": "search", "value": "someone else"}]}
+                kw = {"post_data": json.dumps(other)}
+            return original(route, **kw)
+        with mock.patch.object(fake.FakeRoute, "fallback", other_value):
+            self.assertEqual(reader(page).table("x"), (None, None))
+
+    def test_a_reply_to_a_request_that_regained_a_projection_does_not_count(self):
+        page = Page()
+        original = fake.FakeRoute.fallback
+
+        def with_projection(route, **kw):
+            if "post_data" in kw:
+                other = json.loads(kw["post_data"])
+                other["tableServerData"]["projection"] = ["accountName"]
+                kw = {"post_data": json.dumps(other)}
+            return original(route, **kw)
+        with mock.patch.object(fake.FakeRoute, "fallback", with_projection):
+            self.assertEqual(reader(page).table("x"), (None, None))
+
+    def test_a_reply_to_the_matching_rewritten_request_counts(self):
+        page = Page(search={"x": {"status": 200, "total": 0, "rows": []}})
+        self.assertEqual(reader(page).table("x")[0], 200)
+
     def test_headers_and_cookies_are_never_read(self):
         page = Page(search={"x": {"status": 200, "total": 0, "rows": []}})
         reader(page).search("x")  # FakeResponse.headers raises if touched
@@ -506,6 +562,51 @@ class TriggerTests(unittest.TestCase):
         status, _ = reader(page).table("x")
         self.assertEqual(status, 200)
         self.assertEqual((page.reloads, page.gotos), (1, 1))
+
+
+class DialogHeaderTests(unittest.TestCase):
+    """Review finding 1: with the Add Account form open the sort trigger must never touch a button inside a dialog."""
+
+    def test_the_header_lookup_skips_a_dialog_button_and_takes_the_table_s(self):
+        page = Page()
+        page.dialog_header = True
+        found = runner._in_app_sort_header(page)
+        self.assertIsNotNone(found)
+        self.assertFalse(found.in_dialog)
+
+    def test_a_dialog_only_header_is_never_returned(self):
+        page = Page(header=False)
+        page.dialog_header = True
+        self.assertIsNone(runner._in_app_sort_header(page))
+
+    def test_a_dispatched_read_with_the_form_open_never_touches_the_dialog_button(self):
+        page = Page()
+        page.dialog_header = True
+        r = reader(page)
+        r.table("warm")
+        page.form_open = True
+        self.assertEqual(r.table("b", form_open=True)[0], 200)
+        self.assertEqual((page.dispatches, page.dialog_header_clicks), (1, 0))
+
+    def test_with_only_a_dialog_header_the_read_fails_closed_without_any_click_or_reload(self):
+        page = Page(header=False)
+        page.dialog_header = True
+        page.form_open = True
+        self.assertEqual(reader(page).table("x", form_open=True), (None, None))
+        self.assertEqual((page.dialog_header_clicks, page.dispatches, page.header_clicks, page.reloads, page.gotos),
+                         (0, 0, 0, 0, 0))
+
+    def test_a_header_that_cannot_be_classified_is_not_used(self):
+        page = Page()
+
+        def broken(self, js, *_a):
+            raise RuntimeError("detached")
+        with mock.patch.object(fake.FakeHeaderControl, "evaluate", broken):
+            self.assertIsNone(runner._in_app_sort_header(page))
+
+    def test_the_dialog_selector_covers_the_usual_modal_markers(self):
+        for marker in ("[role=dialog]", "[aria-modal=true]", ".modal", "dialog"):
+            self.assertIn(marker, runner.SEARCH_DIALOG_SELECTOR)
 
 
 class SessionTests(unittest.TestCase):

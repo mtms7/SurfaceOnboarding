@@ -246,6 +246,7 @@ class Harness:
         self.state_dir, self.approval_path = state_dir, approval_path
         self.counts = {"fill": 0, "click": 0, "readback": 0, "write": 0}
         self.dup_result = None
+        self.recheck_result = {"tenant_name": "pass", "domains": "pass"}
         self.source_result = None
         self.order = []
         self._click, self._fill, self._readback = click, fill, readback
@@ -297,6 +298,13 @@ class Harness:
         self.order.append("dup")
         return self.dup_result
 
+    def form_recheck(self, inputs):
+        self.counts["recheck"] = self.counts.get("recheck", 0) + 1
+        self.order.append("recheck")
+        if isinstance(self.recheck_result, Exception):
+            raise self.recheck_result
+        return self.recheck_result
+
     def write_record(self, data):
         self.counts["write"] += 1
         self.order.append("write")
@@ -317,6 +325,7 @@ class Harness:
             kwargs.setdefault("prior_records", [DRY_RECORD])
             kwargs.setdefault("live_duplicate_check", self.dup_check)
             kwargs.setdefault("live_source_check", self.source_check)
+            kwargs.setdefault("live_form_recheck", self.form_recheck)
         kwargs.update(extra)
         return pc.run(self.inputs() if inputs is None else inputs, dry_run, self.fill_form, self.click_confirm,
                       self.read_back, self.write_record, **kwargs)
@@ -515,7 +524,7 @@ class TestFreshClock(Base):
         result = pc.run(h.inputs(), False, h.fill_form, h.click_confirm, h.read_back, h.write_record,
                         owner_go=True, _production_target_fn=target_ok, prior_records=[DRY_RECORD],
                         live_duplicate_check=h.dup_check,
-                        live_source_check=h.source_check)
+                        live_source_check=h.source_check, live_form_recheck=h.form_recheck)
         # The fixtures are dated 2026-10-16 12:00 UTC; with the real clock a click only happens if the fresh gate
         # passed, and then the approval was consumed first.
         self.assertEqual(h.counts["click"], 1 if h.consumed() else 0)
@@ -587,8 +596,9 @@ class TestLiveCreate(Base):
         h = self.harness()
         result = h.run(dry_run=False, owner_go=True)
         self.assertEqual(result.outcome, "readback_verified")
-        self.assertEqual(h.counts, {"fill": 1, "click": 1, "readback": 1, "write": 2, "dup": 1, "src": 1})
-        self.assertEqual(h.order, ["fill", "dup", "src", "write", "click", "readback", "write"])
+        self.assertEqual(h.counts, {"fill": 1, "click": 1, "readback": 1, "write": 2, "dup": 1, "src": 1,
+                                       "recheck": 1})
+        self.assertEqual(h.order, ["fill", "dup", "src", "recheck", "write", "click", "readback", "write"])
         self.assertEqual(h.at_click, {"consumed": True, "outcomes": ["attempt_started"]})
         self.assertEqual(h.outcomes, ["attempt_started", "readback_verified"])
         self.assertTrue(h.consumed())
@@ -912,3 +922,53 @@ class TestSourceRecheck(Base):
         self.assertEqual(result.outcome, "refused")
         self.assertEqual(h.counts["click"], 0)
         self.assertFalse(h.consumed())
+
+
+class TestFormRecheck(Base):
+    """Review finding 1: the verified form is compared again after the live reads, right before the intent record and consume."""
+
+    def test_order_is_duplicate_then_source_then_form_recheck_then_click(self):
+        h = self.harness()
+        self.assertEqual(h.run(dry_run=False, owner_go=True).outcome, "readback_verified")
+        self.assertEqual([step for step in h.order if step != "write"],
+                         ["fill", "dup", "src", "recheck", "click", "readback"])
+
+    def test_a_form_that_changed_during_the_reads_refuses_before_consume_and_click(self):
+        h = self.harness()
+        h.recheck_result = {"tenant_name": "pass", "domains": "fail"}
+        result = h.run(dry_run=False, owner_go=True)
+        self.assertEqual((result.outcome, result.reason), ("refused", "form_changed_during_checks"))
+        self.assertEqual(h.counts["click"], 0)
+        self.assertFalse(h.consumed())
+        self.assertNotIn("attempt_started", h.outcomes)
+
+    def test_unverifiable_recheck_results_refuse(self):
+        for bad in ({}, None, "pass", {"tenant_name": "fail"}, {"tenant_name": True}):
+            h = self.harness()
+            h.recheck_result = bad
+            result = h.run(dry_run=False, owner_go=True)
+            self.assertEqual((result.outcome, result.reason), ("refused", "form_changed_during_checks"), bad)
+            self.assertEqual((h.counts["click"], h.consumed()), (0, False))
+
+    def test_a_recheck_that_raises_refuses(self):
+        h = self.harness()
+        h.recheck_result = RuntimeError("detached")
+        result = h.run(dry_run=False, owner_go=True)
+        self.assertEqual(result.reason, "form_changed_during_checks")
+        self.assertEqual((h.counts["click"], h.consumed()), (0, False))
+
+    def test_a_missing_recheck_refuses_a_live_create(self):
+        h = self.harness()
+        result = h.run(dry_run=False, owner_go=True, live_form_recheck=None)
+        self.assertEqual((result.outcome, result.reason), ("refused", "form_recheck_missing"))
+        self.assertEqual((h.counts["click"], h.consumed()), (0, False))
+
+    def test_the_recheck_is_not_used_by_a_dry_run(self):
+        h = self.harness()
+        self.assertEqual(h.run(dry_run=True).outcome, "dry_run_passed")
+        self.assertEqual(h.counts.get("recheck", 0), 0)
+
+    def test_the_new_reasons_are_known_and_kept_in_the_record(self):
+        from integration.onboarding import production_create_live as live
+        for code in ("form_changed_during_checks", "form_recheck_missing"):
+            self.assertEqual(live.live_known_reason(code), code)

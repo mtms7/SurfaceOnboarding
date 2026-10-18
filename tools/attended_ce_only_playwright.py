@@ -4760,15 +4760,31 @@ def _search_triggers() -> list[tuple[str, int]]:
     return triggers
 
 
+# Review fix 2026-10-18: the sort trigger must only ever touch the tenant table, never a button inside an open dialog or the
+# Add Account form (a click there could change what the Confirm click submits).
+SEARCH_DIALOG_SELECTOR = ("[role=dialog],[role=alertdialog],[aria-modal=true],dialog,.modal,.MuiDialog-root,.MuiModal-root")
+SEARCH_OUTSIDE_DIALOG_JS = "(el) => !el.closest('" + SEARCH_DIALOG_SELECTOR + "')"
+SEARCH_SORT_HEADER_CANDIDATES = 50
+
+
 def _in_app_sort_header(page: Any) -> Any | None:
-    """The first sortable column header of the tenant table, or None (then the reload is used)."""
+    """The first sortable column header of the tenant table OUTSIDE any dialog, or None (then the reload is used).
+
+    Each candidate is asked in the DOM whether it sits inside a dialog; one that is, or cannot be classified, is never used.
+    With the Add Account form open and no other candidate the read fails closed (the caller never reloads then).
+    """
     try:
         headers = page.locator(SEARCH_SORT_HEADER_SELECTOR)
-        return headers.first if headers.count() >= 1 else None
+        for index in range(min(headers.count(), SEARCH_SORT_HEADER_CANDIDATES)):
+            candidate = headers.nth(index)
+            try:
+                if candidate.evaluate(SEARCH_OUTSIDE_DIALOG_JS) is True:
+                    return candidate
+            except Exception:
+                continue
     except Exception:
         return None
-
-
+    return None
 
 
 def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult | None":
@@ -8933,6 +8949,20 @@ def _is_pdr_table_response(response: Any) -> bool:
         return False
 
 
+def _is_rewritten_read(request: Any, fields: dict[str, Any], drops: Any) -> bool:
+    """True only when the request body the page sent carries the rewritten fields and none of the dropped keys.
+
+    A reply counts only for a request whose body really is the rewritten one (search value, unique_fields override, no
+    projection); identity alone would also trust a request whose rewrite was never applied.
+    """
+    try:
+        server = json.loads(request.post_data or "")["tableServerData"]
+    except Exception:
+        return False
+    return (isinstance(server, dict) and all(server.get(key) == value for key, value in fields.items())
+            and not any(key in server for key in drops))
+
+
 class ProductionPageReader:
     """Read-only production reads, all through requests the PAGE sends itself (no script is evaluated in the page).
 
@@ -9028,10 +9058,10 @@ class ProductionPageReader:
                 if production_probe.read_body_problem(text, strict=strict) is not None:
                     route.fallback()  # unchanged: the guard aborts it and the missing rewrite fails the read closed
                     return
-                rewritten.append(request)
                 route.fallback(post_data=text)  # fallback, not continue_: the request guard must see the rewritten body
+                rewritten.append(request)  # only a rewrite that was handed on counts (review fix 2026-10-18)
             except Exception:
-                route.fallback()
+                route.fallback()  # unchanged and NOT recorded: the missing rewrite fails the read closed
 
         try:
             self.page.route(PDR_TABLE_ROUTE, rewrite)
@@ -9053,7 +9083,8 @@ class ProductionPageReader:
                 rewritten.clear()  # only this attempt's request counts
                 try:
                     with self.page.expect_response(lambda r: _is_pdr_table_response(r)
-                                                   and any(r.request is q for q in rewritten), timeout=timeout) as info:
+                                                   and any(r.request is q and _is_rewritten_read(q, fields, drops)
+                                                           for q in rewritten), timeout=timeout) as info:
                         if kind == "in_app":
                             self._click_header(header)
                         elif kind == "in_app_dispatch":
@@ -9385,9 +9416,43 @@ def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool]) -> dict
     return production_dry_run.advanced_report(found, states, targets)
 
 
+def _pdr_form_reads(page: Any, intended: Any, date_kept: Any) -> dict[str, Any]:
+    """Read (never change) every verified control of the open form, in the shape ``production_dry_run.compare_reads`` takes."""
+    return {
+        "texts": {label: _pdr_input_value(page, label) for label, _v in intended.texts},
+        "blanks": {label: _pdr_input_value(page, label) for label in intended.blanks},
+        "selects": {name: _pdr_read_selected(page, name) for name, _o, _e in intended.selects},
+        "toggles": {key: _pdr_read_checked(page, key) for key, _t in intended.toggles},
+        "dates": {key: bool(date_kept(page, key, value)) for key, value in intended.dates},
+        "operator_empty": _verify_operator_account_empty(page) is None,
+        "scan_now": _pdr_read_checked(page, "scan_now") if intended.scan_now is not None else None,
+    }
+
+
+def _pdr_recheck_form(page: Any, intended: Any, date_kept: Any, overrides: Any, country_code: Any) -> dict[str, str]:
+    """Review fix 2026-10-18: the verification compare again, READ ONLY, on the form that is still open.
+
+    Same reads and compare as the fill (``{key: pass | fail}``), plus the advanced controls against their targets (no click,
+    no expand) and the exact country code the form submits. Anything unreadable or different is a ``fail``.
+    """
+    fields = production_dry_run.compare_reads(intended, _pdr_form_reads(page, intended, date_kept),
+                                              overrides if isinstance(overrides, dict) else None)
+    states: dict[str, Any] = {}
+    for name in (*production_dry_run.ADVANCED_NAMES, *production_dry_run.INFO_ADVANCED_NAMES):
+        control = _locate_checkbox(page, name)
+        try:
+            states[name] = None if control is None else bool(control.first.is_checked())
+        except Exception:
+            states[name] = None
+    report = production_dry_run.advanced_report(True, states, dict(intended.advanced_targets))
+    fields["advanced_controls"] = "pass" if production_dry_run.advanced_problem(report) is None else "fail"
+    fields["country_code"] = "pass" if country_code is not None and _pcr_selected_country_code(page) == country_code else "fail"
+    return fields
+
+
 def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extras: dict[str, Any],
                          fill_date: Any, date_kept: Any, keep_open: bool = False,
-                         confirm_preflight: bool = False) -> dict[str, str]:
+                         confirm_preflight: bool = False, form_state: dict[str, Any] | None = None) -> dict[str, str]:
     """Open the form, check its schema, fill, read the advanced controls, verify by read-back, re-check the session.
 
     Returns ``{field key: "pass" | "fail"}``; raises FormRefusal for a refusal with its own reason. The form is always
@@ -9434,16 +9499,9 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
         problem = production_dry_run.schema_problem(after, after_advanced=True) or production_dry_run.advanced_problem(extras)
         if problem:
             raise refusal(problem)
-        reads = {
-            "texts": {label: _pdr_input_value(page, label) for label, _v in intended.texts},
-            "blanks": {label: _pdr_input_value(page, label) for label in intended.blanks},
-            "selects": {name: _pdr_read_selected(page, name) for name, _o, _e in intended.selects},
-            "toggles": {key: _pdr_read_checked(page, key) for key, _t in intended.toggles},
-            "dates": {key: bool(date_kept(page, key, value)) for key, value in intended.dates},
-            "operator_empty": _verify_operator_account_empty(page) is None,
-            "scan_now": _pdr_read_checked(page, "scan_now") if intended.scan_now is not None else None,
-        }
-        fields = production_dry_run.compare_reads(intended, reads, overrides)
+        if form_state is not None:
+            form_state["overrides"] = dict(overrides)
+        fields = production_dry_run.compare_reads(intended, _pdr_form_reads(page, intended, date_kept), overrides)
         session = _pdr_session_problem(page, form_open=True)  # the form is open: a dispatched sort click, never a reload
         if session:
             raise refusal(session, fields)
@@ -10361,10 +10419,11 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         again = (load_source or CE_ROUTE.load_source)(reference)
         return again.source_revision, bool(again.salesforce_id_present)
 
-    def run_live(candidate: Any, fill: Any, click: Any, read: Any, duplicate_check: Any) -> Any:
+    def run_live(candidate: Any, fill: Any, click: Any, read: Any, duplicate_check: Any, recheck: Any = None) -> Any:
         return production_create.run(candidate, False, fill, click, read, write_record, owner_go=owner_go is True,
                                      prior_records=prior, prior_review_cleared_by_owner=cleared, clock=clock or stamp,
-                                     live_duplicate_check=duplicate_check, live_source_check=source_check)
+                                     live_duplicate_check=duplicate_check, live_source_check=source_check,
+                                     live_form_recheck=recheck)
 
     # 3. The ordered gate BEFORE any browser: a refusal here opens nothing.
     if production_create.evaluate_gate(inputs, production_target) is not None:
@@ -10392,12 +10451,14 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                                         duplicate_found=early is not None and early not in session_codes,
                                         precheck_reason=early or "")
 
-            strict_state: dict[str, Any] = {"expected": None}
+            strict_state: dict[str, Any] = {"expected": None, "code": None, "overrides": {}}
 
             def fill(_inputs: Any) -> dict[str, str]:
                 fields = _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
-                                              date_kept or _license_date_kept, keep_open=True, confirm_preflight=True)
+                                              date_kept or _license_date_kept, keep_open=True, confirm_preflight=True,
+                                              form_state=strict_state)
                 code = _pcr_selected_country_code(page)  # the exact value the form submits, compared exactly in the readback
+                strict_state["code"] = code
                 try:
                     strict_state["expected"] = production_contract.expected_readback_row(
                         {**contract_intended, "country_code": code}, strict=True)
@@ -10420,6 +10481,10 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                     return "prior_records_invalid"
                 return create_ui.dry_run_problem(again, reference_value, (clock or stamp)())
 
+            def form_recheck(_inputs: Any) -> dict[str, str]:  # after the live reads, before the intent record and the consume
+                return _pdr_recheck_form(page, intended, date_kept or _license_date_kept, strict_state["overrides"],
+                                         strict_state["code"])
+
             def click(_inputs: Any) -> str:
                 return live.click_confirm_once(page, guard, clicks, locate=_locate_confirm_button,
                                                wait_enabled=_confirm_enabled)
@@ -10437,7 +10502,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                     return None
                 return found
 
-            result = run_live(final, fill, click, read, duplicate_check)
+            result = run_live(final, fill, click, read, duplicate_check, form_recheck)
             if clicks.confirm_clicks == 0 and production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds:
                 # Nothing was confirmed: leave no half-filled form behind (Cancel, never Confirm).
                 if not _pdr_close_form(page, clicks):
@@ -10488,10 +10553,8 @@ def run_production_search_probe(*, environ: Any | None = None, now: datetime | N
                     outcome["reason"] = worker
                 else:
                     name_reply, domain_reply = _pcr_search(page, control["name"]), _pcr_search(page, control["domain"])
-                    wanted = live._norm(control["name"])
-                    proven = [any(isinstance(r, dict) and live._norm(r.get("name")) == wanted
-                                  for r in (reply.get("rows") or []) if isinstance(reply, dict))
-                              for reply in (name_reply, domain_reply)]
+                    proven = [live.control_reply_problem(reply, control, field) is None
+                              for reply, field in ((name_reply, "name"), (domain_reply, "domain"))]
                     outcome.update(name_search_proven=proven[0], domain_search_proven=proven[1],
                                    control_sha=hashlib.sha256(control["name"].casefold().encode("utf-8")).hexdigest()[:16])
                     ok = all(proven)

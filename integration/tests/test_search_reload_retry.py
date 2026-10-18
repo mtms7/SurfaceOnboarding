@@ -233,6 +233,9 @@ class InAppTriggerTests(unittest.TestCase):
         page = FakePage(reload_hangs=False, goto_hangs=False)
 
         class _Header:
+            def evaluate(self, js, *_a):
+                return True  # outside every dialog
+
             def click(self, timeout=None):
                 page.calls.append("sort_click")
                 if sends_request:
@@ -243,6 +246,9 @@ class InAppTriggerTests(unittest.TestCase):
 
             def count(self):
                 return 1
+
+            def nth(self, _index):
+                return self.first
         page.locator = lambda selector: _Headers() if selector == runner.SEARCH_SORT_HEADER_SELECTOR else None
         return page
 

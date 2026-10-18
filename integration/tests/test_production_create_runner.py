@@ -157,6 +157,7 @@ class LivePage(dry.FakePage):
         self.readbacks = list(readbacks if readbacks is not None else [reply([good_row()])])
         self.readback_calls = 0
         self.popup_handlers = []
+        self.on_read = {}  # search value -> callable run once when that value is read with the form open
 
     def create_body(self):
         return good_create_body() if self.body == "good" else self.body
@@ -185,6 +186,8 @@ class LivePage(dry.FakePage):
                 for handler in self.popup_handlers:
                     handler(None)
             return self.readbacks.pop(0) if self.readbacks else reply([])
+        if self.form_open and value in self.on_read:  # something changes the open form while the live reads run
+            self.on_read.pop(value)()
         return super()._serve_table(value)
 
 
@@ -586,7 +589,9 @@ class SearchControlTests(Base):
     def test_a_control_the_searches_do_not_return_means_the_search_is_unproven(self):
         for search in ({CONTROL["domain"]: reply([])}, {CONTROL["name"]: reply([])},
                        {CONTROL["domain"]: reply([{**control_row(), "name": "Somebody Else"}])},
-                       {CONTROL["domain"]: {"status": 500, "total": None, "rows": None}}):
+                       {CONTROL["domain"]: {"status": 500, "total": None, "rows": None}},
+                       {CONTROL["name"]: reply([control_row()], total=400)},  # the filter was ignored: truncated
+                       {CONTROL["domain"]: reply([{**control_row(), "domain": "other.example"}])}):
             h = self.harness(search=dict(search))
             self.refused(h, "search_unproven")
 
@@ -613,6 +618,61 @@ class SearchControlTests(Base):
         text = "".join(Path(p).read_text(encoding="utf-8") for p in pcr.list_records(refusal.records, CO))
         self.assertNotIn(CONTROL["name"], text)
         self.assertNotIn(CONTROL["domain"], text)
+
+
+class FormRecheckTests(Base):
+    """Review finding 1: the verified form is compared again after the live reads; a dialog header is never clicked."""
+
+    def changed(self, h):
+        result = h.go()
+        self.assertEqual(result["result"], "form_changed_during_checks")
+        self.assertEqual((h.page.confirm_clicks, h.page.form_open), (0, False))
+        self.assertIsNone(h.approval_unused())  # nothing consumed
+        self.assertNotIn("attempt_started", h.outcomes())
+        self.assertEqual(h.outcomes()[-1], "refused")
+
+    def test_a_text_value_changed_during_the_duplicate_reads_refuses_before_consume_and_click(self):
+        h = self.harness()
+        h.page.on_read[NAME] = lambda: setattr(h.page.texts["Company name"], "value", "Changed Co")
+        self.changed(h)
+
+    def test_a_select_changed_during_the_duplicate_reads_refuses(self):
+        h = self.harness()
+        h.page.on_read[DOMAIN] = lambda: setattr(h.page.selects["accountType"], "value", "Trial")
+        self.changed(h)
+
+    def test_an_advanced_control_flipped_during_the_duplicate_reads_refuses(self):
+        h = self.harness()
+        h.page.on_read[NAME] = lambda: h.page.advanced_state.update(aiEnabled=True)
+        self.changed(h)
+
+    def test_the_country_changed_during_the_duplicate_reads_refuses(self):
+        h = self.harness()
+        h.page.on_read[NAME] = lambda: setattr(h.page, "country_value", "US")
+        self.changed(h)
+
+    def test_an_unchanged_form_still_creates(self):
+        h = self.harness()
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertEqual(h.page.confirm_clicks, 1)
+
+    def test_a_dialog_header_button_is_never_clicked_during_the_live_reads(self):
+        h = self.harness()
+        h.page.dialog_header = True
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertEqual(h.page.dialog_header_clicks, 0)
+        self.assertEqual(h.page.dispatches, 6)
+
+    def test_a_dialog_only_header_fails_the_late_check_closed_without_any_click(self):
+        h = self.harness(header=False)
+        h.page.dialog_header = True
+        self.assertEqual(h.go()["result"], "production_session_not_ready")
+        self.assertEqual((h.page.dialog_header_clicks, h.page.dispatches, h.page.confirm_clicks), (0, 0, 0))
+        self.assertIsNone(h.approval_unused())
+
+    def test_the_new_reasons_are_in_the_fixed_live_enum(self):
+        for code in ("form_changed_during_checks", "form_recheck_missing"):
+            self.assertIn(code, live.LIVE_REASONS)
 
 
 class SourceRecheckTests(Base):
@@ -878,6 +938,24 @@ class SearchProbeTests(Base):
         result = self.probe(h)
         self.assertEqual((result["result"], result["reason"], result["domain_search_proven"]),
                          ("production_search_probe_refused", "search_unproven", False))
+
+    def test_a_filter_the_server_ignored_is_unproven_even_when_the_control_is_in_the_rows(self):
+        for key in ("name", "domain"):
+            h = self.harness(search={CONTROL[key]: reply([control_row()], total=400)})
+            result = self.probe(h)
+            self.assertEqual((result["result"], result["reason"]), ("production_search_probe_refused", "search_unproven"), key)
+            self.assertFalse(result[f"{key}_search_proven"], key)
+
+    def test_a_domain_search_whose_row_has_another_domain_is_unproven(self):
+        h = self.harness(search={CONTROL["domain"]: reply([{**control_row(), "domain": "other.example"}])})
+        result = self.probe(h)
+        self.assertEqual((result["reason"], result["name_search_proven"], result["domain_search_proven"]),
+                         ("search_unproven", True, False))
+
+    def test_the_report_line_keeps_its_shape(self):
+        result = self.probe(self.harness())
+        self.assertEqual(list(result), ["result", "reason", "name_search_proven", "domain_search_proven"])
+        self.assertEqual(result["reason"], "proven")
 
     def test_no_control_or_no_gate(self):
         self.assertEqual(self.probe(self.harness(), clone=dry.good_clone)["reason"], "search_control_unavailable")
