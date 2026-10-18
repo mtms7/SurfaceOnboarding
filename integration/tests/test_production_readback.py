@@ -22,6 +22,7 @@ from integration.onboarding import session_readiness
 from integration.tests import page_own_table as pot
 from integration.tests import test_production_contract as fx
 import tools.attended_ce_only_playwright as runner
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 CO = "CO-0797"
@@ -133,12 +134,13 @@ LINE_KEYS = BASE_LINE_KEYS | {"variant_result", "variant_absent"}  # the readbac
 
 
 class GateTests(unittest.TestCase):
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_flags_stay_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run unlocked by owner go 2026-10-18 (docs/53 step 3); the relock commit reverts this
         text = Path(session_readiness.__file__).read_text(encoding="utf-8")
         self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = True  # owner go 2026-10-18")
-        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = False$")
+        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = True  # owner go 2026-10-18")  # unlock window
 
     def test_missing_gate_reads_nothing_and_opens_nothing(self):
         for env, reason in (({}, "gate_missing"), ({probe.GATE_ENV: "0", probe.REF_ENV: "PROBE-D4-20261016"}, "gate_missing"),

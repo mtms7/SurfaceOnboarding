@@ -20,6 +20,7 @@ from integration.onboarding import production_create_record as pcr
 from integration.onboarding import salesforce_uuid_writeback as wb
 from integration.onboarding import session_readiness
 from integration.onboarding.run_target import ProductionLocked, RunTarget
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc)
 UUID = "0123456789abcdef0123456789abcdef"
@@ -188,13 +189,16 @@ class TestGate(unittest.TestCase):
 class TestLockedByDefault(unittest.TestCase):
     """The default target check is the real one. A fully valid unlock leaves only the runner flag, which must refuse."""
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_runner_flag_is_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_only_the_runner_flag_blocks_a_valid_unlock(self):
         reason = pc.evaluate_gate(make_inputs(environ=unlock_environ()), approval_check_fn=approval_ok)
         self.assertEqual(reason, "production_locked:production_runner_not_supported")
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_flag_true_would_open_that_gate_proving_the_flag_is_the_only_reason(self):
         with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True):
             reason = pc.evaluate_gate(make_inputs(environ=unlock_environ()), approval_check_fn=approval_ok)
@@ -424,6 +428,7 @@ class TestRefusals(Base):
             self.assertEqual(rec["co_reference"], "CO-0797")
             self.assertFalse(h.consumed())
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_default_checks_refuse_while_locked_even_with_a_valid_unlock(self):
         for environ in ({REF_ENV: REF}, unlock_environ()):
             h = self.harness()
@@ -886,6 +891,7 @@ class TestSourceBoundary(unittest.TestCase):
                         r"\bimport tools\b", r"os\.system", r"os\.popen", r"\bPopen\b", r"PRODUCTION_RUNNER_SUPPORTED\s*="):
             self.assertIsNone(re.search(pattern, self.text), pattern)
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_runner_flag_still_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
 
