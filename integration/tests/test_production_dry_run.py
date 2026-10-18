@@ -108,6 +108,7 @@ class Ctl:
     def __init__(self, page, kind, key, value="", checked=False, options=None, mangle=None, enabled=True):
         self.page, self.kind, self.key = page, kind, key
         self.hit = key not in page.hit_fail
+        self.scrolled = False  # a control below the fold is hit-testable only after it was scrolled into view
         self.value, self.checked, self.options, self.mangle, self.enabled = value, checked, options or [], mangle, enabled
 
     def count(self):
@@ -143,9 +144,12 @@ class Ctl:
             self.page.fire("POST", ORIGIN + "/api/v1/backoffice/account/add")
         self.value = label
 
+    def scroll_into_view_if_needed(self, **_kw):
+        self.scrolled = True
+
     def evaluate(self, js):
-        if js == pdr.HIT_TEST_JS:
-            return self.hit
+        if js == pdr.HIT_TEST_JS:  # elementFromPoint finds nothing outside the viewport
+            return self.hit and (self.key not in self.page.below_fold or self.scrolled)
         return self.value if self.kind == "select" else 0
 
     def locator(self, _selector):
@@ -204,8 +208,9 @@ class FakePage(pot.PageOwnTable):
 
     def __init__(self, *, advanced=None, form_fields=None, text_labels=None, mangle=None, write_on_select=False,
                  session=None, search=None, demo=None, advanced_button=True, sw_count=0, hit_fail=(),
-                 click_fail=(), add_label="Add Account", header=True):
+                 click_fail=(), add_label="Add Account", header=True, below_fold=()):
         self.hit_fail, self.click_fail, self.sw_count, self.add_label = set(hit_fail), set(click_fail), sw_count, add_label
+        self.below_fold = set(below_fold)
         self.confirm_enabled, self.confirm_hit, self.scrolled = True, True, 0
         self.url = ORIGIN + "/backoffice/tenantManagement"
         self.clicks, self.keys = [], []
@@ -1101,14 +1106,26 @@ class FlowTests(unittest.TestCase):
         out = h.run()
         self.assertEqual(out["result"], "toggle_click_failed")
         data, _ = h.record()
-        self.assertEqual(data["form_fields_checked"], {"toggle.leakedCredentialsAllowed": "fail"})
+        self.assertEqual(data["form_fields_checked"], {"toggle.leakedCredentialsAllowed": "fail",
+                                                       "toggle.leakedCredentialsAllowed.stage_hit_test": "fail"})
         self.assertNotIn("leakedCredentialsAllowed", h.page.clicks)
         self.assertEqual(h.page.clicks[-1], "Cancel")
+
+    def test_a_toggle_below_the_fold_is_scrolled_into_view_before_its_hit_test(self):
+        # Live 2026-10-18 (CO-0798 dry run): refused toggle_click_failed on the first toggle of the long form; the hit
+        # test ran on a control outside the viewport, where elementFromPoint finds nothing (the Confirm path scrolls first).
+        expected = Harness(self).run()["result"]
+        h = Harness(self, below_fold={"leakedCredentialsAllowed"})
+        out = h.run()
+        self.assertEqual(out["result"], expected)
+        self.assertNotEqual(out["result"], "toggle_click_failed")
+        self.assertIn("leakedCredentialsAllowed", h.page.clicks)
 
     def test_toggle_click_failure_never_retries_with_force(self):
         h = Harness(self, click_fail={"leakedCredentialsAllowed"})  # Ctl.click asserts there is no force=True retry
         out = h.run()
         self.assertEqual(out["result"], "toggle_click_failed")
+        self.assertEqual(h.record()[0]["form_fields_checked"].get("toggle.leakedCredentialsAllowed.stage_click"), "fail")
         self.assertNotIn("Confirm", h.page.clicks)
         self.assertEqual(h.page.clicks[-1], "Cancel")
         self.assertNotIn("force=True", _glue_source())

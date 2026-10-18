@@ -9338,16 +9338,27 @@ def _pdr_set_toggle(page: Any, clicks: Any, key: str, target: bool) -> bool:
     """Set one toggle by a plain click. False when the control is missing; FormRefusal(toggle_click_failed) when the
     click cannot be made safely: no forced click ever, and the element at the toggle's centre must be the toggle (or
     its own label) before it is clicked."""
-    failed = production_create.FormRefusal("toggle_click_failed", {f"toggle.{key}": "fail"})
+    def failed(stage: str) -> Exception:  # the record names the stage that failed (a name only, no value)
+        return production_create.FormRefusal("toggle_click_failed",
+                                             {f"toggle.{key}": "fail", f"toggle.{key}.stage_{stage}": "fail"})
+
     control = _pdr_checkbox(page, key)
     if control is None:
         return False
+    stage = "read"
     try:
         if control.first.is_checked() == target:
             return True
+        # Live 2026-10-18: the hit test must run on the control as the click will see it (elementFromPoint finds nothing
+        # outside the viewport, and the toggles sit below the fold of the long form), as the Confirm path already does.
+        stage = "scroll"
+        control.first.scroll_into_view_if_needed(timeout=FIELD_TIMEOUT_MS)
+        stage = "hit_test"
         if control.first.evaluate(production_dry_run.HIT_TEST_JS) is not True:
-            raise failed
+            raise failed(stage)
+        stage = "click"
         clicks.click(production_dry_run.CLICK_SET_TOGGLE, control.first, key, timeout=TOGGLE_CLICK_TIMEOUT_MS)
+        stage = "state"
         for _poll in range(20):
             if control.first.is_checked() == target:
                 return True
@@ -9357,8 +9368,8 @@ def _pdr_set_toggle(page: Any, clicks: Any, key: str, target: bool) -> bool:
     except production_create.FormRefusal:
         raise
     except Exception:
-        raise failed from None
-    raise failed
+        raise failed(stage) from None
+    raise failed(stage)
 
 
 def _pdr_select_by_name(page: Any, name: str, option: str) -> tuple[str | None, str]:
