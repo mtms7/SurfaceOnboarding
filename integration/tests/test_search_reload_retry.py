@@ -233,6 +233,9 @@ class InAppTriggerTests(unittest.TestCase):
         page = FakePage(reload_hangs=False, goto_hangs=False)
 
         class _Header:
+            def element_handle(self, **_kw):
+                return self
+
             def evaluate(self, js, *_a):
                 return True  # outside every dialog
 

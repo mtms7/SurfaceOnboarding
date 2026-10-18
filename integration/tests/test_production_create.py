@@ -239,6 +239,9 @@ class TestRealApprovalCodes(unittest.TestCase):
         self.assertEqual(self.gate(source_revision_now=None), "approval_revision_drift")
 
 
+EXTRA_RECHECK = {"advanced_controls": "pass", "country_code": "pass", "spycloud_state": "pass", "form_schema": "pass"}
+
+
 class Harness:
     """Fakes for every external side effect; counts calls. Approval and gate are the real code."""
 
@@ -246,7 +249,7 @@ class Harness:
         self.state_dir, self.approval_path = state_dir, approval_path
         self.counts = {"fill": 0, "click": 0, "readback": 0, "write": 0}
         self.dup_result = None
-        self.recheck_result = {"tenant_name": "pass", "domains": "pass"}
+        self.recheck_result = {"tenant_name": "pass", "domains": "pass", **EXTRA_RECHECK}
         self.source_result = None
         self.order = []
         self._click, self._fill, self._readback = click, fill, readback
@@ -949,6 +952,28 @@ class TestFormRecheck(Base):
             result = h.run(dry_run=False, owner_go=True)
             self.assertEqual((result.outcome, result.reason), ("refused", "form_changed_during_checks"), bad)
             self.assertEqual((h.counts["click"], h.consumed()), (0, False))
+
+    def test_a_recheck_that_covers_fewer_keys_than_the_fill_refuses_as_missing(self):
+        h = self.harness()
+        h.recheck_result = {"tenant_name": "pass", **EXTRA_RECHECK}  # "domains" was verified at the fill
+        result = h.run(dry_run=False, owner_go=True)
+        self.assertEqual((result.outcome, result.reason), ("refused", "form_recheck_missing"))
+        self.assertEqual((h.counts["click"], h.consumed()), (0, False))
+        self.assertNotIn("attempt_started", h.outcomes)
+
+    def test_a_recheck_without_any_one_extra_item_refuses_as_missing(self):
+        for dropped in EXTRA_RECHECK:
+            h = self.harness()
+            h.recheck_result = {"tenant_name": "pass", "domains": "pass",
+                                **{k: v for k, v in EXTRA_RECHECK.items() if k != dropped}}
+            result = h.run(dry_run=False, owner_go=True)
+            self.assertEqual((result.outcome, result.reason), ("refused", "form_recheck_missing"), dropped)
+            self.assertEqual((h.counts["click"], h.consumed()), (0, False))
+
+    def test_a_recheck_that_is_a_superset_of_the_fill_passes(self):
+        h = self.harness()
+        h.recheck_result = {"tenant_name": "pass", "domains": "pass", "something_new": "pass", **EXTRA_RECHECK}
+        self.assertEqual(h.run(dry_run=False, owner_go=True).outcome, "readback_verified")
 
     def test_a_recheck_that_raises_refuses(self):
         h = self.harness()

@@ -4770,21 +4770,31 @@ SEARCH_SORT_HEADER_CANDIDATES = 50
 def _in_app_sort_header(page: Any) -> Any | None:
     """The first sortable column header of the tenant table OUTSIDE any dialog, or None (then the reload is used).
 
-    Each candidate is asked in the DOM whether it sits inside a dialog; one that is, or cannot be classified, is never used.
-    With the Add Account form open and no other candidate the read fails closed (the caller never reloads then).
+    Each candidate is resolved ONCE to an element handle and asked in the DOM whether it sits inside a dialog; one that is,
+    or cannot be classified, is never used. The SAME handle is returned, so the click lands on the element that was
+    classified (``_sort_header_still_outside`` re-asks right before the click). With the Add Account form open and no
+    other candidate the read fails closed (the caller never reloads then).
     """
     try:
         headers = page.locator(SEARCH_SORT_HEADER_SELECTOR)
         for index in range(min(headers.count(), SEARCH_SORT_HEADER_CANDIDATES)):
-            candidate = headers.nth(index)
             try:
-                if candidate.evaluate(SEARCH_OUTSIDE_DIALOG_JS) is True:
-                    return candidate
+                handle = headers.nth(index).element_handle(timeout=FIELD_TIMEOUT_MS)
+                if handle is not None and handle.evaluate(SEARCH_OUTSIDE_DIALOG_JS) is True:
+                    return handle
             except Exception:
                 continue
     except Exception:
         return None
     return None
+
+
+def _sort_header_still_outside(handle: Any) -> bool:
+    """Right before the click: the pinned header is still attached and still outside every dialog (else no click)."""
+    try:
+        return handle.evaluate(SEARCH_OUTSIDE_DIALOG_JS) is True
+    except Exception:
+        return False
 
 
 def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult | None":
@@ -4842,6 +4852,8 @@ def _search_tenants(page: Any, search: Any, lookup: str) -> "TenantSearchResult 
                 with page.expect_response(lambda r: _is_inventory_response(r)
                                           and any(r.request is q for q in rewritten), timeout=timeout) as info:
                     if kind == "in_app":
+                        if not _sort_header_still_outside(header):
+                            raise RuntimeError("sort_header_changed")  # fail closed: no click, then the reload fallback
                         header.click(timeout=FIELD_TIMEOUT_MS)
                     elif kind == "reload":
                         page.reload(wait_until="domcontentloaded")
@@ -8964,7 +8976,8 @@ def _is_rewritten_read(request: Any, fields: dict[str, Any], drops: Any) -> bool
 
 
 class ProductionPageReader:
-    """Read-only production reads, all through requests the PAGE sends itself (no script is evaluated in the page).
+    """Read-only production reads, all through requests the PAGE sends itself (no fetch or
+    other script is run in the page; the only evaluation is the read-only ``closest()`` that classifies the sort header).
 
     ``table`` triggers the page's own table request, rewrites only its body and returns ``(status, parsed body)`` or
     ``(None, None)`` (fail closed) when the rewrite did not happen or no reply arrived. Passive ``response`` events keep
@@ -9023,6 +9036,8 @@ class ProductionPageReader:
         return triggers
 
     def _click_header(self, header: Any) -> None:
+        if not _sort_header_still_outside(header):
+            raise RuntimeError("sort_header_changed")  # the classified element changed: nothing is clicked
         if self.click_log is not None:
             self.click_log.click(production_dry_run.CLICK_SORT_HEADER, header, "sort_table_header", timeout=FIELD_TIMEOUT_MS)
         else:
@@ -9088,6 +9103,8 @@ class ProductionPageReader:
                         if kind == "in_app":
                             self._click_header(header)
                         elif kind == "in_app_dispatch":
+                            if not _sort_header_still_outside(header):
+                                raise RuntimeError("sort_header_changed")  # fail closed: nothing is dispatched
                             header.dispatch_event("click")  # reaches the table behind the open form; clicks nothing else
                         elif kind == "reload":
                             self.page.reload(wait_until="domcontentloaded")
@@ -9429,11 +9446,23 @@ def _pdr_form_reads(page: Any, intended: Any, date_kept: Any) -> dict[str, Any]:
     }
 
 
-def _pdr_recheck_form(page: Any, intended: Any, date_kept: Any, overrides: Any, country_code: Any) -> dict[str, str]:
+def _pdr_form_signature(form: Any) -> list[tuple[str, str, str, str]] | None:
+    """The sanitized form's controls as sorted (name, label, type, data-am) tuples: no values, no secrets."""
+    fields = form.get("fields") if isinstance(form, dict) else None
+    if not isinstance(fields, list):
+        return None
+    return sorted((str(f.get("name", "")), str(f.get("label", "")), str(f.get("type", "")), str(f.get("data_am", "")))
+                  for f in fields if isinstance(f, dict))
+
+
+def _pdr_recheck_form(page: Any, intended: Any, date_kept: Any, overrides: Any, country_code: Any,
+                      info_controls: Any = None, form_signature: Any = None) -> dict[str, str]:
     """Review fix 2026-10-18: the verification compare again, READ ONLY, on the form that is still open.
 
     Same reads and compare as the fill (``{key: pass | fail}``), plus the advanced controls against their targets (no click,
-    no expand) and the exact country code the form submits. Anything unreadable or different is a ``fail``.
+    no expand), the exact country code the form submits, the informational advanced controls (SpyCloud) exactly as they were
+    at the fill, and the form schema (the fill's read-only schema check, and the same set of controls). Anything unreadable
+    or different is a ``fail``.
     """
     fields = production_dry_run.compare_reads(intended, _pdr_form_reads(page, intended, date_kept),
                                               overrides if isinstance(overrides, dict) else None)
@@ -9447,6 +9476,17 @@ def _pdr_recheck_form(page: Any, intended: Any, date_kept: Any, overrides: Any, 
     report = production_dry_run.advanced_report(True, states, dict(intended.advanced_targets))
     fields["advanced_controls"] = "pass" if production_dry_run.advanced_problem(report) is None else "fail"
     fields["country_code"] = "pass" if country_code is not None and _pcr_selected_country_code(page) == country_code else "fail"
+    seen = report["advanced_controls"]
+    fields["spycloud_state"] = ("pass" if isinstance(info_controls, dict) and info_controls
+                                and all(info_controls.get(n) is not None and seen.get(n) == info_controls.get(n)
+                                        for n in production_dry_run.INFO_ADVANCED_NAMES) else "fail")
+    try:
+        after = production_probe.sanitize_form(page.evaluate(production_probe.FORM_JS))
+        schema_ok = (production_dry_run.schema_problem(after, after_advanced=True) is None
+                     and form_signature is not None and _pdr_form_signature(after) == form_signature)
+    except Exception:
+        schema_ok = False
+    fields["form_schema"] = "pass" if schema_ok else "fail"
     return fields
 
 
@@ -9501,6 +9541,10 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
             raise refusal(problem)
         if form_state is not None:
             form_state["overrides"] = dict(overrides)
+            # F1: what the live re-check must see again, exactly (informational controls feed the create payload)
+            form_state["info_controls"] = {name: extras["advanced_controls"].get(name)
+                                           for name in production_dry_run.INFO_ADVANCED_NAMES}
+            form_state["form_signature"] = _pdr_form_signature(after)
         fields = production_dry_run.compare_reads(intended, _pdr_form_reads(page, intended, date_kept), overrides)
         session = _pdr_session_problem(page, form_open=True)  # the form is open: a dispatched sort click, never a reload
         if session:
@@ -10483,7 +10527,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
 
             def form_recheck(_inputs: Any) -> dict[str, str]:  # after the live reads, before the intent record and the consume
                 return _pdr_recheck_form(page, intended, date_kept or _license_date_kept, strict_state["overrides"],
-                                         strict_state["code"])
+                                         strict_state["code"], strict_state.get("info_controls"),
+                                         strict_state.get("form_signature"))
 
             def click(_inputs: Any) -> str:
                 return live.click_confirm_once(page, guard, clicks, locate=_locate_confirm_button,

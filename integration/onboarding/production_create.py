@@ -243,6 +243,15 @@ def _form_verified(fields: Any) -> bool:
             and all(isinstance(k, str) and v == "pass" for k, v in fields.items()))
 
 
+# Review fix F3 (2026-10-18): what a live re-check must cover besides every key the fill verified.
+RECHECK_EXTRA_KEYS =("advanced_controls", "country_code", "spycloud_state", "form_schema")
+
+
+def _recheck_complete(rechecked: Mapping[str, Any], filled: Mapping[str, Any]) -> bool:
+    """The re-check result names every control the fill verified plus the extra items (it may name more, never fewer)."""
+    return {k for k in filled if isinstance(k, str)} | set(RECHECK_EXTRA_KEYS) <= set(rechecked)
+
+
 def _norm_domains(value: Any) -> frozenset[str] | None:
     if not isinstance(value, (list, tuple)) or not value or not all(isinstance(v, str) for v in value):
         return None
@@ -435,6 +444,8 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         return _refuse(write_record, inputs, "form_changed_during_checks",
                        {k: v for k, v in rechecked.items() if isinstance(k, str) and isinstance(v, str)}
                        if isinstance(rechecked, Mapping) else checked)
+    if not _recheck_complete(rechecked, fields):  # a smaller re-check than the fill is never a clearance
+        return _refuse(write_record, inputs, "form_recheck_missing", checked)
 
     # Intent record first: if it cannot be written nothing is consumed or clicked.
     intent = {**_base_record(inputs, OUTCOME_ATTEMPT_STARTED), **_expected_details(inputs),

@@ -604,6 +604,71 @@ class DialogHeaderTests(unittest.TestCase):
         with mock.patch.object(fake.FakeHeaderControl, "evaluate", broken):
             self.assertIsNone(runner._in_app_sort_header(page))
 
+    def test_a_header_that_detaches_between_the_check_and_the_click_is_never_clicked(self):
+        page = Page()
+        page.form_open = True
+        calls = []
+
+        def detaching(self, js, *_a):
+            calls.append(1)
+            if len(calls) > 1:
+                raise RuntimeError("element is not attached to the DOM")
+            return True
+        with mock.patch.object(fake.FakeHeaderControl, "evaluate", detaching):
+            self.assertEqual(reader(page).table("x", form_open=True), (None, None))
+        self.assertEqual((page.dispatches, page.header_clicks, page.dialog_header_clicks, page.reloads, page.gotos),
+                         (0, 0, 0, 0, 0))
+
+    def test_the_classified_element_is_the_one_that_is_clicked(self):
+        page = Page()
+        page.form_open = True
+        dialog = fake.FakeHeaderControl(page, in_dialog=True)
+        dom = {}
+
+        class Outside(fake.FakeHeaderControl):
+            def evaluate(self, js, *_a):
+                answer = super().evaluate(js)
+                dom["el"] = dialog  # the DOM changes right after the answer: a lazy locator now points at the dialog button
+                return answer
+        outside = Outside(page)
+        dom["el"] = outside
+
+        class Pinned:
+            def __init__(self, element):
+                self.element = element
+
+            def evaluate(self, js, *_a):
+                return self.element.evaluate(js)
+
+            def dispatch_event(self, name, *_a, **_k):
+                return self.element.dispatch_event(name)
+
+            def click(self, **kw):
+                return self.element.click(**kw)
+
+        class Lazy(Pinned):
+            """A locator: every call resolves the element again."""
+
+            def __init__(self):
+                pass
+
+            @property
+            def element(self):
+                return dom["el"]
+
+            def element_handle(self, **_kw):
+                return Pinned(dom["el"])
+
+        class Headers:
+            def count(self):
+                return 1
+
+            def nth(self, _index):
+                return Lazy()
+        page.locator = lambda selector: Headers() if selector == fake.HEADER_SELECTOR else None
+        self.assertEqual(reader(page).table("x", form_open=True)[0], 200)
+        self.assertEqual((page.dispatches, page.dialog_header_clicks), (1, 0))
+
     def test_the_dialog_selector_covers_the_usual_modal_markers(self):
         for marker in ("[role=dialog]", "[aria-modal=true]", ".modal", "dialog"):
             self.assertIn(marker, runner.SEARCH_DIALOG_SELECTOR)

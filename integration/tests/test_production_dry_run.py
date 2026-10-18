@@ -215,6 +215,8 @@ class FakePage(pot.PageOwnTable):
         self.form_fields = form_fields if form_fields is not None else PROBE_FIELDS
         self.advanced = advanced if advanced is not None else {n: False for n in pdr.ADVANCED_NAMES}
         self.advanced_state = dict(self.advanced)
+        self.spy_state = True  # the informational SpyCloud box (ON is the server default)
+        self.extra_fields = []  # controls that appear in the expanded form after the fill (a re-render)
         self.session = session or {pdr.AUTHORITIES_PATH: {"status": 200}, pdr.ACCOUNT_INFO_PATH: {"status": 200}}
         self.search = search if search is not None else {}
         self.demo = demo or {"status": 200, "hit": False, "count": 3}
@@ -270,7 +272,7 @@ class FakePage(pot.PageOwnTable):
             if self.expanded:
                 fields += [(n, "", "checkbox", None, "") for n in list(self.advanced_state) + ["spyCloudEnabled"]
                            if n in self.advanced_state or n == "spyCloudEnabled"]
-            return form_of(fields)
+            return form_of(fields + list(self.extra_fields))
         if script == pdr.SERVICE_WORKER_JS:
             return {"count": self.sw_count}
         raise AssertionError("unexpected evaluate: a production read never evaluates a script in the page")
@@ -315,7 +317,7 @@ class FakePage(pot.PageOwnTable):
                 box = self._advanced_boxes()[key]
                 return box
             if self.expanded and key == "spyCloudEnabled":
-                return Ctl(self, "checkbox", key, checked=True)
+                return Ctl(self, "checkbox", key, checked=self.spy_state)
             return Missing()
         if selector == runner.OPERATOR_ACCOUNT_INPUT_SELECTOR:
             return Ctl(self, "text", "operator")

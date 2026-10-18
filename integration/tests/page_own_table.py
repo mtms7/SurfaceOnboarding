@@ -100,6 +100,9 @@ class FakeHeaderControl:
     def nth(self, _index):
         return self
 
+    def element_handle(self, **_kw):
+        return self  # a pinned element: the runner classifies and clicks this one object
+
     def evaluate(self, js, *_a):
         assert "closest" in str(js)  # the runner asks the DOM whether the button sits inside a dialog
         return not self.in_dialog

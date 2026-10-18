@@ -646,6 +646,34 @@ class FormRecheckTests(Base):
         h.page.on_read[NAME] = lambda: h.page.advanced_state.update(aiEnabled=True)
         self.changed(h)
 
+    def test_spycloud_flipped_during_the_duplicate_reads_refuses_before_consume_and_click(self):
+        h = self.harness()
+        h.page.on_read[NAME] = lambda: setattr(h.page, "spy_state", False)
+        self.changed(h)
+
+    def test_an_unknown_extra_control_appearing_during_the_reads_refuses(self):
+        h = self.harness()
+        h.page.on_read[NAME] = lambda: h.page.extra_fields.append(("", "Surprise setting", "text", None, ""))
+        self.changed(h)
+
+    def test_a_known_control_removed_during_the_reads_refuses(self):
+        h = self.harness()
+        h.page.on_read[NAME] = lambda: setattr(h.page, "form_fields",
+                                               [f for f in h.page.form_fields if f[0] != "notificationsAllowed"])
+        self.changed(h)
+
+    def test_the_recheck_result_covers_every_fill_key_and_the_extra_items(self):
+        seen = {}
+        original = runner._pdr_recheck_form
+
+        def spy(*args, **kw):
+            seen.update(original(*args, **kw))
+            return seen
+        h = self.harness()
+        with mock.patch.object(runner, "_pdr_recheck_form", spy):
+            self.assertEqual(h.go()["result"], "created_verified")
+        self.assertLessEqual({"advanced_controls", "country_code", "spycloud_state", "form_schema"}, set(seen))
+
     def test_the_country_changed_during_the_duplicate_reads_refuses(self):
         h = self.harness()
         h.page.on_read[NAME] = lambda: setattr(h.page, "country_value", "US")
