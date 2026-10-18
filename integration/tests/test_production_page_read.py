@@ -178,7 +178,11 @@ class GuardBodyTests(unittest.TestCase):
                     self.assertEqual(page.fire("POST", TABLE_URL, raw), "aborted")
                     self.assertEqual(guard.blocked[("POST", contract.ACCOUNTS_PATH)], 1)
                     self.assertEqual(guard.api_calls, {})
-                    self.assertEqual(guard.blocked_api_writes() if hasattr(guard, "blocked_api_writes") else 1, 1)
+                    # 2026-10-18 (live dry run #6): a table-SHAPED body (offset, page size, filters, method variants) is
+                    # still aborted but is the page's own table read, not a write attempt; anything else still counts.
+                    table_shaped = label in ("offset", "big_page", "empty_filters", "bad_method")
+                    if hasattr(guard, "blocked_api_writes"):
+                        self.assertEqual(guard.blocked_api_writes(), 0 if table_shaped else 1)
 
     def test_a_request_without_a_body_attribute_is_aborted(self):
         for name, make in self.GUARDS:

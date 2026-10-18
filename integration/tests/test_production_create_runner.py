@@ -444,6 +444,17 @@ class LiveDuplicateTests(Base):
         self.assertIsNone(h.approval_unused())
         self.assertNotIn("attempt_started", h.outcomes())
 
+    def test_the_pages_own_table_refresh_during_the_fill_is_aborted_and_the_create_proceeds(self):
+        h = self.harness()
+        original, outcomes = h.page._open, []
+
+        def open_and_refresh():  # live dry run #6: the page refreshes its own table while the form is open
+            original()
+            outcomes.append(h.page.fire("POST", dry.ORIGIN + pdr.ACCOUNTS_PATH, dry.pot.PAGE_DEFAULT_BODY))
+        h.page._open = open_and_refresh
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertEqual(outcomes, ["aborted"])
+
     def test_a_stray_create_post_during_the_fill_is_blocked(self):
         h = self.harness(write_on_select=True)
         self.assertEqual(h.go()["result"], "write_request_blocked")

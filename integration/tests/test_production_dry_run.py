@@ -1096,16 +1096,49 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(data["blocked_requests"], ["POST /api/v1/backoffice/account/add"])
         self.assertEqual(data["redactions"], 0)
 
-    def test_a_blocked_page_table_refresh_is_named_by_its_path(self):
-        h = Harness(self)
+    def refreshing(self, h, *extra_posts):
         original = h.page._open
+        routes = []
 
-        def open_and_refresh():  # the page sends its own unfiltered table request while the form opens
+        def open_and_refresh():  # the page sends its own unfiltered table request while the form opens (live dry run #6)
             original()
-            h.page.fire("POST", ORIGIN + pdr.ACCOUNTS_PATH, pot.PAGE_DEFAULT_BODY)
+            routes.append(h.page.fire("POST", ORIGIN + pdr.ACCOUNTS_PATH, pot.PAGE_DEFAULT_BODY))
+            for url in extra_posts:
+                h.page.fire("POST", ORIGIN + url, "{}")
         h.page._open = open_and_refresh
+        return routes
+
+    def test_the_pages_own_table_refresh_is_aborted_but_is_not_a_write_attempt(self):
+        h = Harness(self)
+        outcomes = self.refreshing(h)
+        self.assertEqual(h.run()["result"], "dry_run_passed")
+        self.assertEqual(outcomes, ["aborted"])  # still never sent (not a validated search body)
+        self.assertEqual(h.page.reads_with_form_open, 0)
+
+    def test_a_real_write_next_to_a_table_refresh_still_refuses_and_names_only_the_write(self):
+        h = Harness(self)
+        self.refreshing(h, "/api/v1/backoffice/account/add")
         self.assertEqual(h.run()["result"], "write_request_blocked")
-        self.assertEqual(h.record()[0]["blocked_requests"], ["POST " + pdr.ACCOUNTS_PATH])
+        self.assertEqual(h.record()[0]["blocked_requests"], ["POST /api/v1/backoffice/account/add"])
+
+    def test_the_guard_counts_every_blocked_api_write_but_a_table_shaped_refresh(self):
+        guard = pdr.DryRunRequestGuard()
+        page = FakePage()
+        guard.install(page)
+        table = ORIGIN + pdr.ACCOUNTS_PATH
+        self.assertEqual(page.fire("POST", table, pot.PAGE_DEFAULT_BODY), "aborted")  # the page's own load: aborted
+        self.assertEqual((guard.blocked_api_writes(), guard.blocked_api_write_names()), (0, []))
+        for url, body in ((table, json.dumps({"tableServerData": {"offset": 0, "items_per_page": 1, "filters": {"delete": True}}})),
+                          (table + "?op=x", pot.PAGE_DEFAULT_BODY),
+                          (table, json.dumps({"tableServerData": {"offset": 0, "items_per_page": 1, "projection": ["x" * 30000]}})),
+                          (table, json.dumps({"tableServerData": {"offset": 0, "items_per_page": 1, "delete": True}})),
+                          (table, json.dumps({"tableServerData": {"offset": 0, "items_per_page": 1}, "action": "x"})),
+                          (table, None), (table, "not json"),
+                          (ORIGIN + "/api/v1/backoffice/account/add", "{}")):
+            self.assertEqual(page.fire("POST", url, body), "aborted")
+        self.assertEqual(guard.blocked_api_writes(), 8)  # nested write-ish, query string, oversize, write-ish key,
+        # extra top level, no body, junk, account/add (review nits 2026-10-18: only a clean table-shaped load is a refresh)
+        self.assertEqual(guard.blocked_api_write_names(), ["POST /api/v1/backoffice/account/add", "POST " + pdr.ACCOUNTS_PATH])
 
     def test_a_session_expired_before_the_form_refuses_without_opening_it(self):
         # 2026-10-18: no read runs inside the open form any more; the session is judged right before it opens.

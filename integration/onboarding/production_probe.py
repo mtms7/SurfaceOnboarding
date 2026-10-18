@@ -279,6 +279,40 @@ REWRITE_PAGE_UNIQUE = "page_unique_no_projection"  # diagnostic variant A: the p
 REWRITE_MODES = (REWRITE_STRICT, REWRITE_PAGE_UNIQUE)
 
 
+def table_refresh_shape(raw: object) -> bool:
+    """True when ``raw`` is shaped like the page's OWN table load: top level exactly ``tableServerData`` whose keys are
+    only the known table keys (offset and page size present). Values are not judged: such a request is still aborted
+    when it is not a validated search (``read_body_problem``); this only says it is a table read, not a write attempt.
+    No body, junk, an oversize body, an extra top-level key or any unknown (write-ish) key AT ANY DEPTH is never
+    table-shaped (review nits 2026-10-18)."""
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else raw
+        if not isinstance(text, str) or len(text) > _MAX_BODY_CHARS:
+            return False
+        body = json.loads(text)
+    except Exception:
+        return False
+    if not isinstance(body, dict) or set(body) != {"tableServerData"} or not isinstance(body["tableServerData"], dict):
+        return False
+    if not {"offset", "items_per_page"} <= set(body["tableServerData"]) <= _TABLE_KEYS:
+        return False
+    return _keys_within(body, _TABLE_REFRESH_VOCABULARY)
+
+
+# Every key a table load or search body may carry, at any depth (the HAR grammar plus the Dev search leaf).
+_TABLE_REFRESH_VOCABULARY = frozenset({"tableServerData", *_TABLE_KEYS, "direction", "key", "and", "or", *_LEAF_KEYS})
+
+
+def _keys_within(node: object, allowed: frozenset[str], depth: int = 0) -> bool:
+    if depth > 12:
+        return False
+    if isinstance(node, dict):
+        return all(isinstance(k, str) and k in allowed and _keys_within(v, allowed, depth + 1) for k, v in node.items())
+    if isinstance(node, list):
+        return all(_keys_within(v, allowed, depth + 1) for v in node)
+    return True
+
+
 def read_body_problem(raw: object, *, strict: bool = False) -> str | None:
     """None only when ``raw`` (JSON text or bytes) is exactly one bounded read-only table search; else a short reason.
 

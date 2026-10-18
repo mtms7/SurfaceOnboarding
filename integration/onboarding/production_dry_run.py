@@ -204,6 +204,9 @@ class DryRunRequestGuard(production_probe.RequestGuard):
         if not allowed:
             key = (method, where)
             self.blocked[key] = self.blocked.get(key, 0) + 1
+            if (method == "POST" and any(p.fullmatch(where) for p in DRY_RUN_READ_POST_PATHS)
+                    and "?" not in url and production_probe.table_refresh_shape(post_data)):
+                self.table_refreshes[key] = self.table_refreshes.get(key, 0) + 1  # still aborted; a read, not a write
             route.abort()
             return
         if "/api/" in where:
@@ -213,15 +216,36 @@ class DryRunRequestGuard(production_probe.RequestGuard):
             self.other_read_count += 1
         route.continue_()
 
+    @property
+    def table_refreshes(self) -> dict[tuple[str, str], int]:
+        """Aborted table POSTs whose body is shaped like the page's own table load (see ``blocked_api_writes``)."""
+        if not hasattr(self, "_table_refreshes"):
+            self._table_refreshes: dict[tuple[str, str], int] = {}
+        return self._table_refreshes
+
+    def _write_attempts(self) -> dict[tuple[str, str], int]:
+        """Aborted production API requests that count as write attempts, by (method, path template).
+
+        Owner go 2026-10-18 (live dry run #6): the page refreshes its own account table (a ``POST`` to the read-only table
+        path with a table-shaped body) while the form is open. It is still ABORTED, but it is a read, so it no longer
+        refuses the run. A table POST with any other body (write-ish or unknown key, extra top level, none, junk), any
+        other method, and every other API path (account/add, account/{id}/edit, ...) still counts.
+        """
+        out: dict[tuple[str, str], int] = {}
+        for (method, where), count in self.blocked.items():
+            if where.startswith("/api/") and method not in SAFE_METHODS:
+                left = count - self.table_refreshes.get((method, where), 0)
+                if left > 0:
+                    out[(method, where)] = left
+        return out
+
     def blocked_api_writes(self) -> int:
-        """Aborted requests to the production API (an attempted account/add or account/edit counts here)."""
-        return sum(count for (method, where), count in self.blocked.items()
-                   if where.startswith("/api/") and method not in SAFE_METHODS)
+        """Aborted write attempts to the production API (an attempted account/add or account/edit counts here)."""
+        return sum(self._write_attempts().values())
 
     def blocked_api_write_names(self) -> list[str]:
-        """Which API requests were aborted: method and path template only (ids replaced), for the refusal record."""
-        return sorted({f"{method} {where}" for (method, where) in self.blocked
-                       if where.startswith("/api/") and method not in SAFE_METHODS})
+        """Which API write attempts were aborted: method and path template only (ids replaced), for the refusal record."""
+        return sorted(f"{method} {where}" for (method, where) in self._write_attempts())
 
 
 # --- Click allowlist ----------------------------------------------------------------------------------------------
