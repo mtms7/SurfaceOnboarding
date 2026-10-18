@@ -9542,7 +9542,7 @@ def _pdr_recheck_form(page: Any, intended: Any, date_kept: Any, overrides: Any, 
 def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extras: dict[str, Any],
                          fill_date: Any, date_kept: Any, keep_open: bool = False,
                          confirm_preflight: bool = False, form_state: dict[str, Any] | None = None) -> dict[str, str]:
-    """Open the form, check its schema, fill, read the advanced controls, verify by read-back, re-check the session.
+    """Open the form, check its schema, fill, set and read the advanced controls, verify by read-back (no BackOffice read).
 
     Returns ``{field key: "pass" | "fail"}``; raises FormRefusal for a refusal with its own reason. The form is always
     cancelled (never confirmed) before this returns or raises; ``extras["form_cancelled"] = False`` when it did not close.
@@ -10621,7 +10621,13 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 # A popup, new page or service worker that appeared AFTER the click (even after the poll window) means the
                 # outcome cannot be trusted: returning None records ``created_unverified`` / ``readback_unavailable``, which the
                 # dashboard shows and treats as create_outcome_unknown (CO blocked, no VERIFIED record).
-                if found is not None and (guard.create_blocked or live.post_click_problem(page, guard) is not None):
+                # Pre-unlock review 2026-10-18: any OTHER write attempt the guard aborted (a follow-up call by the app after
+                # the create) may leave a half-provisioned tenant: never VERIFIED, and the record names it (method + path).
+                writes = guard.blocked_api_write_names()
+                if writes:
+                    extras["blocked_requests"] = writes
+                if found is not None and (guard.create_blocked or writes
+                                          or live.post_click_problem(page, guard) is not None):
                     return None
                 return found
 

@@ -433,7 +433,8 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     if reason is not None:
         return _refuse(write_record, inputs, reason, checked)
 
-    # The live reads ran with the verified form open: compare every control again, right before anything is armed or consumed.
+    # Time passed since the fill (the Salesforce re-read; the BackOffice reads ran with the form CLOSED before it opened,
+    # owner decision 2026-10-18): compare every control again, right before anything is armed or consumed.
     if live_form_recheck is None:
         return _refuse(write_record, inputs, "form_recheck_missing", checked)
     try:

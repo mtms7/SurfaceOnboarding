@@ -117,6 +117,8 @@ class ConfirmBtn:
                     handler(SimpleNamespace(request=SimpleNamespace(method="POST"), url=ORIGIN + live.CREATE_PATH,
                                             status=self.page.create_status))
         self.page.form_open = False
+        for path, body in self.page.requests_after_click:  # the app's own follow-up requests after the create
+            self.page.fire("POST", ORIGIN + path, body)
         for _ in range(self.page.popups_after_click):
             for handler in self.page.popup_handlers:
                 handler(None)
@@ -148,6 +150,7 @@ class LivePage(dry.FakePage):
         self.extra_pages = []
         self.popups_after_click = 0
         self.workers_after_click = 0
+        self.requests_after_click = []
         self.popup_on_readback = False
         self.context = SimpleNamespace(pages=[self], route=lambda pattern, handler: self.routes.append((pattern, handler)),
                                        on=self._context_on)
@@ -878,6 +881,22 @@ class ContextGuardAndCountryTests(Base):
         self.assertNotIn("readback_verified", h.outcomes())
         self.assertEqual(h.page.confirm_clicks, 1)
         self.assertTrue(ui.co_status(h.loaded_records())["blocking"])
+
+    def test_a_blocked_follow_up_write_after_the_click_is_unknown_and_named(self):
+        # Pre-unlock review 2026-10-18: an app write the guard aborted after the create (e.g. an invite or a settings call)
+        # could leave a half-provisioned tenant, so the outcome is never VERIFIED; the record names the request.
+        h = self.harness()
+        h.page.requests_after_click = [("/api/v1/backoffice/account/0123456789abcdef01234567/inviteUser", "{}")]
+        self.assertEqual(h.go()["result"], "create_outcome_unknown")
+        self.assertEqual(h.page.confirm_clicks, 1)
+        self.assertTrue(ui.co_status(h.loaded_records())["blocking"])
+        named = [r.get("blocked_requests") for r in h.loaded_records() if r.get("blocked_requests")]
+        self.assertEqual(named, [["POST /api/v1/backoffice/account/{id}/inviteUser"]])
+
+    def test_the_pages_own_table_refresh_after_the_click_does_not_spoil_a_verified_create(self):
+        h = self.harness()
+        h.page.requests_after_click = [(pdr.ACCOUNTS_PATH, dry.pot.PAGE_DEFAULT_BODY)]
+        self.assertEqual(h.go()["result"], "created_verified")
 
     def test_a_service_worker_appearing_after_the_click_is_unknown(self):
         h = self.harness()
