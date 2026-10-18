@@ -218,6 +218,11 @@ class DryRunRequestGuard(production_probe.RequestGuard):
         return sum(count for (method, where), count in self.blocked.items()
                    if where.startswith("/api/") and method not in SAFE_METHODS)
 
+    def blocked_api_write_names(self) -> list[str]:
+        """Which API requests were aborted: method and path template only (ids replaced), for the refusal record."""
+        return sorted({f"{method} {where}" for (method, where) in self.blocked
+                       if where.startswith("/api/") and method not in SAFE_METHODS})
+
 
 # --- Click allowlist ----------------------------------------------------------------------------------------------
 CLICK_OPEN_CREATE_FORM = "open_create_form"

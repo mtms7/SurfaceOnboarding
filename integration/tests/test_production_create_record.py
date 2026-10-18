@@ -329,5 +329,27 @@ class TestEditableParameters(Base):
         self.assertEqual(pcr.editable_parameters(pcr.load(path)), [])
 
 
+
+class BlockedRequestNameTests(unittest.TestCase):
+    """Live 2026-10-18: the dry-run refusal names the aborted request by method and path template only."""
+
+    def test_a_path_template_is_kept_and_anything_else_is_redacted(self):
+        import tempfile
+        from datetime import datetime, timezone
+        from integration.onboarding import production_create_record as pcr
+        folder = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, folder, True)
+        blob = "A" * 48
+        path = pcr.record(folder, {"co_reference": "CO-0001", "outcome": "refused", "refusal_reason": "write_request_blocked",
+                                   "blocked_requests": ["POST /api/v1/backoffice/getAllDetailedAccounts",
+                                                       f"POST /api/v1/backoffice/account/{blob}/edit",
+                                                       "POST /api/v1/x?token=abc", "free text"]},
+                          datetime(2026, 10, 18, 22, 0, tzinfo=timezone.utc))
+        data = pcr.load(path)
+        self.assertEqual(data["blocked_requests"][0], "POST /api/v1/backoffice/getAllDetailedAccounts")
+        self.assertEqual(data["blocked_requests"][1:], [pcr.REDACTED] * 3)
+        self.assertEqual(data["redactions"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

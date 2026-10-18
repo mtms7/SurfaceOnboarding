@@ -531,15 +531,16 @@ class TriggerTests(unittest.TestCase):
             r.table(value)
         self.assertEqual((page.reloads, page.header_clicks, page.dispatches), (2, 0, 0))
 
-    def test_with_the_form_open_only_a_dispatched_click_is_used_never_a_reload(self):
+    def test_with_the_form_open_no_read_runs_at_all(self):
+        # Owner decision 2026-10-18 (live: no sort header is ever found): a read requested with the form open is refused.
         page = Page()
         r = reader(page)
         r.table("warm")  # the first read reloads (form closed)
         page.form_open = True
         reloads = page.reloads
-        status, _ = r.table("b", form_open=True)
-        self.assertEqual(status, 200)
-        self.assertEqual((page.reloads, page.dispatches, page.header_clicks), (reloads, 1, 0))
+        self.assertEqual(r.table("b", form_open=True), (None, None))
+        self.assertEqual((page.reloads, page.dispatches, page.header_clicks), (reloads, 0, 0))
+        self.assertEqual(r.last_read, {"form_open_read_refused": "fail"})
 
     def test_with_the_form_open_and_no_header_it_fails_closed_without_reloading(self):
         page = Page(header=False)
@@ -585,8 +586,8 @@ class DialogHeaderTests(unittest.TestCase):
         r = reader(page)
         r.table("warm")
         page.form_open = True
-        self.assertEqual(r.table("b", form_open=True)[0], 200)
-        self.assertEqual((page.dispatches, page.dialog_header_clicks), (1, 0))
+        self.assertEqual(r.table("b", form_open=True), (None, None))  # refused: nothing dispatched, nothing clicked
+        self.assertEqual((page.dispatches, page.dialog_header_clicks), (0, 0))
 
     def test_with_only_a_dialog_header_the_read_fails_closed_without_any_click_or_reload(self):
         page = Page(header=False)
@@ -666,7 +667,9 @@ class DialogHeaderTests(unittest.TestCase):
             def nth(self, _index):
                 return Lazy()
         page.locator = lambda selector: Headers() if selector == fake.HEADER_SELECTOR else None
-        self.assertEqual(reader(page).table("x", form_open=True)[0], 200)
+        header = runner._in_app_sort_header(page)  # the classifier pins ONE element (form-open reads are refused now)
+        self.assertTrue(runner._sort_header_still_outside(header))
+        header.dispatch_event("click")
         self.assertEqual((page.dispatches, page.dialog_header_clicks), (1, 0))
 
     def test_the_dialog_selector_covers_the_usual_modal_markers(self):
@@ -709,15 +712,13 @@ class SessionTests(unittest.TestCase):
         reader(page).session_problem()  # FakeResponse.headers / bodies of passive GETs raise if read
         self.assertEqual(page.evaluated, [])
 
-    def test_with_the_form_open_the_check_uses_the_dispatched_click(self):
+    def test_with_the_form_open_the_session_check_is_refused_fail_closed(self):
         page = Page()
         r = reader(page)
         self.assertIsNone(r.session_problem())
         page.form_open = True
-        self.assertIsNone(r.session_problem(form_open=True))
-        self.assertEqual(page.dispatches, 1)
-        page.header_present = False
-        self.assertEqual(r.session_problem(form_open=True), "production_session_not_ready")  # cannot trigger: fail closed
+        self.assertEqual(r.session_problem(form_open=True), "production_session_not_ready")  # never read with the form open
+        self.assertEqual(page.dispatches, 0)
 
 
 class DemoTests(unittest.TestCase):

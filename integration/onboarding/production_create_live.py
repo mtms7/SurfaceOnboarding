@@ -46,6 +46,7 @@ LIVE_REASONS = frozenset({
     "confirm_preflight_failed", "extra_pages_open", "launch_ticket_invalid", "source_recheck_unavailable",
     "approval_revision_drift", "salesforce_prior_uuid_present", "live_source_check_missing", "service_worker_present", "service_worker_check_failed",
     "readback_payload_mismatch", "readback_payload_unchecked", "form_changed_during_checks", "form_recheck_missing",
+    "duplicate_check_stale",
 })
 
 

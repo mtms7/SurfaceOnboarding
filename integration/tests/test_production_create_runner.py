@@ -208,8 +208,16 @@ class Harness(dry.Harness):
     def mint(self, revision=REV, operator="milton", when=NOW):
         return ticket.mint(self.records, CO, revision, REF, operator, when)
 
+    def load_source(self, ref):
+        # Changes to the OPEN, verified form are simulated in the window between the fill and the Confirm click: the
+        # Salesforce re-read runs there (no BackOffice read runs while the form is open, owner decision 2026-10-18).
+        if self.page.form_open:
+            for key in list(self.page.on_read):
+                self.page.on_read.pop(key)()
+        return super().load_source(ref)
+
     def go(self, *, runner_flag=True, dry_flag=True, go=True, revision=REV, clone=good_clone, source=None, dry_run_record=True,
-           with_ticket=True, operator="milton", ticket_when=NOW, rows=None):
+           with_ticket=True, operator="milton", ticket_when=NOW, rows=None, clock=None, fill_date=None):
         if dry_run_record:
             self.seed_dry_run()
         for record in rows or ():
@@ -223,8 +231,8 @@ class Harness(dry.Harness):
             line = runner.run_production_create(
                 CO, revision, owner_go=go, environ=env, now=NOW, records_parent=self.records,
                 approval_path=self.approval_path, load_source=(lambda _r: source) if source else self.load_source,
-                clone_facts=clone, open_page=self.open_page, fill_date=lambda *_a: True, date_kept=lambda *_a: True,
-                run_day=DAY, ticket_parent=self.records, org_probe=dry.ORG_PROBE)
+                clone_facts=clone, open_page=self.open_page, fill_date=fill_date or (lambda *_a: True),
+                date_kept=lambda *_a: True, run_day=DAY, ticket_parent=self.records, org_probe=dry.ORG_PROBE, clock=clock)
         self.stdout, self.line = out.getvalue(), line
         return json.loads(line)
 
@@ -380,30 +388,61 @@ class LiveDuplicateTests(Base):
             def get(self, key, default=None):
                 if key == runner.PDR_SESSION_CHECK_VALUE:
                     self.calls += 1
-                    if self.calls >= 3:  # early check, the check inside the filled form, then the live pre-check
+                    if self.calls >= 2:  # the early check, then the live pre-check right before the form opens
                         return {"status": 401, "total": None, "rows": None}
                 return super().get(key, default)
         h = self.harness(search=ThirdRefused())
         result = h.go()
         self.assertIn(result["result"], ("production_session_expired",))
         self.assertEqual(h.page.confirm_clicks, 0)
+        self.assertNotIn("Add Account", h.page.clicks)
         self.assertIsNone(h.approval_unused())
 
-    def test_a_late_check_that_cannot_be_triggered_with_the_form_open_refuses_before_the_click(self):
-        h = self.harness(header=False)  # no sort header: with the form open there is no safe trigger (never a reload)
-        self.assertEqual(h.go()["result"], "production_session_not_ready")
-        self.assertEqual(h.page.confirm_clicks, 0)
-        self.assertEqual((h.page.reloads, h.page.gotos), (5, 0))  # the five early reads (no header: reloads) and nothing once the form was open
-        self.assertIsNone(h.approval_unused())
+    def test_without_a_sort_header_every_read_reloads_with_the_form_closed(self):
+        h = self.harness(header=False)  # the live case (2026-10-18): no sort header is ever found
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertEqual((h.page.reads_with_form_open, h.page.dispatches, h.page.gotos), (0, 0, 0))
 
     def test_every_live_read_is_the_pages_own_rewritten_request_and_the_form_is_never_reloaded(self):
         h = self.harness()
         self.assertEqual(h.go()["result"], "created_verified")
         self.assertEqual(h.page.reloads, 1)  # the first read only
-        self.assertEqual(h.page.dispatches, 6)  # fill-time session check + the live pre-check (session, 2 control, name, domain)
+        self.assertEqual((h.page.dispatches, h.page.reads_with_form_open), (0, 0))  # nothing read while the form is open
         self.assertEqual(set(h.page.fetches), {("POST", pdr.ACCOUNTS_PATH)})
         for body in h.page.table_bodies:  # every read body is the validated grammar
             self.assertIsNone(runner.production_probe.read_body_problem(json.dumps(body)))
+
+    def test_every_live_read_runs_with_the_form_closed(self):
+        h = self.harness()
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertEqual((h.page.reads_with_form_open, h.page.dispatches), (0, 0))
+
+    def test_a_duplicate_found_right_before_the_form_opens_refuses_before_it_opens(self):
+        row = {"name": "Someone Else", "domain": DOMAIN, "alternates": [], "emails": [], "deleted": False}
+        h = self.harness(search=Flip({"unused": reply([])}, {DOMAIN: reply([row])}))  # clean early, a match pre-form
+        self.expect_refusal(h, "duplicate_in_production")
+        self.assertNotIn("Add Account", h.page.clicks)  # the form was never opened
+
+    def test_pre_form_reads_older_than_the_bound_refuse_before_consume_and_click(self):
+        moment = [NOW]
+
+        def slow_fill(*_a):
+            moment[0] = NOW + runner.PCR_PRE_FORM_MAX_AGE + timedelta(seconds=1)
+            return True
+        h = self.harness()
+        self.assertEqual(h.go(clock=lambda: moment[0], fill_date=slow_fill)["result"], "duplicate_check_stale")
+        self.assertEqual((h.page.confirm_clicks, h.page.form_open), (0, False))
+        self.assertIsNone(h.approval_unused())
+
+    def test_reads_going_stale_during_the_salesforce_reread_refuse_before_consume_and_click(self):
+        moment = [NOW]
+        h = self.harness()
+        # the hook fires in the Salesforce re-read, i.e. AFTER the duplicate hook judged the age (review fix 2026-10-18)
+        h.page.on_read["late"] = lambda: moment.__setitem__(0, NOW + runner.PCR_PRE_FORM_MAX_AGE + timedelta(seconds=1))
+        self.assertEqual(h.go(clock=lambda: moment[0])["result"], "form_changed_during_checks")
+        self.assertEqual((h.page.confirm_clicks, h.page.form_open), (0, False))
+        self.assertIsNone(h.approval_unused())
+        self.assertNotIn("attempt_started", h.outcomes())
 
     def test_a_stray_create_post_during_the_fill_is_blocked(self):
         h = self.harness(write_on_select=True)
@@ -710,14 +749,13 @@ class FormRecheckTests(Base):
         h.page.dialog_header = True
         self.assertEqual(h.go()["result"], "created_verified")
         self.assertEqual(h.page.dialog_header_clicks, 0)
-        self.assertEqual(h.page.dispatches, 6)
+        self.assertEqual((h.page.dispatches, h.page.reads_with_form_open), (0, 0))
 
-    def test_a_dialog_only_header_fails_the_late_check_closed_without_any_click(self):
+    def test_a_dialog_only_header_is_never_clicked_and_the_reads_reload_with_the_form_closed(self):
         h = self.harness(header=False)
         h.page.dialog_header = True
-        self.assertEqual(h.go()["result"], "production_session_not_ready")
-        self.assertEqual((h.page.dialog_header_clicks, h.page.dispatches, h.page.confirm_clicks), (0, 0, 0))
-        self.assertIsNone(h.approval_unused())
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertEqual((h.page.dialog_header_clicks, h.page.dispatches, h.page.reads_with_form_open), (0, 0, 0))
 
     def test_the_new_reasons_are_in_the_fixed_live_enum(self):
         for code in ("form_changed_during_checks", "form_recheck_missing"):
@@ -860,7 +898,11 @@ class ContextGuardAndCountryTests(Base):
 
     def test_the_dry_run_age_is_rechecked_at_click_time(self):
         h = self.harness()
-        times = iter([NOW, NOW + timedelta(hours=25)])
+        calls = [0]
+
+        def clock():  # the pre-form read stamp, the fresh gate and the read age at NOW; the dry-run age check 25 h later
+            calls[0] += 1
+            return NOW if calls[0] < 4 else NOW + timedelta(hours=25)
         # stamp() is fixed in the harness; use the runner's own clock hook to move time forward for the late check
         h.seed_dry_run()
         h.mint()
@@ -869,7 +911,7 @@ class ContextGuardAndCountryTests(Base):
             line = runner.run_production_create(
                 CO, REV, owner_go=True, environ=dict(dry.UNLOCK), now=NOW, records_parent=h.records, approval_path=h.approval_path,
                 load_source=h.load_source, clone_facts=good_clone, open_page=h.open_page, fill_date=lambda *_a: True,
-                date_kept=lambda *_a: True, run_day=DAY, clock=lambda: next(times), ticket_parent=h.records, org_probe=dry.ORG_PROBE)
+                date_kept=lambda *_a: True, run_day=DAY, clock=clock, ticket_parent=h.records, org_probe=dry.ORG_PROBE)
         self.assertEqual(json.loads(line)["result"], "dry_run_old")
         self.assertEqual(h.page.confirm_clicks, 0)
         self.assertIsNone(h.approval_unused())

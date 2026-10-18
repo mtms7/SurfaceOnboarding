@@ -229,6 +229,7 @@ class PageOwnTable:
         self.passive = passive if passive is not None else {}
         self.demo_reply, self.demo_domain = demo, demo_domain
         self.skip_table_response = False  # simulates a page that never answers its own table request
+        self.reads_with_form_open = 0  # owner decision 2026-10-18: no read may run while the Add Account form is open
 
     # -- routing, exactly like Playwright: the last registered handler runs first, fallback passes on
     def route(self, pattern, handler):
@@ -266,6 +267,8 @@ class PageOwnTable:
             self._emit("response", FakeResponse("GET", ORIGIN + pdr.DEMO_DOMAINS_PATH, demo[0], demo[1]))
 
     def _table_request(self):
+        if getattr(self, "form_open", False) and not getattr(self, "confirm_clicks", 0):
+            self.reads_with_form_open += 1
         if self.fire("POST", TABLE_URL, PAGE_DEFAULT_BODY) == "aborted" or self.skip_table_response:
             return
         request = self.routed[-1].request

@@ -9032,7 +9032,7 @@ class ProductionPageReader:
 
     def _triggers(self, form_open: bool) -> list[tuple[str, int]]:
         if form_open:
-            return [("in_app_dispatch", SEARCH_IN_APP_TIMEOUT_MS)]
+            return []  # owner decision 2026-10-18: never a read with the form open (``table`` refuses it first)
         triggers = [("in_app", SEARCH_IN_APP_TIMEOUT_MS)] if (self.in_app and self._loaded and SEARCH_IN_APP_TRIGGER) else []
         triggers.append(("reload", SEARCH_RESPONSE_TIMEOUT_MS))
         triggers.extend(("navigate", SEARCH_RESPONSE_TIMEOUT_MS) for _ in range(SEARCH_RELOAD_RETRIES))
@@ -9054,6 +9054,11 @@ class ProductionPageReader:
         2xx (401 and 403 included) comes back with no body. ``mode`` is strict (name + domain override, the page's own
         projection removed, validated with the strict grammar) for every read except the readback diagnostic variant A.
         """
+        if form_open:
+            # Owner decision 2026-10-18 (live dry runs #3/#4: no sort header is ever found, so nothing can trigger the
+            # page's own read behind the open form): no read runs while the Add Account form is open. Fail closed.
+            self.last_read = {"form_open_read_refused": "fail"}
+            return None, None
         try:
             fields = production_probe.table_rewrite_fields(value, mode)
             drops = production_probe.table_rewrite_drops(mode)
@@ -9590,12 +9595,12 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
                                            for name in production_dry_run.INFO_ADVANCED_NAMES}
             form_state["form_signature"] = _pdr_form_signature(after)
         fields = production_dry_run.compare_reads(intended, _pdr_form_reads(page, intended, date_kept), overrides)
-        session = _pdr_session_problem(page, form_open=True)  # the form is open: a dispatched sort click, never a reload
-        if session:
-            stages = getattr(_pdr_reader(page), "last_read", None) or {}
-            raise refusal(session, {**fields, **{f"session.{k}": v for k, v in stages.items()
-                                                 if isinstance(k, str) and v in ("pass", "fail")}})
+        # No BackOffice read here: the form is open (owner decision 2026-10-18). The session and duplicate reads ran with
+        # the form closed right before it opened. A session lost since then makes the live create POST fail: recorded as
+        # uncertain_submit (approval consumed, no readback), the CO blocked until the owner checks BackOffice by hand.
         if guard.blocked_api_writes():
+            names = getattr(guard, "blocked_api_write_names", None)
+            extras["blocked_requests"] = names() if callable(names) else []  # live dry run #5: name what was blocked
             raise refusal("write_request_blocked", fields)
         if confirm_preflight:  # locate / enabled / scroll / hit-test of Confirm, never clicked: a NOT_CLICKED shows up HERE first
             from integration.onboarding import production_create_live as _live
@@ -10320,6 +10325,10 @@ def _pcr_selected_country_code(page: Any) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(r"[A-Z]{2}", value) else None
 
 
+# The live reads run with the form closed right before it opens; the consume and the click must follow within this bound.
+PCR_PRE_FORM_MAX_AGE = timedelta(seconds=180)
+
+
 def _pcr_search(page: Any, value: str, form_open: bool = False) -> Any:
     return _pdr_reader(page).search(value, form_open=form_open)
 
@@ -10328,8 +10337,8 @@ def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str
                                 extras: dict[str, Any] | None = None, *, form_open: bool = False) -> str | None:
     """The live BackOffice duplicate pre-check, right before the click: session, POSITIVE CONTROL, name search, domain search, demo list.
 
-    Read-only reads through the page's own table request (``form_open``: the verified Add Account form is open, so only a
-    dispatched sort click may trigger them) and the request guard. The clone is only a hint: this re-checks BackOffice itself by exact
+    Read-only reads through the page's own table request and the request guard, always with the Add Account form CLOSED
+    (owner decision 2026-10-18: ``form_open`` reads are refused by the reader). The clone is only a hint: this re-checks BackOffice itself by exact
     name (with the " - CE Only" suffix) and by primary domain, plus the demo-domain rule. The generic search filter is
     unproven for domains, so first the SAME two searches are run for a control tenant taken from the fresh clone and must
     return it (otherwise ``search_unproven``: an empty target result is never a clearance). Any match, ambiguity or error
@@ -10377,9 +10386,11 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     Order: arguments; the dry-run constant; the live production target (runner constant, sessions flag, approval
     reference, exact origin); Salesforce source and clone; the ordered gate (approval bound to CO, route and the CURRENT
     revision) before any browser; then in the signed-in page the service-worker check, the session check, the early live
-    duplicate check, the form fill and verification (the form stays open), and ``production_create.run`` live: owner go, prior dry
-    run, no unreviewed attempt, fresh gate, the LIVE duplicate pre-check, the intent record, the approval consume, ONE
-    Confirm click, the bounded readback and the compare against docs/49. Every external step is injectable (tests).
+    duplicate check, and ``production_create.run`` live: owner go, prior dry run, no unreviewed attempt, then (in the fill)
+    the LIVE duplicate pre-check with the form CLOSED right before it opens, the form fill and verification (the form stays
+    open, nothing is read while it is), fresh gate, the pre-form result and its age (``PCR_PRE_FORM_MAX_AGE``), the
+    Salesforce re-read, the read-only form re-check, the intent record, the approval consume, ONE Confirm click, the
+    bounded readback and the compare against docs/49. Every external step is injectable (tests).
     """
     from integration.onboarding import production_create_live as live
     from integration.onboarding import session_readiness as readiness
@@ -10497,6 +10508,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         if dry_problem is not None:
             return refused(dry_problem)
     cleared = bool(prior) and create_ui.review_cleared(prior)  # only an owner-reviewed NOT_CLICKED attempt
+    pre_form: dict[str, Any] = {}  # the live duplicate check run with the form CLOSED right before it opens
 
     def no_fill(_inputs: Any) -> Any:
         raise RuntimeError("production_dry_run_form_not_reached")
@@ -10544,6 +10556,13 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
             strict_state: dict[str, Any] = {"expected": None, "code": None, "overrides": {}}
 
             def fill(_inputs: Any) -> dict[str, str]:
+                # Owner decision 2026-10-18: the live BackOffice reads (session, control, name, domain, demo list) run HERE,
+                # with the form closed, immediately before it opens; none runs while it is open.
+                started = (clock or stamp)()  # stamped BEFORE the reads: the age covers the oldest of them
+                problem = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
+                pre_form.update(at=started, problem=problem)
+                if problem is not None:
+                    raise production_create.FormRefusal(problem)
                 fields = _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
                                               date_kept or _license_date_kept, keep_open=True, confirm_preflight=True,
                                               form_state=strict_state)
@@ -10560,21 +10579,34 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                     guard.expected_payload = None  # payload_expectation_unavailable: never verifies, nothing pre-send aborted
                 return fields
 
-            def duplicate_check(_inputs: Any) -> str | None:  # runs with the verified form OPEN: dispatched sort click only
-                problem = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras,
-                                                      form_open=True)
-                if problem is not None:
-                    return problem
+            def pre_form_fresh() -> bool:
+                try:
+                    age = (clock or stamp)() - pre_form["at"]
+                except Exception:
+                    return False
+                return timedelta(0) <= age <= PCR_PRE_FORM_MAX_AGE
+
+            def duplicate_check(_inputs: Any) -> str | None:  # the form is OPEN: no read here, only the pre-form result
+                if "at" not in pre_form:
+                    return "duplicate_check_unavailable"
+                if pre_form["problem"] is not None:
+                    return pre_form["problem"]
+                if not pre_form_fresh():
+                    return "duplicate_check_stale"  # the fill took too long: the reads are no longer right before the click
                 # The 24 h dry-run age is judged again here, right before the consume and the click.
                 again = _pcr_prior_records(parent, reference)
                 if again is None:
                     return "prior_records_invalid"
                 return create_ui.dry_run_problem(again, reference_value, (clock or stamp)())
 
-            def form_recheck(_inputs: Any) -> dict[str, str]:  # after the live reads, before the intent record and the consume
-                return _pdr_recheck_form(page, intended, date_kept or _license_date_kept, strict_state["overrides"],
-                                         strict_state["code"], strict_state.get("info_controls"),
-                                         strict_state.get("form_signature"))
+            def form_recheck(_inputs: Any) -> dict[str, str]:  # the last hook before the intent record and the consume
+                fields = _pdr_recheck_form(page, intended, date_kept or _license_date_kept, strict_state["overrides"],
+                                           strict_state["code"], strict_state.get("info_controls"),
+                                           strict_state.get("form_signature"))
+                # Review fix 2026-10-18: the pre-form reads must still be within the bound HERE (after the Salesforce re-read
+                # and this DOM re-check), not only at the duplicate hook; a fail refuses form_changed_during_checks.
+                fields["pre_form_age"] = "pass" if "at" in pre_form and pre_form_fresh() else "fail"
+                return fields
 
             def click(_inputs: Any) -> str:
                 return live.click_confirm_once(page, guard, clicks, locate=_locate_confirm_button,

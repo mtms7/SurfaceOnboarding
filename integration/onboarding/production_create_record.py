@@ -32,7 +32,7 @@ EDITABLE_CANDIDATES = ("account_id", "account_uuid", "domains", "plan_summary", 
 
 _SCALAR_FIELDS = ("route", "approval_ref", "refusal_reason", "tenant_name", "account_id", "account_uuid",
                   "plan_summary", "salesforce_revision", "search_control", "operator")
-_LIST_FIELDS = ("domains", "response_shape", "readback_mismatches", "payload_mismatches")
+_LIST_FIELDS = ("domains", "response_shape", "readback_mismatches", "payload_mismatches", "blocked_requests")
 ADVANCED_SECTION_VALUES = ("found", "not_found")
 ADVANCED_CONTROL_STATES = ("on", "off", "absent")
 _ALLOWED = frozenset({"co_reference", "outcome", "recorded_at", "redactions", "form_fields_checked",
@@ -50,6 +50,8 @@ _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
 _REASON_RE = re.compile(r"[a-z][a-z0-9_]{2,80}")
 _NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}")
 _PAYLOAD_NAME_RE = re.compile(r"(?:unexpected:)?[A-Za-z0-9_.-]{1,80}")  # a create-body field name, ``unexpected:`` prefix allowed
+# A request the dry-run guard aborted (live 2026-10-18): HTTP method and the path TEMPLATE only (ids already replaced).
+_BLOCKED_REQUEST_RE = re.compile(r"[A-Z]{3,7} /api/[A-Za-z0-9_./{}-]{1,160}")
 
 
 class ProductionCreateRecordError(Exception):
@@ -95,6 +97,18 @@ def _clean_payload_name(value: Any, counter: list[int]) -> str | None:
     return REDACTED
 
 
+def _clean_blocked_request(value: Any, counter: list[int]) -> str | None:
+    """``METHOD /api/path/template`` (strict shape, no query, no secret-like segment) or ``[redacted]``."""
+    if isinstance(value, bool) or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if _BLOCKED_REQUEST_RE.fullmatch(text) and not any(_JWT_RE.search(part) or _BLOB_RE.search(part)
+                                                       for part in text.split(" ", 1)[1].split("/")):
+        return text  # judged per path segment: a long path is not a blob, a long opaque segment still is
+    counter[0] += 1
+    return REDACTED
+
+
 def _clean_reason(value: Any, counter: list[int]) -> str | None:
     """A refusal reason code: ``^[a-z][a-z0-9_]{2,80}$`` or ``[redacted]``. None when not a string."""
     if isinstance(value, bool) or not isinstance(value, str):
@@ -123,6 +137,7 @@ def _sanitize(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
         value = data.get(name)
         if isinstance(value, (list, tuple)):
             clean_item = (_clean_payload_name if name == "payload_mismatches"
+                          else _clean_blocked_request if name == "blocked_requests"
                           else _clean_name if name in ("response_shape", "readback_mismatches") else _clean_free)
             items = [clean_item(v, counter) for v in list(value)[:MAX_LIST_ITEMS]]
             out[name] = [i for i in items if i is not None]

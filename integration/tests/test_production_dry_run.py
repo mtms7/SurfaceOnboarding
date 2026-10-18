@@ -872,9 +872,9 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(set(page.fetches), {("POST", pdr.ACCOUNTS_PATH)})  # only the page's own, rewritten table requests
         values = page.table_values
         self.assertEqual((values.count(POISON_NAME + " - CE Only"), values.count(POISON_DOMAIN)), (1, 1))  # name and domain
-        self.assertEqual(values.count(runner.PDR_SESSION_CHECK_VALUE), 2)  # before the form and again inside the filled form
+        self.assertEqual(values.count(runner.PDR_SESSION_CHECK_VALUE), 1)  # before the form only (no read while it is open)
         self.assertEqual(page.reloads, 1)  # only the first read reloads; the later ones use the sort header
-        self.assertEqual(page.dispatches, 1)  # the late session check runs with the form open: dispatched click, no reload
+        self.assertEqual((page.dispatches, page.reads_with_form_open), (0, 0))
         data, text = h.record()
         self.assertEqual(data["outcome"], "dry_run_passed")
         self.assertTrue(data["form_fields_checked"])
@@ -1091,20 +1091,28 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(all(r.abort_called and not r.continue_called for r in writes))
         self.assertEqual(h.page.clicks[-1], "Cancel")
         self.assertNotIn("Confirm", h.page.clicks)
+        # Live 2026-10-18 (dry run #5): the record names WHICH request was blocked (method and path template only)
+        data, text = h.record()
+        self.assertEqual(data["blocked_requests"], ["POST /api/v1/backoffice/account/add"])
+        self.assertEqual(data["redactions"], 0)
 
-    def test_session_expiring_during_the_fill_refuses(self):
-        class SecondRefused(dict):
-            calls = 0
+    def test_a_blocked_page_table_refresh_is_named_by_its_path(self):
+        h = Harness(self)
+        original = h.page._open
 
-            def get(self, key, default=None):
-                if key == runner.PDR_SESSION_CHECK_VALUE:
-                    self.calls += 1
-                    if self.calls >= 2:  # the check inside the filled form: the page's own reply is now 401
-                        return {"status": 401, "total": None, "rows": None}
-                return super().get(key, default)
-        h = Harness(self, search=SecondRefused())
+        def open_and_refresh():  # the page sends its own unfiltered table request while the form opens
+            original()
+            h.page.fire("POST", ORIGIN + pdr.ACCOUNTS_PATH, pot.PAGE_DEFAULT_BODY)
+        h.page._open = open_and_refresh
+        self.assertEqual(h.run()["result"], "write_request_blocked")
+        self.assertEqual(h.record()[0]["blocked_requests"], ["POST " + pdr.ACCOUNTS_PATH])
+
+    def test_a_session_expired_before_the_form_refuses_without_opening_it(self):
+        # 2026-10-18: no read runs inside the open form any more; the session is judged right before it opens.
+        h = Harness(self, search={runner.PDR_SESSION_CHECK_VALUE: {"status": 401, "total": None, "rows": None}})
         self.assertEqual(h.run()["result"], "production_session_expired")
-        self.assertEqual(h.page.clicks[-1], "Cancel")
+        self.assertNotIn("Add Account", h.page.clicks)
+        self.assertEqual(h.page.reads_with_form_open, 0)
 
     def test_form_that_does_not_cancel_is_refused(self):
         h = Harness(self)
@@ -1145,31 +1153,21 @@ class FlowTests(unittest.TestCase):
         self.assertNotEqual(out["result"], "toggle_click_failed")
         self.assertIn("leakedCredentialsAllowed", h.page.clicks)
 
-    def form_open_read_stages(self, h):
-        out = h.run()
-        self.assertEqual(out["result"], "production_session_not_ready")
-        fields = h.record()[0]["form_fields_checked"]
-        self.assertEqual(h.page.clicks[-1], "Cancel")
-        self.assertNotIn("Confirm", h.page.clicks)
-        return {k[len("session."):]: v for k, v in fields.items() if k.startswith("session.")}
-
-    def test_a_form_open_read_whose_dispatch_sends_nothing_names_its_stages(self):
-        # Live 2026-10-18 (CO-0798 dry run #3): refused production_session_not_ready at the post-fill session check with
-        # the form open; the record must say which stage failed (names and pass/fail only, never a value).
+    def test_no_table_read_runs_while_the_form_is_open(self):
+        # Live 2026-10-18 (CO-0798 dry runs #3/#4): no sort header is ever found, so a read with the form open cannot work;
+        # owner decision: every read runs with the form closed, right before it opens, and none while it is open.
         h = Harness(self)
-        h.page.dispatch_ignored = True
-        stages = self.form_open_read_stages(h)
-        self.assertEqual(stages, {"trigger_in_app_dispatch": "pass", "header_found": "pass", "trigger_sent": "pass",
-                                  "request_routed": "fail", "rewritten": "fail", "body_matched": "fail",
-                                  "reply": "fail", "status_2xx": "fail"})
+        h.page.dispatch_ignored = True  # the live symptom no longer matters: nothing is read with the form open
+        self.assertEqual(h.run()["result"], "dry_run_passed")
+        self.assertEqual((h.page.reads_with_form_open, h.page.dispatches), (0, 0))
 
-    def test_a_form_open_read_without_a_header_outside_the_dialog_names_its_stage(self):
-        h = Harness(self)
-        original = h.page._header
-        h.page._header = lambda: original() if not h.page.form_open else None
-        stages = self.form_open_read_stages(h)
-        self.assertEqual(stages.get("header_found"), "fail")
-        self.assertNotIn("trigger_sent", stages)
+    def test_the_reader_refuses_a_read_requested_with_the_form_open(self):
+        page = FakePage(search={"x": {"status": 200, "total": 0, "rows": []}})
+        page.form_open = True
+        reader = runner.ProductionPageReader(page)
+        self.assertEqual(reader.table("x", form_open=True), (None, None))
+        self.assertEqual(reader.last_read, {"form_open_read_refused": "fail"})
+        self.assertEqual((page.dispatches, page.reloads, page.header_clicks, page.reads_with_form_open), (0, 0, 0, 0))
 
     def test_toggle_click_failure_never_retries_with_force(self):
         h = Harness(self, click_fail={"leakedCredentialsAllowed"})  # Ctl.click asserts there is no force=True retry
