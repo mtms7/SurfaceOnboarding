@@ -324,7 +324,8 @@ class ShapeTests(unittest.TestCase):
 
     def test_hostname_lists_reject_pii_shaped_items_and_oversize(self):
         for column in ("userEmailDomains", "leakedCredentialsScannedDomains", "alternateDomains", "accountLicense.allowedModules"):
-            for bad in (["jane@example.com"], ["two words.example.com"], ["a" * 254], ["ok.example.com"] * 51, [5], ["tab	.example"]):
+            many = redash.ALT_DOMAINS_MAX_ITEMS + 1 if column == "alternateDomains" else 51  # alternate domains: own bound
+            for bad in (["jane@example.com"], ["two words.example.com"], ["a" * 254], ["ok.example.com"] * many, [5], ["tab	.example"]):
                 with self.subTest(column=column, bad=bad[:1]):
                     self.assertEqual(self.refused(**{column: bad}), "redash_schema_unavailable")
         redash.normalize(reply([row253(1, userEmailDomains=["ok.example.com"] * 3, alternateDomains=["Alt.Example.com."])]), 253)
@@ -366,11 +367,26 @@ class ShapeTests(unittest.TestCase):
         lists = {"alternateDomains": [host] * 4, "userEmailDomains": [host] * 4, "leakedCredentialsScannedDomains": [host] * 4,
                  "accountLicense.allowedModules": ["m" * 20] * 3}
         redash.normalize(reply([row253(1, **lists)]), 253)  # inside the per-row list budget: accepted
-        self.assertEqual(self.refused(**{**lists, "alternateDomains": [host] * 50}), "redash_schema_unavailable")  # over budget
+        over = [host] * 49  # under the 50-item cap, over the 1,500-character row budget: only the budget can refuse
+        self.assertEqual(self.refused(**{**lists, "userEmailDomains": over}), "redash_schema_unavailable")
+        many = [f"alt{n}.example.com" for n in range(1622)]  # query 253: real-sized alternate domains pass (own bounds)
+        self.assertEqual(redash.normalize(reply([row253(1, **{**lists, "alternateDomains": many})]), 253).rows[0]["alternateDomains"], many)
         root = Path(__import__("tempfile").mkdtemp())
         snapshot_253(root, 20, **lists, accountName="N" * 120)
         size = max(path.stat().st_size for path in (root / "prod-clone").glob("redash-*.json"))
-        self.assertLess(size / 20 * 6000, vs.MAX_FILE_BYTES)  # 6,000 worst-case rows
+        # 6,000 worst-case rows plus the whole-result alternate-domain bounds, at the measured cost per character and per item
+        def alt_size(alts):
+            alt_root = Path(__import__("tempfile").mkdtemp())
+            snapshot_253(alt_root, 20, **{**lists, "alternateDomains": alts}, accountName="N" * 120)
+            return max(path.stat().st_size for path in (alt_root / "prod-clone").glob("redash-*.json")) / 20
+        base = alt_size([])
+        narrow = alt_size([f"d{n:04d}.co" for n in range(1000)]) - base  # 1,000 items of 8 characters
+        wide = alt_size([f"d{n:04d}" + "x" * 40 + ".co" for n in range(1000)]) - base  # 1,000 items of 48 characters
+        per_char = (wide - narrow) / 40_000
+        per_item = (narrow - per_char * 8000) / 1000
+        worst = (size / 20 * 6000 + per_char * redash.ALT_DOMAINS_MAX_TOTAL_CHARS
+                 + per_item * redash.ALT_DOMAINS_MAX_TOTAL_ITEMS)
+        self.assertLess(worst, vs.MAX_FILE_BYTES)
 
 
 if __name__ == "__main__":

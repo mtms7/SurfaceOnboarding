@@ -86,10 +86,13 @@ class SnapshotDashboardCase(ServerCase):
                 patcher = patch.object(module, name, folder / getattr(module, name).name)
                 patcher.start()
                 self.addCleanup(patcher.stop)
-        # The summary-approval file is a desktop-time constant under the repo; keep the test hermetic (nothing there = unavailable).
-        patcher = patch.object(dashboard, "REVIEW_APPROVAL_PATH", folder / "onboarding_review_approvals.json")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # The summary- and create-approval files are desktop-time constants under the repo; keep the test hermetic (nothing
+        # there = unavailable). 2026-10-18: the first real create approval on this PC exposed the missing second patch.
+        for name, file_name in (("REVIEW_APPROVAL_PATH", "onboarding_review_approvals.json"),
+                                ("PRODUCTION_APPROVAL_PATH", "production_create_approvals.json")):
+            patcher = patch.object(dashboard, name, folder / file_name)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.calls = []
         self.guard("subprocess.run", "subprocess.Popen", "subprocess.check_output", "os.system", "webbrowser.open_new_tab")
         real_connect = socket.create_connection

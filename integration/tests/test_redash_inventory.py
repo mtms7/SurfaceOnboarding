@@ -125,6 +125,42 @@ class AdapterTests(unittest.TestCase):
         listed = redash.normalize(result([row(1, alternateDomains='["a.example.com"]')])).rows[0]
         self.assertEqual(listed["alternateDomains"], ["a.example.com"])
 
+    # Live finding 2026-10-18: query 251 has 125 tenants with more than 50 alternate domains (max 1,622, up to ~28,500
+    # characters) and one comma-joined item; the v2 list caps refused the whole snapshot from 2026-10-17 on.
+    def test_real_sized_alternate_domain_lists_are_accepted(self):
+        hosts = [f"alt{n}.customer{n % 7}.example.com" for n in range(1622)]
+        tenant = redash.normalize(result([row(1, alternateDomains=hosts)])).rows[0]
+        self.assertEqual(tenant["alternateDomains"], hosts)
+        self.assertEqual(len(inventory.minimize_row(tenant)["alternate_domains"]), 1622)
+
+    def test_a_comma_joined_alternate_domain_is_split_into_hostnames(self):
+        tenant = redash.normalize(result([row(1, alternateDomains=["a.example.com", "b.example.com, c.example.com"])])).rows[0]
+        self.assertEqual(tenant["alternateDomains"], ["a.example.com", "b.example.com", "c.example.com"])
+        tenant = redash.normalize(result([row(1, alternateDomains=["d.example.com,"])])).rows[0]
+        self.assertEqual(tenant["alternateDomains"], ["d.example.com"])
+
+    def test_alternate_domains_keep_the_hostname_shape_and_their_own_bounds(self):
+        bound = redash.ALT_DOMAINS_MAX_ITEMS
+        for bad in (["jane@example.com"], ["two words.example.com"], ["a.example.com, jane@example.com"], [","],
+                    ["a" * 254], [5], ["ok.example.com"] * (bound + 1),
+                    ["x" * 60 + ".example.com"] * (redash.ALT_DOMAINS_MAX_ROW_CHARS // 72 + 1)):
+            with self.subTest(bad=bad[:1], n=len(bad)), self.assertRaises(inventory.InventoryError) as raised:
+                redash.normalize(result([row(1, alternateDomains=bad)]))
+            self.assertEqual(raised.exception.reason, "redash_schema_unavailable")
+
+    def test_alternate_domains_across_the_whole_result_are_bounded(self):
+        per_row = ["h" * 60 + f"{n:04d}.example.com" for n in range(1000)]  # 76,000 characters, inside the row bound
+        rows_needed = redash.ALT_DOMAINS_MAX_TOTAL_CHARS // 76_000 + 1
+        with self.assertRaises(inventory.InventoryError) as raised:
+            redash.normalize(result([row(n, alternateDomains=per_row) for n in range(1, rows_needed + 1)]))
+        self.assertEqual(raised.exception.reason, "inventory_too_large")
+        redash.normalize(result([row(n, alternateDomains=per_row) for n in range(1, rows_needed - 1)]))  # under: accepted
+        short = [f"d{n:04d}.co" for n in range(redash.ALT_DOMAINS_MAX_ITEMS)]  # many items, few characters
+        rows_needed = redash.ALT_DOMAINS_MAX_TOTAL_ITEMS // len(short) + 1
+        with self.assertRaises(inventory.InventoryError) as raised:
+            redash.normalize(result([row(n, alternateDomains=short) for n in range(1, rows_needed + 1)]))
+        self.assertEqual(raised.exception.reason, "inventory_too_large")
+
     def test_rows_without_identity_duplicates_and_conflicts(self):
         with self.assertRaises(inventory.InventoryError) as raised:
             inventory.assemble_rows(redash.normalize(result([row(1, **{"_id": None})])).rows)

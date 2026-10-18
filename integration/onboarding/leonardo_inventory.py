@@ -247,7 +247,7 @@ def _terms_accepted(value: Any) -> bool | None:
 
 
 _DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
-MAX_ALTERNATE_DOMAINS = 500
+MAX_ALTERNATE_DOMAINS = 5000  # 2026-10-18: live tenants hold up to 1,622; the cut must never hide a duplicate match
 
 
 def canonical_domain(value: Any) -> str | None:

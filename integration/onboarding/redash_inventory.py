@@ -21,7 +21,7 @@ import json
 import re
 from typing import Any, Mapping
 
-from .leonardo_inventory import EXPECTED_PATHS, REDASH_MAX_TOTAL, InventoryError
+from .leonardo_inventory import EXPECTED_PATHS, MAX_ALTERNATE_DOMAINS, REDASH_MAX_TOTAL, InventoryError
 
 QUERY_ID = 251  # the live source and default; see PROFILES for the other selectable query
 V2_QUERY_ID = 253  # "Tenant inventory v2 (read-only)": flat, wider projection; used only when selected
@@ -104,6 +104,12 @@ _HOSTNAME = re.compile(r"[A-Za-z0-9*_.-]{1,253}")  # no '@', no spaces, at most 
 _COUNTRY_CODE = re.compile(r"[A-Z]{2}")
 _ENUM = re.compile(r"[A-Za-z0-9_ -]{1,32}")
 MAX_ROW_LIST_CHARS = 1500  # all list items of one row together: bounds the worst-case row so 6,000 rows stay under 32 MB
+# Alternate domains have their own bounds (live 2026-10-18: 125 tenants over 50 items, max 1,622 items / ~28,500
+# characters in one row, ~567,000 characters in all): per row, and for the whole result so the file stays under 32 MB.
+ALT_DOMAINS_MAX_ITEMS = MAX_ALTERNATE_DOMAINS  # the same bound minimize_row keeps, so nothing is cut later
+ALT_DOMAINS_MAX_ROW_CHARS = 100_000
+ALT_DOMAINS_MAX_TOTAL_CHARS = 1_500_000  # live ~567,000
+ALT_DOMAINS_MAX_TOTAL_ITEMS = 90_000  # live ~35,900; each item also costs ~13 bytes of JSON in the snapshot
 
 
 def v2_key(column: str) -> str:
@@ -168,6 +174,25 @@ def _hostnames(items: Any) -> list[str]:
     if type(items) is not list or len(items) > _MAX_LIST_ITEMS             or not all(type(item) is str and _HOSTNAME.fullmatch(item) for item in items):
         raise InventoryError("redash_schema_unavailable")
     return items
+
+
+def _alternate_domains(items: list[Any]) -> list[str]:
+    """Hostname-shaped alternate domains under their own bounds; a comma-joined item is split into its parts first
+    (each part must still be a hostname, and at least one must remain). Anything else refuses, no value in the reason."""
+    hosts: list[str] = []
+    for item in items:
+        if type(item) is str and "," in item:
+            parts = [part.strip() for part in item.split(",") if part.strip()]
+            if not parts:
+                raise InventoryError("redash_schema_unavailable")
+            hosts.extend(parts)
+        else:
+            hosts.append(item)
+    if (len(hosts) > ALT_DOMAINS_MAX_ITEMS
+            or not all(type(host) is str and _HOSTNAME.fullmatch(host) for host in hosts)
+            or sum(len(host) for host in hosts) > ALT_DOMAINS_MAX_ROW_CHARS):
+        raise InventoryError("redash_schema_unavailable")
+    return hosts
 
 
 def validate_row_schema(payload: Any) -> str:
@@ -347,7 +372,7 @@ def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> t
         elif column in LIST_COLUMNS:
             value = _domain_list(value)
             if value is not None:
-                _hostnames(value)
+                value = _alternate_domains(value)
         if column == "operatorCount":  # only "is an operator assigned" is kept, never who
             if value is not None and not 0 <= value <= MAX_OPERATOR_COUNT:
                 raise InventoryError("redash_schema_unavailable")
@@ -364,8 +389,8 @@ def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> t
 
 
 def _list_chars(row: Mapping[str, Any], v2: Mapping[str, Any]) -> int:
-    """Characters held in every list of one row (alternate domains, v2 lists, allowed modules)."""
-    total = sum(len(item) for item in row.get("alternateDomains") or () if type(item) is str)
+    """Characters held in the v2 lists and allowed modules of one row (alternate domains have their own bounds)."""
+    total = 0
     lic = row.get("accountLicense")
     for value in [*(v2.values()), *((lic or {}).values() if isinstance(lic, dict) else ())]:
         if type(value) is list:
@@ -397,6 +422,7 @@ def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
         raise InventoryError("redash_schema_unavailable")
     rows = []
     v2_rows: dict[str, dict[str, Any]] = {}
+    alt_chars = alt_items = 0
     for raw in table:
         if not isinstance(raw, dict):
             raise InventoryError("redash_schema_unavailable")
@@ -406,6 +432,10 @@ def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
             raise InventoryError("redash_schema_unavailable") from None
         if _list_chars(row, v2) > MAX_ROW_LIST_CHARS:
             raise InventoryError("redash_schema_unavailable")
+        alt_chars += sum(len(host) for host in row.get("alternateDomains") or ())
+        alt_items += len(row.get("alternateDomains") or ())
+        if alt_chars > ALT_DOMAINS_MAX_TOTAL_CHARS or alt_items > ALT_DOMAINS_MAX_TOTAL_ITEMS:
+            raise InventoryError("inventory_too_large")
         rows.append(row)
         if profile.row_schema == ROW_SCHEMA_V2 and type(row.get("id")) is str:
             v2_rows.setdefault(row["id"], v2)  # a repeated id keeps its first row, as assemble_rows does
