@@ -122,6 +122,8 @@ class FakeHeaderControl:
             self.page.dialog_header_clicks += 1
             return
         self.page.dispatches += 1
+        if getattr(self.page, "dispatch_ignored", False):  # live 2026-10-18 symptom: no table request behind the modal
+            return
         self.page._table_request()
 
 

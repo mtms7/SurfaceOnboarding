@@ -8994,6 +8994,9 @@ class ProductionPageReader:
         self._demo_response: Any = None
         self._demo: tuple[int | None, Any] = (None, None)
         self._loaded = False
+        # Stages of the LAST table read, names and pass/fail only (live 2026-10-18 dry run #3: a form-open read failed
+        # with no clue where); recorded with a session refusal, never a value, a body or a header.
+        self.last_read: dict[str, str] = {}
         try:
             page.on("response", self._on_response)
         except Exception:
@@ -9058,6 +9061,9 @@ class ProductionPageReader:
             return None, None
         strict = mode == production_probe.REWRITE_STRICT
         rewritten: list[Any] = []
+        stages: dict[str, str] = {}
+        self.last_read = stages
+        routed: list[bool] = []
 
         def rewrite(route: Any) -> None:
             try:
@@ -9065,6 +9071,7 @@ class ProductionPageReader:
                 if request.method != "POST":
                     route.fallback()
                     return
+                routed.append(True)
                 body = json.loads(request.post_data or "")
                 body["tableServerData"].update(fields)
                 for key in drops:
@@ -9086,8 +9093,10 @@ class ProductionPageReader:
         try:
             for kind, timeout in self._triggers(form_open):
                 header = None
+                stages[f"trigger_{kind}"] = "pass"
                 if kind in PDR_IN_APP_TRIGGERS:
                     header = _in_app_sort_header(self.page)
+                    stages["header_found"] = "pass" if header is not None else "fail"
                     if header is None:
                         continue
                 elif kind == "navigate":  # retire the hung document first (2026-10-06 live finding in the Dev runner)
@@ -9096,6 +9105,7 @@ class ProductionPageReader:
                     except Exception:
                         pass
                 rewritten.clear()  # only this attempt's request counts
+                routed.clear()
                 try:
                     with self.page.expect_response(lambda r: _is_pdr_table_response(r)
                                                    and any(r.request is q and _is_rewritten_read(q, fields, drops)
@@ -9110,6 +9120,8 @@ class ProductionPageReader:
                             self.page.reload(wait_until="domcontentloaded")
                         else:
                             self.page.goto(PDR_NAVIGATE_URL, wait_until="domcontentloaded", timeout=timeout)
+                        if kind in PDR_IN_APP_TRIGGERS:
+                            stages["trigger_sent"] = "pass"  # the click/dispatch call returned (not: that it did anything)
                     response = info.value
                     if kind in ("reload", "navigate"):
                         self._loaded = True
@@ -9125,6 +9137,17 @@ class ProductionPageReader:
                 self.page.unroute(PDR_TABLE_ROUTE, rewrite)
             except Exception:
                 pass
+            if stages.get("header_found") != "fail" or "trigger_sent" in stages:
+                stages["request_routed"] = "pass" if routed else "fail"
+                stages["rewritten"] = "pass" if rewritten else "fail"
+                try:
+                    matched = any(_is_rewritten_read(q, fields, drops) for q in rewritten)
+                except Exception:
+                    matched = False
+                stages["body_matched"] = "pass" if matched else "fail"
+                stages["reply"] = "pass" if response is not None else "fail"
+                code = getattr(response, "status", None)
+                stages["status_2xx"] = "pass" if type(code) is int and 200 <= code < 300 else "fail"
         self._digest_demo()
         status = getattr(response, "status", None)
         if response is None or not rewritten or type(status) is not int:
@@ -9569,7 +9592,9 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
         fields = production_dry_run.compare_reads(intended, _pdr_form_reads(page, intended, date_kept), overrides)
         session = _pdr_session_problem(page, form_open=True)  # the form is open: a dispatched sort click, never a reload
         if session:
-            raise refusal(session, fields)
+            stages = getattr(_pdr_reader(page), "last_read", None) or {}
+            raise refusal(session, {**fields, **{f"session.{k}": v for k, v in stages.items()
+                                                 if isinstance(k, str) and v in ("pass", "fail")}})
         if guard.blocked_api_writes():
             raise refusal("write_request_blocked", fields)
         if confirm_preflight:  # locate / enabled / scroll / hit-test of Confirm, never clicked: a NOT_CLICKED shows up HERE first

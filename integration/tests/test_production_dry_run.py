@@ -1145,6 +1145,32 @@ class FlowTests(unittest.TestCase):
         self.assertNotEqual(out["result"], "toggle_click_failed")
         self.assertIn("leakedCredentialsAllowed", h.page.clicks)
 
+    def form_open_read_stages(self, h):
+        out = h.run()
+        self.assertEqual(out["result"], "production_session_not_ready")
+        fields = h.record()[0]["form_fields_checked"]
+        self.assertEqual(h.page.clicks[-1], "Cancel")
+        self.assertNotIn("Confirm", h.page.clicks)
+        return {k[len("session."):]: v for k, v in fields.items() if k.startswith("session.")}
+
+    def test_a_form_open_read_whose_dispatch_sends_nothing_names_its_stages(self):
+        # Live 2026-10-18 (CO-0798 dry run #3): refused production_session_not_ready at the post-fill session check with
+        # the form open; the record must say which stage failed (names and pass/fail only, never a value).
+        h = Harness(self)
+        h.page.dispatch_ignored = True
+        stages = self.form_open_read_stages(h)
+        self.assertEqual(stages, {"trigger_in_app_dispatch": "pass", "header_found": "pass", "trigger_sent": "pass",
+                                  "request_routed": "fail", "rewritten": "fail", "body_matched": "fail",
+                                  "reply": "fail", "status_2xx": "fail"})
+
+    def test_a_form_open_read_without_a_header_outside_the_dialog_names_its_stage(self):
+        h = Harness(self)
+        original = h.page._header
+        h.page._header = lambda: original() if not h.page.form_open else None
+        stages = self.form_open_read_stages(h)
+        self.assertEqual(stages.get("header_found"), "fail")
+        self.assertNotIn("trigger_sent", stages)
+
     def test_toggle_click_failure_never_retries_with_force(self):
         h = Harness(self, click_fail={"leakedCredentialsAllowed"})  # Ctl.click asserts there is no force=True retry
         out = h.run()
