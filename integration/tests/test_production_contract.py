@@ -387,11 +387,13 @@ class SearchBodyAndScriptTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             contract.build_readback_body("  ")
 
-    def test_script_is_read_only_and_names_no_secret_store(self):
-        script = contract.READBACK_JS
-        self.assertIn("'POST'", script)
-        for word in ("localStorage", "sessionStorage", "document.cookie", "Authorization", "headers.get"):
-            self.assertNotIn(word, script)
+    def test_the_readback_reducer_names_no_secret_store_and_runs_no_script(self):
+        import inspect
+
+        source = inspect.getsource(contract.readback_reply) + inspect.getsource(contract._pick_ok)
+        for word in ("localStorage", "sessionStorage", "document.cookie", "Authorization", "headers", "fetch("):
+            self.assertNotIn(word, source)
+        self.assertFalse(hasattr(contract, "READBACK_JS"))  # no script is evaluated in the page any more
         self.assertEqual(contract.ACCOUNTS_PATH, "/api/v1/backoffice/getAllDetailedAccounts")
         self.assertIn("accountUuid", contract.READBACK_PICK_PATHS)
 

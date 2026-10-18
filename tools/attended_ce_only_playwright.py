@@ -8908,41 +8908,224 @@ def _pdr_approval_path() -> Path:
     return state_file(Path(__file__).resolve().parents[1] / "integration" / production_approval.STATE_FILE_NAME)
 
 
-def _pdr_page_get(page: Any, path: str) -> Any:
-    """One page-context GET (status and authority names only). Never reads a token, cookie or header."""
-    if not production_dry_run.fetch_allowed("GET", path):
-        raise RuntimeError("production_dry_run_fetch_not_allowed")
+# --- Production reads through the page's OWN table request (docs/48 note 2026-10-18) ---------------------------------
+# The cookie-only in-page ``fetch`` was refuted live: after a human SSO+MFA sign-in both getAllDetailedAccounts searches
+# answered 401, because the page authenticates with an in-page session token header. So nothing production is fetched by
+# the runner. The PAGE sends its own table request (its own headers and token, never read or logged); a page route
+# rewrites ONLY the ``tableServerData`` JSON body (production_probe.table_rewrite_fields) and hands the request on with
+# ``route.fallback`` so the request guard judges the REWRITTEN body; the page's own reply is parsed in Python.
+PDR_TABLE_ROUTE = re.compile(re.escape(production_probe.PRODUCTION_ORIGIN + production_probe.TABLE_READ_PATH) + r"(?:\?.*)?$")
+PDR_NAVIGATE_URL = production_probe.PRODUCTION_ORIGIN + production_probe.PROBE_START_PATH
+# Asked for by every duplicate search: the fields the verdicts compare (the page's own projection is replaced).
+PDR_SEARCH_PROJECTION = ("accountName", "accountDomain", "alternateDomains", "userEmailDomains", "isDeleted")
+PDR_SESSION_CHECK_VALUE = "session-check"  # matches no tenant: the session check reads (almost) no rows
+PDR_IN_APP_TRIGGERS = ("in_app", "in_app_dispatch")
+
+
+def _is_pdr_table_response(response: Any) -> bool:
+    """Exactly the table POST on the production origin; anything else is ignored."""
     try:
-        reply = page.evaluate(production_dry_run.SESSION_GET_JS, path)
+        return (response.request.method == "POST"
+                and production_probe.url_origin(response.url) == production_probe.PRODUCTION_ORIGIN
+                and production_probe.url_path(response.url) == production_probe.TABLE_READ_PATH)
     except Exception:
-        return {"status": 0}
-    return reply if isinstance(reply, dict) else {"status": 0}
+        return False
 
 
-def _pdr_session_problem(page: Any) -> str | None:
-    """docs/48 section 1: GET getAuthorities and accountInfo from the page; fail closed unless both are 200."""
-    return production_dry_run.session_verdict(_pdr_page_get(page, production_dry_run.AUTHORITIES_PATH),
-                                              _pdr_page_get(page, production_dry_run.ACCOUNT_INFO_PATH))
+class ProductionPageReader:
+    """Read-only production reads, all through requests the PAGE sends itself (no script is evaluated in the page).
+
+    ``table`` triggers the page's own table request, rewrites only its body and returns ``(status, parsed body)`` or
+    ``(None, None)`` (fail closed) when the rewrite did not happen or no reply arrived. Passive ``response`` events keep
+    only the STATUS of the page's own getAuthorities / accountInfo calls (a refusal is sticky) and the demo-domain list
+    the page itself fetched (parsed right after each trigger, kept in memory only, never logged). The first read of a
+    document reloads it (so the page's start-up calls are observed); later reads use the in-app column sort, which only
+    re-sorts the table. With the Add Account form open a reload would destroy it, so only a DISPATCHED click on the sort
+    header is used and nothing else (no reload, no navigation).
+    """
+
+    def __init__(self, page: Any, *, in_app: bool = True, click_log: Any = None) -> None:
+        self.page, self.in_app, self.click_log = page, in_app, click_log
+        self.observed: dict[str, int] = {}
+        self._demo_response: Any = None
+        self._demo: tuple[int | None, Any] = (None, None)
+        self._loaded = False
+        try:
+            page.on("response", self._on_response)
+        except Exception:
+            pass  # no passive signals: the session still rests on the table status, the demo list becomes unavailable
+
+    def _on_response(self, response: Any) -> None:
+        """Status only. Never reads a header or a body here."""
+        try:
+            if str(response.request.method).upper() != "GET":
+                return
+            url, status = str(response.url), response.status
+            if production_probe.url_origin(url) != production_probe.PRODUCTION_ORIGIN:
+                return
+            path = production_probe.url_path(url)
+            if path in production_dry_run.PASSIVE_SESSION_PATHS and type(status) is int:
+                if self.observed.get(path) not in (401, 403):  # a refusal is never erased by a later 200
+                    self.observed[path] = status
+            elif path == production_dry_run.DEMO_DOMAINS_PATH:
+                self._demo_response = response
+        except Exception:
+            pass
+
+    def _digest_demo(self) -> None:
+        response, self._demo_response = self._demo_response, None
+        if response is None:
+            return
+        status: Any = None
+        try:
+            status = response.status
+            self._demo = (status, response.json() if status == 200 else None)
+        except Exception:
+            self._demo = (status if type(status) is int else None, None)
+
+    def _triggers(self, form_open: bool) -> list[tuple[str, int]]:
+        if form_open:
+            return [("in_app_dispatch", SEARCH_IN_APP_TIMEOUT_MS)]
+        triggers = [("in_app", SEARCH_IN_APP_TIMEOUT_MS)] if (self.in_app and self._loaded and SEARCH_IN_APP_TRIGGER) else []
+        triggers.append(("reload", SEARCH_RESPONSE_TIMEOUT_MS))
+        triggers.extend(("navigate", SEARCH_RESPONSE_TIMEOUT_MS) for _ in range(SEARCH_RELOAD_RETRIES))
+        return triggers
+
+    def _click_header(self, header: Any) -> None:
+        if self.click_log is not None:
+            self.click_log.click(production_dry_run.CLICK_SORT_HEADER, header, "sort_table_header", timeout=FIELD_TIMEOUT_MS)
+        else:
+            header.click(timeout=FIELD_TIMEOUT_MS)
+
+    def table(self, value: str, projection: Any, *, form_open: bool = False) -> tuple[int | None, Any]:
+        """One read-only table search for ``value`` through the page's own request; ``(status, JSON body | None)``.
+
+        ``(None, None)``: nothing was rewritten, no reply arrived in time, or the value or projection is invalid. A status
+        that is not 2xx (401 and 403 included) comes back with no body.
+        """
+        try:
+            fields = production_probe.table_rewrite_fields(value, projection)
+        except ValueError:
+            return None, None
+        rewritten: list[Any] = []
+
+        def rewrite(route: Any) -> None:
+            try:
+                request = route.request
+                if request.method != "POST":
+                    route.fallback()
+                    return
+                body = json.loads(request.post_data or "")
+                body["tableServerData"].update(fields)
+                text = json.dumps(body)
+                if production_probe.read_body_problem(text) is not None:
+                    route.fallback()  # unchanged: the guard aborts it and the missing rewrite fails the read closed
+                    return
+                rewritten.append(request)
+                route.fallback(post_data=text)  # fallback, not continue_: the request guard must see the rewritten body
+            except Exception:
+                route.fallback()
+
+        try:
+            self.page.route(PDR_TABLE_ROUTE, rewrite)
+        except Exception:
+            return None, None
+        response: Any = None
+        try:
+            for kind, timeout in self._triggers(form_open):
+                header = None
+                if kind in PDR_IN_APP_TRIGGERS:
+                    header = _in_app_sort_header(self.page)
+                    if header is None:
+                        continue
+                elif kind == "navigate":  # retire the hung document first (2026-10-06 live finding in the Dev runner)
+                    try:
+                        self.page.goto("about:blank", wait_until="domcontentloaded", timeout=FIELD_TIMEOUT_MS)
+                    except Exception:
+                        pass
+                rewritten.clear()  # only this attempt's request counts
+                try:
+                    with self.page.expect_response(lambda r: _is_pdr_table_response(r)
+                                                   and any(r.request is q for q in rewritten), timeout=timeout) as info:
+                        if kind == "in_app":
+                            self._click_header(header)
+                        elif kind == "in_app_dispatch":
+                            header.dispatch_event("click")  # reaches the table behind the open form; clicks nothing else
+                        elif kind == "reload":
+                            self.page.reload(wait_until="domcontentloaded")
+                        else:
+                            self.page.goto(PDR_NAVIGATE_URL, wait_until="domcontentloaded", timeout=timeout)
+                    response = info.value
+                    if kind in ("reload", "navigate"):
+                        self._loaded = True
+                    break
+                except Exception as exc:
+                    if kind in PDR_IN_APP_TRIGGERS:
+                        continue  # no table request from the sort: fall back to the reload (never with the form open)
+                    if kind == "reload" and "Timeout" in type(exc).__name__ + str(exc)[:80]:
+                        continue
+                    break
+        finally:
+            try:
+                self.page.unroute(PDR_TABLE_ROUTE, rewrite)
+            except Exception:
+                pass
+        self._digest_demo()
+        status = getattr(response, "status", None)
+        if response is None or not rewritten or type(status) is not int:
+            return None, None
+        if not 200 <= status < 300:
+            return status, None
+        try:
+            return status, response.json()
+        except Exception:
+            return status, None
+
+    def search(self, value: str, *, form_open: bool = False) -> dict[str, Any]:
+        status, body = self.table(value, PDR_SEARCH_PROJECTION, form_open=form_open)
+        return production_dry_run.search_reply(status, body)
+
+    def readback(self, value: str) -> dict[str, Any]:
+        status, body = self.table(value, production_contract.READBACK_PICK_PATHS)
+        return production_contract.readback_reply(status, body)
+
+    def session_problem(self, *, form_open: bool = False) -> str | None:
+        """Signed in? From the page's own table reply status plus the statuses of its own start-up calls; nothing else."""
+        status, _body = self.table(PDR_SESSION_CHECK_VALUE, ("accountName",), form_open=form_open)
+        return production_dry_run.session_verdict(status, dict(self.observed))
+
+    def demo_reply(self, domains: Any) -> dict[str, Any]:
+        """The demo-domain verdict input from the list the page fetched itself, else status 0 (unavailable, fail closed)."""
+        status, body = self._demo
+        return production_dry_run.demo_reply(status, body, domains)
 
 
-def _pdr_evaluate(page: Any, script: str, method: str, path: str, argument: Any) -> Any:
-    if not production_dry_run.fetch_allowed(method, path):
-        raise RuntimeError("production_dry_run_fetch_not_allowed")
-    try:
-        reply = page.evaluate(script, argument)
-    except Exception:
-        return {"status": 0}
-    return reply if isinstance(reply, dict) else {"status": 0}
+def _pdr_reader(page: Any, *, in_app: bool | None = None, click_log: Any = None) -> ProductionPageReader:
+    """The one reader of ``page`` (created on first use); ``in_app`` / ``click_log`` update it when given."""
+    reader = getattr(page, "_pdr_reader", None)
+    if not isinstance(reader, ProductionPageReader):
+        reader = ProductionPageReader(page)
+        try:
+            page._pdr_reader = reader
+        except Exception:
+            pass
+    if in_app is not None:
+        reader.in_app = in_app
+    if click_log is not None:
+        reader.click_log = click_log
+    return reader
+
+
+def _pdr_session_problem(page: Any, *, form_open: bool = False) -> str | None:
+    """docs/48 note 2026-10-18: signed in, from the page's OWN traffic and status codes only; fail closed otherwise."""
+    return _pdr_reader(page).session_problem(form_open=form_open)
 
 
 def _pdr_duplicate_problem(page: Any, tenant_name: str, domains: tuple[str, ...]) -> str | None:
-    """docs/48 section 2: name and domain searches through the page's own fetch, plus the demo-domain list."""
-    replies = [_pdr_evaluate(page, production_dry_run.ACCOUNT_SEARCH_JS, "POST", production_dry_run.ACCOUNTS_PATH,
-                             [production_dry_run.ACCOUNTS_PATH, production_dry_run.build_search_body(value)])
-               for value in (tenant_name, *domains)]
-    demo = _pdr_evaluate(page, production_dry_run.DEMO_DOMAINS_JS, "GET", production_dry_run.DEMO_DOMAINS_PATH,
-                         [production_dry_run.DEMO_DOMAINS_PATH, list(domains)])
-    return production_dry_run.duplicate_verdict(replies, demo, tenant_name, domains)
+    """docs/48 section 2: name and domain searches through the page's own table request, plus the demo-domain list."""
+    reader = _pdr_reader(page)
+    replies = [reader.search(value) for value in (tenant_name, *domains)]
+    return production_dry_run.duplicate_verdict(replies, reader.demo_reply(domains), tenant_name, domains)
 
 
 def _pdr_clone_facts(source: Any, now: datetime) -> dict[str, Any]:
@@ -9246,7 +9429,7 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
             "scan_now": _pdr_read_checked(page, "scan_now") if intended.scan_now is not None else None,
         }
         fields = production_dry_run.compare_reads(intended, reads, overrides)
-        session = _pdr_session_problem(page)
+        session = _pdr_session_problem(page, form_open=True)  # the form is open: a dispatched sort click, never a reload
         if session:
             raise refusal(session, fields)
         if guard.blocked_api_writes():
@@ -9415,6 +9598,7 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
             guard = production_dry_run.DryRunRequestGuard()
             guard.install(page)
             clicks = production_dry_run.ClickLog()
+            _pdr_reader(page, click_log=clicks)
             # Service workers and WebSockets bypass the request guard: any registration refuses before anything else.
             try:
                 worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
@@ -9449,10 +9633,10 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
 
 
 # --- Production READ-ONLY readback (docs/42 section 6.3, docs/49 section 3) ------------------------------------------
-# One attended, read-only look at ONE created tenant: the page's own fetch searches getAllDetailedAccounts by the exact
-# tenant name, the single row whose name AND domain match is compared with the intended CE-only values, and its
-# accountUuid is compared with the CO's Account_UUID__c. It types nothing, clicks nothing (no ClickLog exists here)
-# and never opens the create form. Probe-class gate; PRODUCTION_RUNNER_SUPPORTED and PRODUCTION_DRY_RUN_SUPPORTED are
+# One attended, read-only look at ONE created tenant: the page's OWN table request (body rewritten, see ProductionPageReader)
+# searches getAllDetailedAccounts by the exact tenant name, the single row whose name AND domain match is compared with the
+# intended CE-only values, and its accountUuid is compared with the CO's Account_UUID__c. It types nothing, clicks nothing
+# (no ClickLog exists here; every read is a reload of the same page) and never opens the create form. Probe-class gate; PRODUCTION_RUNNER_SUPPORTED and PRODUCTION_DRY_RUN_SUPPORTED are
 # not read or changed. Results are field names and pass/fail only; neither UUID is printed or kept.
 READBACK_RESULT_COMPLETE = "production_readback_complete"
 READBACK_RESULT_REFUSED = "production_readback_refused"
@@ -9526,7 +9710,8 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
 
     Order: probe-class gate and exact origin; the fixed Salesforce read of the Dev runner (intended values and the CO's
     Account_UUID__c) BEFORE any browser; then in the signed-in page (sign-in wait: 3 consecutive authenticated polls,
-    15 minutes) the request guard, the service-worker check, one page-context search POST and the comparison.
+    15 minutes) the request guard (a table POST passes only with a validated read body), the service-worker check, one
+    search through the page's own table request (reload, body rewritten) and the comparison.
     """
     environ = os.environ if environ is None else environ
     now = now or datetime.now(timezone.utc)
@@ -9551,12 +9736,12 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
         try:
             intended = ce_production_intended(source)
             expected_row = production_contract.expected_readback_row(intended)
-            body = production_contract.build_readback_body(intended["tenant_name"])
+            production_contract.build_readback_body(intended["tenant_name"])  # validates the search value
         except Exception:
             raise _ReadbackStop("intended_unavailable") from None
         try:
             with (open_page or _pdr_browser_page)(target, wait_seconds) as page:
-                guard = production_probe.RequestGuard()
+                guard = production_probe.RequestGuard(require_read_body=True)
                 guard.install(page)
                 try:
                     worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
@@ -9565,9 +9750,7 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
                 worker_problem = production_dry_run.service_worker_verdict(worker)
                 if worker_problem:
                     raise _ReadbackStop(worker_problem)
-                reply = _pdr_evaluate(page, production_contract.READBACK_JS, "POST", production_contract.ACCOUNTS_PATH,
-                                      [production_contract.ACCOUNTS_PATH, body,
-                                       list(production_contract.READBACK_PICK_PATHS)])
+                reply = _pdr_reader(page, in_app=False).readback(intended["tenant_name"])  # reload only: zero clicks
                 outcome = readback_analyse(reply, intended["tenant_name"], intended["primary_domain"], expected_row,
                                            getattr(source, "salesforce_account_uuid", "") or "")
                 if _readback_blocked_writes(guard):
@@ -9943,18 +10126,16 @@ def _pcr_selected_country_code(page: Any) -> str | None:
     return value if isinstance(value, str) and re.fullmatch(r"[A-Z]{2}", value) else None
 
 
-def _pcr_search(page: Any, value: str) -> Any:
-    from integration.onboarding import production_create_live as live
-
-    return _pdr_evaluate(page, production_dry_run.ACCOUNT_SEARCH_JS, "POST", production_dry_run.ACCOUNTS_PATH,
-                         [production_dry_run.ACCOUNTS_PATH, live.live_search_body(value)])
+def _pcr_search(page: Any, value: str, form_open: bool = False) -> Any:
+    return _pdr_reader(page).search(value, form_open=form_open)
 
 
 def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str, control: Any = None,
-                                extras: dict[str, Any] | None = None) -> str | None:
+                                extras: dict[str, Any] | None = None, *, form_open: bool = False) -> str | None:
     """The live BackOffice duplicate pre-check, right before the click: session, POSITIVE CONTROL, name search, domain search, demo list.
 
-    Read-only page fetches through the request guard. The clone is only a hint: this re-checks BackOffice itself by exact
+    Read-only reads through the page's own table request (``form_open``: the verified Add Account form is open, so only a
+    dispatched sort click may trigger them) and the request guard. The clone is only a hint: this re-checks BackOffice itself by exact
     name (with the " - CE Only" suffix) and by primary domain, plus the demo-domain rule. The generic search filter is
     unproven for domains, so first the SAME two searches are run for a control tenant taken from the fresh clone and must
     return it (otherwise ``search_unproven``: an empty target result is never a clearance). Any match, ambiguity or error
@@ -9964,7 +10145,7 @@ def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str
 
     from integration.onboarding import production_create_live as live
 
-    session = _pdr_session_problem(page)
+    session = _pdr_session_problem(page, form_open=form_open)
     if session:
         return session
     if isinstance(control, dict) and isinstance(control.get("name"), str) and extras is not None:
@@ -9972,10 +10153,9 @@ def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str
     if not (isinstance(control, dict) and isinstance(control.get("name"), str) and isinstance(control.get("domain"), str)):
         control_replies = (None, None)
     else:
-        control_replies = (_pcr_search(page, control["name"]), _pcr_search(page, control["domain"]))
-    name_reply, domain_reply = _pcr_search(page, tenant_name), _pcr_search(page, primary_domain)
-    demo = _pdr_evaluate(page, production_dry_run.DEMO_DOMAINS_JS, "GET", production_dry_run.DEMO_DOMAINS_PATH,
-                         [production_dry_run.DEMO_DOMAINS_PATH, [primary_domain]])
+        control_replies = (_pcr_search(page, control["name"], form_open), _pcr_search(page, control["domain"], form_open))
+    name_reply, domain_reply = _pcr_search(page, tenant_name, form_open), _pcr_search(page, primary_domain, form_open)
+    demo = _pdr_reader(page).demo_reply([primary_domain])
     return live.checked_duplicate_problem(control, control_replies, name_reply, domain_reply, demo, tenant_name,
                                           primary_domain)
 
@@ -10091,7 +10271,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         contract_intended = ce_production_intended(source, day)
         production_contract.expected_readback_row(contract_intended)  # validates the intended values; the STRICT row (exact
         # country code read from the filled form) is built after the fill
-        readback_body = production_contract.build_readback_body(contract_intended["tenant_name"])
+        production_contract.build_readback_body(contract_intended["tenant_name"])  # validates the search value
     except production_dry_run.MappingError as error:
         return refused(str(error))
     except ValueError as error:
@@ -10151,6 +10331,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
             guard = live.LiveRequestGuard()
             guard.install(page)
             clicks = live.LiveClickLog()
+            _pdr_reader(page, click_log=clicks)
             try:
                 worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
             except Exception:
@@ -10182,8 +10363,9 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                     guard.expected_payload = None  # payload_expectation_unavailable: never verifies, nothing pre-send aborted
                 return fields
 
-            def duplicate_check(_inputs: Any) -> str | None:
-                problem = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
+            def duplicate_check(_inputs: Any) -> str | None:  # runs with the verified form OPEN: dispatched sort click only
+                problem = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras,
+                                                      form_open=True)
                 if problem is not None:
                     return problem
                 # The 24 h dry-run age is judged again here, right before the consume and the click.
@@ -10197,10 +10379,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                                                wait_enabled=_confirm_enabled)
 
             def read(_inputs: Any) -> Any:
-                def fetch() -> Any:
-                    return _pdr_evaluate(page, production_contract.READBACK_JS, "POST", production_contract.ACCOUNTS_PATH,
-                                         [production_contract.ACCOUNTS_PATH, readback_body,
-                                          list(production_contract.READBACK_PICK_PATHS)])
+                def fetch() -> Any:  # the page's own table request, body rewritten; after the click a reload is allowed
+                    return _pdr_reader(page).readback(contract_intended["tenant_name"])
                 found = live.poll_readback(fetch, contract_intended, strict_state["expected"], page.wait_for_timeout)
                 if isinstance(found, dict):  # names only; a non-empty list makes the result created_mismatch, never verified
                     found["payload_mismatches"] = guard.payload_mismatches()
@@ -10254,8 +10434,9 @@ def run_production_search_probe(*, environ: Any | None = None, now: datetime | N
         control = facts.get("control") if isinstance(facts, dict) else None
         if control:
             with (open_page or _pdr_browser_page)(target, wait_seconds) as page:
-                guard = production_probe.RequestGuard()
+                guard = production_probe.RequestGuard(require_read_body=True)
                 guard.install(page)
+                _pdr_reader(page, in_app=False)  # read-only command: every read is a reload, no click
                 worker = production_dry_run.service_worker_verdict(page.evaluate(production_dry_run.SERVICE_WORKER_JS))
                 if worker:
                     outcome["reason"] = worker

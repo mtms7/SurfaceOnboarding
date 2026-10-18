@@ -106,7 +106,12 @@ class RequestGuardTests(unittest.TestCase):
         for method in ("PUT", "PATCH", "DELETE"):
             self.assertFalse(live.live_request_decision(method, CREATE_URL, armed=True)[0], method)
         self.assertTrue(live.live_request_decision("GET", ORIGIN + "/api/v1/authenticated/getAuthorities", armed=False)[0])
-        self.assertTrue(live.live_request_decision("POST", ORIGIN + pdr.ACCOUNTS_PATH, armed=False)[0])
+        read_body = json.dumps({"tableServerData": {"offset": 0, "items_per_page": 100,
+                                                    "filters": {"and": [{"method": "search", "value": "x"}]}}})
+        self.assertTrue(live.live_request_decision("POST", ORIGIN + pdr.ACCOUNTS_PATH, armed=False, post_data=read_body)[0])
+        self.assertFalse(live.live_request_decision("POST", ORIGIN + pdr.ACCOUNTS_PATH, armed=False)[0])  # no body: no clearance
+        self.assertFalse(live.live_request_decision("POST", ORIGIN + pdr.ACCOUNTS_PATH, armed=True,
+                                                    post_data=read_body.replace("tableServerData", "other"))[0])
 
     def test_unarmed_create_is_aborted_and_counted(self):
         guard = live.LiveRequestGuard()
@@ -291,12 +296,16 @@ class DuplicateTests(unittest.TestCase):
         self.assertEqual(self.verdict(domain_reply={"status": 403, "total": None, "rows": None}), "production_session_expired")
         self.assertEqual(self.verdict(name_reply=reply([row()], total=5)), "duplicate_ambiguous")
 
-    def test_search_body_has_no_projection_so_domains_come_back(self):
-        body = live.live_search_body(NAME)["tableServerData"]
-        self.assertNotIn("projection", body)
-        self.assertEqual(body["filters"], {"and": [{"method": "search", "value": NAME}]})
+    def test_search_projection_keeps_the_domain_fields_so_domains_come_back(self):
+        from integration.onboarding import production_probe
+        import tools.attended_ce_only_playwright as runner
+
+        fields = production_probe.table_rewrite_fields(NAME, runner.PDR_SEARCH_PROJECTION)
+        for name in ("accountName", "accountDomain", "alternateDomains", "userEmailDomains", "isDeleted"):
+            self.assertIn(name, fields["projection"])
+        self.assertEqual(fields["filters"], {"and": [{"method": "search", "value": NAME}]})
         with self.assertRaises(ValueError):
-            live.live_search_body(" ")
+            production_probe.table_rewrite_fields(" ", runner.PDR_SEARCH_PROJECTION)
 
 
 def contract_row(**over):

@@ -3,12 +3,13 @@
 A dry run opens the real production Add Account form, types the intended values, READS the advanced controls, verifies
 every control by reading it back, then Cancels. It never clicks Confirm/Submit/Save and creates nothing. This module
 holds only the decisions: value mapping, schema expectations, the session / duplicate / demo-domain verdicts, the
-advanced-control report, the stricter request guard and the click allowlist. It opens no connection and reads no file;
-the in-page scripts below are plain strings the runner hands to ``page.evaluate``.
+advanced-control report, the stricter request guard and the click allowlist. It opens no connection and reads no file.
 
-Secrets: the in-page scripts return only HTTP status codes, authority NAMES and a few non-secret row fields (name,
-domain lists, deleted flag). They never read, return or log a token, cookie, header or storage entry. Nothing here keeps
-a typed value in a record: results are field names and pass/fail.
+Reads (docs/48 note 2026-10-18): the cookie-only in-page ``fetch`` was refuted live (401 after a human SSO+MFA sign-in),
+so no script is evaluated in the page any more. The runner lets the PAGE send its own table request, rewrites only the
+``tableServerData`` JSON body and reads the page's own reply in Python; the reducers below keep only status codes and a
+few non-secret row fields (name, domain lists, deleted flag). Nothing here reads, returns or logs a token, cookie,
+header or storage entry, and nothing keeps a typed value in a record: results are field names and pass/fail.
 """
 
 from __future__ import annotations
@@ -20,66 +21,56 @@ from typing import Any, Mapping
 
 from . import production_probe
 
-# --- Page-context API calls (read only) ---------------------------------------------------------------------------
+# --- The page's own API traffic (read only) -----------------------------------------------------------------------
 AUTHORITIES_PATH = "/api/v1/authenticated/getAuthorities"
 ACCOUNT_INFO_PATH = "/api/v1/authenticated/accountInfo"
-ACCOUNTS_PATH = "/api/v1/backoffice/getAllDetailedAccounts"
+ACCOUNTS_PATH = production_probe.TABLE_READ_PATH
 DEMO_DOMAINS_PATH = "/api/v1/backoffice/systemSettings/demoAccountDomains"
-FETCH_GET_PATHS = frozenset({AUTHORITIES_PATH, ACCOUNT_INFO_PATH, DEMO_DOMAINS_PATH})
-FETCH_POST_PATHS = frozenset({ACCOUNTS_PATH})
-SEARCH_PAGE_SIZE = 100
+# Passive signals: the status of the page's own start-up calls, observed when it makes them (never requested by the runner).
+PASSIVE_SESSION_PATHS = frozenset({AUTHORITIES_PATH, ACCOUNT_INFO_PATH})
+SEARCH_PAGE_SIZE = production_probe.TABLE_ROW_LIMIT
 
-# GET a session-proof path. Returns the status; for getAuthorities only, the list of authority NAMES (every entry a
-# string, else null). Nothing else is read: no header, cookie, storage entry or other body value.
-SESSION_GET_JS = """async (path) => {
-  try {
-    const r = await fetch(path, {method: 'GET', credentials: 'include', headers: {'Accept': 'application/json'}});
-    let names = null;
-    if (path.endsWith('/getAuthorities') && r.status === 200) {
-      try {
-        const b = await r.json();
-        const a = b && b.authorities;
-        names = (Array.isArray(a) && a.every(x => typeof x === 'string')) ? a.slice(0, 500) : null;
-      } catch (e) { names = null; }
-    }
-    return {status: r.status, names: names};
-  } catch (e) { return {status: 0, names: null}; }
-}"""
+_NO_REPLY = {"status": 0, "total": None, "rows": None}
 
-# GET the demo-domain list and compare IN the page: only a boolean and a count leave it, never the list.
-DEMO_DOMAINS_JS = """async (args) => {
-  try {
-    const path = args[0], domains = args[1];
-    const r = await fetch(path, {method: 'GET', credentials: 'include', headers: {'Accept': 'application/json'}});
-    if (r.status !== 200) return {status: r.status, hit: null, count: null};
-    const b = await r.json();
-    const list = b && b.demoDomains;
-    if (!Array.isArray(list) || !list.every(x => typeof x === 'string')) return {status: 200, hit: null, count: null};
-    const norm = (s) => String(s).trim().toLowerCase().replace(/\\.$/, '');
-    const set = new Set(list.map(norm));
-    return {status: 200, hit: domains.some(d => set.has(norm(d))), count: list.length};
-  } catch (e) { return {status: 0, hit: null, count: null}; }
-}"""
 
-# POST the name-search grammar the Dev runner uses and return ONLY name, domain lists, deleted flag and counts.
-ACCOUNT_SEARCH_JS = """async (args) => {
-  try {
-    const path = args[0], body = args[1];
-    const r = await fetch(path, {method: 'POST', credentials: 'include',
-      headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-    if (r.status !== 200) return {status: r.status, total: null, rows: null};
-    const b = await r.json();
-    const p = b && b.pagination_response;
-    const rows = p && p.table_data;
-    if (!p || !Array.isArray(rows) || typeof p.total_count !== 'number') return {status: 200, total: null, rows: null};
-    const strs = (v) => Array.isArray(v) ? v.filter(x => typeof x === 'string').slice(0, 50) : [];
-    return {status: 200, total: p.total_count, rows: rows.slice(0, 200).map(x => ({
-      name: (x && typeof x.accountName === 'string') ? x.accountName : null,
-      domain: (x && typeof x.accountDomain === 'string') ? x.accountDomain : null,
-      alternates: strs(x && x.alternateDomains), emails: strs(x && x.userEmailDomains),
-      deleted: !!(x && x.isDeleted === true)}))};
-  } catch (e) { return {status: 0, total: null, rows: null}; }
-}"""
+def _strings(value: object) -> list[str]:
+    return [x for x in value if isinstance(x, str)][:50] if isinstance(value, list) else []
+
+
+def search_reply(status: object, body: object) -> dict[str, Any]:
+    """Reduce the page's OWN table reply (HTTP status, parsed JSON body) to {status, total, rows}.
+
+    ``rows`` keep only name, domain, alternate and email domain lists and the deleted flag. A missing status is status 0;
+    a non-200 status carries no rows; a 200 with an unexpected schema (any row that is not an object, a missing or
+    non-integer total) has ``total``/``rows`` None, which every verdict treats as unavailable.
+    """
+    if type(status) is not int:
+        return dict(_NO_REPLY)
+    if status != 200:
+        return {"status": status, "total": None, "rows": None}
+    paged = body.get("pagination_response") if isinstance(body, dict) else None
+    rows = paged.get("table_data") if isinstance(paged, dict) else None
+    total = paged.get("total_count") if isinstance(paged, dict) else None
+    if not isinstance(rows, list) or type(total) is not int or not all(isinstance(x, dict) for x in rows):
+        return {"status": 200, "total": None, "rows": None}
+    return {"status": 200, "total": total, "rows": [
+        {"name": x["accountName"] if isinstance(x.get("accountName"), str) else None,
+         "domain": x["accountDomain"] if isinstance(x.get("accountDomain"), str) else None,
+         "alternates": _strings(x.get("alternateDomains")), "emails": _strings(x.get("userEmailDomains")),
+         "deleted": x.get("isDeleted") is True} for x in rows[:200]]}
+
+
+def demo_reply(status: object, body: object, domains: Any) -> dict[str, Any]:
+    """Compare the demo-domain list the page fetched itself with ``domains`` HERE: only a boolean and a count leave."""
+    if type(status) is not int:
+        return {"status": 0, "hit": None, "count": None}
+    if status != 200:
+        return {"status": status, "hit": None, "count": None}
+    listed = body.get("demoDomains") if isinstance(body, dict) else None
+    if not isinstance(listed, list) or not all(isinstance(x, str) for x in listed):
+        return {"status": 200, "hit": None, "count": None}
+    known = {_norm_domain(x) for x in listed}
+    return {"status": 200, "hit": any(_norm_domain(d) in known for d in domains), "count": len(listed)}
 
 
 # Service workers and WebSockets are invisible to page.route: any registration refuses the run before the form is touched.
@@ -153,33 +144,9 @@ def known_reason(code: object) -> str:
     return code if isinstance(code, str) and code in KNOWN_REASONS else "unexpected_error"
 
 
-def fetch_allowed(method: str, path: str) -> bool:
-    """True only for the exact page-context calls the dry run makes (GET session/demo reads, POST account search)."""
-    if method == "GET":
-        return path in FETCH_GET_PATHS
-    if method == "POST":
-        return path in FETCH_POST_PATHS
-    return False
-
-
-def build_search_body(value: str) -> dict[str, Any]:
-    """The name-search body (Dev grammar: ``filters = {and:[{method:"search", value}]}``, offset 0, 100 rows).
-
-    The sort and unique_fields follow the HAR name-search call (docs/48 section 2); the projection asks for the
-    account name only. Unverified against the real server: a non-200 reply refuses the run (fail closed).
-    """
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("search_value_invalid")
-    return {"tableServerData": {
-        "offset": 0, "items_per_page": SEARCH_PAGE_SIZE,
-        "sort": {"direction": "asc", "key": "accountName"},
-        "filters": {"and": [{"method": "search", "value": value}]},
-        "unique_fields": ["accountName"], "projection": ["accountName"]}}
-
-
 # --- Request guard (stricter than the probe's) --------------------------------------------------------------------
 SAFE_METHODS = frozenset({"GET", "HEAD"})
-DRY_RUN_READ_POST_PATHS = (re.compile(r"/api/v1/backoffice/getAllDetailedAccounts"),)
+DRY_RUN_READ_POST_PATHS = (re.compile(re.escape(production_probe.TABLE_READ_PATH)),)
 # Forbidden control semantics: no click may ever target a control whose name suggests one of these.
 FORBIDDEN_CLICK_WORDS = ("confirm", "submit", "save")
 # The only label that may open the form: the probe's create-control candidates ("Add Account" opens it client-side).
@@ -201,9 +168,10 @@ def _static_same_site(url: str) -> bool:
     return "." in last and last.rsplit(".", 1)[-1].casefold() in _STATIC_EXTENSIONS
 
 
-def request_decision(method: str, url: str) -> tuple[bool, str]:
+def request_decision(method: str, url: str, post_data: object = None) -> tuple[bool, str]:
     """(allowed, reason). GET/HEAD only to the production origin (or a same-site static asset by extension), and POST
-    only to the account-table read on the production origin. Everything else is aborted."""
+    only to the account-table read on the production origin WITH a validated read body (``production_probe.
+    read_body_problem``: no body, a write-ish key or an unexpected shape is never a clearance). Everything else is aborted."""
     verb = (method or "").upper()
     on_production = production_probe.url_origin(url) == production_probe.PRODUCTION_ORIGIN
     if verb in SAFE_METHODS:
@@ -212,6 +180,8 @@ def request_decision(method: str, url: str) -> tuple[bool, str]:
         return False, "cross_origin_blocked"
     if (verb == "POST" and on_production
             and any(p.fullmatch(production_probe.url_path(url)) for p in DRY_RUN_READ_POST_PATHS)):
+        if production_probe.read_body_problem(post_data) is not None:
+            return False, "table_body_not_read_only"
         return True, "allowlisted_read_post"
     return False, "write_or_unlisted_method_blocked"
 
@@ -225,7 +195,11 @@ class DryRunRequestGuard(production_probe.RequestGuard):
         except Exception:
             route.abort()
             return
-        allowed, _reason = request_decision(method, url)
+        try:  # the body the guard sees: after ``route.fallback(post_data=...)`` it is the rewritten one
+            post_data = getattr(route.request, "post_data", None)
+        except Exception:
+            post_data = None
+        allowed, _reason = request_decision(method, url, post_data)
         where = self._where(url)
         if not allowed:
             key = (method, where)
@@ -250,7 +224,9 @@ CLICK_OPEN_CREATE_FORM = "open_create_form"
 CLICK_CANCEL_CREATE_FORM = "cancel_create_form"
 CLICK_EXPAND_ADVANCED = "expand_advanced"
 CLICK_SET_TOGGLE = "set_toggle"
-ALLOWED_CLICKS = frozenset({CLICK_OPEN_CREATE_FORM, CLICK_CANCEL_CREATE_FORM, CLICK_EXPAND_ADVANCED, CLICK_SET_TOGGLE})
+CLICK_SORT_HEADER = "sort_table_header"  # a column-header sort: it only triggers the page's own read-only table request
+ALLOWED_CLICKS = frozenset({CLICK_OPEN_CREATE_FORM, CLICK_CANCEL_CREATE_FORM, CLICK_EXPAND_ADVANCED, CLICK_SET_TOGGLE,
+                            CLICK_SORT_HEADER})
 
 
 class ClickRefused(RuntimeError):
@@ -517,16 +493,20 @@ def _status(reply: object) -> int | None:
     return status if type(status) is int else None
 
 
-def session_verdict(authorities: object, account_info: object) -> str | None:
-    """None when signed in: status 200 on both calls and a non-empty list of authority names (else a reason code)."""
-    for reply in (authorities, account_info):
-        status = _status(reply)
-        if status in (401, 403):
-            return "production_session_expired"
-        if status != 200:
-            return "production_session_not_ready"
-    names = authorities.get("names") if isinstance(authorities, Mapping) else None
-    if not isinstance(names, list) or not names or not all(isinstance(n, str) and n.strip() for n in names):
+def session_verdict(table_status: object, observed: Mapping[str, Any] | None = None) -> str | None:
+    """None when signed in, judged from the page's OWN traffic and STATUS CODES only (docs/48 note 2026-10-18).
+
+    ``table_status`` is the status of the page's own (rewritten) table reply: 200 is required; 401 or 403 is
+    ``production_session_expired``; no reply or any other status is ``production_session_not_ready``. ``observed`` maps the
+    page's own getAuthorities / accountInfo paths to the status seen when the page made those calls: a 401 or 403 there is
+    also expired and any other non-200 is not ready; a call the page never made is simply absent (not required).
+    """
+    seen = [table_status, *(observed or {}).values()]
+    if any(type(x) is int and x in (401, 403) for x in seen):
+        return "production_session_expired"
+    if type(table_status) is not int or table_status != 200:
+        return "production_session_not_ready"
+    if any(type(x) is not int or x != 200 for x in (observed or {}).values()):
         return "production_session_not_ready"
     return None
 

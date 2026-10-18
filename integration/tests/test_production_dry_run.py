@@ -21,6 +21,7 @@ from integration.onboarding import production_create_record as pcr
 from integration.onboarding import production_dry_run as pdr
 from integration.onboarding import production_probe as probe
 from integration.onboarding import session_readiness
+from integration.tests import page_own_table as pot
 from integration.onboarding.run_target import ProductionLocked, production_dry_run_target, production_target
 import tools.attended_ce_only_playwright as runner
 
@@ -78,6 +79,10 @@ PROBE_FIELDS = [
 ]
 
 
+VALID_READ_BODY = json.dumps({"tableServerData": {"offset": 0, "items_per_page": 100,
+                                                  "filters": {"and": [{"method": "search", "value": "x"}]}}})
+
+
 def form_of(fields):
     return {"fields": [{"name": n, "label": label, "type": t, "required": False, "option_count": c, "data_am": a}
                        for n, label, t, c, a in fields], "buttons": ["Advanced options", "Cancel", "Confirm"]}
@@ -85,27 +90,7 @@ def form_of(fields):
 
 # --- fake page ------------------------------------------------------------------------------------------------------
 
-class FakeRequest:
-    def __init__(self, method, url, post_data=None):
-        self.method, self.url = method, url
-        if post_data is not None:  # a request without a body attribute stays possible: the guard must cope with it
-            self.post_data = post_data
-
-
-class FakeRoute:
-    def __init__(self, method, url, post_data=None):
-        self.request = FakeRequest(method, url, post_data)
-        self.outcome = None
-        self.abort_called = False
-        self.continue_called = False
-
-    def continue_(self, **_kw):
-        self.continue_called = True
-        self.outcome = "continued"
-
-    def abort(self, *_a):
-        self.abort_called = True
-        self.outcome = "aborted"
+FakeRequest, FakeRoute = pot.FakeRequest, pot.FakeRoute
 
 
 class Missing:
@@ -212,25 +197,28 @@ class Button:
             self.effect()
 
 
-class FakePage:
+class FakePage(pot.PageOwnTable):
+    """A production page whose table answers from ``search`` (value -> reduced reply). Reads are the PAGE's own table
+    requests (see page_own_table): ``session`` is the status of its own start-up calls, ``demo`` the demo-domain list it
+    fetches on load (reduced {status, hit, count}); a sort header exists unless ``header=False``."""
+
     def __init__(self, *, advanced=None, form_fields=None, text_labels=None, mangle=None, write_on_select=False,
                  session=None, search=None, demo=None, advanced_button=True, sw_count=0, hit_fail=(),
-                 click_fail=(), add_label="Add Account"):
+                 click_fail=(), add_label="Add Account", header=True):
         self.hit_fail, self.click_fail, self.sw_count, self.add_label = set(hit_fail), set(click_fail), sw_count, add_label
         self.confirm_enabled, self.confirm_hit, self.scrolled = True, True, 0
-        self.routed = []
         self.url = ORIGIN + "/backoffice/tenantManagement"
-        self.clicks, self.fetches, self.keys, self.routes = [], [], [], []
+        self.clicks, self.keys = [], []
         self.form_open, self.expanded = False, False
         self.write_on_select = write_on_select
         self.advanced_button = advanced_button
         self.form_fields = form_fields if form_fields is not None else PROBE_FIELDS
         self.advanced = advanced if advanced is not None else {n: False for n in pdr.ADVANCED_NAMES}
         self.advanced_state = dict(self.advanced)
-        self.session = session or {pdr.AUTHORITIES_PATH: {"status": 200, "names": ["BACKOFFICE_ACCESS"]},
-                                   pdr.ACCOUNT_INFO_PATH: {"status": 200, "names": None}}
-        self.search = search or {}
+        self.session = session or {pdr.AUTHORITIES_PATH: {"status": 200}, pdr.ACCOUNT_INFO_PATH: {"status": 200}}
+        self.search = search if search is not None else {}
         self.demo = demo or {"status": 200, "hit": False, "count": 3}
+        self._init_table(header=header, passive=self.session, demo=self.demo, demo_domain=POISON_DOMAIN)
         self.keyboard = SimpleNamespace(press=self._press)
         self.typed = []
         self.texts = {}
@@ -270,22 +258,7 @@ class FakePage:
     def _advanced_boxes(self):
         return {n: Ctl(self, "checkbox", n, checked=self.advanced_state[n]) for n in self.advanced_state}
 
-    # -- playwright surface
-    def route(self, pattern, handler):
-        self.routes.append((pattern, handler))
-
-    def on(self, *_a):
-        pass
-
-    def fire(self, method, url, post_data=None):
-        route = FakeRoute(method, url, post_data)
-        self.routed.append(route)
-        for _pattern, handler in reversed(self.routes):  # the last registered handler runs first, like Playwright
-            handler(route)
-            if route.outcome:
-                break
-        return route.outcome
-
+    # -- playwright surface (routing, the page's own table request, reload, expect_response: PageOwnTable)
     def wait_for_timeout(self, _ms):
         pass
 
@@ -300,24 +273,10 @@ class FakePage:
             return form_of(fields)
         if script == pdr.SERVICE_WORKER_JS:
             return {"count": self.sw_count}
-        # Page-context fetches pass through the same route handlers as every other request: an aborted one fails.
-        if script == pdr.SESSION_GET_JS:
-            self.fetches.append(("GET", arg))
-            if self.fire("GET", ORIGIN + arg) == "aborted":
-                return {"status": 0, "names": None}
-            return self.session.get(arg, {"status": 0})
-        if script == pdr.DEMO_DOMAINS_JS:
-            self.fetches.append(("GET", arg[0]))
-            if self.fire("GET", ORIGIN + arg[0]) == "aborted":
-                return {"status": 0, "hit": None, "count": None}
-            return self.demo
-        if script == pdr.ACCOUNT_SEARCH_JS:
-            self.fetches.append(("POST", arg[0]))
-            if self.fire("POST", ORIGIN + arg[0]) == "aborted":
-                return {"status": 0, "total": None, "rows": None}
-            value = arg[1]["tableServerData"]["filters"]["and"][0]["value"]
-            return self.search.get(value, {"status": 200, "total": 0, "rows": []})
-        raise AssertionError("unexpected evaluate")
+        raise AssertionError("unexpected evaluate: a production read never evaluates a script in the page")
+
+    def _serve_table(self, value, _projection):
+        return self.search.get(value, {"status": 200, "total": 0, "rows": []})
 
     def get_by_role(self, role, name=None, exact=False):
         if role == "button" and name == self.add_label == "Add Account":
@@ -340,6 +299,8 @@ class FakePage:
         return Missing()
 
     def locator(self, selector):
+        if selector == pot.HEADER_SELECTOR:  # the table header lives behind the form, so it is found either way
+            return self._header() or Missing()
         if not self.form_open:
             return Missing()
         match = re.fullmatch(r'select\[name="(\w+)"\]', selector)
@@ -718,23 +679,6 @@ class AdvancedTests(unittest.TestCase):
 
 
 class VerdictTests(unittest.TestCase):
-    OK = {"status": 200, "names": ["BACKOFFICE_ACCESS"]}
-
-    def test_session_verdict(self):
-        self.assertIsNone(pdr.session_verdict(self.OK, {"status": 200}))
-        for auth, info, reason in (({"status": 401, "names": None}, {"status": 200}, "production_session_expired"),
-                                   (self.OK, {"status": 403}, "production_session_expired"),
-                                   ({"status": 500, "names": None}, {"status": 200}, "production_session_not_ready"),
-                                   ({"status": 0}, {"status": 200}, "production_session_not_ready"),
-                                   ({"status": 200, "names": []}, {"status": 200}, "production_session_not_ready"),
-                                   ({"status": 200, "names": None}, {"status": 200}, "production_session_not_ready"),
-                                   ({"status": 200, "names": [1]}, {"status": 200}, "production_session_not_ready"),
-                                   ({"status": "200", "names": ["a"]}, {"status": 200}, "production_session_not_ready"),
-                                   (None, {"status": 200}, "production_session_not_ready"),
-                                   (self.OK, None, "production_session_not_ready")):
-            with self.subTest(auth=auth, info=info):
-                self.assertEqual(pdr.session_verdict(auth, info), reason)
-
     def rows(self, *rows, total=None):
         return {"status": 200, "total": len(rows) if total is None else total, "rows": list(rows)}
 
@@ -768,58 +712,23 @@ class VerdictTests(unittest.TestCase):
         self.assertEqual(pdr.duplicate_verdict([], {"status": 200, "hit": False}, "n", ("d.example",)),
                          "duplicate_check_unavailable")
 
-    def test_search_body_uses_the_dev_grammar(self):
-        body = pdr.build_search_body("Grupo Patio")
-        server = body["tableServerData"]
-        self.assertEqual(server["filters"], {"and": [{"method": "search", "value": "Grupo Patio"}]})
-        self.assertEqual((server["offset"], server["items_per_page"], server["projection"]), (0, 100, ["accountName"]))
-        with self.assertRaises(ValueError):
-            pdr.build_search_body("  ")
-
     @unittest.skipUnless(shutil.which("node"), "node is needed to run the in-page scripts")
-    def test_in_page_scripts_return_only_status_names_and_row_fields(self):
-        """Run each page script in node with a stub fetch whose reply is full of secrets; check what comes back."""
-        secret = "SECRET-TOKEN-VALUE"
+    def test_the_only_in_page_script_left_is_the_service_worker_count(self):
+        program = ("const f = (" + pdr.SERVICE_WORKER_JS + ");\n"
+                   "Object.defineProperty(globalThis, 'navigator', {value: {serviceWorker: {getRegistrations: async () => [1, 2]}}, configurable: true});\n"
+                   "f().then(r => console.log(JSON.stringify(r)));")
+        done = subprocess.run(["node", "-e", program], capture_output=True, text=True, timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout), {"count": 2})
 
-        def run(script, argument, body, status=200):
-            program = ("const f = (" + script + ");\n"
-                       "Object.defineProperty(globalThis, 'navigator', {value: {serviceWorker: {getRegistrations: async () => [1, 2]}}, configurable: true});\n"
-                       "globalThis.fetch = async (path, init) => ({status: " + str(status) + ", json: async () => (" + json.dumps(body) + ")});\n"
-                       "f(" + json.dumps(argument) + ").then(r => console.log(JSON.stringify(r)));")
-            done = subprocess.run(["node", "-e", program], capture_output=True, text=True, timeout=30)
-            self.assertEqual(done.returncode, 0, done.stderr)
-            self.assertNotIn(secret, done.stdout)
-            return json.loads(done.stdout)
-
-        auth = run(pdr.SESSION_GET_JS, pdr.AUTHORITIES_PATH, {"authorities": ["A", "B"], "token": secret, "cookie": secret})
-        self.assertEqual(auth, {"status": 200, "names": ["A", "B"]})
-        self.assertEqual(run(pdr.SESSION_GET_JS, pdr.AUTHORITIES_PATH, {"authorities": ["A", 3], "token": secret})["names"], None)
-        self.assertEqual(run(pdr.SESSION_GET_JS, pdr.ACCOUNT_INFO_PATH, {"accountName": secret, "token": secret}),
-                         {"status": 200, "names": None})
-        self.assertEqual(run(pdr.SESSION_GET_JS, pdr.AUTHORITIES_PATH, {"authorities": ["A"], "token": secret}, 401),
-                         {"status": 401, "names": None})
-        demo = run(pdr.DEMO_DOMAINS_JS, [pdr.DEMO_DOMAINS_PATH, ["Hit.example."]], {"demoDomains": ["hit.example", secret]})
-        self.assertEqual(set(demo), {"status", "hit", "count"})
-        self.assertIs(demo["hit"], True)
-        miss = run(pdr.DEMO_DOMAINS_JS, [pdr.DEMO_DOMAINS_PATH, ["other.example"]], {"demoDomains": ["hit.example"]})
-        self.assertIs(miss["hit"], False)
-        row = {"accountName": "N", "accountDomain": "d.example", "alternateDomains": ["a.example", 7],
-               "userEmailDomains": ["e.example"], "isDeleted": True, "token": secret, "primaryUser": {"email": secret}}
-        found = run(pdr.ACCOUNT_SEARCH_JS, [pdr.ACCOUNTS_PATH, {}], {"pagination_response": {"total_count": 1, "table_data": [row]}})
-        self.assertEqual(set(found), {"status", "total", "rows"})
-        self.assertEqual(found["rows"], [{"name": "N", "domain": "d.example", "alternates": ["a.example"],
-                                          "emails": ["e.example"], "deleted": True}])
-        self.assertEqual(run(pdr.SERVICE_WORKER_JS, None, {}), {"count": 2})
-
-    def test_page_fetches_pass_through_the_request_guard(self):
-        page = FakePage()
-        pdr.DryRunRequestGuard().install(page)
-        body = pdr.build_search_body("x")
-        allowed = page.evaluate(pdr.ACCOUNT_SEARCH_JS, [pdr.ACCOUNTS_PATH, body])
-        self.assertEqual(allowed["status"], 200)
-        blocked = page.evaluate(pdr.ACCOUNT_SEARCH_JS, ["/api/v1/backoffice/account/add", body])
-        self.assertEqual(blocked, {"status": 0, "total": None, "rows": None})
+    def test_the_pages_own_table_request_passes_through_the_request_guard(self):
+        page = FakePage(search={"x": {"status": 200, "total": 0, "rows": []}})
+        guard = pdr.DryRunRequestGuard()
+        guard.install(page)
+        self.assertEqual(runner._pcr_search(page, "x")["status"], 200)
+        self.assertEqual(page.fire("POST", ORIGIN + "/api/v1/backoffice/account/add", "{}"), "aborted")
         self.assertTrue(page.routed[-1].abort_called and not page.routed[-1].continue_called)
+        self.assertEqual(guard.api_calls[("POST", pdr.ACCOUNTS_PATH)]["count"], 1)
 
     def test_revision_pattern(self):
         for good in (REV, "r29", "a.b:c_d-e+f", "x" * 64):
@@ -870,7 +779,7 @@ class GuardTests(unittest.TestCase):
                 ("POST", api + "account/abc123abc123abc123/campaign/executions", False),
                 ("POST", ORIGIN + "/api/v1/auth/verify", False), ("POST", "https://telemetry.example/x", False)):
             with self.subTest(method=method, url=url):
-                self.assertEqual(pdr.request_decision(method, url)[0], allowed)
+                self.assertEqual(pdr.request_decision(method, url, VALID_READ_BODY)[0], allowed)
 
     def test_guard_aborts_account_writes_and_counts_them(self):
         guard, page = pdr.DryRunRequestGuard(), FakePage()
@@ -878,13 +787,14 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(page.fire("POST", ORIGIN + "/api/v1/backoffice/account/add"), "aborted")
         self.assertEqual(page.fire("POST", ORIGIN + "/api/v1/backoffice/account/abc123abc123abc123/edit"), "aborted")
         self.assertEqual(page.fire("POST", "https://telemetry.example/x"), "aborted")
-        self.assertEqual(page.fire("POST", ORIGIN + "/api/v1/backoffice/getAllDetailedAccounts"), "continued")
+        self.assertEqual(page.fire("POST", ORIGIN + "/api/v1/backoffice/getAllDetailedAccounts", VALID_READ_BODY), "continued")
+        self.assertEqual(page.fire("POST", ORIGIN + "/api/v1/backoffice/getAllDetailedAccounts"), "aborted")  # no body: no clearance
         self.assertEqual(page.fire("GET", ORIGIN + "/api/v1/authenticated/getAuthorities"), "continued")
-        self.assertEqual(guard.blocked_api_writes(), 2)  # the telemetry POST is blocked but is not a production API write
+        self.assertEqual(guard.blocked_api_writes(), 3)  # the telemetry POST is blocked but is not a production API write
         self.assertTrue(any(w.endswith("/account/add") for (_m, w) in guard.blocked))
         self.assertEqual(page.fire("GET", "https://tracker.example/pixel"), "aborted")
         self.assertEqual(page.fire("GET", "https://cdn.pentera.io/a.css"), "continued")
-        self.assertEqual(guard.blocked_api_writes(), 2)  # cross-origin GETs are counted but are not API writes
+        self.assertEqual(guard.blocked_api_writes(), 3)  # cross-origin GETs are counted but are not API writes
 
     def test_click_log_allows_only_the_allowlist_and_never_confirm_submit_save(self):
         clicked = []
@@ -946,9 +856,12 @@ class FlowTests(unittest.TestCase):
         self.assertIn("Advanced options", page.clicks)
         for name in pdr.ADVANCED_NAMES:  # advanced controls are read, never clicked
             self.assertNotIn(name, page.clicks)
-        self.assertEqual(sorted(set(page.fetches)), sorted({("GET", pdr.AUTHORITIES_PATH), ("GET", pdr.ACCOUNT_INFO_PATH),
-                                                          ("GET", pdr.DEMO_DOMAINS_PATH), ("POST", pdr.ACCOUNTS_PATH)}))
-        self.assertEqual(page.fetches.count(("POST", pdr.ACCOUNTS_PATH)), 2)  # name and primary domain
+        self.assertEqual(set(page.fetches), {("POST", pdr.ACCOUNTS_PATH)})  # only the page's own, rewritten table requests
+        values = page.table_values
+        self.assertEqual((values.count(POISON_NAME + " - CE Only"), values.count(POISON_DOMAIN)), (1, 1))  # name and domain
+        self.assertEqual(values.count(runner.PDR_SESSION_CHECK_VALUE), 2)  # before the form and again inside the filled form
+        self.assertEqual(page.reloads, 1)  # only the first read reloads; the later ones use the sort header
+        self.assertEqual(page.dispatches, 1)  # the late session check runs with the form open: dispatched click, no reload
         data, text = h.record()
         self.assertEqual(data["outcome"], "dry_run_passed")
         self.assertTrue(data["form_fields_checked"])
@@ -1027,16 +940,24 @@ class FlowTests(unittest.TestCase):
         self.assertFalse(h.records.exists())
 
     def test_session_failures_refuse_before_any_form_or_search(self):
-        for reply, reason in (({"status": 401, "names": None}, "production_session_expired"),
-                              ({"status": 403, "names": None}, "production_session_expired"),
-                              ({"status": 500, "names": None}, "production_session_not_ready"),
-                              ({"status": 200, "names": []}, "production_session_not_ready")):
-            h = Harness(self, session={pdr.AUTHORITIES_PATH: reply, pdr.ACCOUNT_INFO_PATH: {"status": 200}})
-            with self.subTest(reason=reason, status=reply["status"]):
+        check = runner.PDR_SESSION_CHECK_VALUE
+        refused = {"status": 0}
+        cases = (  # (page kwargs, reason): the page's own start-up calls, or the status of its own table reply
+            (dict(session={pdr.AUTHORITIES_PATH: {"status": 401}, pdr.ACCOUNT_INFO_PATH: {"status": 200}}), "production_session_expired"),
+            (dict(session={pdr.AUTHORITIES_PATH: {"status": 403}, pdr.ACCOUNT_INFO_PATH: {"status": 200}}), "production_session_expired"),
+            (dict(session={pdr.AUTHORITIES_PATH: {"status": 200}, pdr.ACCOUNT_INFO_PATH: {"status": 401}}), "production_session_expired"),
+            (dict(session={pdr.AUTHORITIES_PATH: {"status": 500}, pdr.ACCOUNT_INFO_PATH: {"status": 200}}), "production_session_not_ready"),
+            (dict(search={check: {"status": 401, "total": None, "rows": None}}), "production_session_expired"),
+            (dict(search={check: {"status": 403, "total": None, "rows": None}}), "production_session_expired"),
+            (dict(search={check: {"status": 500, "total": None, "rows": None}}), "production_session_not_ready"),
+            (dict(search={check: refused}), "production_session_not_ready"))  # the page never answered its own request
+        for kwargs, reason in cases:
+            h = Harness(self, **kwargs)
+            with self.subTest(reason=reason, kwargs=sorted(kwargs)):
                 out = h.run()
                 self.assertEqual(out["result"], reason)
                 self.assertEqual(h.page.clicks, [])
-                self.assertNotIn(("POST", pdr.ACCOUNTS_PATH), h.page.fetches)
+                self.assertEqual(set(h.page.table_values), {check})  # no name or domain search ran
                 self.assertEqual(h.record()[0]["refusal_reason"], reason)
 
     def test_duplicate_demo_and_doubt_refuse_before_the_form(self):
@@ -1138,17 +1059,16 @@ class FlowTests(unittest.TestCase):
         self.assertNotIn("Confirm", h.page.clicks)
 
     def test_session_expiring_during_the_fill_refuses(self):
-        h = Harness(self)
-        original = h.page.evaluate
-        calls = {"n": 0}
+        class SecondRefused(dict):
+            calls = 0
 
-        def evaluate(script, arg=None):
-            if script == pdr.SESSION_GET_JS and arg == pdr.AUTHORITIES_PATH:
-                calls["n"] += 1
-                if calls["n"] >= 2:
-                    return {"status": 401, "names": None}
-            return original(script, arg)
-        h.page.evaluate = evaluate
+            def get(self, key, default=None):
+                if key == runner.PDR_SESSION_CHECK_VALUE:
+                    self.calls += 1
+                    if self.calls >= 2:  # the check inside the filled form: the page's own reply is now 401
+                        return {"status": 401, "total": None, "rows": None}
+                return super().get(key, default)
+        h = Harness(self, search=SecondRefused())
         self.assertEqual(h.run()["result"], "production_session_expired")
         self.assertEqual(h.page.clicks[-1], "Cancel")
 

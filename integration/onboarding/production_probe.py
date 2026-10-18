@@ -41,6 +41,19 @@ READ_POST_PATHS = (
     re.compile(r"/api/v1/backoffice/account/[A-Za-z0-9_-]{1,64}/campaign/executions"),
 )
 MAX_API_ENTRIES = 200
+
+# --- The one read body the guards accept for the table endpoint (docs/48 note 2026-10-18) --------------------------
+# The page sends its OWN getAllDetailedAccounts request; the runner rewrites only the JSON ``tableServerData`` fields below.
+# A POST to the endpoint passes the guard only when its body is exactly one bounded, read-only table search: the HAR key
+# set, offset 0, at most TABLE_ROW_LIMIT rows, and a filter that is one ``search`` clause or the verified ``or`` variant.
+TABLE_READ_PATH = "/api/v1/backoffice/getAllDetailedAccounts"
+TABLE_ROW_LIMIT = 100
+_TABLE_KEYS = frozenset({"offset", "items_per_page", "sort", "filters", "unique_fields", "projection"})
+_LEAF_KEYS = frozenset({"method", "value", "field"})
+_OR_METHODS = frozenset({"search", "equals"})
+_PATH_LIKE = re.compile(r"[A-Za-z0-9_.]{1,80}")
+_MAX_BODY_CHARS = 20_000
+_MAX_VALUE_CHARS = 200
 _ID_SEGMENT = re.compile(r"(?i)^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9]{5,}|[A-Za-z0-9]{16,64})$")
 
 # --- Click guard -------------------------------------------------------------
@@ -225,6 +238,93 @@ def path_template(url: object) -> str:
     return "/".join("{id}" if _is_id_segment(part) else part for part in url_path(url).split("/"))
 
 
+def _value_ok(value: object) -> bool:
+    return (isinstance(value, str) and bool(value.strip()) and len(value) <= _MAX_VALUE_CHARS
+            and re.search(r"[\x00-\x1f\x7f]", value) is None)
+
+
+def _leaf_ok(leaf: object, methods: frozenset[str], allow_field: bool) -> bool:
+    if not isinstance(leaf, dict) or not {"method", "value"} <= set(leaf) <= _LEAF_KEYS:
+        return False
+    if leaf["method"] not in methods or not _value_ok(leaf["value"]):
+        return False
+    field = leaf.get("field")
+    return "field" not in leaf or (allow_field and isinstance(field, str) and _PATH_LIKE.fullmatch(field) is not None)
+
+
+def _filters_ok(filters: object) -> bool:
+    if not isinstance(filters, dict) or set(filters) != {"and"}:
+        return False
+    clauses = filters["and"]
+    if not isinstance(clauses, list) or len(clauses) != 1 or not isinstance(clauses[0], dict):
+        return False
+    clause = clauses[0]
+    if set(clause) == {"or"}:  # the HAR name-list variant: {and:[{or:[{method, value, field}]}]}
+        leaves = clause["or"]
+        return isinstance(leaves, list) and 1 <= len(leaves) <= 50 and all(_leaf_ok(x, _OR_METHODS, True) for x in leaves)
+    return _leaf_ok(clause, frozenset({"search"}), False)  # the Dev grammar: {and:[{method:"search", value}]}
+
+
+def _names_ok(names: object, limit: int) -> bool:
+    return (isinstance(names, list) and len(names) <= limit
+            and all(isinstance(n, str) and _PATH_LIKE.fullmatch(n) is not None for n in names))
+
+
+def read_body_problem(raw: object) -> str | None:
+    """None only when ``raw`` (JSON text or bytes) is exactly one bounded read-only table search; else a short reason.
+
+    Top level: ``tableServerData`` and nothing else. Inside: only the HAR keys; ``offset`` 0; ``items_per_page`` an int
+    from 1 to TABLE_ROW_LIMIT; ``filters`` one ``search`` clause or the verified ``or`` variant (non-empty bounded
+    values, optional field path); optional ``sort`` {direction, key}, ``unique_fields`` and ``projection`` (path-like
+    names only). Any other key, a missing body, junk or an oversized body is refused.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except UnicodeDecodeError:
+            return "body_unreadable"
+    if not isinstance(raw, str) or not raw.strip() or len(raw) > _MAX_BODY_CHARS:
+        return "body_unreadable"
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return "body_unreadable"
+    if not isinstance(body, dict) or set(body) != {"tableServerData"} or not isinstance(body["tableServerData"], dict):
+        return "body_keys"
+    server = body["tableServerData"]
+    if not {"offset", "items_per_page", "filters"} <= set(server) <= _TABLE_KEYS:
+        return "body_keys"
+    offset, size = server["offset"], server["items_per_page"]
+    if type(offset) is not int or offset != 0 or type(size) is not int or not 1 <= size <= TABLE_ROW_LIMIT:
+        return "paging"
+    if not _filters_ok(server["filters"]):
+        return "filters"
+    sort = server.get("sort")
+    if "sort" in server and not (isinstance(sort, dict) and set(sort) <= {"direction", "key"}
+                                 and all(isinstance(v, str) and len(v) <= 80 for v in sort.values())):
+        return "sort"
+    if "unique_fields" in server and not _names_ok(server["unique_fields"], 20):
+        return "unique_fields"
+    if "projection" in server and not _names_ok(server["projection"], 80):
+        return "projection"
+    return None
+
+
+def table_rewrite_fields(value: str, projection: tuple[str, ...] | list[str]) -> dict[str, Any]:
+    """The ``tableServerData`` fields the runner overwrites on the page's own request; nothing else is ever changed.
+
+    ``unique_fields`` is name + domain on purpose: the page's own load request collapses rows by account type, license
+    type and first name (docs/48), which would hide tenants from a duplicate check. The sort the page sent is kept.
+    """
+    if not _value_ok(value):
+        raise ValueError("search_value_invalid")
+    names = list(projection)
+    if not names or not _names_ok(names, 80):
+        raise ValueError("projection_invalid")
+    return {"offset": 0, "items_per_page": TABLE_ROW_LIMIT, "filters": {"and": [{"method": "search", "value": value}]},
+            "unique_fields": ["accountName", "accountDomain"], "projection": names}
+
+
 def request_decision(method: str, url: str) -> tuple[bool, str]:
     """(allowed, reason). Fail closed: unknown methods and every non-listed write are refused."""
     verb = (method or "").upper()
@@ -239,10 +339,11 @@ def request_decision(method: str, url: str) -> tuple[bool, str]:
 class RequestGuard:
     """Routes every request of the probe page: allow reads, abort everything else, record names only."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, require_read_body: bool = False) -> None:
         self.api_calls: dict[tuple[str, str], dict[str, Any]] = {}
         self.blocked: dict[tuple[str, str], int] = {}
         self.other_read_count = 0
+        self.require_read_body = require_read_body  # True: a table POST passes only with a validated read body
 
     @staticmethod
     def _where(url: str) -> str:
@@ -255,6 +356,11 @@ class RequestGuard:
             route.abort()
             return
         allowed, _reason = request_decision(method, url)
+        if allowed and self.require_read_body and method == "POST" and url_path(url) == TABLE_READ_PATH:
+            try:
+                allowed = read_body_problem(getattr(route.request, "post_data", None)) is None
+            except Exception:
+                allowed = False
         where = self._where(url)
         if not allowed:
             key = (method, where)

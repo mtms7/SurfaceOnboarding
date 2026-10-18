@@ -36,7 +36,7 @@ CREATE_FLAGS_OFF = ("automatedDiscoveryEnabled", "subDomainsReconEnabled", "webD
                     "webDorkingEnabled", "staticOutboundIpEnabled", "aiEnabled", "webAiAttackerEnabled", "vodBetaEnabled")
 
 ACCOUNTS_PATH = "/api/v1/backoffice/getAllDetailedAccounts"
-SEARCH_PAGE_SIZE = 100
+SEARCH_PAGE_SIZE = production_probe.TABLE_ROW_LIMIT
 REPORT_PREFIX = "readback-"
 
 _MISSING = object()
@@ -390,36 +390,36 @@ def build_readback_body(name: str) -> dict[str, Any]:
         "unique_fields": ["accountName", "accountDomain"]}}
 
 
-# POST the search from the page (its own session) and return only the compared fields as a flat {dotted path: scalar |
-# list of strings} per row. No token, cookie, header or storage entry is read; no other row field leaves the page.
-READBACK_JS = """async (args) => {
-  try {
-    const path = args[0], body = args[1], picks = args[2];
-    const r = await fetch(path, {method: 'POST', credentials: 'include',
-      headers: {'Accept': 'application/json', 'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-    if (r.status !== 200) return {status: r.status, total: null, rows: null};
-    const b = await r.json();
-    const p = b && b.pagination_response;
-    const rows = p && p.table_data;
-    if (!p || !Array.isArray(rows) || typeof p.total_count !== 'number') return {status: 200, total: null, rows: null};
-    const walk = (row, key) => {
-      if (row && typeof row === 'object' && Object.prototype.hasOwnProperty.call(row, key)) return row[key];
-      let node = row;
-      for (const part of key.split('.')) {
-        if (!node || typeof node !== 'object' || !Object.prototype.hasOwnProperty.call(node, part)) return undefined;
-        node = node[part];
-      }
-      return node;
-    };
-    const ok = (v) => v === null || ['string', 'number', 'boolean'].includes(typeof v)
-      || (Array.isArray(v) && v.length <= 50 && v.every(x => typeof x === 'string'));
-    return {status: 200, total: p.total_count, rows: rows.slice(0, 200).map(row => {
-      const out = {};
-      for (const key of picks) { const v = walk(row, key); if (v !== undefined && ok(v)) out[key] = v; }
-      return out;
-    })};
-  } catch (e) { return {status: 0, total: null, rows: null}; }
-}"""
+def _pick_ok(value: Any) -> bool:
+    return (value is None or isinstance(value, (str, int, float, bool))
+            or (isinstance(value, list) and len(value) <= 50 and all(isinstance(x, str) for x in value)))
+
+
+def readback_reply(status: Any, body: Any) -> dict[str, Any]:
+    """Reduce the page's OWN table reply (HTTP status, parsed JSON body) to {status, total, rows} for the readback.
+
+    Each row becomes a flat {dotted path: scalar | list of strings} holding only the READBACK_PICK_PATHS the contract
+    compares; no other row field, token, cookie or header leaves this function. A missing status is status 0, a non-200
+    status carries no rows, and a 200 with an unexpected schema has ``total``/``rows`` None (fail closed).
+    """
+    if type(status) is not int:
+        return {"status": 0, "total": None, "rows": None}
+    if status != 200:
+        return {"status": status, "total": None, "rows": None}
+    paged = body.get("pagination_response") if isinstance(body, Mapping) else None
+    rows = paged.get("table_data") if isinstance(paged, Mapping) else None
+    total = paged.get("total_count") if isinstance(paged, Mapping) else None
+    if not isinstance(rows, list) or type(total) is not int or not all(isinstance(r, Mapping) for r in rows):
+        return {"status": 200, "total": None, "rows": None}
+    picked = []
+    for row in rows[:200]:
+        out: dict[str, Any] = {}
+        for key in READBACK_PICK_PATHS:
+            value = _lookup(row, key)
+            if value is not _MISSING and _pick_ok(value):
+                out[key] = value
+        picked.append(out)
+    return {"status": 200, "total": total, "rows": picked}
 
 
 # --- Redacted report -----------------------------------------------------------------------------------------------------

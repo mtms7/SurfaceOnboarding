@@ -139,11 +139,12 @@ def is_create_request(method: object, url: object) -> bool:
             and production_probe.url_path(url) == CREATE_PATH)
 
 
-def live_request_decision(method: str, url: str, *, armed: bool) -> tuple[bool, str]:
-    """(allowed, reason): the dry-run table, plus the create POST while ``armed``. Everything else is aborted."""
+def live_request_decision(method: str, url: str, *, armed: bool, post_data: object = None) -> tuple[bool, str]:
+    """(allowed, reason): the dry-run table (a table POST needs a validated read body), plus the create POST while ``armed``.
+    Everything else is aborted."""
     if is_create_request(method, url):
         return (True, "armed_create_post") if armed else (False, "create_post_not_armed")
-    return production_dry_run.request_decision(method, url)
+    return production_dry_run.request_decision(method, url, post_data)
 
 
 class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
@@ -356,11 +357,6 @@ def click_confirm_once(page: Any, guard: LiveRequestGuard, clicks: LiveClickLog,
 
 
 # --- Live duplicate pre-check verdict ------------------------------------------------------------------------------------
-
-def live_search_body(value: str) -> dict[str, Any]:
-    """The verified name/domain search grammar WITHOUT a projection, so a returned row keeps its domain fields."""
-    return production_contract.build_readback_body(value)
-
 
 def live_duplicate_problem(name_reply: object, domain_reply: object, demo_reply: object, tenant_name: str,
                            primary_domain: str) -> str | None:

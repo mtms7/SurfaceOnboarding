@@ -156,7 +156,6 @@ class LivePage(dry.FakePage):
         country.evaluate = lambda js: self.country_value if "el.value" in str(js) else original(js)
         self.readbacks = list(readbacks if readbacks is not None else [reply([good_row()])])
         self.readback_calls = 0
-        self.response_handlers = []
         self.popup_handlers = []
 
     def create_body(self):
@@ -166,26 +165,27 @@ class LivePage(dry.FakePage):
         self.on("popup" if event == "page" else event, handler)
 
     def on(self, event, handler):
-        if event == "response":
-            self.response_handlers.append(handler)
+        super().on(event, handler)
         if event == "popup":
             self.popup_handlers.append(handler)
+
+    @property
+    def response_handlers(self):
+        return self.handlers.setdefault("response", [])
 
     def get_by_role(self, role, name=None, exact=False):
         if role == "button" and name == "Confirm" and self.form_open:
             return ConfirmBtn(self)
         return super().get_by_role(role, name, exact)
 
-    def evaluate(self, script, arg=None):
-        if script == contract.READBACK_JS:
+    def _serve_table(self, value, projection):
+        if projection == list(contract.READBACK_PICK_PATHS):  # the post-click readback: the page's own rewritten request
             self.readback_calls += 1
             if self.popup_on_readback and self.readback_calls > 1:  # a page opens AFTER the click, once the poll has begun
                 for handler in self.popup_handlers:
                     handler(None)
-            if self.fire("POST", ORIGIN + arg[0]) == "aborted":
-                return {"status": 0, "total": None, "rows": None}
             return self.readbacks.pop(0) if self.readbacks else reply([])
-        return super().evaluate(script, arg)
+        return super()._serve_table(value, projection)
 
 
 class Harness(dry.Harness):
@@ -370,19 +370,36 @@ class LiveDuplicateTests(Base):
         self.assertNotIn("Confirm", h.page.clicks)
 
     def test_session_lost_at_the_final_check(self):
-        h = self.harness()
-        calls = {"n": 0}
-        original = h.page.session.get
+        class ThirdRefused(dict):
+            calls = 0
 
-        def flaky(path, default=None):
-            calls["n"] += 1
-            if calls["n"] > 2 and path == pdr.AUTHORITIES_PATH:
-                return {"status": 401, "names": None}
-            return original(path, default)
-        h.page.session = SimpleNamespace(get=flaky)
+            def get(self, key, default=None):
+                if key == runner.PDR_SESSION_CHECK_VALUE:
+                    self.calls += 1
+                    if self.calls >= 3:  # early check, the check inside the filled form, then the live pre-check
+                        return {"status": 401, "total": None, "rows": None}
+                return super().get(key, default)
+        h = self.harness(search=ThirdRefused())
         result = h.go()
         self.assertIn(result["result"], ("production_session_expired",))
         self.assertEqual(h.page.confirm_clicks, 0)
+        self.assertIsNone(h.approval_unused())
+
+    def test_a_late_check_that_cannot_be_triggered_with_the_form_open_refuses_before_the_click(self):
+        h = self.harness(header=False)  # no sort header: with the form open there is no safe trigger (never a reload)
+        self.assertEqual(h.go()["result"], "production_session_not_ready")
+        self.assertEqual(h.page.confirm_clicks, 0)
+        self.assertEqual((h.page.reloads, h.page.gotos), (5, 0))  # the five early reads (no header: reloads) and nothing once the form was open
+        self.assertIsNone(h.approval_unused())
+
+    def test_every_live_read_is_the_pages_own_rewritten_request_and_the_form_is_never_reloaded(self):
+        h = self.harness()
+        self.assertEqual(h.go()["result"], "created_verified")
+        self.assertEqual(h.page.reloads, 1)  # the first read only
+        self.assertEqual(h.page.dispatches, 6)  # fill-time session check + the live pre-check (session, 2 control, name, domain)
+        self.assertEqual(set(h.page.fetches), {("POST", pdr.ACCOUNTS_PATH)})
+        for body in h.page.table_bodies:  # every read body is the validated grammar
+            self.assertIsNone(runner.production_probe.read_body_problem(json.dumps(body)))
 
     def test_a_stray_create_post_during_the_fill_is_blocked(self):
         h = self.harness(write_on_select=True)
@@ -587,8 +604,10 @@ class SearchControlTests(Base):
     def test_the_control_runs_in_the_same_session_before_the_target_and_is_recorded_only_as_a_hash(self):
         h = self.harness()
         h.go()
-        values = [f[1] for f in h.page.fetches if f[0] == "POST"]
+        values = h.page.table_values
         self.assertGreaterEqual(len(values), 4)
+        self.assertLess(values.index(CONTROL["name"]), values.index(NAME))
+        self.assertLess(values.index(CONTROL["domain"]), values.index(DOMAIN))
         refusal = self.harness(search={CONTROL["domain"]: reply([])})
         refusal.go()
         text = "".join(Path(p).read_text(encoding="utf-8") for p in pcr.list_records(refusal.records, CO))

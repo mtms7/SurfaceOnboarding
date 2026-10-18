@@ -19,6 +19,7 @@ from unittest import mock
 from integration.onboarding import production_contract as contract
 from integration.onboarding import production_probe as probe
 from integration.onboarding import session_readiness
+from integration.tests import page_own_table as pot
 from integration.tests import test_production_contract as fx
 import tools.attended_ce_only_playwright as runner
 
@@ -39,58 +40,34 @@ def make_source(uuid=SF_UUID):
         salesforce_account_uuid=uuid)
 
 
-class FakeRequest:
-    def __init__(self, method, url):
-        self.method, self.url = method, url
-
-
-class FakeRoute:
-    def __init__(self, method, url):
-        self.request = FakeRequest(method, url)
-        self.outcome = None
-
-    def continue_(self, **_kw):
-        self.outcome = "continued"
-
-    def abort(self, *_a):
-        self.outcome = "aborted"
-
-
-class FakePage:
-    """Records everything; any interaction beyond page.evaluate / route / on is a test failure."""
+class FakePage(pot.PageOwnTable):
+    """Records everything; the readback may only reload the page (its own table request, body rewritten): no click, no typing."""
 
     def __init__(self, reply=None, workers=0, attempt_write=False):
         self.url = ORIGIN + "/backoffice/tenantManagement"
         self.reply = reply if reply is not None else good_reply()
         self.workers = workers
         self.attempt_write = attempt_write
-        self.routes, self.listeners, self.evaluated, self.routed = [], [], [], []
-        self.clicks, self.typed = [], []
+        self.form_open = False
+        self.evaluated, self.clicks, self.typed = [], [], []
+        self._init_table(header=True, passive={})
 
-    def route(self, pattern, handler):
-        self.routes.append((pattern, handler))
-
-    def on(self, event, callback):
-        self.listeners.append((event, callback))
-
-    def _request(self, method, url):
-        route = FakeRoute(method, url)
-        self.routes[0][1](route)
-        self.routed.append((method, url, route.outcome))
-        return route.outcome
+    def triples(self):
+        """(method, url, outcome) of every request the guard routed."""
+        return [(r.request.method, r.request.url, r.outcome) for r in self.routed]
 
     def evaluate(self, script, argument=None):
         self.evaluated.append(script)
         if script == runner.production_dry_run.SERVICE_WORKER_JS:
             return {"count": self.workers}
-        if script == contract.READBACK_JS:
-            self.search_argument = argument
-            self._request("POST", SEARCH_URL)
-            if self.attempt_write:
-                self._request("POST", ADD_URL)
-                self._request("PUT", ORIGIN + "/api/v1/backoffice/account/" + "a" * 24 + "/edit")
-            return self.reply
-        raise AssertionError("unexpected evaluate")
+        raise AssertionError("unexpected evaluate: the readback evaluates nothing but the service-worker count")
+
+    def _serve_table(self, value, projection):
+        self.search_argument = (value, projection)
+        if self.attempt_write:
+            self.fire("POST", ADD_URL, "{}")
+            self.fire("PUT", ORIGIN + "/api/v1/backoffice/account/" + "a" * 24 + "/edit", "{}")
+        return self.reply
 
     # Anything that would act on the page: the readback must never call these.
     def click(self, *a, **k):
@@ -106,10 +83,7 @@ class FakePage:
         raise AssertionError("readback must not locate controls")
 
     def locator(self, *a, **k):
-        raise AssertionError("readback must not locate controls")
-
-    def goto(self, *a, **k):
-        raise AssertionError("readback must not navigate")
+        raise AssertionError("readback must not locate controls (it never uses the in-app sort)")
 
 
 def good_row(**over):
@@ -241,6 +215,7 @@ class ReadbackRunTests(unittest.TestCase):
             self.assertNotIn(secret, text)
             self.assertNotIn(secret, report_text)
         self.assertEqual((h.page.clicks, h.page.typed), ([], []))
+        self.assertEqual((h.page.header_clicks, h.page.dispatches), (0, 0))  # a reload only: the sort header is never touched
         self.assertEqual(report["clicks"], 0)
 
     def test_uses_probe_target_exact_origin_and_dedicated_profile(self):
@@ -254,12 +229,16 @@ class ReadbackRunTests(unittest.TestCase):
         h.run()
         self.assertEqual(h.page.routes[0][0], "**/*")
         self.assertEqual(h.page.evaluated[0], runner.production_dry_run.SERVICE_WORKER_JS)
-        path, body, picks = h.page.search_argument
-        self.assertEqual(path, contract.ACCOUNTS_PATH)
-        self.assertEqual(body["tableServerData"]["filters"], {"and": [{"method": "search", "value": fx.NAME}]})
-        self.assertEqual(body["tableServerData"]["sort"], {"direction": "asc", "key": "accountName"})
+        value, picks = h.page.search_argument
+        self.assertEqual((value, picks), (fx.NAME, list(contract.READBACK_PICK_PATHS)))
         self.assertIn("accountUuid", picks)
-        self.assertEqual(h.page.routed, [("POST", SEARCH_URL, "continued")])
+        server = h.page.table_bodies[0]["tableServerData"]  # the page's own request with ONLY these fields rewritten
+        self.assertEqual(server["filters"], {"and": [{"method": "search", "value": fx.NAME}]})
+        self.assertEqual((server["offset"], server["items_per_page"]), (0, contract.SEARCH_PAGE_SIZE))
+        self.assertEqual(server["unique_fields"], ["accountName", "accountDomain"])
+        self.assertEqual(server["sort"], json.loads(pot.PAGE_DEFAULT_BODY)["tableServerData"]["sort"])  # kept as the page sent it
+        self.assertEqual(h.page.triples(), [("POST", SEARCH_URL, "continued")])
+        self.assertEqual((h.page.reloads, h.page.gotos), (1, 0))
 
     def test_mismatches_are_field_names_only(self):
         row = good_row(accountType="customer", **{"accountLicense.assetsNumber": "1"})
@@ -323,16 +302,16 @@ class ReadbackRunTests(unittest.TestCase):
                 h = Harness(self, workers=workers)
                 line, _ = h.run()
                 self.assertEqual(line["reason"], reason)
-                self.assertNotIn(contract.READBACK_JS, h.page.evaluated)
-                self.assertEqual(h.page.routed, [])
+                self.assertEqual(h.page.table_values, [])
+                self.assertEqual(h.page.triples(), [])
 
     def test_guard_blocks_a_write_attempt_and_refuses(self):
         h = Harness(self, attempt_write=True)
         line, text = h.run()
         self.assertEqual((line["result"], line["reason"]), ("production_readback_refused", "write_request_blocked"))
-        self.assertIn(("POST", ADD_URL, "aborted"), h.page.routed)
-        self.assertTrue(all(outcome == "aborted" for method, url, outcome in h.page.routed if url == ADD_URL or method == "PUT"))
-        self.assertEqual(h.page.routed[0], ("POST", SEARCH_URL, "continued"))
+        self.assertIn(("POST", ADD_URL, "aborted"), h.page.triples())
+        self.assertTrue(all(outcome == "aborted" for method, url, outcome in h.page.triples() if url == ADD_URL or method == "PUT"))
+        self.assertEqual(h.page.triples()[0], ("POST", SEARCH_URL, "continued"))
         report, _, _ = h.report()
         blocked = {(item["method"], item["path"]): item["count"] for item in report["blocked_requests"]}
         self.assertEqual(blocked[("POST", "/api/v1/backoffice/account/add")], 1)
@@ -358,8 +337,8 @@ class ReadbackRunTests(unittest.TestCase):
 
     def test_unexpected_exception_in_page_is_a_fixed_code(self):
         h = Harness(self)
-        h.page.evaluate = mock.Mock(side_effect=[{"count": 0}, ValueError("secret text " + SF_UUID)])
-        # _pdr_evaluate swallows page errors as status 0 -> search_unavailable; text never leaks
+        h.page.reload = mock.Mock(side_effect=ValueError("secret text " + SF_UUID))
+        # the reader swallows page errors (nothing rewritten, no reply) -> search_unavailable; text never leaks
         line, text = h.run()
         self.assertEqual(line["reason"], "search_unavailable")
         self.assertNotIn(SF_UUID, text)
@@ -449,9 +428,11 @@ class CodeShapeTests(unittest.TestCase):
         for needle in ("account/add", "account/edit"):
             self.assertNotIn(needle, inspect.getsource(runner.run_production_readback))
 
-    def test_only_search_post_is_fetchable(self):
-        self.assertTrue(runner.production_dry_run.fetch_allowed("POST", contract.ACCOUNTS_PATH))
-        self.assertFalse(runner.production_dry_run.fetch_allowed("POST", "/api/v1/backoffice/account/add"))
+    def test_the_guard_requires_a_validated_read_body_and_the_reader_never_clicks(self):
+        source = inspect.getsource(runner.run_production_readback)
+        self.assertIn("RequestGuard(require_read_body=True)", source)
+        self.assertIn("in_app=False", source)  # every read is a reload: zero clicks
+        self.assertNotIn("page.evaluate(production_contract", source)
 
 
 if __name__ == "__main__":
