@@ -383,13 +383,13 @@ class IssueToolTests(unittest.TestCase):
 
     def test_locks_stay_false_and_the_tool_does_not_reference_them(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        dry_run_before = session_readiness.PRODUCTION_DRY_RUN_SUPPORTED
         source = Path(tool.__file__).read_text(encoding="utf-8")
         self.assertNotIn("PRODUCTION_RUNNER_SUPPORTED", source)
         self.assertNotIn("PRODUCTION_DRY_RUN_SUPPORTED", source)
-        self.assertEqual(self.run_tool().code, 0)  # works while locked
+        self.assertEqual(self.run_tool().code, 0)  # works while the create is locked
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, dry_run_before)  # never changed by the tool
 
     def test_eligibility_matches_the_dashboard_rules(self):
         from tools import serve_attended_open_onboardings_dashboard as dashboard

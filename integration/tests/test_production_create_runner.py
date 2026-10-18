@@ -249,7 +249,7 @@ class Base(unittest.TestCase):
 class LockTests(Base):
     def test_constants_are_hard_coded_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run unlocked by owner go 2026-10-18 (docs/53 step 3); the relock commit reverts this
 
     def test_both_locks_false_reaches_nothing(self):
         h = self.harness()
@@ -277,7 +277,8 @@ class LockTests(Base):
         out = runner.run_production_create(CO, REV, owner_go=True, environ=dict(dry.UNLOCK), now=NOW,
                                            records_parent=h.records, approval_path=h.approval_path,
                                            load_source=h.load_source, open_page=h.open_page)
-        self.assertIn("production_locked_production_dry_run_not_supported", out)
+        # dry run unlocked by owner go 2026-10-18 (docs/53 step 3): the create lock alone still refuses, before anything runs
+        self.assertIn("production_locked_production_runner_not_supported", out)
         self.no_external_activity(h)
 
     def test_the_old_dry_run_stubs_still_refuse_to_confirm(self):

@@ -372,15 +372,16 @@ class Harness:
 
 class LockTests(unittest.TestCase):
     def test_flags_are_hard_coded_false_and_separate(self):
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run unlocked by owner go 2026-10-18 (docs/53 step 3); the relock commit reverts this
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         text = Path(session_readiness.__file__).read_text(encoding="utf-8")
-        self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = False$")
+        self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = True  # owner go 2026-10-18")
         self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = False$")
 
     def test_dry_run_target_is_locked_with_its_own_reason(self):
-        with self.assertRaises(ProductionLocked) as caught:
-            production_dry_run_target({**UNLOCK, **approval.unlock_environ(_record())}, NOW)
+        with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", False):  # the locked path, whatever the build
+            with self.assertRaises(ProductionLocked) as caught:
+                production_dry_run_target({**UNLOCK, **approval.unlock_environ(_record())}, NOW)
         self.assertEqual(caught.exception.reason, "production_dry_run_not_supported")
 
     def test_dry_run_flag_never_opens_the_live_target(self):
@@ -394,7 +395,8 @@ class LockTests(unittest.TestCase):
 
     def test_runner_flag_never_opens_the_dry_run(self):
         env = {**UNLOCK, **approval.unlock_environ(_record())}
-        with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True):
+        with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True), \
+                mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", False):
             with self.assertRaises(ProductionLocked) as caught:
                 production_dry_run_target(env, NOW)
         self.assertEqual(caught.exception.reason, "production_dry_run_not_supported")
@@ -450,8 +452,9 @@ class LockTests(unittest.TestCase):
     def test_dry_run_locked_by_default(self):
         harness = Harness(self)
         records = []
-        result = pc.run(_inputs(harness, environ={**UNLOCK, **approval.unlock_environ(_record())}), True,
-                        lambda _i: {"x": "pass"}, lambda _i: None, lambda _i: None, lambda d: records.append(d) or Path("r"))
+        with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", False):  # the locked path, whatever the build
+            result = pc.run(_inputs(harness, environ={**UNLOCK, **approval.unlock_environ(_record())}), True,
+                            lambda _i: {"x": "pass"}, lambda _i: None, lambda _i: None, lambda d: records.append(d) or Path("r"))
         self.assertEqual(result.reason, "production_locked:production_dry_run_not_supported")
 
 
@@ -1223,7 +1226,6 @@ class FlowTests(unittest.TestCase):
 
     def test_live_create_stays_locked(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
         h = Harness(self)
         with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True):
             records = []
