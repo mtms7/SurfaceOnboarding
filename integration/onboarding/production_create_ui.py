@@ -57,7 +57,8 @@ CREATE_OUTCOME_UNKNOWN = "create_outcome_unknown"
 DRY_RUN_PASSED = "dry_run_passed"
 NO_ATTEMPT = "no_attempt"
 _MISMATCH_REASONS = frozenset({"readback_name_mismatch", "readback_domains_mismatch", "readback_account_id_missing",
-                               "readback_account_id_mismatch", "readback_uuid_invalid", "readback_contract_mismatch"})
+                               "readback_account_id_mismatch", "readback_uuid_invalid", "readback_contract_mismatch",
+                               "readback_payload_mismatch"})
 STATUS_TEXT = {
     CREATED_VERIFIED: ("chip-ok", "Created and verified",
                        "The tenant exists and the readback matches the contract. Next: write the Account UUID to Salesforce."),

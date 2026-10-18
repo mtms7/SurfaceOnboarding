@@ -86,13 +86,15 @@ def form_of(fields):
 # --- fake page ------------------------------------------------------------------------------------------------------
 
 class FakeRequest:
-    def __init__(self, method, url):
+    def __init__(self, method, url, post_data=None):
         self.method, self.url = method, url
+        if post_data is not None:  # a request without a body attribute stays possible: the guard must cope with it
+            self.post_data = post_data
 
 
 class FakeRoute:
-    def __init__(self, method, url):
-        self.request = FakeRequest(method, url)
+    def __init__(self, method, url, post_data=None):
+        self.request = FakeRequest(method, url, post_data)
         self.outcome = None
         self.abort_called = False
         self.continue_called = False
@@ -275,8 +277,8 @@ class FakePage:
     def on(self, *_a):
         pass
 
-    def fire(self, method, url):
-        route = FakeRoute(method, url)
+    def fire(self, method, url, post_data=None):
+        route = FakeRoute(method, url, post_data)
         self.routed.append(route)
         for _pattern, handler in reversed(self.routes):  # the last registered handler runs first, like Playwright
             handler(route)
@@ -682,7 +684,23 @@ class AdvancedTests(unittest.TestCase):
         self.assertEqual(report["advanced_controls"]["fullNucleiScanEnabled"], "off")
         self.assertEqual(report["advanced_controls"]["spyCloudEnabled"], "on")
         self.assertEqual(sorted(report["advanced_mismatches"]), ["aiEnabled", "automatedDiscoveryEnabled"])
+        self.assertEqual(pdr.advanced_problem(report), "advanced_mismatch")
+        self.assertIn("advanced_mismatch", pdr.KNOWN_REASONS)
+
+    def test_all_off_has_no_problem_and_info_control_never_gates(self):
+        states = {n: False for n in pdr.ADVANCED_NAMES}
+        states["spyCloudEnabled"] = True  # informational: no Dev target
+        report = pdr.advanced_report(True, states, self.targets)
+        self.assertEqual(report["advanced_mismatches"], [])
         self.assertIsNone(pdr.advanced_problem(report))
+
+    def test_the_three_payload_off_flags_gate_too(self):
+        for name in ("fullNucleiScanEnabled", "authenticatedTestingEnabled", "multipleAttackStacksEnabled"):
+            states = {n: False for n in pdr.ADVANCED_NAMES}
+            states[name] = True
+            report = pdr.advanced_report(True, states, self.targets)
+            self.assertEqual(report["advanced_mismatches"], [name])
+            self.assertEqual(pdr.advanced_problem(report), "advanced_mismatch")
 
     def test_absent_control_is_a_mismatch_and_refuses(self):
         states = {n: False for n in pdr.ADVANCED_NAMES}
@@ -1064,17 +1082,21 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(h.page.clicks[-1], "Cancel")
         self.assertNotIn("Confirm", h.page.clicks)
 
-    def test_advanced_absence_refuses_state_difference_is_only_recorded(self):
+    def test_advanced_absence_and_state_difference_both_refuse(self):
         states = {n: False for n in pdr.ADVANCED_NAMES}
         states.update(aiEnabled=True, webDorkingEnabled=True)
         h = Harness(self, advanced=states)
         out = h.run()
-        self.assertEqual(out["result"], "dry_run_passed")
+        self.assertEqual(out["result"], "advanced_mismatch")
         data, _ = h.record()
+        self.assertEqual(data["outcome"], "refused")
+        self.assertEqual(data["refusal_reason"], "advanced_mismatch")
         self.assertEqual(sorted(data["advanced_mismatches"]), ["aiEnabled", "webDorkingEnabled"])
         self.assertEqual(data["advanced_controls"]["aiEnabled"], "on")
         self.assertNotIn("aiEnabled", h.page.clicks)  # read, never changed
         self.assertTrue(h.page.advanced_state["aiEnabled"])
+        self.assertEqual(h.page.clicks[-1], "Cancel")
+        self.assertNotIn("Confirm", h.page.clicks)
 
         missing = Harness(self, advanced={n: False for n in pdr.ADVANCED_NAMES if n != "fullNucleiScanEnabled"})
         out = missing.run()

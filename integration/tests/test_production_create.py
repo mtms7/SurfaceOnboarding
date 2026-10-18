@@ -284,7 +284,8 @@ class Harness:
         if self._readback is not None:
             return self._readback
         return {"tenant_name": "Grupo Patio", "domains": ["patio.cl"], "account_id": "a" * 24, "account_uuid": UUID,
-                "response_shape": ["id", "uuid", "access_token"], "contract_mismatches": []}
+                "response_shape": ["id", "uuid", "access_token"], "contract_mismatches": [],
+                "payload_mismatches": []}
 
     def source_check(self, inputs):
         self.counts["src"] = self.counts.get("src", 0) + 1
@@ -720,10 +721,39 @@ class TestLiveCreate(Base):
 
     def test_domain_compare_is_case_and_order_insensitive(self):
         rb = {"tenant_name": "Grupo Patio", "domains": ["B.COM", " a.com "], "account_id": "a" * 24,
-              "account_uuid": UUID.upper(), "contract_mismatches": []}
+              "account_uuid": UUID.upper(), "contract_mismatches": [], "payload_mismatches": []}
         h = self.harness(readback=rb)
         inputs = h.inputs(expected_domains=("A.com", "b.com"))
         self.assertEqual(h.run(inputs, dry_run=False, owner_go=True).outcome, "readback_verified")
+
+
+class TestCreatePayloadVerdict(Base):
+    GOOD = {"tenant_name": "Grupo Patio", "domains": ["patio.cl"], "account_id": "a" * 24, "account_uuid": UUID,
+            "contract_mismatches": []}
+
+    def test_a_payload_mismatch_is_created_unverified_with_names_only(self):
+        rb = {**self.GOOD, "payload_mismatches": ["scanNow", "unexpected:brandNewFlag"]}
+        result = self.harness(readback=rb).run(dry_run=False, owner_go=True)
+        self.assertEqual((result.outcome, result.reason), ("created_unverified", "readback_payload_mismatch"))
+        record = pcr.load(result.record_path)
+        self.assertEqual(record["payload_mismatches"], ["scanNow", "unexpected:brandNewFlag"])
+
+    def test_a_readback_never_compared_to_the_create_body_cannot_verify(self):
+        for rb in (dict(self.GOOD), {**self.GOOD, "payload_mismatches": None}, {**self.GOOD, "payload_mismatches": [1]}):
+            self.setUp()
+            result = self.harness(readback=rb).run(dry_run=False, owner_go=True)
+            self.assertEqual((result.outcome, result.reason), ("created_unverified", "readback_payload_unchecked"))
+
+    def test_both_lists_are_recorded_when_the_row_and_the_body_differ(self):
+        rb = {**self.GOOD, "contract_mismatches": ["mfaRequired"], "payload_mismatches": ["scanNow"]}
+        result = self.harness(readback=rb).run(dry_run=False, owner_go=True)
+        self.assertEqual(result.reason, "readback_contract_mismatch")
+        record = pcr.load(result.record_path)
+        self.assertEqual((record["readback_mismatches"], record["payload_mismatches"]), (["mfaRequired"], ["scanNow"]))
+
+    def test_an_empty_payload_list_verifies(self):
+        rb = {**self.GOOD, "payload_mismatches": []}
+        self.assertEqual(self.harness(readback=rb).run(dry_run=False, owner_go=True).outcome, "readback_verified")
 
 
 class TestWritebackStep(Base):

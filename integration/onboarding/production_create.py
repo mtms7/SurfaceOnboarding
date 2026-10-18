@@ -272,6 +272,12 @@ def _compare_readback(inputs: CreateInputs, found: Any) -> str | None:
         return "readback_contract_unchecked"
     if mismatches:
         return "readback_contract_mismatch"
+    # The one allowed create POST body, compared to docs/49 s.1 (field NAMES only). Never compared = never verified.
+    payload = found.get("payload_mismatches")
+    if not isinstance(payload, (list, tuple)) or not all(isinstance(m, str) for m in payload):
+        return "readback_payload_unchecked"
+    if payload:
+        return "readback_payload_mismatch"
     return None
 
 
@@ -288,6 +294,8 @@ def _readback_record(inputs: CreateInputs, outcome: str, reason: str, found: Any
             data["response_shape"] = list(found["response_shape"])
         if isinstance(found.get("contract_mismatches"), (list, tuple)):
             data["readback_mismatches"] = [m for m in found["contract_mismatches"] if isinstance(m, str)]
+        if isinstance(found.get("payload_mismatches"), (list, tuple)):
+            data["payload_mismatches"] = [m for m in found["payload_mismatches"] if isinstance(m, str)]
     return data
 
 

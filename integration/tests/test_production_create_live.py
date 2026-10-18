@@ -3,6 +3,7 @@ confirm click, the live duplicate verdict and the bounded readback. Fakes only: 
 
 from __future__ import annotations
 
+import json
 import re
 import unittest
 from pathlib import Path
@@ -412,3 +413,91 @@ class SourceHygieneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CreatePayloadCaptureTests(unittest.TestCase):
+    """The one allowed create POST body is kept redacted (no name, domain, email) and compared to docs/49 section 1."""
+
+    def setUp(self):
+        from integration.tests import test_production_contract as fx
+        self.fx = fx
+        self.expected = contract.expected_create_payload(fx.intended())
+
+    def body(self, **changes):
+        flat = self.fx.create_flat()
+        for key, value in changes.items():
+            if value is KeyError:
+                flat.pop(key.replace("__", "."), None)
+            else:
+                flat[key.replace("__", ".")] = value
+        return json.dumps(self.fx.unflatten(flat))
+
+    def capture(self, raw, expected="default"):
+        guard = live.LiveRequestGuard()
+        guard.expected_payload = self.expected if expected == "default" else expected
+        guard.arm()
+        route = Route("POST", CREATE_URL)
+        route.request.post_data = raw
+        guard.handle(route)
+        self.assertEqual(route.outcome, "continued")
+        return guard
+
+    def test_a_matching_body_has_no_mismatch_and_the_kept_form_holds_no_identifying_value(self):
+        guard = self.capture(self.body())
+        self.assertEqual(guard.payload_mismatches(), [])
+        kept = json.dumps(guard.create_body, sort_keys=True, default=str)
+        for secret in (self.fx.NAME, self.fx.DOMAIN, "test.user+acme@" + self.fx.INTERNAL, '"Test"', '"User"'):
+            self.assertNotIn(secret, kept)
+
+    def test_deviations_are_reported_by_field_name_only(self):
+        for key, value, name in (("scanNow", True, "scanNow"), ("license__assetsNumber", 1, "license.assetsNumber"),
+                                 ("license__subDomainsNumber", "1", "license.subDomainsNumber"),
+                                 ("mfaRequired", False, "mfaRequired"), ("additionalNetworks", [], "additionalNetworks"),
+                                 ("campaignsTimeoutInHours", 48, "campaignsTimeoutInHours"),
+                                 ("leakedCredentialsSettings__spyCloudSettings__enabled", False,
+                                  "leakedCredentialsSettings.spyCloudSettings.enabled"),
+                                 ("scanningInterval", "DAILY", "scanningInterval"),
+                                 ("accountName", "Someone Else - CE Only", "accountName"),
+                                 ("accountDomain", "other.example", "accountDomain"),
+                                 ("userEmailDomains", ["customer.example"], "userEmailDomains"),
+                                 ("accountCountryCode", "US", "accountCountryCode"),
+                                 ("license__startDate", "not a date", "license.startDate"),
+                                 ("firstName", "", "firstName"),
+                                 ("license__reconLevel", "ALL_ASSETS", "license.reconLevel")):
+            guard = self.capture(self.body(**{key: value}))
+            self.assertEqual(guard.payload_mismatches(), [name], key)
+            self.assertNotIn("Someone Else", json.dumps(guard.create_body, default=str))
+            self.assertNotIn("other.example", json.dumps(guard.create_body, default=str))
+
+    def test_missing_and_extra_fields_are_named(self):
+        self.assertEqual(self.capture(self.body(license__enabled=KeyError)).payload_mismatches(), ["license.enabled"])
+        self.assertEqual(self.capture(self.body(brandNewFlag="secret-value")).payload_mismatches(), ["unexpected:brandNewFlag"])
+        self.assertNotIn("secret-value", json.dumps(self.capture(self.body(brandNewFlag="secret-value")).create_body, default=str))
+
+    def test_unreadable_missing_or_unexpected_bodies_never_match(self):
+        for raw in (None, "", "not json", "[1, 2]", "x" * 300_000, b"\xff\xfe"):
+            guard = self.capture(raw)
+            self.assertEqual(guard.payload_mismatches(), ["body_unreadable"], raw if not isinstance(raw, str) else raw[:10])
+        self.assertEqual(self.capture(self.body(), expected=None).payload_mismatches(), ["payload_expectation_unavailable"])
+        self.assertEqual(live.LiveRequestGuard().payload_mismatches(), ["payload_expectation_unavailable"])
+        guard = live.LiveRequestGuard()
+        guard.expected_payload = self.expected
+        self.assertEqual(guard.payload_mismatches(), ["body_unreadable"])  # nothing captured yet
+
+    def test_a_request_object_without_post_data_does_not_break_the_one_create(self):
+        guard = live.LiveRequestGuard()
+        guard.expected_payload = self.expected
+        guard.arm()
+        route = Route("POST", CREATE_URL)
+        guard.handle(route)
+        self.assertEqual((route.outcome, guard.create_requests()), ("continued", 1))
+        self.assertEqual(guard.payload_mismatches(), ["body_unreadable"])
+
+    def test_only_the_first_allowed_post_is_captured(self):
+        guard = self.capture(self.body())
+        second = Route("POST", CREATE_URL)
+        second.request.post_data = self.body(scanNow=True)
+        guard.arm()
+        guard.handle(second)
+        self.assertEqual(second.outcome, "aborted")
+        self.assertEqual(guard.payload_mismatches(), [])

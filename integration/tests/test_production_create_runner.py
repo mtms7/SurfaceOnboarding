@@ -52,9 +52,32 @@ def good_clone(source, now):
 
 def good_row(**over):
     strict = {"accountLicense.startDate": "2026-10-16T09:00:00.000Z", "accountLicense.expirationDate": "2027-05-20T07:00:00.000Z",
-              "mfaRequired": True, "organizationEmail": ORG_EMAIL}
+              "primaryUser.isMfaRequired": True, "organizationEmail": ORG_EMAIL,
+              "campaignExecutionSettings.domainsMultiAttackStackSettings.enabled": False}
     strict.update(over)
     return contract_row(accountName=NAME, accountDomain=DOMAIN, **strict)
+
+
+def good_create_body(**changes):
+    """The docs/49 s.1 body for the runner's intended values (shape fields get a sample), as the page would send it."""
+    expected = contract.expected_create_payload({**runner.ce_production_intended(SOURCE, DAY), "country_code": "CL"})
+    samples = {"non_empty_text": "x", "iso2": "CL", "iso_utc": "2026-10-16T12:00:00.000Z", "number": 5}
+    flat = {}
+    for key, want in expected.items():
+        if isinstance(want, contract._Shape):
+            name = want.name
+            want = f"{name[len('iso_utc_on_'):]}T07:00:00.000Z" if name.startswith("iso_utc_on_") else samples[name]
+        flat[key] = want
+    for key, value in changes.items():
+        flat[key.replace("__", ".")] = value
+    body = {}
+    for key, value in flat.items():
+        node = body
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+    return json.dumps(body)
 
 
 class ConfirmBtn:
@@ -88,7 +111,7 @@ class ConfirmBtn:
         assert "force" not in kw, "a forced click must never be made"
         self.page.confirm_clicks += 1
         for _ in range(self.page.posts):
-            outcome = self.page.fire("POST", ORIGIN + live.CREATE_PATH)
+            outcome = self.page.fire("POST", ORIGIN + live.CREATE_PATH, self.page.create_body())
             if outcome == "continued" and self.page.create_status is not None:
                 for handler in self.page.response_handlers:
                     handler(SimpleNamespace(request=SimpleNamespace(method="POST"), url=ORIGIN + live.CREATE_PATH,
@@ -115,8 +138,9 @@ class Flip(dict):
 
 
 class LivePage(dry.FakePage):
-    def __init__(self, *, create_status=200, readbacks=None, confirm_enabled=True, posts=1, hit=True, **kw):
+    def __init__(self, *, create_status=200, readbacks=None, confirm_enabled=True, posts=1, hit=True, body="good", **kw):
         super().__init__(**kw)
+        self.body = body
         self.create_status, self.confirm_enabled, self.posts, self.hit = create_status, confirm_enabled, posts, hit
         self.confirm_clicks = 0
         self.scrolled = self.hit_calls = 0
@@ -134,6 +158,9 @@ class LivePage(dry.FakePage):
         self.readback_calls = 0
         self.response_handlers = []
         self.popup_handlers = []
+
+    def create_body(self):
+        return good_create_body() if self.body == "good" else self.body
 
     def _context_on(self, event, handler):
         self.on("popup" if event == "page" else event, handler)
@@ -477,6 +504,54 @@ class CreateTests(Base):
                 self.assertNotIn(fragment, text)
 
 
+class AdvancedMismatchTests(Base):
+    def test_an_advanced_control_not_off_refuses_before_the_consume_and_the_click(self):
+        states = {n: False for n in dry.pdr.ADVANCED_NAMES}
+        states["fullNucleiScanEnabled"] = True
+        h = self.harness(advanced=states)
+        self.assertEqual(h.go()["result"], "advanced_mismatch")
+        self.assertEqual((h.page.confirm_clicks, h.page.form_open), (0, False))
+        self.assertIsNone(h.approval_unused())
+        self.assertNotIn("attempt_started", h.outcomes())
+        record = [r for r in h.loaded_records() if r["outcome"] == "refused"][0]
+        self.assertEqual(record["refusal_reason"], "advanced_mismatch")
+        self.assertEqual(record["advanced_mismatches"], ["fullNucleiScanEnabled"])
+
+
+class CreateBodyTests(Base):
+    def verdict(self, **kw):
+        h = self.harness(**kw)
+        return h, h.go()["result"]
+
+    def test_a_body_that_matches_the_contract_verifies(self):
+        h, result = self.verdict()
+        self.assertEqual(result, "created_verified")
+        record = [r for r in h.loaded_records() if r["outcome"] == "readback_verified"][0]
+        self.assertEqual(record.get("payload_mismatches"), [])
+
+    def test_a_deviating_body_is_created_mismatch_with_names_only_and_never_a_pre_send_abort(self):
+        body = good_create_body(scanNow=True, license__assetsNumber=1, brandNewFlag="customer-secret-value",
+                                accountDomain="other-customer.example")
+        h, result = self.verdict(body=body)
+        self.assertEqual(result, "created_mismatch")
+        self.assertEqual(h.page.confirm_clicks, 1)  # the create was sent: no pre-send abort
+        record = [r for r in h.loaded_records() if r["outcome"] == "created_unverified"][0]
+        self.assertEqual(record["refusal_reason"], "readback_payload_mismatch")
+        self.assertEqual(sorted(record["payload_mismatches"]),
+                         ["accountDomain", "license.assetsNumber", "scanNow", "unexpected:brandNewFlag"])
+        text = "".join(Path(p).read_text(encoding="utf-8") for p in pcr.list_records(h.records, CO))
+        for leaked in ("customer-secret-value", "other-customer.example", ORG_EMAIL):  # tenant name/domain are recorded by the readback anyway
+            self.assertNotIn(leaked, text)
+        self.assertNotIn("readback_verified", h.outcomes())
+
+    def test_a_missing_or_unreadable_body_never_verifies(self):
+        for body in (None, "not json"):
+            h, result = self.verdict(body=body)
+            self.assertEqual(result, "created_mismatch", body)
+            record = [r for r in h.loaded_records() if r["outcome"] == "created_unverified"][0]
+            self.assertEqual(record["payload_mismatches"], ["body_unreadable"])
+
+
 class SearchControlTests(Base):
     """The generic search filter is unproven for domains: a control tenant from the clone must come back first."""
 
@@ -583,7 +658,7 @@ class LaunchTicketTests(Base):
 class StrictReadbackTests(Base):
     def test_license_dates_mfa_and_organization_email_are_compared_by_name_only(self):
         bad = good_row(**{"accountLicense.expirationDate": "2027-06-01T07:00:00.000Z",
-                          "accountLicense.startDate": "2026-12-01T09:00:00.000Z", "mfaRequired": False,
+                          "accountLicense.startDate": "2026-12-01T09:00:00.000Z", "primaryUser.isMfaRequired": False,
                           "organizationEmail": "someone.else@pentera.io"})
         h = self.harness(readbacks=[reply([bad])])
         self.assertEqual(h.go()["result"], "created_mismatch")
@@ -596,7 +671,7 @@ class StrictReadbackTests(Base):
 
     def test_missing_paths_are_mismatches_not_silently_ignored(self):
         row_ = good_row()
-        for key in ("mfaRequired", "organizationEmail", "accountLicense.startDate", "accountLicense.expirationDate"):
+        for key in ("primaryUser.isMfaRequired", "organizationEmail", "accountLicense.startDate", "accountLicense.expirationDate"):
             del row_[key]
         h = self.harness(readbacks=[reply([row_])])
         self.assertEqual(h.go()["result"], "created_mismatch")

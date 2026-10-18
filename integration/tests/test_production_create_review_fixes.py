@@ -322,18 +322,47 @@ class StrictContractTests(unittest.TestCase):
 
     def row(self, **over):
         base = tl.contract_row(**{"accountLicense.startDate": "2026-10-16T09:00:00.000Z",
-                                  "accountLicense.expirationDate": "2027-05-20T07:00:00.000Z", "mfaRequired": True,
-                                  "organizationEmail": "m+x@pentera.io"})
+                                  "accountLicense.expirationDate": "2027-05-20T07:00:00.000Z", "primaryUser.isMfaRequired": True,
+                                  "organizationEmail": "m+x@pentera.io",
+                                  "campaignExecutionSettings.domainsMultiAttackStackSettings.enabled": False})
         base.update(over)
         return base
 
     def test_exact_row_passes_and_each_deviation_is_named(self):
         expected = contract.expected_readback_row(self.INTENDED, strict=True)
         self.assertEqual(contract.compare_readback(expected, self.row())[0], [])
-        for key, bad, name in (("mfaRequired", False, "mfaRequired"), ("organizationEmail", "x@pentera.io", "organizationEmail"),
+        for key, bad, name in (("primaryUser.isMfaRequired", False, "mfaRequired"), ("organizationEmail", "x@pentera.io", "organizationEmail"),
                                ("accountLicense.expirationDate", "2027-05-21T07:00:00.000Z", "licenseExpirationDate"),
                                ("accountLicense.startDate", "2026-10-20T09:00:00.000Z", "licenseStartDate")):
             self.assertEqual(contract.compare_readback(expected, self.row(**{key: bad}))[0], [name], key)
+
+    def test_mfa_is_read_from_the_dev_verified_row_path_only(self):
+        expected = contract.expected_readback_row(self.INTENDED, strict=True)
+        base = self.row()
+        for stale in ("primaryUser.isMfaRequired", "mfaRequired", "accountSettings.mfaRequired", "accountLicense.mfaRequired"):
+            base.pop(stale, None)
+        self.assertEqual(contract.compare_readback(expected, {**base, "primaryUser.isMfaRequired": True})[0], [])
+        nested = {**base, "primaryUser": {"isMfaRequired": True}}
+        self.assertEqual(contract.compare_readback(expected, nested)[0], [])
+        self.assertEqual(contract.compare_readback(expected, {**base, "primaryUser.isMfaRequired": False})[0], ["mfaRequired"])
+        self.assertEqual(contract.compare_readback(expected, {**base, "primaryUser.isMfaRequired": "true"})[0], ["mfaRequired"])
+        self.assertEqual(contract.compare_readback(expected, base)[0], ["mfaRequired"])  # absent fails closed
+        # a path the Dev probe never verified must not be able to satisfy the check
+        self.assertEqual(contract.compare_readback(expected, {**base, "mfaRequired": True})[0], ["mfaRequired"])
+        self.assertIn("primaryUser.isMfaRequired", contract.READBACK_PICK_PATHS)
+
+    def test_multiple_attack_stacks_is_read_back_off_at_its_dev_verified_path(self):
+        path = "campaignExecutionSettings.domainsMultiAttackStackSettings.enabled"
+        expected = contract.expected_readback_row(self.INTENDED, strict=True)
+        self.assertEqual(contract.compare_readback(expected, self.row())[0], [])
+        self.assertEqual(contract.compare_readback(expected, self.row(**{path: True}))[0], ["multipleAttackStacksEnabled"])
+        base = self.row()
+        del base[path]
+        self.assertEqual(contract.compare_readback(expected, base)[0], ["multipleAttackStacksEnabled"])
+        self.assertNotIn("multipleAttackStacksEnabled", contract.expected_readback_row(self.INTENDED))
+        # the two top-level flags are nullable and not in the create body: no readback check without a verified default
+        for name in ("fullNucleiScanEnabled", "authenticatedTestingEnabled"):
+            self.assertNotIn(name, expected)
 
     def test_start_day_tolerates_one_day_and_non_strict_is_unchanged(self):
         expected = contract.expected_readback_row(self.INTENDED, strict=True)

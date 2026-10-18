@@ -15,6 +15,7 @@ Secrets and values: the readback keeps only the compared fields of ONE row; no t
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -44,6 +45,7 @@ LIVE_REASONS = frozenset({
     "dry_run_old", "salesforce_org_not_pinned", "country_code_unavailable", "salesforce_alias_not_pinned", "intended_unavailable", "production_dry_run_form_not_reached", "search_unproven", "search_control_unavailable",
     "confirm_preflight_failed", "extra_pages_open", "launch_ticket_invalid", "source_recheck_unavailable",
     "approval_revision_drift", "salesforce_prior_uuid_present", "live_source_check_missing", "service_worker_present", "service_worker_check_failed",
+    "readback_payload_mismatch", "readback_payload_unchecked",
 })
 
 
@@ -52,6 +54,81 @@ def live_known_reason(code: object) -> str:
     if isinstance(code, str) and code in LIVE_REASONS:
         return code
     return production_dry_run.known_reason(code)
+
+
+# --- The one create body, kept redacted -----------------------------------------------------------------------------------
+
+MAX_BODY_CHARS = 200_000
+MAX_KEPT_TEXT = 40
+# String fields whose value is a setting, never a name, domain, address or token: kept as sent so a deviation is visible.
+NON_IDENTIFYING_TEXT = frozenset({
+    "accountType", "accountCountryCode", "scanningInterval", "leakedCredentialsScanningInterval", "license.licenseType",
+    "license.assetsNumber", "license.domainsNumber", "license.startDate", "license.expirationDate"})
+
+
+class _Redacted:
+    """A value that was not kept (only its type name): never equal to anything the contract expects."""
+
+    __slots__ = ("kind",)
+
+    def __init__(self, kind: str) -> None:
+        self.kind = kind
+
+    def __repr__(self) -> str:
+        return f"<{self.kind}>"
+
+
+def _text_ok(want: Any, value: str) -> bool:
+    if isinstance(want, production_contract._Shape):
+        return want.matches(value)
+    return isinstance(want, str) and value == want
+
+
+def _identifying(name: str, value: Any, want: Any) -> tuple[bool, Any]:
+    """(matched, kept) for a string or list-of-strings field outside NON_IDENTIFYING_TEXT. A match keeps NOTHING."""
+    if isinstance(value, str):
+        return _text_ok(want, value), _Redacted("str")
+    if isinstance(want, list) and len(want) == len(value) and all(isinstance(v, str) for v in value):
+        return all(_text_ok(w, v) for w, v in zip(want, value)), _Redacted("list")
+    return False, _Redacted("list")
+
+
+def redact_create_body(raw: Any, expected: Mapping[str, Any]) -> tuple[dict[str, Any], frozenset[str]] | None:
+    """``(kept, matched)`` of the create body, or None when it is unreadable. ``kept`` is a flat {dotted name: value}.
+
+    Booleans, numbers, null, empty lists and the NON_IDENTIFYING_TEXT settings are kept as sent. An identifying string
+    (name, domain, email, person name) is never kept: when it equals what the runner expected its field NAME goes to
+    ``matched`` (and is left out of ``kept``); a deviating one is kept as its type only.
+    """
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = bytes(raw).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(raw, str) or not raw.strip() or len(raw) > MAX_BODY_CHARS:
+        return None
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(body, dict):
+        return None
+    kept: dict[str, Any] = {}
+    matched: set[str] = set()
+    for name, value in production_contract._flatten(body).items():
+        if value is None or isinstance(value, (bool, int, float)) or (isinstance(value, list) and not value):
+            kept[name] = value
+        elif name in NON_IDENTIFYING_TEXT and isinstance(value, str) and len(value) <= MAX_KEPT_TEXT:
+            kept[name] = value
+        elif isinstance(value, (str, list)) and all(isinstance(v, str) for v in ([value] if isinstance(value, str) else value)):
+            ok, stand_in = _identifying(name, value, expected.get(name))
+            if ok:
+                matched.add(name)
+            else:
+                kept[name] = stand_in
+        else:
+            kept[name] = _Redacted(type(value).__name__)
+    return kept, frozenset(matched)
 
 
 # --- Request guard: reads plus exactly one armed create POST -------------------------------------------------------
@@ -82,6 +159,9 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         self.create_used = False
         self.create_blocked = 0
         self.popups = 0
+        self.expected_payload: Mapping[str, Any] | None = None  # docs/49 s.1, set before the click
+        self.create_body: dict[str, Any] | None = None          # the ONE allowed body, redacted (never persisted raw)
+        self.create_matched: frozenset[str] = frozenset()       # identifying fields that equalled the expectation
 
     def install(self, page: Any) -> None:
         """Route at CONTEXT level (``page.route`` does not cover popups or new pages) and count every popup / new page.
@@ -125,7 +205,21 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         self.create_used, self.armed = True, False
         entry = self.api_calls.setdefault((method, where), {"count": 0, "statuses": set()})
         entry["count"] += 1
+        try:  # capture must never stop the one allowed create: any failure leaves the body unreadable (a mismatch later)
+            kept = redact_create_body(getattr(route.request, "post_data", None), self.expected_payload or {})
+            self.create_body, self.create_matched = kept if kept is not None else (None, frozenset())
+        except Exception:
+            self.create_body, self.create_matched = None, frozenset()
         route.continue_()
+
+    def payload_mismatches(self) -> list[str]:
+        """Field NAMES where the captured create body differs from ``expected_payload`` (docs/49 s.1); never values."""
+        if not isinstance(self.expected_payload, Mapping):
+            return ["payload_expectation_unavailable"]
+        if self.create_body is None:
+            return ["body_unreadable"]
+        pending = {name: want for name, want in self.expected_payload.items() if name not in self.create_matched}
+        return production_contract.compare_payload(pending, self.create_body)
 
     def create_statuses(self) -> list[int]:
         entry = self.api_calls.get(("POST", CREATE_PATH))

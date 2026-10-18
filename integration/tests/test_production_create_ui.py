@@ -203,6 +203,8 @@ class GateTests(Base):
     def test_status_mapping(self):
         self.assertEqual(ui.ui_status("readback_verified"), ui.CREATED_VERIFIED)
         self.assertEqual(ui.ui_status("created_unverified", "readback_contract_mismatch"), ui.CREATED_MISMATCH)
+        self.assertEqual(ui.ui_status("created_unverified", "readback_payload_mismatch"), ui.CREATED_MISMATCH)
+        self.assertEqual(ui.ui_status("created_unverified", "readback_payload_unchecked"), ui.CREATE_OUTCOME_UNKNOWN)
         self.assertEqual(ui.ui_status("created_unverified", "readback_name_mismatch"), ui.CREATED_MISMATCH)
         self.assertEqual(ui.ui_status("created_unverified", "readback_unavailable"), ui.CREATE_OUTCOME_UNKNOWN)
         self.assertEqual(ui.ui_status("uncertain_submit"), ui.CREATE_OUTCOME_UNKNOWN)

@@ -135,7 +135,7 @@ KNOWN_REASONS = frozenset({
     "multiple_live_paid_tenants", "timing_window_not_met", "sessions_not_ready", "schema_unexpected",
     "dry_run_flag_invalid", "form_fill_failed", "form_verification_failed", "clock_unavailable", "record_write_failed",
     "unexpected_schema", "create_form_unavailable", "fill_form_schema_unavailable", "fill_value_mismatch",
-    "fill_value_invalid", "advanced_control_absent", "advanced_section_not_found", "production_session_expired",
+    "fill_value_invalid", "advanced_control_absent", "advanced_section_not_found", "advanced_mismatch", "production_session_expired",
     "production_session_not_ready", "duplicate_ambiguous", "duplicate_check_unavailable", "demo_domain_conflict",
     "write_request_blocked", "form_left_open", "service_worker_present", "service_worker_check_failed",
     "toggle_click_failed", "approval_expired_during_run", "clone_stale_during_run", "production_locked_during_run",
@@ -497,11 +497,18 @@ def advanced_report(section_found: bool, states: Mapping[str, Any], targets: Map
 
 
 def advanced_problem(report: Mapping[str, Any]) -> str | None:
-    """Refuse when Dev sets a control that production does not have (the create could not set it)."""
+    """Refuse when Dev sets a control that production does not have, or one that is not in its Dev target state.
+
+    The create never clicks an advanced control, so a control that is already on (or off where Dev wants it on) would be
+    submitted as found: ``advanced_mismatch`` refuses before any Confirm. The record keeps the control NAMES only.
+    """
     controls = report.get("advanced_controls") or {}
     if any(controls.get(name) == "absent" for name in ADVANCED_NAMES):
         return "advanced_section_not_found" if report.get("advanced_section") == "not_found" else "advanced_control_absent"
-    return None
+    mismatches = report.get("advanced_mismatches")
+    if not isinstance(mismatches, (list, tuple)):
+        return "advanced_mismatch"  # a report without the comparison is never a clearance
+    return "advanced_mismatch" if mismatches else None
 
 
 # --- Session, duplicate and demo-domain verdicts --------------------------------------------------------------------

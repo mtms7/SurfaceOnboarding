@@ -10176,6 +10176,10 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                         {**contract_intended, "country_code": code}, strict=True)
                 except ValueError:
                     raise production_create.FormRefusal("country_code_unavailable", fields) from None
+                try:  # docs/49 s.1: what the one create POST body must contain (the guard compares it after the click)
+                    guard.expected_payload = production_contract.expected_create_payload({**contract_intended, "country_code": code})
+                except ValueError:
+                    guard.expected_payload = None  # payload_expectation_unavailable: never verifies, nothing pre-send aborted
                 return fields
 
             def duplicate_check(_inputs: Any) -> str | None:
@@ -10198,6 +10202,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                                          [production_contract.ACCOUNTS_PATH, readback_body,
                                           list(production_contract.READBACK_PICK_PATHS)])
                 found = live.poll_readback(fetch, contract_intended, strict_state["expected"], page.wait_for_timeout)
+                if isinstance(found, dict):  # names only; a non-empty list makes the result created_mismatch, never verified
+                    found["payload_mismatches"] = guard.payload_mismatches()
                 # A popup, new page or service worker that appeared AFTER the click (even after the poll window) means the
                 # outcome cannot be trusted: returning None records ``created_unverified`` / ``readback_unavailable``, which the
                 # dashboard shows and treats as create_outcome_unknown (CO blocked, no VERIFIED record).

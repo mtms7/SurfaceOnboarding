@@ -32,7 +32,7 @@ EDITABLE_CANDIDATES = ("account_id", "account_uuid", "domains", "plan_summary", 
 
 _SCALAR_FIELDS = ("route", "approval_ref", "refusal_reason", "tenant_name", "account_id", "account_uuid",
                   "plan_summary", "salesforce_revision", "search_control", "operator")
-_LIST_FIELDS = ("domains", "response_shape", "readback_mismatches")
+_LIST_FIELDS = ("domains", "response_shape", "readback_mismatches", "payload_mismatches")
 ADVANCED_SECTION_VALUES = ("found", "not_found")
 ADVANCED_CONTROL_STATES = ("on", "off", "absent")
 _ALLOWED = frozenset({"co_reference", "outcome", "recorded_at", "redactions", "form_fields_checked",
@@ -49,6 +49,7 @@ _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
 # looks like a JWT or a long opaque blob is still redacted.
 _REASON_RE = re.compile(r"[a-z][a-z0-9_]{2,80}")
 _NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+_PAYLOAD_NAME_RE = re.compile(r"(?:unexpected:)?[A-Za-z0-9_.-]{1,80}")  # a create-body field name, ``unexpected:`` prefix allowed
 
 
 class ProductionCreateRecordError(Exception):
@@ -83,6 +84,17 @@ def _clean_name(value: Any, counter: list[int]) -> str | None:
     return REDACTED
 
 
+def _clean_payload_name(value: Any, counter: list[int]) -> str | None:
+    """A create-body field name from the payload comparison (strict shape; optional ``unexpected:`` prefix)."""
+    if isinstance(value, bool) or not isinstance(value, str):
+        return None
+    text = value.strip()
+    if _PAYLOAD_NAME_RE.fullmatch(text) and not (_JWT_RE.search(text) or _BLOB_RE.search(text)):
+        return text
+    counter[0] += 1
+    return REDACTED
+
+
 def _clean_reason(value: Any, counter: list[int]) -> str | None:
     """A refusal reason code: ``^[a-z][a-z0-9_]{2,80}$`` or ``[redacted]``. None when not a string."""
     if isinstance(value, bool) or not isinstance(value, str):
@@ -110,7 +122,8 @@ def _sanitize(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
     for name in _LIST_FIELDS:
         value = data.get(name)
         if isinstance(value, (list, tuple)):
-            clean_item = _clean_name if name in ("response_shape", "readback_mismatches") else _clean_free
+            clean_item = (_clean_payload_name if name == "payload_mismatches"
+                          else _clean_name if name in ("response_shape", "readback_mismatches") else _clean_free)
             items = [clean_item(v, counter) for v in list(value)[:MAX_LIST_ITEMS]]
             out[name] = [i for i in items if i is not None]
     checked = data.get("form_fields_checked")

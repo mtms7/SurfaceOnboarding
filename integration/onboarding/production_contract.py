@@ -198,8 +198,10 @@ ROW_FLAG_PATHS: dict[str, tuple[str, ...]] = {
 STRICT_ROW_PATHS: dict[str, tuple[str, ...]] = {
     "licenseStartDate": ("accountLicense.startDate", "startDate", "accountLicense.licenseStartDate"),
     "licenseExpirationDate": ("accountLicense.expirationDate", "expirationDate", "accountLicense.licenseExpirationDate"),
-    "mfaRequired": ("mfaRequired", "accountSettings.mfaRequired", "accountLicense.mfaRequired"),
+    "mfaRequired": ("primaryUser.isMfaRequired",),  # the one path the Dev schema probe verified (leonardo_inventory.py)
     "organizationEmail": ("organizationEmail", "primaryUser.email"),
+    # Dev-verified path (VALIDATION_TOGGLE_PATHS); the create body sets it False, so the row carries a boolean.
+    "multipleAttackStacksEnabled": ("campaignExecutionSettings.domainsMultiAttackStackSettings.enabled",),
 }
 ROW_PATHS: dict[str, tuple[str, ...]] = {
     "reconLevel": ("reconLevel", "accountLicense.reconLevel"),
@@ -262,11 +264,11 @@ def _day_shape(days: tuple[str, ...], name: str) -> _Shape:
 
 
 def strict_row_expectations(intended: Mapping[str, Any]) -> dict[str, Any]:
-    """The extra readback checks of the live create: license start and expiration day, MFA on, the organization email."""
+    """The extra readback checks of the live create: license start and expiration day, MFA on, the organization email, MAS off."""
     code = intended.get("country_code")
     if not isinstance(code, str) or _ISO2.fullmatch(code) is None:  # the exact filled form value, never just an ISO2 shape
         raise ValueError("intended_country_code_invalid")
-    expected: dict[str, Any] = {"mfaRequired": True, "accountCountryCode": code}
+    expected: dict[str, Any] = {"mfaRequired": True, "accountCountryCode": code, "multipleAttackStacksEnabled": False}
     end = _day(intended.get("license_end"))
     expected["licenseExpirationDate"] = _day_shape((end,), "expiration_day_" + end)
     start = intended.get("license_start")

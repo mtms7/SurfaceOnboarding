@@ -95,6 +95,13 @@ class TestAllowlistAndShape(Base):
         shape = pcr.load(path)["response_shape"]
         self.assertEqual(shape, ["id"])
 
+    def test_payload_mismatches_are_field_names_only(self):
+        names = ["scanNow", "license.assetsNumber", "unexpected:brandNewFlag", "has a space", "unexpected:" + "A" * 60 + ".b",
+                 {"nested": "value"}, 5]
+        path = self.write(good(payload_mismatches=names))
+        self.assertEqual(pcr.load(path)["payload_mismatches"],
+                         ["scanNow", "license.assetsNumber", "unexpected:brandNewFlag", pcr.REDACTED, pcr.REDACTED])
+
     def test_account_uuid_and_ids_not_redacted(self):
         path = self.write(good(account_id="0123456789abcdef01234567"))
         rec = pcr.load(path)
