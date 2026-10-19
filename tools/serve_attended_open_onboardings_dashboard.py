@@ -6886,6 +6886,12 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     sheet = _sheet_result(row, match=match, ce_route=ce_route, start_iso=_prod_view_start(reference), country=country, clone=clone)
     guide = production_views.production_co_guide(sheet, clone=clone, recorded_duplicates=_recorded_duplicates(reference))
     guide["closing"] = _prod_view_closing(_production_page_state(reference, row))
+    try:
+        own = create_ui.own_onboarding(production_records_parent(), reference, row)
+    except Exception:  # noqa: BLE001 - the normal verdict stays
+        own = None
+    if own:  # this dashboard onboarded the CO: never "Blocked: a tenant exists" for its own create
+        guide.update({"verdict": "onboarded", "headline": own, "rows": [], "after": [], "leave": ""})
     main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
                  + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)

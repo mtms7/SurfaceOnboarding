@@ -27,7 +27,14 @@ _ISO = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9]{2}:[0-9]{2}(?::[0-9]{
 _UUID_LIKE = re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-")
 _CO = re.compile(r"CO-[0-9]{4,10}")
 _STATES = frozenset({"scan_completed", "unconfirmed", "row_not_found", "row_ambiguous", "production_session_expired",
-                     "read_unavailable", "reply_unexpected"})
+                     "read_unavailable", "reply_unexpected", "scan_running", "no_ce_scan_yet", "unrecognized",
+                     "executions_unavailable"})
+# Confirmed live 2026-10-19 (owner, CO-0798 Details > Duration Per Scan): the CE scan is the LEAKED_CREDENTIALS_DISCOVERY
+# execution; DONE (and DONE_WITH_ERRORS, as for Dev scans, owner 2026-10-07) is finished, PENDING is running.
+CE_CAMPAIGN = "LEAKED_CREDENTIALS_DISCOVERY"
+EXEC_DONE = frozenset({"DONE", "DONE_WITH_ERRORS"})
+EXEC_RUNNING = frozenset({"PENDING"})
+_EXEC_KEYS = ("campaign_type", "execution_type", "status", "start", "end", "duration_ms")
 
 
 def _safe(value: Any) -> Any:
@@ -93,6 +100,9 @@ def record(parent: Path, co: str, reply: Mapping[str, Any], now: datetime) -> Pa
     stamp = now.astimezone(timezone.utc)
     data = {"co_reference": co, "recorded_at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"), "state": reply["state"],
             "found": bool(reply.get("found")), "fields": fields}
+    execs = reply.get("executions")
+    if isinstance(execs, list):
+        data["executions"] = [{k: _safe(e.get(k)) for k in _EXEC_KEYS} for e in execs[:50] if isinstance(e, Mapping)]
     folder = Path(parent) / SUBDIR
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     path = folder / f"{co}-{stamp.strftime('%Y%m%dT%H%M%SZ')}.json"
@@ -123,3 +133,21 @@ def latest(parent: Path, co: str) -> dict[str, Any] | None:
             if best is None or str(item.get("recorded_at")) >= str(best.get("recorded_at")):
                 best = item
     return best
+
+
+def executions_state(parsed: Any) -> str:
+    """The CE scan state from the parsed Duration Per Scan executions (the Dev parser's shape): ``scan_completed`` when
+    every LEAKED_CREDENTIALS_DISCOVERY execution is DONE, ``scan_running`` when one is PENDING, ``no_ce_scan_yet`` when
+    there is none, ``unrecognized`` for any other status, ``executions_unavailable`` when nothing was parsed."""
+    rows = parsed.get("executions") if isinstance(parsed, Mapping) else None
+    if not isinstance(rows, list):
+        return "executions_unavailable"
+    ce = [r for r in rows if isinstance(r, Mapping) and r.get("campaign_type") == CE_CAMPAIGN]
+    if not ce:
+        return "no_ce_scan_yet"
+    statuses = {r.get("status") for r in ce}
+    if statuses & EXEC_RUNNING:
+        return "scan_running"
+    if statuses <= EXEC_DONE:
+        return "scan_completed"
+    return "unrecognized"

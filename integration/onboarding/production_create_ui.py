@@ -482,6 +482,11 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
                   "I authorize ONE production create for this CO and approval</label></div>"
                   "<button type='submit'>Create in production</button></form></section>")
     if status is not None and status["code"] == CREATED_VERIFIED:
+        if uuid_write_state == "written_verified":
+            status_html = ("<div class='card-head'><h2 id='co-create-title' class='pill'>Production create</h2>"
+                           + _chip("chip-ok", "Onboarded") + "</div><p class='note'>Created and verified in BackOffice; the "
+                           "Account UUID is written to Salesforce and read back.</p>")
+            return "<section class='card' aria-labelledby='co-create-title'>" + status_html + "</section>"
         return ("<section class='card' aria-labelledby='co-create-title'>" + status_html + _uuid_form_html(inputs, status, uuid_write_state)
                 + "</section>")
     blocked = ("<section class='card' aria-labelledby='co-create-title'>"
@@ -949,7 +954,11 @@ def progress_card_html(progress: Mapping[str, Any]) -> str:
 
 SCAN_STATE_TEXT = {
     "scan_completed": "The CE scan is finished.",
-    "unconfirmed": "Read the tenant's scan fields; which value means \"finished\" is not confirmed yet, so no stage moved.",
+    "unconfirmed": "Read the tenant's scan fields, but not its Duration Per Scan list; no stage moved.",
+    "scan_running": "The CE scan (LEAKED_CREDENTIALS_DISCOVERY) is still running; check again later.",
+    "no_ce_scan_yet": "No CE scan (LEAKED_CREDENTIALS_DISCOVERY) has run for this tenant yet; check again later.",
+    "unrecognized": "The CE scan has a status this dashboard does not know; nothing moved. Check BackOffice by hand.",
+    "executions_unavailable": "The Duration Per Scan list could not be read; nothing moved. Check again.",
     "row_not_found": "The tenant was not found by its Account UUID.",
     "row_ambiguous": "More than one row has this Account UUID; nothing moved.",
     "production_session_expired": "The BackOffice session expired; sign in again and re-check.",
@@ -1006,3 +1015,20 @@ def scan_card_html(parent: Path, co: str, *, running: bool) -> str:
         body = "<p class='note'>" + escape(gate_text(problem)) + "</p>"
     return ("<section class='card' aria-labelledby='co-scan-title'><div class='card-head'><h2 id='co-scan-title' "
             "class='pill'>CE scan</h2></div>" + lines + body + "</section>")
+
+
+def own_onboarding(parent: Path, co: str, row: Mapping[str, Any] | None) -> str | None:
+    """The page headline when THIS dashboard onboarded the CO (verified create, UUID written and read back, and the CO
+    holds that same UUID), else None: such a CO is onboarded, never "blocked: a tenant exists"."""
+    try:
+        history = load_co_records(parent, co)
+    except Exception:
+        return None
+    status = co_status(history)
+    uuid = salesforce_uuid_writeback.normalise_uuid(status.get("uuid")) if status["code"] == CREATED_VERIFIED else None
+    if (uuid is None or last_uuid_write(parent, co) != "written_verified"
+            or salesforce_uuid_writeback.verify_after_write(row, uuid) != "verified"):
+        return None
+    when = next((str(r.get("recorded_at")) for r in reversed(history) if r.get("outcome") == "readback_verified"), "")
+    return ("Onboarded in production by this dashboard: tenant created and verified" + (" at " + when.replace("T", " ") if when else "")
+            + "; Account UUID written to Salesforce and read back.")

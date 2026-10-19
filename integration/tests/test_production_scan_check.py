@@ -205,5 +205,105 @@ class DashboardTests(base.Base):
         self.assertEqual(moves.call_args.kwargs["scan_state"], "unconfirmed")
 
 
+
+# --- 2026-10-19 live check of CO-0798: the table row has no CE result; the Duration Per Scan executions list does ---------
+
+def executions(*rows):
+    return {"executions": [dict(campaign_type=c, execution_type="SINGLE_ATTACK_STACK", status=st, start="2026-10-19T18:45:00+00:00",
+                                end="2026-10-19T18:55:00+00:00", duration_ms=618000) for c, st in rows]}
+
+
+class ExecutionsStateTests(unittest.TestCase):
+    def test_a_done_leaked_credentials_discovery_is_finished(self):
+        self.assertEqual(sc.executions_state(executions(("LEAKED_CREDENTIALS_DISCOVERY", "DONE"))), "scan_completed")
+        self.assertEqual(sc.executions_state(executions(("LEAKED_CREDENTIALS_DISCOVERY", "DONE_WITH_ERRORS"))), "scan_completed")
+
+    def test_running_none_other_or_unknown_is_not_finished(self):
+        self.assertEqual(sc.executions_state(executions(("LEAKED_CREDENTIALS_DISCOVERY", "PENDING"))), "scan_running")
+        self.assertEqual(sc.executions_state(executions(("LEAKED_CREDENTIALS_DISCOVERY", "DONE"),
+                                                        ("LEAKED_CREDENTIALS_DISCOVERY", "PENDING"))), "scan_running")
+        self.assertEqual(sc.executions_state(executions()), "no_ce_scan_yet")
+        self.assertEqual(sc.executions_state(executions(("RECON", "DONE"))), "no_ce_scan_yet")
+        self.assertEqual(sc.executions_state(executions(("LEAKED_CREDENTIALS_DISCOVERY", "WEIRD"))), "unrecognized")
+        self.assertEqual(sc.executions_state(None), "executions_unavailable")
+
+
+class RunnerExecutionsTests(base.Base):
+    def run_check(self, parsed=None, error=None):
+        self.record("readback_verified", account_uuid=UUID, account_id="6ad6629ec6675e6765827358",
+                    tenant_name="Advanced Technology International - CE Only")
+        calls = []
+
+        def read_exec(page, tenant, account_id):
+            calls.append((tenant, account_id))
+            if error:
+                raise error
+            return parsed
+
+        @contextmanager
+        def open_page(target, wait):
+            yield FakePage()
+        reader = SimpleNamespace(table=lambda value, **kw: (200, body(tenant_row(lastScanStatusEnum=None))))
+        with mock.patch.object(runner, "_pdr_reader", return_value=reader),                 mock.patch.object(runner, "_launch_os_name", return_value="nt"),                 mock.patch.object(runner, "_read_production_executions", side_effect=read_exec),                 mock.patch.object(runner.production_dry_run, "service_worker_verdict", return_value=None):
+            line = json.loads(runner.run_production_scan_check(CO, environ={}, now=NOW, records_parent=self.dir,
+                                                               open_page=open_page))
+        return line, calls
+
+    def test_the_executions_list_decides_and_is_recorded_masked(self):
+        line, calls = self.run_check(parsed=executions(("LEAKED_CREDENTIALS_DISCOVERY", "DONE")))
+        self.assertEqual(line["result"], "scan_completed")
+        self.assertEqual(calls, [("Advanced Technology International - CE Only", "6ad6629ec6675e6765827358")])
+        latest = sc.latest(self.dir, CO)
+        self.assertEqual(latest["state"], "scan_completed")
+        self.assertEqual(latest["executions"][0]["campaign_type"], "LEAKED_CREDENTIALS_DISCOVERY")
+        self.assertNotIn("execution_id", json.dumps(latest))
+
+    def test_a_running_scan_moves_nothing(self):
+        line, _calls = self.run_check(parsed=executions(("LEAKED_CREDENTIALS_DISCOVERY", "PENDING")))
+        self.assertEqual(line["result"], "scan_running")
+
+    def test_an_unreadable_executions_list_is_a_code(self):
+        line, _calls = self.run_check(error=RuntimeError("scan_status_executions_unavailable"))
+        self.assertEqual(line["result"], "executions_unavailable")
+
+
+class OwnOnboardingTests(base.Base):
+    def setUp(self):
+        super().setUp()
+        self.record("readback_verified", account_uuid=UUID)
+
+    def test_a_create_and_uuid_write_by_this_dashboard_is_onboarded_not_blocked(self):
+        self.assertIsNone(ui.own_onboarding(self.dir, CO, base.row(Account_UUID__c=UUID)))  # UUID not written by us yet
+        ui.record_uuid_write(self.dir, CO, UUID, "written_verified", NOW)
+        headline = ui.own_onboarding(self.dir, CO, base.row(Account_UUID__c=UUID))
+        self.assertTrue(headline.startswith("Onboarded in production by this dashboard"))
+        self.assertNotIn(UUID, headline)
+        self.assertIsNone(ui.own_onboarding(self.dir, CO, base.row(Account_UUID__c=OTHER)))  # another UUID: not ours
+
+    def test_the_create_card_says_the_uuid_is_written(self):
+        self.unlocked()
+        ui.record_uuid_write(self.dir, CO, UUID, "written_verified", NOW)
+        html = ui.create_card_html(self.inputs(row=base.row(Account_UUID__c=UUID)), "written_verified")
+        self.assertNotIn("Next: write the Account", html)
+        self.assertIn("Account UUID is written to Salesforce", html)
+
+
+class CoPageVerdictTests(base.Base):
+    def test_the_co_page_says_onboarded_for_its_own_create(self):
+        from integration.tests import test_production_co_page as cop
+        from integration.onboarding import production_create_record as pcr
+        page_case = cop.PageBase("run")
+        page_case.setUp()
+        self.addCleanup(page_case.doCleanups)
+        parent = page_case.env.parent   # the fixture's own records folder (its patch wins inside page())
+        pcr.record(parent, {"co_reference": CO, "approval_ref": base.REF, "outcome": "readback_verified",
+                            "route": base.ROUTE, "salesforce_revision": base.REV, "account_uuid": UUID}, NOW)
+        ui.record_uuid_write(parent, CO, UUID, "written_verified", NOW)
+        with mock.patch.object(dashboard, "_production_create_html", return_value=""):
+            page = page_case.page(row={**cop.ROW, "Account_UUID__c": UUID})
+        self.assertIn("Onboarded in production by this dashboard", page)
+        self.assertNotIn("do not create another", page)
+        self.assertNotIn(UUID, page[page.index("<main"):].replace("value='" + UUID, ""))
+
 if __name__ == "__main__":
     unittest.main()

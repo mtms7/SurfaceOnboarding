@@ -5472,10 +5472,10 @@ def parse_scan_executions(body: Any) -> dict[str, Any] | None:
     return result
 
 
-def _is_scan_exec_response(response: Any) -> bool:
-    """Exactly the app's executions POST on the Development origin (any tenant id; the caller compares it)."""
+def _is_scan_exec_response(response: Any, origin: str = DEVELOPMENT_ORIGIN) -> bool:
+    """Exactly the app's executions POST on ``origin`` (Development by default; any tenant id; the caller compares it)."""
     try:
-        return (response.request.method == "POST" and _url_origin(response.url) == DEVELOPMENT_ORIGIN
+        return (response.request.method == "POST" and _url_origin(response.url) == origin
                 and SCAN_EXEC_PATH.fullmatch(_url_path(response.url)) is not None)
     except Exception:
         return False
@@ -5496,7 +5496,7 @@ def _scan_details_snapshot(page: Any) -> None:
         _log().error("scan_executions", "details_snapshot", exc)
 
 
-def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[str, Any]:
+def read_scan_executions(page: Any, tenant_name: str, expected_id: str, origin: str = DEVELOPMENT_ORIGIN) -> dict[str, Any]:
     """Open the tenant's Details > Duration Per Scan and return the parsed executions reply.
 
     Raises LeonardoSessionExpired (401/403) or RuntimeError with scan_status_executions_unavailable /
@@ -5507,7 +5507,7 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str) -> dict[
     seen: list[Any] = []
 
     def on_response(candidate: Any) -> None:
-        if _is_scan_exec_response(candidate):
+        if _is_scan_exec_response(candidate, origin):
             seen.append(candidate)
 
     page.on("response", on_response)
@@ -10417,6 +10417,12 @@ def _launch_os_name() -> str:
     return os.name
 
 
+def _read_production_executions(page: Any, tenant_name: str, account_id: str) -> dict[str, Any]:
+    """Production: the same read-only Details > Duration Per Scan read (row, row menu, Details, tab; never a hazard item),
+    capturing the app's own executions reply on the exact production origin for the verified account id."""
+    return read_scan_executions(page, tenant_name, account_id, origin=production_probe.PRODUCTION_ORIGIN)
+
+
 def _scan_check_line(result: str) -> str:
     return json.dumps({"result": result, "production_write": "not_performed", "salesforce_writeback": "not_performed"},
                       separators=(",", ":"))
@@ -10450,6 +10456,7 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
     verified = [r for r in history if r.get("outcome") == "readback_verified"]
     uuid = verified[-1].get("account_uuid") if verified else None
     tenant = verified[-1].get("tenant_name") if verified else None
+    account_id = verified[-1].get("account_id") if verified else None
     if (create_ui.co_status(history)["code"] != create_ui.CREATED_VERIFIED or not isinstance(uuid, str)
             or not re.fullmatch(ACCOUNT_UUID_PATTERN, uuid) or not isinstance(tenant, str) or not tenant.strip()):
         return _scan_check_line("no_verified_create")
@@ -10469,6 +10476,16 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
             else:
                 status, body = _pdr_reader(page, in_app=False).table(tenant, mode=production_probe.REWRITE_STRICT)
                 reply = scan.scan_reply(status, body, uuid)
+                # Live 2026-10-19: the row holds no CE result; the Duration Per Scan executions list decides.
+                if reply["found"] and isinstance(account_id, str) and account_id:
+                    try:
+                        parsed = _read_production_executions(page, tenant, account_id)
+                        reply = {**reply, "state": scan.executions_state(parsed),
+                                 "executions": list((parsed or {}).get("executions") or [])}
+                    except LeonardoSessionExpired:
+                        reply = {**reply, "state": "production_session_expired"}
+                    except Exception:
+                        reply = {**reply, "state": "executions_unavailable"}
     except RuntimeError as error:
         result = "production_sign_in_timeout" if str(error) == "production_dry_run_login_timeout" else "scan_check_failed"
     except Exception:
