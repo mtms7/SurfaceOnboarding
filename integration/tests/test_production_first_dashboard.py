@@ -23,10 +23,11 @@ from integration.tests import test_dev_prod_areas as areas_module
 from integration.tests.test_redash_inventory import FAKE_KEY, GET, FakeOpener, result, row as clone_row
 import tools.redash_inventory_collector as collector
 import tools.serve_attended_open_onboardings_dashboard as dashboard
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 # Both create constants True, patched explicitly so tests of the unlocked pages keep proving them after the relock commit.
 unlocked_build = patch.multiple(readiness, PRODUCTION_RUNNER_SUPPORTED=True, PRODUCTION_DRY_RUN_SUPPORTED=True)
+# The create lock patched back to False inside an unlocked_build test (the real build is locked).
+locked_create_build = patch.object(readiness, "PRODUCTION_RUNNER_SUPPORTED", False)
 
 CE = {"Onboarding_Product__c": dashboard.CE_ROUTE_PRODUCT, "Onboarding_Type__c": dashboard.CE_ROUTE_TYPE}
 ROWS = [
@@ -259,7 +260,6 @@ class LandingTests(unittest.TestCase):
         self.assertNotIn("href='/?queue=", page)
         self.assertIn("href='/dev?", filtered)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_rows_chips_and_links(self):
         page = self.page()
         ok = self.row_of(page, "CO-0780")
@@ -323,7 +323,6 @@ class LandingTests(unittest.TestCase):
         self.assertIn("<span class='chip chip-warn'>Clone unusable: inventory_snapshot_missing</span>", page)
         self.assertIn("redash_inventory_collector.py --collect", page)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_lock_chip_while_locked(self):
         self.assertIn("<span class='chip chip-warn'>Create locked</span>", self.page())
 
@@ -416,7 +415,6 @@ class CoPageTests(unittest.TestCase):
     def heads(self, page):
         return [text(h) for h in re.findall(r"<h2[^>]*>(.*?)</h2>", page, flags=re.S)]
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_cards_in_the_production_first_order(self):
         page = self.page()
         self.assertEqual(self.heads(page), ["Production create", "Production readiness", "Salesforce facts", "Production checks",
@@ -484,7 +482,6 @@ class CoPageTests(unittest.TestCase):
         self.assertIn("chip-bad'>Already set</span>", filled)
         self.assertNotIn("a" * 32, filled)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_locked_build_names_the_gate_reason_once_and_has_no_create_control(self):
         page = self.page()
         self.assertNotIn("class='banner banner-warn' role='status'><strong>Production create is locked.", page)  # no banner
@@ -494,7 +491,6 @@ class CoPageTests(unittest.TestCase):
         self.assertEqual(controls(page, allow=("/attended/review-approve", "Approve this summary")), [])
         self.assertIn("<span class='chip chip-warn'>Create locked</span>", page)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_no_create_control_in_any_state_even_with_a_valid_approval_and_a_verified_record(self):
         self.env.write_approvals(approval())
         self.env.write_record(record("CO-0780", "readback_verified"))
@@ -505,7 +501,7 @@ class CoPageTests(unittest.TestCase):
                 self.assertNotRegex(page, r"(?i)<(button|a)[^>]*>[^<]*(create in production|start onboarding|confirm)")
 
     def test_an_unlocked_flag_alone_adds_no_control(self):
-        with patch.object(readiness, "PRODUCTION_RUNNER_SUPPORTED", True):
+        with unlocked_build:
             page = self.page(unlock=None)
         self.assertEqual(controls(page, allow=("/attended/review-approve", "Approve this summary")), [])
         self.assertNotIn("Production create is locked", page)
@@ -551,7 +547,6 @@ class CoPageTests(unittest.TestCase):
                       "Duplicate validation: production only"):
             self.assertIn(text_, page)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_readiness_steps_follow_the_record_and_never_become_controls(self):
         def dry_run_item(page):
             start = page.index("<span class='what'>Dry run done<")
@@ -597,7 +592,6 @@ class CoPageTests(unittest.TestCase):
         self.assertNotIn("RAW-SECRET-JSON", bad)
         self.assertNotIn("No create record", card[:card.index("</section>")])
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_the_create_card_owns_the_uuid_step_and_a_locked_build_shows_no_control(self):
         self.assertNotIn("UUID writeback to Salesforce", self.page())   # no separate, contradicting UUID card
         self.env.write_record(record("CO-0780", "readback_verified"))
@@ -729,7 +723,6 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
                     self.assertEqual(request.pages[0][0], 200, path)
         self.assertEqual(areas_module.get("/tenants").redirects, ["/prod/tenants"])
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_production_pages_have_no_post_route_and_the_runner_stays_locked(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         # The guarded create/UUID routes (docs/53) are the ONLY allowed exception: they exist as POST routes but refuse
@@ -781,7 +774,6 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
                 self.assertIn("envpill prod", page)
                 self.assertIn("class='active'>Onboarding</a>", page)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_the_co_production_view_carries_the_lock_footer(self):
         row = areas_module.layout.row_for(areas_module.layout.SURFACE)
         with areas_module.areas(), patch.object(dashboard, "production_now", return_value=NOW):

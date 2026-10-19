@@ -18,7 +18,6 @@ from integration.onboarding import production_create_record as pcr
 from integration.onboarding import production_create_ui as ui
 from integration.onboarding import salesforce_uuid_writeback as wb
 from integration.onboarding import session_readiness as readiness
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
 CO = "CO-0798"
@@ -77,20 +76,17 @@ class Base(unittest.TestCase):
 
 
 class LockedTests(Base):
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_constants_are_false_in_this_build(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run unlocked by owner go 2026-10-18 (docs/53 step 3); the relock commit reverts this
+        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
         self.assertTrue(ui.locked())
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_no_html_at_all_while_locked_without_records(self):
         pcr_dir = self.dir / pcr.RECORDS_SUBDIR
         for item in pcr_dir.iterdir():
             item.unlink()
         self.assertEqual(ui.create_card_html(self.inputs()), "")
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_locked_page_with_a_dry_run_record_has_no_html(self):
         self.assertEqual(ui.create_card_html(self.inputs()), "")
 
@@ -110,7 +106,6 @@ class LockedTests(Base):
             self.assertEqual(ui.create_card_html(self.inputs()), "")
             self.assertEqual(ui.gate(self.inputs())[0], "production_runner_not_supported" if not runner else "production_dry_run_not_supported")
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_every_post_is_refused_while_locked_and_launches_nothing(self):
         launch = mock.Mock()
         values = {"reference": CO, "nonce": "x", "confirm_reference": CO, "production_create_authorized": "1"}
@@ -446,12 +441,15 @@ class SourceTests(unittest.TestCase):
         for forbidden in ("subprocess", "import socket", "urllib", "playwright", "print(", "sf_json", "sf_write_json"):
             self.assertNotIn(forbidden, text)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_dashboard_wiring_is_outside_the_read_only_regions_and_refuses_while_locked(self):
         import tools.serve_attended_open_onboardings_dashboard as dashboard
         self.assertTrue(ui.POST_PATHS <= dashboard.POST_ROUTES)
         self.assertEqual(dashboard.VM_OPERATOR_POSTS, frozenset())
-        self.assertEqual(dashboard._production_create_html(CO, row()), "")
+        import tempfile
+        empty = tempfile.TemporaryDirectory()  # hermetic: never the real records folder (it holds the real CO-0798 create)
+        self.addCleanup(empty.cleanup)
+        with mock.patch.object(dashboard, "production_records_parent", return_value=Path(empty.name)):
+            self.assertEqual(dashboard._production_create_html(CO, row()), "")
         sent = []
         handler = object.__new__(dashboard.Handler)
         handler.send_page = lambda status, page: sent.append((status, page))

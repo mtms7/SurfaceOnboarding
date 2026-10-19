@@ -19,7 +19,6 @@ from integration.onboarding import production_views as views
 from integration.tests import test_dev_prod_areas as areas_module
 from integration.tests import test_production_first_dashboard as base
 import tools.serve_attended_open_onboardings_dashboard as dashboard
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 unlocked_build = base.unlocked_build
 
 ITEM_LABELS = ["Production runner unlocked", "Production session", "Clone fresh under 6 h", "No duplicate in production",
@@ -244,7 +243,6 @@ class ProductionRowTests(CardBase):
                 self.assertRegex(item, r"<span class='chip chip-(ok|warn|bad|neutral)'>(Locked|Ready|Blocked|Unavailable)</span></li>$")
             self.assertIn("<ol class='checks'>", card, name)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_locked_chips_and_reason(self):
         for name, page in self.pages().items():
             card = self.card(page)
@@ -280,7 +278,6 @@ class ProductionRowTests(CardBase):
         self.assertIn("chip-bad'>Blocked</span>", card)
         self.assertNotIn("a" * 32, page)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_create_approval_and_records_feed_the_chips(self):
         self.env.write_approvals(base.approval())
         self.env.write_record(base.record("CO-0780", "dry_run_passed"))
@@ -332,7 +329,6 @@ class HandlerRouteTests(CardBase):
         self.assertNotIn("co-ready-title", prod[1])   # docs/50: the simplified page has no readiness card
         self.assertIn("co-before-title", prod[1])
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_the_card_adds_no_post_route_and_the_lock_holds(self):
         self.assertIs(dashboard.readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertFalse([route for route in dashboard.POST_ROUTES if "onboard-card" in route or route.startswith("/onboard")])

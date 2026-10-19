@@ -24,7 +24,6 @@ from integration.onboarding import production_views as views
 from integration.onboarding import session_readiness as readiness
 from integration.tests import test_production_first_dashboard as base
 import tools.serve_attended_open_onboardings_dashboard as dashboard
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 REF = "CO-0780"
 REV = "2026-10-16T08:00:00.000+0000"
@@ -38,6 +37,7 @@ CONTRADICTIONS = ("Production create is locked", "No valid production approval i
                   "Production create stays locked", "Runner unlocked by configuration")
 DEV_TEXT = ("Leonardo", "Review &amp; start", "(Dev)", "(test)", "Dev start")
 unlocked_build = base.unlocked_build
+locked_create_build = base.locked_create_build
 
 
 def card(page, title_id):

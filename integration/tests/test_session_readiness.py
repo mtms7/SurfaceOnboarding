@@ -16,7 +16,6 @@ from unittest.mock import Mock, patch
 from integration.onboarding import session_readiness as r
 from integration.onboarding.session_readiness import SessionState, SessionStatus
 import tools.serve_attended_open_onboardings_dashboard as dashboard
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 3, 10, 0, 0)
 ORG = "00D000000000001AAA"
@@ -96,7 +95,6 @@ class ProductionLockTests(unittest.TestCase):
              "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_ISSUED": "2026-10-01T00:00:00+00:00",
              "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_EXPIRES": "2026-10-20T00:00:00+00:00"}
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_every_missing_piece_keeps_production_locked(self):
         p = r.production_unlock_problem
         self.assertEqual(p({}, self.UTC_NOW), "production_sessions_flag_missing")
@@ -343,7 +341,6 @@ class LeonardoWorkerTests(unittest.TestCase):
 
 
 class ConnectionPageTests(unittest.TestCase):
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_page_shows_the_sessions_and_a_locked_production_choice(self):
         with patch.object(dashboard, "load_runner_state", return_value={}):
             page = dashboard.page_salesforce_unavailable(failed=False)

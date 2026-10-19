@@ -14,7 +14,6 @@ from pathlib import Path
 from integration.onboarding import production_approval as pa
 from integration.onboarding import session_readiness
 from tools import issue_production_approval as tool
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc)
 OWNER = "owner@example.test"
@@ -382,16 +381,15 @@ class IssueToolTests(unittest.TestCase):
         self.assertEqual(tool.STATE_FILE_NAME, "production_create_approvals.json")
         self.assertEqual(tool.default_state_path().name, "production_create_approvals.json")
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_locks_stay_false_and_the_tool_does_not_reference_them(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        dry_run_before = session_readiness.PRODUCTION_DRY_RUN_SUPPORTED
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
         source = Path(tool.__file__).read_text(encoding="utf-8")
         self.assertNotIn("PRODUCTION_RUNNER_SUPPORTED", source)
         self.assertNotIn("PRODUCTION_DRY_RUN_SUPPORTED", source)
-        self.assertEqual(self.run_tool().code, 0)  # works while the create is locked
+        self.assertEqual(self.run_tool().code, 0)  # works while locked
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, dry_run_before)  # never changed by the tool
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
 
     def test_eligibility_matches_the_dashboard_rules(self):
         from tools import serve_attended_open_onboardings_dashboard as dashboard

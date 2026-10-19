@@ -13,7 +13,6 @@ from unittest.mock import patch
 from integration.onboarding import production_views as views
 from integration.tests import test_production_first_dashboard as base
 import tools.serve_attended_open_onboardings_dashboard as dashboard
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 unlocked_build = base.unlocked_build
 
 REF = "CO-0798"
@@ -87,7 +86,6 @@ class LayoutTests(PageBase):
                 self.assertNotIn(tag, main, tag)
             self.assertNotRegex(main, r"<(button|a)[^>]*>[^<]*(create|confirm|submit)")
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_flags_stay_false_and_unlock_adds_no_control(self):
         self.assertIs(dashboard.readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         with patch.object(dashboard.readiness, "PRODUCTION_RUNNER_SUPPORTED", True):
