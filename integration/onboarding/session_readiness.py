@@ -61,13 +61,13 @@ ENVIRONMENTS: dict[str, SessionEnvironment] = {
 # The runner opens only Leonardo Development URLs today; an environment-aware
 # runner is a separate, reviewed change. Until then production stays locked
 # whatever the configuration says.
-PRODUCTION_RUNNER_SUPPORTED = False
+PRODUCTION_RUNNER_SUPPORTED = True  # owner go 2026-10-18 for ONE attended CO-0798 create (docs/53 step 6); relock after
 # A SEPARATE hard-coded lock for the production CE-only DRY RUN (docs/42 section 6.2): the dry run opens the real
 # production form, types into it and cancels, never clicking Confirm. Owner decision 2026-10-16: no production run
 # until the owner says go, so this stays False until a separate, reviewed change after that go. It never unlocks the
 # create: `production_unlock_problem` and `production_target` ignore it, and the dry-run target ignores
 # PRODUCTION_RUNNER_SUPPORTED.
-PRODUCTION_DRY_RUN_SUPPORTED = False
+PRODUCTION_DRY_RUN_SUPPORTED = True  # owner go 2026-10-18 for the CO-0798 attended dry run (docs/53 step 3)
 
 
 def _production_session_problem(environ: Mapping[str, str], now: datetime) -> str | None:

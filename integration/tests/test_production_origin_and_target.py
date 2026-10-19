@@ -9,6 +9,7 @@ from integration.onboarding.config import AppConfig, PollSchedule
 from integration.onboarding.origin_policy import (LEONARDO_DEVELOPMENT_ORIGIN, PRODUCTION_BACKOFFICE_ORIGIN,
                                                   require_development_origin, require_production_origin)
 from integration.onboarding.run_target import ProductionLocked, RunTarget, development_target, production_target
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 P = "SURFACE_ONBOARDING_PRODUCTION_"
@@ -55,6 +56,7 @@ class ProductionOriginTests(unittest.TestCase):
 
 
 class RunTargetTests(unittest.TestCase):
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_runner_support_flag_stays_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
 
@@ -73,6 +75,7 @@ class RunTargetTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason, reason)
         self.assertIn(reason, str(caught.exception))
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_each_unlock_problem_locks_in_order(self):
         env = good_environ()
         self._locked({}, "production_sessions_flag_missing")
@@ -87,6 +90,7 @@ class RunTargetTests(unittest.TestCase):
         # Everything valid, but the runner lock still holds.
         self._locked(env, "production_runner_not_supported")
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_valid_environ_succeeds_only_with_runner_support_patched(self):
         with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True):
             target = production_target(good_environ(), NOW)
