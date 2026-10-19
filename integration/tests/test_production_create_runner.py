@@ -461,6 +461,20 @@ class LiveDuplicateTests(Base):
         self.assertEqual(h.go()["result"], "created_verified")
         self.assertEqual(outcomes, ["aborted"])
 
+    def test_a_session_refusal_before_the_form_names_the_read_stages(self):
+        # Live 2026-10-19 (first CO-0798 create attempt): refused production_session_not_ready before the form with no
+        # clue where; the record now names the stages of the last read and the page's own start-up statuses (pass/fail).
+        h = self.harness(search={runner.PDR_SESSION_CHECK_VALUE: {"status": 503, "total": None, "rows": None}})
+        self.assertEqual(h.go()["result"], "production_session_not_ready")
+        record = [r for r in h.loaded_records() if r["outcome"] == "refused"][-1]
+        stages = {k: v for k, v in (record.get("form_fields_checked") or {}).items() if k.startswith("session.")}
+        self.assertEqual(stages.get("session.trigger_reload"), "pass")
+        self.assertEqual(stages.get("session.reply"), "pass")
+        self.assertEqual(stages.get("session.status_2xx"), "fail")
+        self.assertEqual(stages.get("session.observed_getAuthorities"), "pass")
+        self.assertEqual(record["redactions"], 0)
+        self.assertNotIn("Add Account", h.page.clicks)
+
     def test_a_stray_create_post_during_the_fill_is_blocked(self):
         h = self.harness(write_on_select=True)
         self.assertEqual(h.go()["result"], "write_request_blocked")

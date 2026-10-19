@@ -9207,6 +9207,17 @@ def _pdr_reader(page: Any, *, in_app: bool | None = None, click_log: Any = None)
     return reader
 
 
+def _pdr_session_stage_fields(page: Any) -> dict[str, str]:
+    """Live 2026-10-19: the stages of the reader's last table read plus the page's own start-up statuses, as
+    ``session.*`` pass/fail names for a session refusal record (never a value, a body, a header or a status number)."""
+    reader = _pdr_reader(page)
+    out = {f"session.{k}": v for k, v in (reader.last_read or {}).items() if isinstance(k, str) and v in ("pass", "fail")}
+    for path, status in dict(reader.observed).items():
+        name = str(path).rstrip("/").rsplit("/", 1)[-1]
+        out[f"session.observed_{name}"] = "pass" if status == 200 else "fail"
+    return out
+
+
 def _pdr_session_problem(page: Any, *, form_open: bool = False) -> str | None:
     """docs/48 note 2026-10-18: signed in, from the page's OWN traffic and status codes only; fail closed otherwise."""
     return _pdr_reader(page).session_problem(form_open=form_open)
@@ -10549,6 +10560,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
             control = facts.get("control")
             early = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
             session_codes = ("production_session_expired", "production_session_not_ready")
+            if early in session_codes:
+                extras["form_fields_checked"] = _pdr_session_stage_fields(page)  # names which read stage failed
             final = dataclasses.replace(inputs, sessions_ready=early not in session_codes,
                                         duplicate_found=early is not None and early not in session_codes,
                                         precheck_reason=early or "")
@@ -10562,7 +10575,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 problem = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
                 pre_form.update(at=started, problem=problem)
                 if problem is not None:
-                    raise production_create.FormRefusal(problem)
+                    raise production_create.FormRefusal(problem, _pdr_session_stage_fields(page)
+                                                        if problem in session_codes else None)
                 fields = _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
                                               date_kept or _license_date_kept, keep_open=True, confirm_preflight=True,
                                               form_state=strict_state)
