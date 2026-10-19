@@ -451,11 +451,11 @@ class ProductionReadinessTests(unittest.TestCase):
         from integration.tests.test_redash_inventory import FAKE_KEY, GET, FakeOpener, result, row
         import tools.redash_inventory_collector as collector
         root = Path(tempfile.mkdtemp())
-        collector.collect(FakeOpener({GET: result([row(1)], "2026-10-05T11:30:00")}), FAKE_KEY, root=root,
+        collector.collect(FakeOpener({GET: result([row(1, _modified="2026-10-05T11:20:00.000000")], "2026-10-05T11:30:00")}), FAKE_KEY, root=root,
                           now=datetime(2026, 10, 5, 12, 0, tzinfo=__import__("datetime").timezone.utc))
         page = self.page(all_open=True, root=root, matches={**MATCHES, "CO-0701": canned("clone_unavailable")})
         self.assertRegex(page, r"Clone unavailable <b>1</b> · clone age \d+ h")
-        self.assertIn("older than 6 h: not trusted", page)
+        self.assertIn("older than 6 h, or the data older than 36 h: not trusted", page)
         missing = self.page()
         self.assertIn("Production clone unusable", missing)
 

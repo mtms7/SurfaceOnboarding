@@ -6327,8 +6327,10 @@ def _clone_info() -> dict[str, Any]:
     except inventory.InventoryError as error:
         return {"reason": error.reason}
     age = int(payload.get("age_seconds") or 0)
-    return {"captured_at": str(payload.get("captured_at") or ""), "age_seconds": age,
-            "trusted": age <= inventory.PRODUCTION_GATE_MAX_AGE.total_seconds(),
+    data_age = production_views._data_age_seconds(payload, datetime.now(timezone.utc))  # noqa: SLF001 - one rule for every page
+    return {"captured_at": str(payload.get("captured_at") or ""), "age_seconds": age, "data_age_seconds": data_age,
+            "trusted": (age <= inventory.PRODUCTION_GATE_MAX_AGE.total_seconds() and data_age is not None
+                        and data_age <= production_views.DATA_LIMIT_SECONDS),
             "label": str(payload.get("environment_label") or "")}
 
 
@@ -6342,14 +6344,19 @@ def _data_age_note(as_of: str, info: dict[str, Any]) -> str:
     clone = (("is " + _age_words(info["age_seconds"]) + " old") if isinstance(info.get("age_seconds"), int)
              else "could not be read (" + str(info.get("reason") or "unknown") + ")")
     published = ("Salesforce data (approval, UUID, domains) was published at " + escape(as_of) + "; " if as_of else "")
-    return published + "the tenant clone is separate and " + escape(clone) + "."
+    data_age = info.get("data_age_seconds")
+    return (published + "the tenant clone is separate and " + escape(clone)
+            + (" (its data is " + escape(_age_words(data_age)) + " old)" if isinstance(data_age, int) else "") + ".")
 
 def _clone_line(info: dict[str, Any]) -> str:
     if "reason" in info:
         return ("Production clone unusable: <code>" + escape(info["reason"]) + "</code>. Refresh it with "
                 + _collect_hint_html() + ".")
     return ("Production clone captured " + escape(info["captured_at"]) + " · data age " + _age_words(info["age_seconds"])
-            + ("" if info["trusted"] else " · <strong>older than 6 h: not trusted</strong>")
+            + (" · newest change in the data " + _age_words(info["data_age_seconds"]) + " old"
+               if isinstance(info.get("data_age_seconds"), int) else " · age of the data unknown")
+            + ("" if info["trusted"] else " · <strong>older than 6 h, or the data older than "
+               + str(production_views.DATA_LIMIT_SECONDS // 3600) + " h: not trusted</strong>")
             + (" · " + escape(info["label"]) if info["label"] else ""))
 
 
@@ -6965,6 +6972,9 @@ def _clone_strip() -> str:
         chip = _chip("chip-warn", "Clone unusable: " + (info["reason"] or "unknown"))
     else:
         words = "Clone " + production_views.age_words(info["age_seconds"]) + " old, limit " + limit
+        if isinstance(info.get("data_age_seconds"), int):
+            words += "; data " + production_views.age_words(info["data_age_seconds"]) + " old, limit " + str(
+                production_views.DATA_LIMIT_SECONDS // 3600) + " h"
         chip = ("<span class='chip chip-ok'>" + escape(words) + " &middot; trusted</span>" if info["state"] == "fresh"
                 else "<span class='chip chip-warn'>" + escape(words) + " &middot; stale, not trusted</span>")
     note = ("" if info["state"] == "fresh" else
@@ -7669,7 +7679,7 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
         with _PRODUCTION_RUNS_LOCK:
             scanning = bool((PRODUCTION_SCAN_RUNS.get(reference) or {}).get("running"))
         parent = production_records_parent()
-        scan_html = (create_ui.scan_card_html(parent, reference, running=scanning)
+        scan_html = (create_ui.scan_card_html(parent, reference, running=scanning, auto=AUTO_SCAN_STATE.get(reference))
                      if create_ui.scan_check_problem(parent, reference) not in ("no_verified_create", "records_unreadable")
                      else "")
         progress = _production_run_progress(reference)
@@ -7762,6 +7772,50 @@ def _production_run_progress(reference: str) -> dict[str, Any] | None:
                                          follow=run.get("follow"))
 
 
+_STAGE_MOVE_LOCK = Lock()  # one CE stage move at a time: the BackOffice check's follow-up and the background job
+AUTO_SCAN_INTERVAL_SECONDS = 600  # the clone is a nightly snapshot read hourly: a 10 minute look is plenty
+AUTO_SCAN_STATE: dict[str, dict[str, str]] = {}  # per CO, the last automatic clone check: {"scan", "at"}
+
+
+def _clone_payload_for_job() -> dict[str, Any]:
+    """The verified newest production clone (hash, environment and schema re-checked by the loader); raises when unusable."""
+    return inventory.load_latest(clone_root(), "prod-clone", max_age=INVENTORY_DISPLAY_MAX_AGE, now=production_now())
+
+
+def _auto_scan_tick() -> None:
+    """One pass of the background job over the COs this dashboard moved to Account Scanning. No browser, no login."""
+    if vm_mode():
+        return
+    parent = production_records_parent()
+    for reference in create_ui.auto_scan_candidates(parent):
+        with _PRODUCTION_RUNS_LOCK:
+            if (PRODUCTION_SCAN_RUNS.get(reference) or {}).get("running"):
+                continue  # the owner's BackOffice check is running for this CO
+        try:
+            with _STAGE_MOVE_LOCK:
+                result = create_ui.auto_scan_finish(
+                    _create_ui_inputs(reference, None), _clone_payload_for_job,
+                    lambda ref=reference: _read_production_writeback_row(ref), _run_sf_argv, create_ui.PINNED_SF_ALIAS)
+            scan = str(result["scan"])
+        except Exception:  # noqa: BLE001 - recorded, never raised in the worker
+            scan = "follow_up_failed"
+        AUTO_SCAN_STATE[reference] = {"scan": scan, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+
+
+def _auto_scan_loop(stop: Any = None) -> None:
+    """Daemon loop: a tick every ``AUTO_SCAN_INTERVAL_SECONDS`` until the process ends."""
+    from threading import Event
+
+    wait = (stop or Event()).wait
+    while True:
+        try:
+            _auto_scan_tick()
+        except Exception:  # noqa: BLE001 - the loop never dies
+            pass
+        if wait(AUTO_SCAN_INTERVAL_SECONDS):
+            return
+
+
 # Build 3: the owner's read-only CE scan checks started by THIS dashboard process: {"running": bool, "stages": list | None}.
 PRODUCTION_SCAN_RUNS: dict[str, dict[str, Any]] = {}
 
@@ -7798,8 +7852,9 @@ def _follow_scan_check(reference: str, process: Any) -> None:
     try:
         latest = scan.latest(production_records_parent(), reference) or {}
         inputs = _create_ui_inputs(reference, None)
-        stages = create_ui.after_scan_finished(inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
-                                               create_ui.PINNED_SF_ALIAS, scan_state=latest.get("state"))
+        with _STAGE_MOVE_LOCK:
+            stages = create_ui.after_scan_finished(inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
+                                                   create_ui.PINNED_SF_ALIAS, scan_state=latest.get("state"))
     except Exception:  # noqa: BLE001
         stages = ["follow_up_failed"]
     with _PRODUCTION_RUNS_LOCK:
@@ -9269,4 +9324,6 @@ if __name__ == "__main__":
     _timing_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     _timing_logger.addHandler(_timing_handler)
     _timing_logger.setLevel(logging.INFO)
+    if not vm_mode():
+        Thread(target=_auto_scan_loop, name="auto-scan", daemon=True).start()
     ThreadingHTTPServer((listener_host, listener_port), Handler).serve_forever()

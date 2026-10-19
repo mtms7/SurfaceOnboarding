@@ -342,6 +342,19 @@ def build_lock(vm: bool) -> str | None:
     return None
 
 
+def _clone_fresh(clone: Mapping[str, Any] | None) -> bool:
+    """Fresh by the query's run time (< 6 h) and, when the status carries it, by the age of the cloned data (docs/56 step 4)."""
+    if not isinstance(clone, Mapping) or clone.get("state") != "fresh":
+        return False
+    age = clone.get("age_seconds")
+    if type(age) is not int or age < 0 or age > production_create.CLONE_MAX_AGE.total_seconds():
+        return False
+    if "data_age_seconds" in clone:
+        data_age = clone["data_age_seconds"]
+        return type(data_age) is int and 0 <= data_age <= production_views.DATA_LIMIT_SECONDS
+    return True
+
+
 def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
     """(first refusal code or None, context). Context: ``approval`` (the record), ``status`` (co_status), ``env``."""
     ctx: dict[str, Any] = {"approval": None, "status": None, "env": None}
@@ -384,10 +397,7 @@ def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
         return "salesforce_session_not_ready", ctx
     if "Account_UUID__c" not in inputs.row or str(inputs.row.get("Account_UUID__c") or "").strip():
         return "salesforce_prior_uuid_present", ctx
-    clone = inputs.clone
-    age = clone.get("age_seconds") if isinstance(clone, Mapping) else None
-    if (not isinstance(clone, Mapping) or clone.get("state") != "fresh" or type(age) is not int or age < 0
-            or age > production_create.CLONE_MAX_AGE.total_seconds()):
+    if not _clone_fresh(inputs.clone):
         return "clone_stale", ctx
     try:
         history = load_co_records(inputs.records_parent, inputs.reference)
@@ -864,6 +874,93 @@ def after_scan_finished(inputs: Inputs, read_row: Callable[[], Mapping[str, Any]
     return results
 
 
+# --- Automatic CE scan finish from the production clone (docs/56 step 3, owner decision 2026-10-19) --------------------------
+
+AUTO_SCAN_WAITING = (("Account Scanning", "written_verified"), ("Scan Completed Successfully", "written_verified"))
+AUTO_SCAN_TEXT = {
+    "finished": "The clone shows the CE scan finished; the stage moves ran.",
+    "finished_with_errors": "The clone shows the CE scan finished with errors; the stage moves ran.",
+    "running": "The clone shows the CE scan still running.",
+    "not_yet": "The clone shows no finished CE scan yet (it is a nightly snapshot); checked again later.",
+    "unknown": "The clone shows a CE scan status this dashboard does not know; nothing moved.",
+    "clone_row_unavailable": "The clone has no single readable row for this Account UUID; nothing moved.",
+    "clone_stale": "The clone is stale or unusable; nothing moved.",
+    "vm_read_only": "This is the VM; nothing moves here.",
+    "no_verified_create": "No verified create and UUID write are recorded for this CO; nothing moved.",
+    "create_time_unknown": "The create time of this CO is not recorded; nothing moved.",
+    "follow_up_failed": "The automatic check failed; nothing moved.",
+}
+
+
+def auto_scan_candidates(parent: Path) -> list[str]:
+    """COs whose newest stage line is a verified Account Scanning or Scan Completed Successfully (sorted); [] if unreadable."""
+    try:
+        lines = (Path(parent) / records.RECORDS_SUBDIR / STAGE_WRITES_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    newest: dict[str, tuple[str, str]] = {}
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return []
+        if isinstance(item, dict) and isinstance(item.get("co_reference"), str) and isinstance(item.get("result"), str):
+            newest[item["co_reference"]] = (str(item.get("to_stage") or ""), item["result"])
+    return sorted(co for co, last in newest.items() if last in AUTO_SCAN_WAITING and CO_PATTERN.fullmatch(co))
+
+
+def _created_ms(history: list[dict[str, Any]]) -> int | None:
+    """The create time recorded for this CO (its newest ``readback_verified``), epoch ms; None when absent or unreadable."""
+    stamps = [r.get("recorded_at") for r in active_history(history) if r.get("outcome") == production_create.OUTCOME_VERIFIED]
+    try:
+        newest = max(datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ") for stamp in stamps)
+    except (TypeError, ValueError):
+        return None
+    return int(newest.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def auto_scan_finish(inputs: Inputs, load_clone: Callable[[], Mapping[str, Any] | None],
+                     read_row: Callable[[], Mapping[str, Any] | None], run_argv: Callable[[list[str]], bool],
+                     target_org: str) -> dict[str, Any]:
+    """The background job for ONE CO: no browser, no login. ``{"scan": <state or refusal>, "stages": [...]}``.
+
+    Acts only on a CO this dashboard moved to Account Scanning (the stage log's newest line), with its verified create and
+    UUID write, on a desktop build with both constants True and a fresh clone. The clone row is matched by the verified
+    Account UUID; only a finished CE scan that ended after the recorded create time runs ``after_scan_finished`` (the same
+    guards as the BackOffice check). A stage move that is rejected or uncertain leaves the CO no candidate, so no retry."""
+    from . import ce_clone_scan
+
+    lock = build_lock(inputs.vm)
+    if lock is not None:
+        return {"scan": lock, "stages": []}
+    if not _clone_fresh(inputs.clone):
+        return {"scan": "clone_stale", "stages": []}
+    if last_stage_write(inputs.records_parent, inputs.reference) not in AUTO_SCAN_WAITING:
+        return {"scan": "not_a_candidate", "stages": []}
+    try:
+        history = load_co_records(inputs.records_parent, inputs.reference)
+    except Exception:
+        return {"scan": "records_unreadable", "stages": []}
+    status = co_status(history)
+    uuid = salesforce_uuid_writeback.normalise_uuid(status.get("uuid")) if status["code"] == CREATED_VERIFIED else None
+    if uuid is None or last_uuid_write(inputs.records_parent, inputs.reference) != "written_verified":
+        return {"scan": "no_verified_create", "stages": []}
+    created = _created_ms(history)
+    if created is None:
+        return {"scan": "create_time_unknown", "stages": []}
+    try:
+        payload = load_clone()
+    except Exception:
+        payload = None
+    v2 = ce_clone_scan.clone_v2_for_uuid(payload, uuid)
+    if v2 is None:
+        return {"scan": "clone_row_unavailable", "stages": []}
+    state = ce_clone_scan.ce_scan_state(v2, created)
+    if not ce_clone_scan.is_finished(state):
+        return {"scan": state, "stages": []}
+    return {"scan": state, "stages": after_scan_finished(inputs, read_row, run_argv, target_org, scan_state="scan_completed")}
+
+
 # --- Same-page progress of one production create (owner request 2026-10-19) -------------------------------------------------
 
 PROGRESS_STEPS = (
@@ -987,7 +1084,7 @@ def scan_check_problem(parent: Path, co: str) -> str | None:
     return None
 
 
-def scan_card_html(parent: Path, co: str, *, running: bool) -> str:
+def scan_card_html(parent: Path, co: str, *, running: bool, auto: Mapping[str, Any] | None = None) -> str:
     """The CE scan section of a created CO: the last recorded check and stage, and the owner's check button."""
     from . import production_scan_check as scan
 
@@ -999,6 +1096,9 @@ def scan_card_html(parent: Path, co: str, *, running: bool) -> str:
     if last is not None:
         lines += ("<p class='note'>Last CE scan check " + escape(str(last.get("recorded_at", "")).replace("T", " "))
                   + ": " + escape(SCAN_STATE_TEXT.get(str(last.get("state")), str(last.get("state")))) + "</p>")
+    if isinstance(auto, Mapping):
+        lines += ("<p class='note'>Automatic clone check " + escape(str(auto.get("at", "")).replace("T", " ").replace("Z", ""))
+                  + ": " + escape(AUTO_SCAN_TEXT.get(str(auto.get("scan")), str(auto.get("scan")))) + "</p>")
     problem = scan_check_problem(parent, co)
     if problem == "onboarding_completed":
         body = "<p class='note'>Onboarding Completed. Nothing else to do for this CO.</p>"

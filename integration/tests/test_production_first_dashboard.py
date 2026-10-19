@@ -88,7 +88,7 @@ class Env:
         self.summary_approvals = self.dir / "onboarding_review_approvals.json"
         self.now = now
         if clone:
-            collector.collect(FakeOpener({GET: result([clone_row(1)], "2026-10-16T09:50:00")}), FAKE_KEY, root=self.clone_root,
+            collector.collect(FakeOpener({GET: result([clone_row(1, _modified="2026-10-16T09:40:00.000000")], "2026-10-16T09:50:00")}), FAKE_KEY, root=self.clone_root,
                               now=CAPTURED + timedelta(minutes=5))
 
     def write_approvals(self, *records):
@@ -311,12 +311,12 @@ class LandingTests(unittest.TestCase):
 
     def test_clone_strip_trusted_stale_and_unusable(self):
         fresh = self.page()
-        self.assertIn("<span class='chip chip-ok'>Clone 2 h 10 min old, limit 6 h &middot; trusted</span>", fresh)
+        self.assertIn("<span class='chip chip-ok'>Clone 2 h 10 min old, limit 6 h; data 2 h 20 min old, limit 36 h &middot; trusted</span>", fresh)
         self.env.now = CAPTURED + timedelta(hours=6)
-        self.assertIn("chip-ok'>Clone 6 h 0 min old, limit 6 h &middot; trusted", self.page())
+        self.assertIn("chip-ok'>Clone 6 h 0 min old, limit 6 h; data 6 h 10 min old, limit 36 h &middot; trusted", self.page())
         self.env.now = CAPTURED + timedelta(hours=6, seconds=1)
         stale = self.page()
-        self.assertIn("<span class='chip chip-warn'>Clone 6 h 0 min old, limit 6 h &middot; stale, not trusted</span>", stale)
+        self.assertIn("<span class='chip chip-warn'>Clone 6 h 0 min old, limit 6 h; data 6 h 10 min old, limit 36 h &middot; stale, not trusted</span>", stale)
         gone = Env(clone=False)
         self.addCleanup(gone.tmp.cleanup)
         page = page_of("/", gone)[1]
@@ -681,7 +681,7 @@ class ApprovalsPageTests(unittest.TestCase):
     @unlocked_build
     def test_the_clone_strip_and_lock_chip(self):
         page = self.page()
-        self.assertIn("Clone 2 h 10 min old, limit 6 h &middot; trusted", page)
+        self.assertIn("Clone 2 h 10 min old, limit 6 h; data 2 h 20 min old, limit 36 h &middot; trusted", page)
         self.assertNotIn("Create locked", page)   # unlocked build: no stale lock chip
         with locked_create_build:
             self.assertIn("<span class='chip chip-warn'>Create locked</span>", self.page())

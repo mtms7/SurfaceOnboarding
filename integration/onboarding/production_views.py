@@ -24,6 +24,7 @@ from .production_create_record import (
     RECORDS_SUBDIR, ProductionCreateRecordError, editable_parameters, list_records, load)
 
 CLONE_LIMIT_SECONDS = int(inventory.PRODUCTION_GATE_MAX_AGE.total_seconds())
+DATA_LIMIT_SECONDS = 36 * 3600  # newest change in the cloned data: the clone is a nightly snapshot, so older means it failed
 DISPLAY_MAX_AGE = timedelta(days=3650)  # any snapshot is loaded for display; staleness is shown, not hidden
 MAX_TEXT = 160
 MAX_LIST = 20
@@ -407,15 +408,28 @@ def timing_window(start_iso: str | None, today: date, days_before: int) -> dict[
 
 # --- Clone status (the strip on every production page) --------------------------------------------------------------
 
+def _data_age_seconds(payload: dict[str, Any], now: datetime) -> int | None:
+    """Age of the newest change in the cloned data (``source.data_latest_modified``); None if absent or unreadable."""
+    source = payload.get("source")
+    stamp = source.get("data_latest_modified") if isinstance(source, dict) else None
+    try:
+        newest = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return max(0, int((now - newest).total_seconds()))
+
+
 def clone_status(root: Path, now: datetime) -> dict[str, Any]:
     """Age and trust of the production clone (Redash) for display.
 
-    ``{"state": "fresh" | "stale" | "unusable", "captured_at", "age_seconds", "limit_seconds": 21600, "reason", "label"}``.
-    Exactly 6 h old is still fresh (the gate uses ``age <= 6 h``); older shows its age but is not trusted. Any problem
-    with the snapshot is "unusable" with the loader's reason code.
+    ``{"state": "fresh" | "stale" | "unusable", "captured_at", "age_seconds", "data_age_seconds", "limit_seconds": 21600,
+    "data_limit_seconds": 129600, "reason", "label"}``. ``age_seconds`` is when Redash last ran the query (exactly 6 h is
+    still fresh: the gate uses ``age <= 6 h``); ``data_age_seconds`` is the age of the newest change in the cloned data
+    (docs/56 step 4): the query can run hourly while the cloned database is a day old. Fresh needs BOTH; an unknown data
+    age is stale (``data_age_unknown``). Any problem with the snapshot is "unusable" with the loader's reason code.
     """
-    base = {"state": "unusable", "captured_at": "", "age_seconds": None, "limit_seconds": CLONE_LIMIT_SECONDS,
-            "reason": "", "label": ""}
+    base = {"state": "unusable", "captured_at": "", "age_seconds": None, "data_age_seconds": None,
+            "limit_seconds": CLONE_LIMIT_SECONDS, "data_limit_seconds": DATA_LIMIT_SECONDS, "reason": "", "label": ""}
     try:
         payload = inventory.load_latest(Path(root), "prod-clone", max_age=DISPLAY_MAX_AGE, now=now)
     except inventory.InventoryError as error:
@@ -423,8 +437,16 @@ def clone_status(root: Path, now: datetime) -> dict[str, Any]:
     except (OSError, ValueError, TypeError):
         return {**base, "reason": "inventory_snapshot_unreadable"}
     age = int(payload.get("age_seconds") or 0)
-    return {**base, "state": "fresh" if age <= CLONE_LIMIT_SECONDS else "stale",
-            "captured_at": _text(payload.get("captured_at")), "age_seconds": age, "label": _text(payload.get("environment_label"))}
+    data_age = _data_age_seconds(payload, now)
+    reason = ""
+    if age > CLONE_LIMIT_SECONDS:
+        reason = "query_stale"
+    elif data_age is None:
+        reason = "data_age_unknown"
+    elif data_age > DATA_LIMIT_SECONDS:
+        reason = "data_stale"
+    return {**base, "state": "stale" if reason else "fresh", "reason": reason, "age_seconds": age, "data_age_seconds": data_age,
+            "captured_at": _text(payload.get("captured_at")), "label": _text(payload.get("environment_label"))}
 
 
 def age_words(seconds: int | None) -> str:

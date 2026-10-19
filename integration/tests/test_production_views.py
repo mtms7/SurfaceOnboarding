@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from integration.onboarding import production_approval as pa
 from integration.onboarding import production_create_record as pcr
@@ -329,6 +330,28 @@ class CloneStatusTests(unittest.TestCase):
         missing = views.clone_status(self.root / "nowhere", self.CAPTURED)
         self.assertEqual((missing["state"], missing["age_seconds"]), ("unusable", None))
         self.assertTrue(missing["reason"])
+
+    def test_the_data_age_is_the_newest_change_and_gates_trust_with_the_query_age(self):
+        now = self.CAPTURED + timedelta(hours=1)
+        info = views.clone_status(self.root, now)
+        self.assertEqual((info["state"], info["reason"]), ("fresh", ""))
+        self.assertIsInstance(info["data_age_seconds"], int)
+        self.assertEqual(info["data_limit_seconds"], views.DATA_LIMIT_SECONDS)
+        # the query just ran (age < 6 h) but the cloned data is a day and a half old: not trusted
+        with mock.patch.object(views, "_data_age_seconds", return_value=views.DATA_LIMIT_SECONDS + 1):
+            late = views.clone_status(self.root, now)
+        self.assertEqual((late["state"], late["reason"], late["age_seconds"]), ("stale", "data_stale", 3600))
+        with mock.patch.object(views, "_data_age_seconds", return_value=views.DATA_LIMIT_SECONDS):
+            self.assertEqual(views.clone_status(self.root, now)["state"], "fresh")
+        with mock.patch.object(views, "_data_age_seconds", return_value=None):
+            unknown = views.clone_status(self.root, now)
+        self.assertEqual((unknown["state"], unknown["reason"]), ("stale", "data_age_unknown"))
+
+    def test_data_age_helper_reads_only_the_recorded_stamp(self):
+        now = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+        self.assertEqual(views._data_age_seconds({"source": {"data_latest_modified": "2026-10-19T10:00:00Z"}}, now), 7200)
+        for bad in ({}, {"source": None}, {"source": {"data_latest_modified": None}}, {"source": {"data_latest_modified": "x"}}):
+            self.assertIsNone(views._data_age_seconds(bad, now))
 
     def test_a_tampered_snapshot_is_unusable(self):
         latest = self.root / "prod-clone" / "latest.json"
