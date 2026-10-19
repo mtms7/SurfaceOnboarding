@@ -33,7 +33,7 @@ below are the ones the BackOffice reply uses and are the expected ones.
       {"$eq": ["$accountId", "$$acc"]},
       {"$eq": ["$campaignTypeEnum", "LEAKED_CREDENTIALS_DISCOVERY"]}]}}},
     {"$sort": {"startDate": -1}},
-    {"$project": {"_id": 0, "status": 1, "startDate": 1, "endDate": 1}}],
+    {"$project": {"_id": 0, "status": "$conversionData.status", "startDate": 1, "endDate": 1}}],
   "as": "lcExecutions"}}
 ```
 
@@ -45,6 +45,11 @@ New columns in the final `$project` (exact names; the collector checks them stri
 | `lastLeakedCredentialsExecutionStart` | `{"$arrayElemAt": ["$lcExecutions.startDate", 0]}` | date |
 | `lastLeakedCredentialsExecutionEnd` | `{"$arrayElemAt": ["$lcExecutions.endDate", 0]}` | date (null while running) |
 | `leakedCredentialsExecutionsCount` | `{"$size": "$lcExecutions"}` | non-negative integer |
+
+**Verified 2026-10-19 (Execute-only runs in Redash, nothing saved):** in `campaignExecutions` the account link is `accountId`,
+the type is `campaignTypeEnum`, the dates are `startDate` / `endDate`, and the status is **`conversionData.status`** (there is no
+top-level `status`; the lookup above projects it as `status`). The corrected query returned 5447 rows, all four columns, status
+non-null on 2900 rows (`DONE` 2886, `PENDING` 14), end non-null on 2887, count > 0 on 2900.
 
 Do **not** add the execution id, the campaign id, or any user, operator or customer value. Leave every existing 253
 column unchanged.
