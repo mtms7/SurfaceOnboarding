@@ -78,7 +78,7 @@ def _stored_paths() -> frozenset[str]:
 
 
 # ----- query 253 (v2): extra columns, strict schema per query ------------------------------------------
-# Column -> kind. Kinds: str, bool, int, interval (str|int), list (list of short strings). Values are stored in
+# Column -> kind. Kinds: str, bool, int, interval (str|int), list (list of short strings), enum (UPPER_SNAKE), date (epoch ms). Values are stored in
 # ``tenant["v2"]`` (flat snake_case keys, None omitted) next to the unchanged v1 row; no personal data.
 V2_COLUMNS: dict[str, str] = {
     "accountCountryCode": "str", "userEmailDomains": "list", "enumerationScanningInterval": "interval",
@@ -90,7 +90,11 @@ V2_COLUMNS: dict[str, str] = {
     "automatedDiscoveryEnabled": "bool", "domainsMultiAttackStackEnabled": "bool",
     "domainsMultiAttackStackAssetsPerStack": "int", "subDomainsMultiAttackStackEnabled": "bool",
     "subDomainsMultiAttackStackAssetsPerStack": "int", "primaryUserMfaRequired": "bool",
-    "primaryUserPresent": "bool", "spyCloudEnabled": "bool"}
+    "primaryUserPresent": "bool", "spyCloudEnabled": "bool",
+    # docs/56: the newest Credential Exposure (LEAKED_CREDENTIALS_DISCOVERY) execution of the account, from the
+    # campaignExecutions lookup in query 253: status (enum), start and end (dates, epoch ms), and the execution count.
+    "lastLeakedCredentialsExecutionStatus": "enum", "lastLeakedCredentialsExecutionStart": "date",
+    "lastLeakedCredentialsExecutionEnd": "date", "leakedCredentialsExecutionsCount": "int"}
 # accountLicense columns query 253 adds; they feed the v1 row's license (so ``minimize_row`` keeps them) and nothing else.
 V2_LICENSE_COLUMNS: dict[str, str] = {
     "accountLicense.reconLevel": "interval", "accountLicense.notificationsAllowed": "bool",
@@ -103,18 +107,24 @@ _MAX_TEXT = 128
 _HOSTNAME = re.compile(r"[A-Za-z0-9*_.-]{1,253}")  # no '@', no spaces, at most 253 characters
 _COUNTRY_CODE = re.compile(r"[A-Z]{2}")
 _ENUM = re.compile(r"[A-Za-z0-9_ -]{1,32}")
+_STATUS_ENUM = re.compile(r"[A-Z][A-Z_]{0,31}")  # an execution status such as DONE, DONE_WITH_ERRORS, PENDING
 MAX_ROW_LIST_CHARS = 1500  # all list items of one row together: bounds the worst-case row so 6,000 rows stay under 32 MB
 # Alternate domains have their own bounds (live 2026-10-18: 125 tenants over 50 items, max 1,622 items / ~28,500
 # characters in one row, ~567,000 characters in all): per row, and for the whole result so the file stays under 32 MB.
 ALT_DOMAINS_MAX_ITEMS = MAX_ALTERNATE_DOMAINS  # the same bound minimize_row keeps, so nothing is cut later
 ALT_DOMAINS_MAX_ROW_CHARS = 100_000
-ALT_DOMAINS_MAX_TOTAL_CHARS = 1_500_000  # live ~567,000
-ALT_DOMAINS_MAX_TOTAL_ITEMS = 90_000  # live ~35,900; each item also costs ~13 bytes of JSON in the snapshot
+ALT_DOMAINS_MAX_TOTAL_CHARS = 1_100_000  # live ~567,000 (was 1,500,000 before the docs/56 columns took 0.7 MB of the budget)
+ALT_DOMAINS_MAX_TOTAL_ITEMS = 70_000  # live ~35,900 (was 90,000); each item also costs ~13 bytes of JSON in the snapshot
+
+
+# The four docs/56 columns keep short stored keys: every byte counts at 6,000 rows under the 32 MB clone limit.
+_V2_SHORT_KEYS = {"lastLeakedCredentialsExecutionStatus": "ce_status", "lastLeakedCredentialsExecutionStart": "ce_start",
+                  "lastLeakedCredentialsExecutionEnd": "ce_end", "leakedCredentialsExecutionsCount": "ce_count"}
 
 
 def v2_key(column: str) -> str:
     """Flat snake_case key for a v2 column (``staticOutboundIpEnabled`` -> ``static_outbound_ip_enabled``)."""
-    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).lower()
+    return _V2_SHORT_KEYS.get(column) or re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", column).lower()
 
 
 V2_KINDS: dict[str, str] = {v2_key(column): kind for column, kind in V2_COLUMNS.items()}
@@ -162,6 +172,11 @@ def _v2_value(kind: str, value: Any) -> Any:
             return value
         if type(value) is float and value == value and abs(value) < 1e12 and value.is_integer() and value >= 0:
             return int(value)
+    elif kind == "enum":
+        if type(value) is str and _STATUS_ENUM.fullmatch(value):
+            return value
+    elif kind == "date":
+        return parse_timestamp_ms(value)  # refuses a bool or garbage; stored as epoch milliseconds
     elif kind == "list":
         items = _domain_list(value)
         if items is not None:

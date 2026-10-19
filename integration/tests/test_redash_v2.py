@@ -45,6 +45,8 @@ def row253(index: int, **overrides):
         "accountLicense.multipleUsersAllowed": True, "accountLicense.apiAccessAllowed": False,
         "accountLicense.phishingEnabled": False, "accountLicense.provisioningEnabled": True,
         "accountLicense.allowedModules": ["recon", "validation"], "accountLicense.elevatedFeaturesEnabled": False,
+        "lastLeakedCredentialsExecutionStatus": "DONE", "lastLeakedCredentialsExecutionStart": "2026-10-19T11:45:00.000Z",
+        "lastLeakedCredentialsExecutionEnd": "2026-10-19T11:55:00.000Z", "leakedCredentialsExecutionsCount": 1,
     })
     values.update(overrides)
     return values
@@ -391,3 +393,54 @@ class ShapeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CeScanColumnTests(unittest.TestCase):
+    """docs/56: the four campaignExecutions columns of query 253 (date and enum kinds, no free text)."""
+
+    def v2(self, **overrides):
+        return next(iter(redash.normalize(reply([row253(1, **overrides)]), 253).v2_rows.values()))
+
+    def test_the_four_columns_are_typed(self):
+        v2 = self.v2()
+        self.assertEqual(v2["ce_status"], "DONE")
+        self.assertEqual(v2["ce_start"], 1792410300000)
+        self.assertEqual(v2["ce_end"], 1792410900000)
+        self.assertEqual(v2["ce_count"], 1)
+
+    def test_no_execution_yet_keeps_only_the_zero_count(self):
+        v2 = self.v2(lastLeakedCredentialsExecutionStatus=None, lastLeakedCredentialsExecutionStart=None,
+                     lastLeakedCredentialsExecutionEnd=None, leakedCredentialsExecutionsCount=0)
+        self.assertEqual(v2["ce_count"], 0)
+        self.assertNotIn("ce_status", v2)
+        self.assertNotIn("ce_end", v2)
+
+    def test_running_execution_has_no_end(self):
+        v2 = self.v2(lastLeakedCredentialsExecutionStatus="PENDING", lastLeakedCredentialsExecutionEnd=None)
+        self.assertEqual(v2["ce_status"], "PENDING")
+        self.assertNotIn("ce_end", v2)
+
+    def test_free_text_or_wrong_types_fail_closed(self):
+        for column, bad in (("lastLeakedCredentialsExecutionStatus", "done; see user@example.com"),
+                            ("lastLeakedCredentialsExecutionStatus", "done"), ("lastLeakedCredentialsExecutionStatus", 3),
+                            ("lastLeakedCredentialsExecutionStart", "not a date"),
+                            ("lastLeakedCredentialsExecutionEnd", True),
+                            ("leakedCredentialsExecutionsCount", -1), ("leakedCredentialsExecutionsCount", "x")):
+            with self.subTest(column=column, bad=bad), self.assertRaises(redash.InventoryError):
+                redash.normalize(reply([row253(1, **{column: bad})]), 253)
+
+    def test_a_missing_column_stops_the_collector(self):
+        raw = row253(1)
+        del raw["lastLeakedCredentialsExecutionStatus"]
+        with self.assertRaises(redash.InventoryError) as caught:
+            redash.normalize(reply([raw]), 253)
+        self.assertEqual(str(caught.exception), "redash_columns_missing")
+
+    def test_stored_values_round_trip_through_the_schema_check(self):
+        normalized = redash.normalize(reply([row253(1)]), 253)
+        payload = {"row_schema": "v2", "source": {"query_id": 253},
+                   "tenants": [{"id": next(iter(normalized.v2_rows)), "v2": dict(next(iter(normalized.v2_rows.values())))}]}
+        self.assertEqual(redash.validate_row_schema(payload), "v2")
+        payload["tenants"][0]["v2"]["ce_status"] = "done"
+        with self.assertRaises(redash.InventoryError):
+            redash.validate_row_schema(payload)
