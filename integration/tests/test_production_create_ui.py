@@ -459,10 +459,10 @@ class SourceTests(unittest.TestCase):
         with mock.patch.object(dashboard, "detail_row", return_value=row()), \
                 mock.patch.object(dashboard, "_launch_production_create", launch), \
                 mock.patch.object(dashboard, "_run_sf_argv", run_sf), \
-                mock.patch.object(dashboard, "_read_production_writeback_row", return_value=row()):
+                mock.patch.object(dashboard, "_read_production_writeback_row", return_value=row()),                 mock.patch.object(dashboard, "production_records_parent", return_value=Path(empty.name)):
             for path in sorted(ui.POST_PATHS):
                 handler._post_production_create(path, CO, {"reference": [CO], "nonce": ["x"]})
-        self.assertEqual(len(sent), 3)
+        self.assertEqual(len(sent), len(ui.POST_PATHS))
         for status, page in sent:
             self.assertEqual(int(status), 409)
             self.assertIn("Nothing was sent", page)

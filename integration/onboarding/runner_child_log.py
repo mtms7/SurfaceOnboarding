@@ -23,7 +23,7 @@ from typing import Any, Mapping, Sequence
 
 LOG_ENV = "SURFACE_ONBOARDING_RUNNER_LOG"
 WITHHELD = "[line withheld]"
-PRODUCTION_FLAGS = ("--production-create", "--production-dry-run")
+PRODUCTION_FLAGS = ("--production-create", "--production-dry-run", "--production-scan-check")
 _KEYS = ("result", "outcome", "reason", "refusal_reason", "record", "record_error", "production_write",
          "salesforce_writeback")
 _CODE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")

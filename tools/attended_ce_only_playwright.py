@@ -10093,9 +10093,18 @@ def main() -> int:
     parser.add_argument("--production-search-probe", action="store_true",
                         help="One attended READ-ONLY proof that the name and domain-only searches return a known clone tenant "
                              "(needs SURFACE_ONBOARDING_PRODUCTION_PROBE=1 and _REF; you sign in with MFA; nothing is typed or clicked).")
+    parser.add_argument("--production-scan-check", action="store_true",
+                        help="With --co: READ-ONLY CE scan check of a tenant created by a verified production create (you sign "
+                             "in with SSO and MFA; nothing is typed, clicked or written).")
     parser.add_argument("--owner-go", action="store_true",
                         help="Only with --production-create: the owner's explicit go for this one create (never implied).")
     args = parser.parse_args()
+    if args.production_scan_check:
+        if (not args.co or args.revision or args.production_create or args.production_dry_run or args.production_probe
+                or args.production_readback or args.dry_run or args.confirm_write or args.owner_go):
+            parser.error("--production-scan-check needs --co and is a separate read-only run")
+        print(run_production_scan_check(args.co))
+        return 0
     if args.production_search_probe:
         if args.co or args.revision or args.production_create or args.dry_run or args.confirm_write:
             parser.error("--production-search-probe is a separate read-only run")
@@ -10401,6 +10410,76 @@ def _pcr_finish_line(result: Any) -> str:
     shown = word if word and word != create_ui.DRY_RUN_PASSED else live.live_known_reason(result.reason or "unexpected_error")
     line = _pcr_line(shown, outcome=result.outcome, record=name, record_error=result.record_error)
     return line if production_dry_run.line_problem(line) is None else _pcr_line("dry_run_line_not_redacted")
+
+
+def _launch_os_name() -> str:
+    """``os.name`` for the launch gate (tests patch this, never ``os.name`` itself)."""
+    return os.name
+
+
+def _scan_check_line(result: str) -> str:
+    return json.dumps({"result": result, "production_write": "not_performed", "salesforce_writeback": "not_performed"},
+                      separators=(",", ":"))
+
+
+def run_production_scan_check(reference: str, *, environ: Any | None = None, now: datetime | None = None,
+                              records_parent: Path | None = None, open_page: Any = None,
+                              wait_seconds: float = MAX_WAIT_SECONDS) -> str:
+    """Build 3 (owner decision 2026-10-19): READ-ONLY CE scan check of one tenant created by a verified production create.
+
+    Bound to the CO's own verified create record (its Account UUID and tenant name); no approval and no lock constant,
+    because nothing is written. Opens tenantManagement in the dedicated profile (SSO + MFA by the owner), installs the
+    read-only request guard, reads the tenant's OWN row through the page's own table request and records only scan field
+    names with safe values (production_scan_check). The VM and unknown runtimes never open a browser.
+    """
+    from integration.onboarding import production_create_ui as create_ui
+    from integration.onboarding import production_scan_check as scan
+
+    environ = dict(os.environ if environ is None else environ)
+    now = now or datetime.now(timezone.utc)
+    if not isinstance(reference, str) or not REFERENCE.fullmatch(reference):
+        return _scan_check_line("invalid_co_reference")
+    runtime = str(environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop")).strip().casefold()
+    if _launch_os_name() != "nt" or runtime != "desktop":  # the dashboard's rule: the Windows attended desktop only
+        return _scan_check_line("browser_launch_not_allowed")
+    parent = records_parent or _pdr_records_parent()
+    try:
+        history = create_ui.load_co_records(parent, reference)
+    except Exception:
+        return _scan_check_line("records_unreadable")
+    verified = [r for r in history if r.get("outcome") == "readback_verified"]
+    uuid = verified[-1].get("account_uuid") if verified else None
+    tenant = verified[-1].get("tenant_name") if verified else None
+    if (create_ui.co_status(history)["code"] != create_ui.CREATED_VERIFIED or not isinstance(uuid, str)
+            or not re.fullmatch(ACCOUNT_UUID_PATTERN, uuid) or not isinstance(tenant, str) or not tenant.strip()):
+        return _scan_check_line("no_verified_create")
+    reply = {"state": "read_unavailable", "found": False, "fields": {}}
+    result = None
+    try:
+        with (open_page or _pdr_browser_page)(production_probe.probe_target(), wait_seconds) as page:
+            guard = production_probe.RequestGuard(require_read_body=True)
+            guard.install(page)
+            try:
+                worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
+            except Exception:
+                worker = None
+            problem = production_dry_run.service_worker_verdict(worker)
+            if problem:
+                result = problem
+            else:
+                status, body = _pdr_reader(page, in_app=False).table(tenant, mode=production_probe.REWRITE_STRICT)
+                reply = scan.scan_reply(status, body, uuid)
+    except RuntimeError as error:
+        result = "production_sign_in_timeout" if str(error) == "production_dry_run_login_timeout" else "scan_check_failed"
+    except Exception:
+        result = "scan_check_failed"
+    if result is not None:
+        return _scan_check_line(result)
+    try:
+        scan.record(parent, reference, reply, now)
+    except Exception:
+        return _scan_check_line("scan_record_failed")
+    return _scan_check_line(reply["state"])
 
 
 def run_production_create(reference: str, acknowledged_revision: str, *, owner_go: bool = False,

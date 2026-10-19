@@ -42,7 +42,8 @@ from . import session_readiness as readiness
 CREATE_PATH = "/attended/production-create"
 UUID_REVIEW_PATH = "/attended/production-uuid-review"
 UUID_CONFIRM_PATH = "/attended/production-uuid-confirm"
-POST_PATHS = frozenset({CREATE_PATH, UUID_REVIEW_PATH, UUID_CONFIRM_PATH})
+SCAN_CHECK_PATH = "/attended/production-scan-check"  # build 3: the owner's read-only CE scan check
+POST_PATHS = frozenset({CREATE_PATH, UUID_REVIEW_PATH, UUID_CONFIRM_PATH, SCAN_CHECK_PATH})
 TOKEN_TTL_SECONDS = 10 * 60
 DRY_RUN_MAX_AGE = timedelta(hours=24)
 SALESFORCE_FRESH_SECONDS = 15 * 60
@@ -75,6 +76,13 @@ STATUS_TEXT = {
 
 # Reason code -> one plain sentence for the page (never free text from an exception).
 GATE_TEXT = {
+    "no_verified_create": "There is no verified production create for this CO, so there is nothing to check.",
+    "uuid_not_written": "The Account UUID is not written to Salesforce yet; the CE scan check comes after it.",
+    "stage_not_account_scanning": "The Salesforce stage is not Account Scanning (moved by this dashboard), so no scan check runs.",
+    "onboarding_completed": "This CO is already Onboarding Completed.",
+    "scan_check_running": "A CE scan check is already running.",
+    "stage_not_expected": "The Salesforce stage was not the expected one, so it was left unchanged.",
+    "stage_write_needs_review": "An earlier stage change has no confirmed result; check Salesforce by hand before anything else.",
     "vm_read_only": "The VM dashboard is read-only guidance; create runs from the owner's Windows desktop.",
     "production_runner_not_supported": "The production runner is locked in this build.",
     "production_dry_run_not_supported": "The production dry run is locked in this build.",
@@ -935,3 +943,66 @@ def progress_card_html(progress: Mapping[str, Any]) -> str:
             "<div class='runprog-bar' role='progressbar' aria-label='Production create progress' aria-valuemin='0' "
             "aria-valuemax='100' aria-valuenow='" + percent + "'><span class='runprog-fill' style='width:" + percent
             + "%'></span></div><ol class='runprog-steps'>" + items + "</ol></div></section>")
+
+
+# --- Build 3: read-only CE scan check and the last stage moves (owner decision 2026-10-19) ---------------------------------
+
+SCAN_STATE_TEXT = {
+    "scan_completed": "The CE scan is finished.",
+    "unconfirmed": "Read the tenant's scan fields; which value means \"finished\" is not confirmed yet, so no stage moved.",
+    "row_not_found": "The tenant was not found by its Account UUID.",
+    "row_ambiguous": "More than one row has this Account UUID; nothing moved.",
+    "production_session_expired": "The BackOffice session expired; sign in again and re-check.",
+    "read_unavailable": "BackOffice did not answer the read; re-check.",
+    "reply_unexpected": "BackOffice answered with an unexpected shape; nothing moved.",
+}
+
+
+def scan_check_problem(parent: Path, co: str) -> str | None:
+    """Why the owner cannot start a CE scan check for ``co`` now, else None (verified create, UUID written, Account Scanning)."""
+    try:
+        history = load_co_records(parent, co)
+    except Exception:
+        return "records_unreadable"
+    if co_status(history)["code"] != CREATED_VERIFIED:
+        return "no_verified_create"
+    if last_uuid_write(parent, co) != "written_verified":
+        return "uuid_not_written"
+    stage = last_stage_write(parent, co)
+    if stage == ("Onboarding Completed", "written_verified"):
+        return "onboarding_completed"
+    if stage is not None and stage[1] in ("write_started", "write_uncertain"):
+        return "stage_write_needs_review"
+    # No local stage line is fine (a stage moved by hand, e.g. CO-0798): the stage moves themselves re-read Salesforce and
+    # move only from exactly Account Scanning.
+    return None
+
+
+def scan_card_html(parent: Path, co: str, *, running: bool) -> str:
+    """The CE scan section of a created CO: the last recorded check and stage, and the owner's check button."""
+    from . import production_scan_check as scan
+
+    last = scan.latest(parent, co)
+    stage = last_stage_write(parent, co)
+    lines = ""
+    if stage is not None:
+        lines += "<p class='note'>Salesforce stage: <strong>" + escape(stage[0] or "unknown") + "</strong> (" + escape(stage[1]) + ")</p>"
+    if last is not None:
+        lines += ("<p class='note'>Last CE scan check " + escape(str(last.get("recorded_at", "")).replace("T", " "))
+                  + ": " + escape(SCAN_STATE_TEXT.get(str(last.get("state")), str(last.get("state")))) + "</p>")
+    problem = scan_check_problem(parent, co)
+    if problem == "onboarding_completed":
+        body = "<p class='note'>Onboarding Completed. Nothing else to do for this CO.</p>"
+    elif running:
+        body = "<p class='note'>A CE scan check is running: sign in with SSO and MFA in the app.pentera.io window.</p>"
+    elif problem is None:
+        body = ("<form class='start-form' method='post' action='" + SCAN_CHECK_PATH + "'>"
+                "<input type='hidden' name='reference' value='" + escape(co) + "'>"
+                "<button type='submit'>Check CE scan in BackOffice</button></form>"
+                "<p class='note'>Read only: opens the BackOffice window (SSO and MFA), reads this tenant's scan fields and, "
+                "only when the scan is finished, moves the stage to Scan Completed Successfully and then Onboarding Completed "
+                "(CE-only skips User Created).</p>")
+    else:
+        body = "<p class='note'>" + escape(gate_text(problem)) + "</p>"
+    return ("<section class='card' aria-labelledby='co-scan-title'><div class='card-head'><h2 id='co-scan-title' "
+            "class='pill'>CE scan</h2></div>" + lines + body + "</section>")

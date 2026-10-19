@@ -7660,11 +7660,17 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
     """The create section of a production CO page. With ``state`` (the review page) a closed gate without a record shows a
     read-only card naming that gate instead of nothing; without it, "" as before. Any failure shows no control."""
     try:
+        with _PRODUCTION_RUNS_LOCK:
+            scanning = bool((PRODUCTION_SCAN_RUNS.get(reference) or {}).get("running"))
+        parent = production_records_parent()
+        scan_html = (create_ui.scan_card_html(parent, reference, running=scanning)
+                     if create_ui.scan_check_problem(parent, reference) not in ("no_verified_create", "records_unreadable")
+                     else "")
         progress = _production_run_progress(reference)
         if progress is not None:
-            return create_ui.progress_card_html(progress)
+            return create_ui.progress_card_html(progress) + (scan_html if progress["done"] else "")
         inputs = _create_ui_inputs(reference, row)
-        html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
+        html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference)) + scan_html
     except Exception:  # noqa: BLE001 - fail closed: no control
         html = ""
     if html or state is None:
@@ -7748,6 +7754,50 @@ def _production_run_progress(reference: str) -> dict[str, Any] | None:
     running = create_ui.LAUNCHES.busy() or run.get("follow") is None
     return create_ui.production_progress(production_records_parent(), reference, run["since"], running=running,
                                          follow=run.get("follow"))
+
+
+# Build 3: the owner's read-only CE scan checks started by THIS dashboard process: {"running": bool, "stages": list | None}.
+PRODUCTION_SCAN_RUNS: dict[str, dict[str, Any]] = {}
+
+
+def _launch_scan_check(reference: str) -> Any:
+    """Start the runner's read-only CE scan check (desktop only) and a worker that moves the stage when it is finished."""
+    if not REFERENCE.fullmatch(reference) or not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
+        return None
+    child = dict(os.environ)
+    child.pop(runner_child_log.LOG_ENV, None)
+    folder = runner_log_dir()
+    if folder is not None:
+        child[runner_child_log.LOG_ENV] = str(folder / (reference + "-scan-" + datetime.now(timezone.utc)
+                                                        .strftime("%Y%m%dT%H%M%SZ") + ".log"))
+    try:
+        process = subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-scan-check", "--co", reference],
+                                   env=child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    with _PRODUCTION_RUNS_LOCK:
+        PRODUCTION_SCAN_RUNS[reference] = {"running": True, "stages": None}
+    Thread(target=_follow_scan_check, args=(reference, process), daemon=True).start()
+    return process
+
+
+def _follow_scan_check(reference: str, process: Any) -> None:
+    """When the check ends: the two stage moves, only for a recorded ``scan_completed`` (create_ui gates every write)."""
+    from integration.onboarding import production_scan_check as scan
+
+    try:
+        process.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        latest = scan.latest(production_records_parent(), reference) or {}
+        inputs = _create_ui_inputs(reference, None)
+        stages = create_ui.after_scan_finished(inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
+                                               create_ui.PINNED_SF_ALIAS, scan_state=latest.get("state"))
+    except Exception:  # noqa: BLE001
+        stages = ["follow_up_failed"]
+    with _PRODUCTION_RUNS_LOCK:
+        PRODUCTION_SCAN_RUNS[reference] = {"running": False, "stages": stages}
 
 
 def _read_production_writeback_row(reference: str) -> dict[str, str | None] | None:
@@ -8695,6 +8745,19 @@ class Handler(BaseHTTPRequestHandler):
             if code != "launched":
                 refuse(code); return
             self.send_redirect("/co/" + reference + "?env=prod")  # the CO page shows the progress (same dashboard)
+            return
+        if path == create_ui.SCAN_CHECK_PATH:
+            if vm_mode():
+                refuse("vm_read_only"); return
+            with _PRODUCTION_RUNS_LOCK:
+                if (PRODUCTION_SCAN_RUNS.get(reference) or {}).get("running"):
+                    refuse("scan_check_running"); return
+            problem = create_ui.scan_check_problem(production_records_parent(), reference)
+            if problem is not None:
+                refuse(problem); return
+            if create_ui.LAUNCHES.busy() or not create_ui.LAUNCHES.claim(lambda: _launch_scan_check(reference)):
+                refuse("launch_in_progress"); return
+            self.send_redirect("/co/" + reference + "?env=prod")
             return
         if path == create_ui.UUID_REVIEW_PATH:
             code, view = create_ui.handle_uuid_review(values, inputs, _read_production_writeback_row(reference))
