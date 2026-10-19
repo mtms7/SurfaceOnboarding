@@ -21,12 +21,19 @@ is not a secret.
 Optional: set $env:SURFACE_AUTOMATION_QUIET = '1' before starting to open the
 automation Chrome off-screen without background throttling (follow the progress
 bar on the CO page; first sign-in/MFA needs the visible window). Not set by default.
+
+-ProductionSessions opens the guarded BackOffice production create path for an
+approved one-CO attempt: it sets SURFACE_ONBOARDING_PRODUCTION_SESSIONS=1 in the
+dashboard process. The approval reference and times still come only from the
+approval record, and every create gate still applies. Without the switch any
+inherited value is cleared, so a Dev-only start never opens production.
 #>
 [CmdletBinding()]
 param(
     [switch]$Restart,
     [switch]$NoLogin,
     [switch]$NoBrowser,
+    [switch]$ProductionSessions,
     [int]$Port = 8012,
     [string]$TargetOrg = 'surface-onboarding',
     [string]$ExpectedOrgId = '',
@@ -137,6 +144,11 @@ $env:SURFACE_SF_TARGET_ORG = $TargetOrg
 $env:SURFACE_SF_EXPECTED_ORG_ID = $ExpectedOrgId
 $env:SURFACE_DASHBOARD_ALLOWED_USERS = $AllowedUser
 $env:SURFACE_PASSWORD_RESET_URL = $PasswordResetUrl
+if ($ProductionSessions) {
+    $env:SURFACE_ONBOARDING_PRODUCTION_SESSIONS = '1'
+} else {
+    Remove-Item Env:SURFACE_ONBOARDING_PRODUCTION_SESSIONS -ErrorAction SilentlyContinue
+}
 $process = Start-Process -FilePath $PythonPath -ArgumentList $quotedDashboard -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardError $startupLog -PassThru
 $deadline = (Get-Date).AddSeconds(20)
 do {

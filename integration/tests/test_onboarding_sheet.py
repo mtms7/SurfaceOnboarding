@@ -338,20 +338,21 @@ class PageBase(unittest.TestCase):
 
 
 class CardTests(PageBase):
-    def test_present_once_after_the_onboard_card_on_both_routes(self):
+    def test_present_once_after_the_readiness_card(self):
         for name, page in self.pages().items():
             self.assertEqual(page.count("sheet-card"), 1, name)
-            self.assertIn("<h2 id='co-sheet-title' class='pill'>Production onboarding sheet</h2>", page, name)
+            self.assertIn("<h2 id='co-sheet-title' class='pill'>Add Account values</h2>", page, name)
+            self.assertNotIn("Production onboarding sheet", page, name)
             self.assertLess(page.index("onboard-card"), page.index("sheet-card"), name)
 
-    def test_sections_in_order(self):
+    def test_only_the_values_no_repeated_checks_manual_steps_or_lock_line(self):
+        # Owner feedback 2026-10-18: the checks are the readiness card; the runner enters these values itself.
         for name, page in self.pages().items():
             card = self.card(page)
-            marks = ["1. Before you start", "A missing match is never a clearance", "2. Enter in Add Account",
-                     "3. After you click Confirm in BackOffice", "Production create stays locked in the dashboard: this sheet is guidance only."]
-            positions = [card.index(mark) for mark in marks]
-            self.assertEqual(positions, sorted(positions), name)
+            for text in ("Before you start", "After you click Confirm", "stays locked", "guidance only", "<ul class='checks'>"):
+                self.assertNotIn(text, card, (name, text))
             self.assertIn("https://app.pentera.io", card)
+            self.assertIn("<table class='dense'>", card)
 
     def test_one_table_row_per_field_with_exact_values(self):
         for name, page in self.pages().items():
@@ -412,8 +413,7 @@ class CardTests(PageBase):
             self.assertIn("Do not onboard this CO:", card, name)
             self.assertIn(views.SHEET_REFUSALS["one_email_domain_required"], card, name)
             self.assertNotIn("<table", card, name)
-            self.assertNotIn("2. Enter in Add Account", card, name)
-            self.assertIn("Production create stays locked in the dashboard", card, name)
+            self.assertNotIn("stays locked", card, name)
 
     def test_uuid_present_refuses(self):
         row = {**ROW, "Account_UUID__c": "a" * 32}
@@ -438,7 +438,7 @@ class CardTests(PageBase):
         with patch.object(views, "onboarding_sheet", side_effect=RuntimeError("boom")):
             for name, page in self.pages().items():
                 card = self.card(page)
-                self.assertIn("The sheet is " + UNAVAILABLE + ".", card, name)
+                self.assertIn("The values are " + UNAVAILABLE + ".", card, name)
                 self.assertNotIn("<table", card, name)
 
 
@@ -460,13 +460,14 @@ class VmModeTests(PageBase):
             for tag in ("<form", "<button", "<input", "<a ", "<script"):
                 self.assertNotIn(tag, card, (name, tag))
 
-    def test_clone_and_match_chip_is_unavailable_when_nothing_is_published(self):
+    def test_clone_check_is_unavailable_when_nothing_is_published(self):
         with base.patched(self.env, unavailable=True), patch.object(dashboard, "vm_mode", return_value=True), \
                 patch.object(dashboard, "inventory_root", return_value=self.env.dir / "missing"), \
                 patch.object(dashboard, "load_runner_state", return_value={}):
             page = dashboard.page_onboard_review(base.summary_for(), base.EXTRAS, "", row=self.VM_ROW)
-        card = self.card(page)
-        self.assertRegex(card, r"Clone and production match.*?chip-warn'>Unavailable</span>")
+        start = page.index("<section class='card onboard-card'")   # the checks live in the readiness card only
+        ready = page[start:page.index("</section>", start)]
+        self.assertRegex(ready, r"Clone fresh under 6 h.*?chip-neutral'>Unavailable</span>")
 
     def test_the_card_shows_the_snapshot_time_and_the_stale_warning(self):
         for stale in (False, True):
@@ -474,7 +475,7 @@ class VmModeTests(PageBase):
                 for name, page in self.pages(row=self.VM_ROW, vm=True, country=None).items():
                     card = self.card(page)
                     self.assertIn("Salesforce data (approval, UUID, domains) was published at 2026-10-16 09:50 UTC; the tenant clone is separate and", card, name)
-                    self.assertEqual(card.count("(as of 2026-10-16 09:50 UTC)"), 3, name)
+                    self.assertEqual(card.count("(as of 2026-10-16 09:50 UTC)"), 0, name)   # the checks are not repeated
                     self.assertEqual("Salesforce data may be out of date: re-check the CO in Salesforce before you start." in card,
                                      stale, name)
 
@@ -587,7 +588,7 @@ class OnboardedAndUnverifiedMatchTests(unittest.TestCase):
         self.assertNotEqual(sheet(match={**match, "co_uuid_set": False}, uuid_state="empty")["state"], "refused")
 
     def test_the_checklist_blocks_onboarded_and_disagreement(self):
-        base = dict(vm=True, locked=True, lock_reason=None, session_ready=None, clone={"state": "fresh", "age_seconds": 60},
+        base = dict(vm=True, locked=True, lock_reason=None, clone={"state": "fresh", "age_seconds": 60},
                     domain_count=1, uuid_state="empty", ce_route=True, start_iso="2026-10-18", today=date(2026, 10, 17),
                     days_before=2, approval=None, create=None)
         items = {i["key"]: i for i in views.onboard_checklist(match={"status": "onboarded", "reason": "", "candidates": [],

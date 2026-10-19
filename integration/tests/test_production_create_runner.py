@@ -153,7 +153,8 @@ class LivePage(dry.FakePage):
         self.workers_after_click = 0
         self.requests_after_click = []
         self.popup_on_readback = False
-        self.context = SimpleNamespace(pages=[self], route=lambda pattern, handler: self.routes.append((pattern, handler)),
+        self.context_routes = []  # its own list: a context route must never be mistaken for the page route
+        self.context = SimpleNamespace(pages=[self], route=lambda pattern, handler: self.context_routes.append((pattern, handler)),
                                        on=self._context_on)
         self.country_value = "CL"
         country, original = self.selects["accountCountry"], self.selects["accountCountry"].evaluate
@@ -879,8 +880,43 @@ class StrictReadbackTests(Base):
         self.assertEqual(h.go()["result"], "created_verified")
 
 
+class LiveGuardInstallTests(unittest.TestCase):
+    def fake(self):
+        page = SimpleNamespace(routes=[], events=[])
+        page.route = lambda pattern, handler: page.routes.append(pattern)
+        page.on = lambda event, handler: page.events.append(event)
+
+        def no_context_route(*_a, **_k):
+            raise AssertionError("context routing is not used")
+        page.context = SimpleNamespace(route=no_context_route, on=lambda event, handler: page.events.append("context." + event))
+        return page
+
+    def test_live_and_dry_run_guards_install_on_the_same_surface_with_the_same_pattern(self):
+        from integration.onboarding import production_create_live as live
+        from integration.onboarding import production_dry_run as pdry
+        dry_page, live_page = self.fake(), self.fake()
+        pdry.DryRunRequestGuard().install(dry_page)
+        live.LiveRequestGuard().install(live_page)
+        self.assertEqual(dry_page.routes, ["**/*"])
+        self.assertEqual(live_page.routes, ["**/*"])
+        self.assertIn("popup", live_page.events)
+        self.assertIn("context.page", live_page.events)   # new pages are still counted (pre-arm / post-click fail closed)
+
+    def test_a_new_page_is_counted_and_routed_best_effort(self):
+        from integration.onboarding import production_create_live as live
+        guard = live.LiveRequestGuard()
+        popup = self.fake()
+        guard._on_popup(popup)
+        self.assertEqual(guard.popups, 1)
+        self.assertEqual(popup.routes, ["**/*"])
+        guard._on_popup(SimpleNamespace())  # cannot be routed: still counted, never raises
+        self.assertEqual(guard.popups, 2)
+
+
 class ContextGuardAndCountryTests(Base):
-    def test_the_guard_is_installed_at_context_level_and_a_popup_after_the_click_is_unknown(self):
+    def test_the_guard_is_installed_at_page_level_like_the_dry_run_and_a_popup_after_the_click_is_unknown(self):
+        # 2026-10-19: the first live create (00:11Z) ended about:blank / production_session_not_ready; the only difference
+        # from the passing dry runs #5-#7 was a CONTEXT-level route. The live guard now routes the page exactly like them.
         h = self.harness()
         h.page.popups_after_click = 1
         result = h.go()
@@ -888,7 +924,8 @@ class ContextGuardAndCountryTests(Base):
         self.assertEqual((h.page.confirm_clicks, h.page.readback_calls), (1, 0))
         self.assertEqual(h.approval_unused(), "approval_consumed")
         self.assertTrue(ui.co_status(h.loaded_records())["blocking"])
-        self.assertTrue(h.page.routes)
+        self.assertEqual([p for p, _h in h.page.routes].count("**/*"), 1)
+        self.assertEqual(h.page.context_routes, [])
 
     def test_a_popup_after_the_poll_window_turns_a_matching_readback_into_unknown(self):
         h = self.harness(readbacks=[reply([]), reply([good_row()])])
@@ -921,9 +958,12 @@ class ContextGuardAndCountryTests(Base):
         self.assertEqual(h.go()["result"], "create_outcome_unknown")
         self.assertEqual(h.page.readback_calls, 0)
 
-    def test_an_unroutable_context_stops_the_run_before_any_form_work(self):
+    def test_an_unroutable_page_stops_the_run_before_any_form_work(self):
         h = self.harness()
-        h.page.context = SimpleNamespace(pages=[h.page])  # no route(): cannot guard popups
+
+        def refuse(*_a, **_k):
+            raise Exception("route unavailable")  # Playwright raises its own Error class, not RuntimeError
+        h.page.route = refuse  # the guard cannot be installed: the live create must not run unguarded
         result = h.go()
         self.assertEqual(result["result"], "production_create_crashed")
         self.assertEqual(h.page.confirm_clicks, 0)

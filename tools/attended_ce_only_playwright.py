@@ -67,7 +67,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import (  # noqa: E402
     production_approval, production_contract, production_create, production_create_record, production_dry_run,
-    production_probe, run_progress)
+    production_probe, run_progress, runner_child_log)
 from integration.onboarding.run_target import (  # noqa: E402
     ProductionLocked, RunTarget, development_target, production_dry_run_target, production_target)
 from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
@@ -9993,6 +9993,7 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
 
 
 def main() -> int:
+    runner_child_log.install_from_env(os.environ, sys.argv[1:])  # the dashboard's redacted log of a production run
     parser = argparse.ArgumentParser(description="Attended Leonardo Development CE-only auto-confirm runner.")
     parser.add_argument("--co", required=False, help="Customer Onboarding reference (e.g. CO-0702).")
     parser.add_argument("--domains", action="store_true",

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 from datetime import datetime, timedelta, timezone
+from html import escape
 import json
 from pathlib import Path
 import re
@@ -23,6 +24,9 @@ from integration.tests.test_redash_inventory import FAKE_KEY, GET, FakeOpener, r
 import tools.redash_inventory_collector as collector
 import tools.serve_attended_open_onboardings_dashboard as dashboard
 from integration.tests.locked_build import locked_create_build  # noqa: E402
+
+# Both create constants True, patched explicitly so tests of the unlocked pages keep proving them after the relock commit.
+unlocked_build = patch.multiple(readiness, PRODUCTION_RUNNER_SUPPORTED=True, PRODUCTION_DRY_RUN_SUPPORTED=True)
 
 CE = {"Onboarding_Product__c": dashboard.CE_ROUTE_PRODUCT, "Onboarding_Type__c": dashboard.CE_ROUTE_TYPE}
 ROWS = [
@@ -255,6 +259,7 @@ class LandingTests(unittest.TestCase):
         self.assertNotIn("href='/?queue=", page)
         self.assertIn("href='/dev?", filtered)
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_rows_chips_and_links(self):
         page = self.page()
         ok = self.row_of(page, "CO-0780")
@@ -318,8 +323,16 @@ class LandingTests(unittest.TestCase):
         self.assertIn("<span class='chip chip-warn'>Clone unusable: inventory_snapshot_missing</span>", page)
         self.assertIn("redash_inventory_collector.py --collect", page)
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_lock_chip_while_locked(self):
         self.assertIn("<span class='chip chip-warn'>Create locked</span>", self.page())
+
+    @unlocked_build
+    def test_unlocked_build_has_no_lock_chip_even_without_an_approval_in_the_environment(self):
+        # Owner feedback 2026-10-18: the session unlock comes from each CO's approval record, never os.environ.
+        page = self.page()
+        self.assertNotIn("Create locked", page)
+        self.assertNotIn("<span class='chip chip-warn'>Locked</span>", self.row_of(page, "CO-0780"))
 
     def test_unreadable_or_unpublished_state_never_reads_as_none(self):
         self.env.approvals.write_text("garbage", encoding="utf-8")
@@ -404,10 +417,10 @@ class CoPageTests(unittest.TestCase):
         return [text(h) for h in re.findall(r"<h2[^>]*>(.*?)</h2>", page, flags=re.S)]
 
     @locked_create_build  # unlock window 2026-10-18: runs as the locked build
-    def test_cards_in_the_mockup_order(self):
+    def test_cards_in_the_production_first_order(self):
         page = self.page()
-        self.assertEqual(self.heads(page), ["Onboard", "Production onboarding sheet", "Salesforce facts", "Production checks", "Approval", "Create", "D2 record",
-                                            "UUID writeback to Salesforce"])
+        self.assertEqual(self.heads(page), ["Production create", "Production readiness", "Salesforce facts", "Production checks",
+                                            "Add Account values", "Approval", "D2 record"])
         self.assertIn("<a class='crumb' href='/'>", page)
         self.assertIn("envpill prod", page)
 
@@ -471,12 +484,13 @@ class CoPageTests(unittest.TestCase):
         self.assertIn("chip-bad'>Already set</span>", filled)
         self.assertNotIn("a" * 32, filled)
 
-    def test_lock_banner_with_the_reason_and_no_create_control(self):
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
+    def test_locked_build_names_the_gate_reason_once_and_has_no_create_control(self):
         page = self.page()
-        self.assertIn("<div class='banner banner-warn' role='status'><strong>Production create is locked.</strong>", page)
-        self.assertIn("Production sessions are not enabled.", page)  # reason from production_unlock_problem
-        locked = self.page(unlock="production_approval_expired")
-        self.assertIn("The configured production approval is expired.", locked)
+        self.assertNotIn("class='banner banner-warn' role='status'><strong>Production create is locked.", page)  # no banner
+        create = page[page.index("<h2 id='co-create-title'"):page.index("</section>", page.index("<h2 id='co-create-title'"))]
+        self.assertIn("chip-warn'>Locked</span>", create)
+        self.assertIn(dashboard.create_ui.gate_text("production_runner_not_supported"), create)
         self.assertEqual(controls(page, allow=("/attended/review-approve", "Approve this summary")), [])
         self.assertIn("<span class='chip chip-warn'>Create locked</span>", page)
 
@@ -495,13 +509,13 @@ class CoPageTests(unittest.TestCase):
             page = self.page(unlock=None)
         self.assertEqual(controls(page, allow=("/attended/review-approve", "Approve this summary")), [])
         self.assertNotIn("Production create is locked", page)
-        self.assertIn("no create control", page.lower())
-        self.assertNotIn("<button", page[page.index("<h2 class='pill'>Create"):page.index("<h2 class='pill'>D2")])
+        self.assertIn(escape(dashboard.create_ui.gate_text("approval_missing")), page)   # the real gate's first refusal
+        self.assertIn("Create blocked", page)
 
     def test_summary_and_create_approvals_are_labelled_differently(self):
         self.env.write_approvals(approval())
         page = self.page()
-        card = page[page.index("<h2 class='pill'>Approval"):page.index("<h2 class='pill'>Create")]
+        card = page[page.index("<h2 class='pill'>Approval"):page.index("<h2 class='pill'>D2 record")]
         self.assertIn("Summary approval (4 hours)", card)
         self.assertIn("Create approval (7 days, one use)", card)
         self.assertIn("Not approved yet", card)  # the summary approval on the desktop
@@ -525,7 +539,7 @@ class CoPageTests(unittest.TestCase):
 
     def test_on_the_server_unpublished_state_says_unavailable_never_not_approved(self):
         page = self.page(unavailable=True)
-        card = page[page.index("<h2 class='pill'>Approval"):page.index("<h2 class='pill'>Create")]
+        card = page[page.index("<h2 class='pill'>Approval"):page.index("<h2 class='pill'>D2 record")]
         self.assertNotIn("Not approved yet", card)
         self.assertNotIn("No create approval recorded", card)
         self.assertGreaterEqual(card.count("unavailable on this server"), 2)
@@ -537,22 +551,24 @@ class CoPageTests(unittest.TestCase):
                       "Duplicate validation: production only"):
             self.assertIn(text_, page)
 
-    def test_create_steps_follow_the_record_and_never_become_controls(self):
-        none = self.page()
-        card = none[none.index("<h2 class='pill'>Create"):none.index("<h2 class='pill'>D2")]
-        self.assertEqual(re.findall(r"<span class='lbl'>([^<]+)</span>", card), ["Dry run", "Owner go", "Submit", "Readback"])
-        self.assertIn("chip-warn'>Locked</span>", card)
-        self.assertEqual(card.count("class='st done"), 0)
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
+    def test_readiness_steps_follow_the_record_and_never_become_controls(self):
+        def dry_run_item(page):
+            start = page.index("<span class='what'>Dry run done<")
+            return page[page.rindex("<li>", 0, start):page.index("</li>", start)]
+        self.assertIn("chip-warn'>Locked</span>", dry_run_item(self.page()))
         self.env.write_record(record("CO-0780", "dry_run_passed"))
         one = self.page()
-        self.assertEqual(one[one.index("<h2 class='pill'>Create"):one.index("<h2 class='pill'>D2")].count("class='st done"), 1)
-        self.assertIn("Dry run passed", one)
-        self.assertNotIn("<button", one[one.index("<h2 class='pill'>Create"):one.index("<h2 class='pill'>D2")])
+        self.assertIn("chip-ok'>Ready</span>", dry_run_item(one))
+        self.assertIn("Dry run passed", one)   # the D2 record
+        self.assertNotIn("<h2 class='pill'>Create</h2>", one)   # the old second Create card is gone
+        self.assertEqual(controls(one, allow=("/attended/review-approve", "Approve this summary")), [])
 
     def test_d2_record_shows_only_allowlisted_fields(self):
         self.env.write_record(record("CO-0780", "readback_verified", tenant_name="<b>State</b>", plan_summary="CE, 1 year"))
         page = self.page()
-        card = page[page.index("<h2 class='pill'>D2 record"):page.index("<h2 class='pill'>UUID")]
+        start = page.index("<h2 class='pill'>D2 record")
+        card = page[start:page.index("</section>", start)]
         for shown in ("Verified", "&lt;b&gt;State&lt;/b&gt;", "a" * 24, "b" * 32, "created.example", "CE, 1 year",
                       "case_2_new_ce_only", "PROD-CE-0785-1", "Editable parameters"):
             self.assertIn(shown, card, shown)
@@ -579,18 +595,16 @@ class CoPageTests(unittest.TestCase):
         card = bad[bad.index("<h2 class='pill'>D2 record"):]
         self.assertIn("Create records unreadable", card)
         self.assertNotIn("RAW-SECRET-JSON", bad)
-        self.assertNotIn("No create record", card[:card.index("UUID writeback")])
+        self.assertNotIn("No create record", card[:card.index("</section>")])
 
     @locked_create_build  # unlock window 2026-10-18: runs as the locked build
-    def test_uuid_writeback_is_locked_until_a_verified_create(self):
-        page = self.page()
-        card = page[page.index("<h2 class='pill'>UUID writeback"):]
-        self.assertIn("Locked until a verified create", card)
+    def test_the_create_card_owns_the_uuid_step_and_a_locked_build_shows_no_control(self):
+        self.assertNotIn("UUID writeback to Salesforce", self.page())   # no separate, contradicting UUID card
         self.env.write_record(record("CO-0780", "readback_verified"))
         verified = self.page()
-        card = verified[verified.index("<h2 class='pill'>UUID writeback"):]
-        self.assertIn("A verified create exists", card)
-        self.assertIn("separate owner go", card)
+        self.assertNotIn("UUID writeback to Salesforce", verified)
+        create = verified[verified.index("<h2 id='co-create-title'"):]
+        self.assertIn("Created and verified", create[:create.index("</section>")])
         self.assertEqual(controls(verified, allow=("/attended/review-approve", "Approve this summary")), [])
 
     def test_values_are_escaped(self):
@@ -670,10 +684,13 @@ class ApprovalsPageTests(unittest.TestCase):
         self.assertNotIn("chip-ok'>Valid", page)
         self.assertNotIn("No approvals recorded", page)
 
+    @unlocked_build
     def test_the_clone_strip_and_lock_chip(self):
         page = self.page()
         self.assertIn("Clone 2 h 10 min old, limit 6 h &middot; trusted", page)
-        self.assertIn("<span class='chip chip-warn'>Create locked</span>", page)
+        self.assertNotIn("Create locked", page)   # unlocked build: no stale lock chip
+        with locked_create_build:
+            self.assertIn("<span class='chip chip-warn'>Create locked</span>", self.page())
 
     def test_a_bad_record_cannot_inject_markup(self):
         self.env.write_approvals(approval(issued_by="<script>alert(1)</script>"))
@@ -736,15 +753,20 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
                           "record_runner", "bootstrap_leonardo_session", ".issue(", ".consume("):
             self.assertNotIn(forbidden, body)
 
-    def test_the_lock_never_depends_on_the_page(self):
-        with patch.object(readiness, "PRODUCTION_RUNNER_SUPPORTED", True):
-            locked, reason = dashboard._production_lock()
-        self.assertTrue(locked)  # the sessions flag and approval are still missing in the environment
-        self.assertEqual(reason, "production_sessions_flag_missing")
-        locked, reason = dashboard._production_lock()
-        self.assertEqual((locked, reason), (True, "production_sessions_flag_missing"))
-        with patch.object(readiness, "production_unlock_problem", side_effect=RuntimeError("boom")):
-            self.assertEqual(dashboard._production_lock()[0], True)  # an unreadable lock state is locked
+    @unlocked_build
+    def test_the_lock_is_the_gate_s_build_lock_never_the_process_environment(self):
+        # Owner feedback 2026-10-18: the per-CO session unlock comes from the approval record inside the gate.
+        with patch.object(readiness, "production_unlock_problem", side_effect=AssertionError("never asked")), \
+                patch.object(dashboard, "vm_mode", return_value=False):
+            self.assertEqual(dashboard._production_lock(), (False, None))
+            with patch.object(readiness, "PRODUCTION_RUNNER_SUPPORTED", False):
+                self.assertEqual(dashboard._production_lock(), (True, "production_runner_not_supported"))
+            with patch.object(readiness, "PRODUCTION_DRY_RUN_SUPPORTED", False):
+                self.assertEqual(dashboard._production_lock(), (True, "production_dry_run_not_supported"))
+        with patch.object(dashboard, "vm_mode", return_value=True):
+            self.assertEqual(dashboard._production_lock(), (True, "vm_read_only"))
+        with patch.object(dashboard.create_ui, "build_lock", side_effect=RuntimeError("boom")):
+            self.assertEqual(dashboard._production_lock(), (True, "production_lock_unreadable"))  # unreadable is locked
 
     def test_history_and_tenants_pages_sit_in_production(self):
         with areas_module.areas():
@@ -759,6 +781,7 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
                 self.assertIn("envpill prod", page)
                 self.assertIn("class='active'>Onboarding</a>", page)
 
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_the_co_production_view_carries_the_lock_footer(self):
         row = areas_module.layout.row_for(areas_module.layout.SURFACE)
         with areas_module.areas(), patch.object(dashboard, "production_now", return_value=NOW):

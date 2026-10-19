@@ -43,6 +43,7 @@ from integration.onboarding import state_paths
 from integration.onboarding import production_views
 from integration.onboarding import production_create_ui as create_ui
 from integration.onboarding import review_approval
+from integration.onboarding import runner_child_log
 from integration.onboarding import run_progress
 from integration.onboarding import users_file
 from integration.onboarding import vm_snapshot
@@ -4485,18 +4486,30 @@ def _age_text(checked_at: datetime | None, now: datetime) -> str:
 
 
 def _environment_chip() -> str:
-    """Leonardo Development is the only environment; production shows as locked (with why, on hover)."""
-    problem = readiness.production_unlock_problem(os.environ, datetime.now(timezone.utc))
-    locked = (" · <span title='" + escape(GATE_REFUSAL_TEXT.get(problem, problem)) + "'>BackOffice production locked</span>"
-              if problem else "")
-    return "<span class='chip chip-neutral'>Leonardo Development" + locked + "</span>"
+    """BackOffice production (locked only by the create gate's own build lock, with why on hover), then Dev."""
+    locked, problem = _production_lock()
+    production = ("<span class='chip chip-warn'><span title='" + escape(create_ui.gate_text(problem)) + "'>BackOffice "
+                  "production locked</span></span>" if locked else "<span class='chip chip-warn'>BackOffice production</span>")
+    return production + " <span class='chip chip-neutral'>Dev: Leonardo Development</span>"
+
+
+def _backoffice_session_row() -> str:
+    """Read-only BackOffice production row: the runner's own recorded results only (no profile, cookie or probe is read)."""
+    try:
+        status = production_views.backoffice_session_status(production_records_parent(),
+                                                            missing_is_unavailable=_state_not_published())
+    except Exception:  # noqa: BLE001 - fail closed: never a guessed sign-in
+        status = {"css": "chip-warn", "label": "Records unreadable", "detail": ""}
+    return ("<tr><th>BackOffice production</th><td><span class='chip " + escape(status["css"]) + "'>" + escape(status["label"])
+            + "</span></td><td>" + escape(status["detail"]) + " <span class='note'>app.pentera.io, signed in by the runner"
+            "</span></td></tr>")
 
 
 def _sessions_card(statuses: dict[str, SessionStatus], waiting: bool, busy: bool = False) -> str:
     """One row per connection, then Prepare / Re-check; rare recovery actions stay folded away."""
     now = readiness_now()
-    rows = ""
-    for system, label in (("salesforce", "Salesforce"), ("leonardo", "Leonardo Development")):
+    rows = _backoffice_session_row()
+    for system, label in (("salesforce", "Salesforce"), ("leonardo", "Leonardo Development (Dev)")):
         status = readiness.effective(statuses[system], now, readiness.READ_TTL)
         css, text = SESSION_CHIPS[status.state]
         detail = "" if status.state is SessionState.READY else escape(
@@ -4520,8 +4533,9 @@ def _sessions_card(statuses: dict[str, SessionStatus], waiting: bool, busy: bool
         + readiness.LEONARDO_DEVELOPMENT + "'><button type='submit'" + disabled + ">Prepare sessions</button></form>"
         "<form method='post' action='/attended/session-recheck'><button class='ghost' type='submit'" + disabled
         + ">Re-check</button></form></div>"
-        "<p class='note'>Prepare signs in only where needed. Complete SSO/MFA on the real Salesforce and Leonardo pages; "
-        "the dashboard never receives credentials, MFA codes, or cookies."
+        "<p class='note'>" + escape(production_views.BACKOFFICE_SESSION_NOTE) + "</p>"
+        "<p class='note'>Prepare signs in to Salesforce and Leonardo Development (Dev) only where needed. Complete SSO/MFA on "
+        "the real Salesforce and Leonardo pages; the dashboard never receives credentials, MFA codes, or cookies."
         + (" This page refreshes every 5 seconds while a sign-in or check runs." if waiting else "") + "</p>"
         "<details class='trouble'><summary>Troubleshooting</summary><div class='actions'>"
         "<form method='post' action='/attended/leonardo-dev-browser-close'><button class='ghost' type='submit'>"
@@ -6847,6 +6861,19 @@ def _production_guide_html(guide: dict[str, Any], match: dict[str, Any]) -> str:
     return verdict + recorded + strip + _guide_matches(match) + table + after + footer
 
 
+PROD_VIEW_UNLOCKED_CLOSING = ("Production create is unlocked in this build: it runs only from the Create in production card on "
+                              "the desktop CO page, after every gate passes.")
+
+
+def _prod_view_closing(state: dict[str, Any]) -> str:
+    """The closing line of the production view, from the same create gate as the Create card (never a stale "locked")."""
+    if state.get("reason") == "vm_read_only":
+        return create_ui.gate_text("vm_read_only")
+    if state.get("phase") == "locked":
+        return production_views.GUIDE_CLOSING
+    return PROD_VIEW_UNLOCKED_CLOSING
+
+
 def page_detail_production(reference: str, row: dict[str, str | None], match: dict[str, Any], country: str | None = None) -> str:
     """The production view of a CO page (GET only: no form, no button, no write): one verdict, one table (docs/50)."""
     account = row.get("Account_Name__c")
@@ -6858,6 +6885,7 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     clone = _clone_status()
     sheet = _sheet_result(row, match=match, ce_route=ce_route, start_iso=_prod_view_start(reference), country=country, clone=clone)
     guide = production_views.production_co_guide(sheet, clone=clone, recorded_duplicates=_recorded_duplicates(reference))
+    guide["closing"] = _prod_view_closing(_production_page_state(reference, row))
     main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
                  + _production_guide_html(guide, match))
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod")
@@ -6892,24 +6920,16 @@ def _state_not_published() -> bool:
 
 
 def _production_lock() -> tuple[bool, str | None]:
-    """(locked, reason code) from session_readiness; an unreadable lock state counts as locked."""
+    """(locked, reason code) for pages without a CO: the create gate's own first refusals (``create_ui.build_lock``).
+
+    The per-CO session unlock comes from that CO's approval record inside the gate (owner feedback 2026-10-18), so it is
+    never judged here from the process environment. An unreadable lock state counts as locked.
+    """
     try:
-        problem = readiness.production_unlock_problem(os.environ, production_now())
+        problem = create_ui.build_lock(vm_mode())
     except Exception:  # noqa: BLE001 - fail closed
         return True, "production_lock_unreadable"
-    if problem is None and readiness.PRODUCTION_RUNNER_SUPPORTED is not True:
-        problem = "production_runner_not_supported"
     return problem is not None, problem
-
-
-def _lock_banner() -> str:
-    locked, reason = _production_lock()
-    if locked:
-        return ("<div class='banner banner-warn' role='status'><strong>Production create is locked.</strong> Review only. "
-                "No create control is shown until the owner unlocks the runner.<span class='sub'>"
-                + escape(production_views.lock_reason_text(reason)) + "</span></div>")
-    return ("<div class='banner' role='status'><strong>Runner unlocked by configuration.</strong> This dashboard still has no "
-            "create control: a create is a separate step with its own owner go, outside these pages.</div>")
 
 
 def _lock_chip() -> str:
@@ -7228,15 +7248,6 @@ def _create_approval_html(reference: str) -> str:
         frozenset({"Reference"})) + "<p class='note'>" + escape(note) + "</p>")
 
 
-def _create_steps_html(done: int, locked: bool) -> str:
-    items = ""
-    for index, name in enumerate(production_views.STEPS):
-        state = "done" if index < done else "current" if index == done and not locked else ""
-        items += ("<li class='st" + (" " + state if state else "") + "'" + (" aria-current='step'" if state == "current" else "") + ">"
-                  "<span class='dot' aria-hidden='true'>" + str(index + 1) + "</span><span class='lbl'>" + escape(name) + "</span></li>")
-    return "<ol class='stages'>" + items + "</ol>"
-
-
 def _record_html(found: dict[str, Any]) -> tuple[str, str]:
     """(card chip, card body) for the D2 record of one CO: allow-listed fields only."""
     state = found["state"]
@@ -7263,61 +7274,42 @@ def _record_html(found: dict[str, Any]) -> tuple[str, str]:
 
 
 DESKTOP_DASHBOARD_ADDRESS = "http://127.0.0.1:8012"
-_STEP_TAGS = re.compile(r"</?(?:b|span)[^>]*>")
 
 
-def _dev_start_state(reference: str, row: dict[str, str | None] | None) -> tuple[bool, str]:
-    """(startable on Dev, reason) from the same rule as the queue's "Review & start" button; unreadable input is never startable."""
-    if row is None:
-        return False, "The CO could not be read, so Dev start is not verified."
-    try:
-        record = load_runner_state().get(reference)
-    except RunnerStateUnavailable:
-        return False, "The local run record could not be read, so Dev start is not verified."
-    except Exception:  # noqa: BLE001 - fail closed
-        return False, "Dev start is not verified."
-    try:
-        key, step, owner = classify_queue_row(row, record)
-    except Exception:  # noqa: BLE001 - fail closed
-        return False, "Dev start is not verified."
-    if key == "ready" and owner == "you" and route_for(row):
-        return True, ""
-    return False, " ".join(_STEP_TAGS.sub(" ", step).split())
+CREATE_PHASE_CHIPS = {"ready": ("chip-ok", "Create ready"), "blocked": ("chip-warn", "Create blocked"),
+                      "locked": ("chip-warn", "Create locked")}
 
 
-def _co_onboard_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None,
-                     domain_count: int | None, start_iso: str | None, ce_route: bool) -> str:
-    """The "Onboard" card at the top of the review page (/onboard/CO-x). Read-only: the production row is a checklist, never a control.
+def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None,
+                   domain_count: int | None, start_iso: str | None, ce_route: bool, state: dict[str, Any]) -> str:
+    """The "Production readiness" card of the production CO page (/onboard/CO-x). Read-only: a checklist, never a control.
 
-    The only link is the existing Dev "Review & start" route, on the desktop, when the CO is Dev-startable.
+    ``state`` is ``create_ui.page_state`` for this CO: the same gate result the Create card shows, so no row contradicts it
+    (owner feedback 2026-10-18). Production BackOffice only; the Dev queue lives under /dev.
     """
     vm = vm_mode()
-    locked, reason = _production_lock()
+    locked = state.get("phase") == "locked"
+    reason = state.get("reason") if locked else None
     now = production_now()
     published = _state_not_published()
     uuid_state = "unread" if row is None or "Account_UUID__c" not in row else "set" if row.get("Account_UUID__c") else "empty"
     records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=published)
+    try:
+        session = production_views.backoffice_session_status(production_records_parent(), missing_is_unavailable=published)
+    except Exception:  # noqa: BLE001 - the row then names no last run
+        session = None
     items = production_views.onboard_checklist(
-        vm=vm, locked=locked, lock_reason=reason, session_ready=None, clone=_clone_status(), match=match, domain_count=domain_count,
+        vm=vm, locked=locked, lock_reason=reason, clone=_clone_status(), match=match, domain_count=domain_count,
         uuid_state=uuid_state, ce_route=ce_route, start_iso=start_iso, today=now.date(), days_before=ONBOARD_DAYS_BEFORE_START,
         approval=production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, now, missing_is_unavailable=published),
-        create=production_views.create_state(records, reference, locked=locked))
-    if vm:
-        where = ("<p class='lede'>Onboarding runs from the desktop dashboard</p><p class='note'>Desktop address: <code>"
-                 + escape(DESKTOP_DASHBOARD_ADDRESS) + "</code></p>")
-        dev_body = "<p class='note'>Dev start is available on the desktop dashboard only.</p>"
-    else:
-        where = ""
-        startable, why = _dev_start_state(reference, row)
-        dev_body = ("<p><a class='btn' href='/co/" + escape(reference) + "'>Review &amp; start (Dev)</a></p>" if startable
-                    else "<p class='note'>Not startable on Dev: " + escape(why) + "</p>")
+        create=production_views.create_state(records, reference, locked=locked), gate=state, session=session)
+    where = ("<p class='lede'>Onboarding runs from the desktop dashboard</p><p class='note'>Desktop address: <code>"
+             + escape(DESKTOP_DASHBOARD_ADDRESS) + "</code></p>") if vm else ""
     rows = "".join(_check_item(item["label"], escape(item["detail"]), _chip(*production_views.CHECK_CHIPS[item["status"]]))
                    for item in items)
-    return ("<section class='card onboard-card' aria-labelledby='co-onboard-title'><div class='card-head'>"
-            "<h2 id='co-onboard-title' class='pill'>Onboard</h2></div>" + where
-            + "<h3 class='sub-h'>Leonardo Development (test)</h3>" + dev_body
-            + "<h3 class='sub-h'>Production BackOffice</h3><ol class='checks'>" + rows + "</ol>"
-            "<p class='note'>Production create stays locked until the owner unlocks the runner.</p></section>")
+    return ("<section class='card onboard-card' aria-labelledby='co-ready-title'><div class='card-head'>"
+            "<h2 id='co-ready-title' class='pill'>Production readiness</h2>" + _chip(*CREATE_PHASE_CHIPS[state["phase"]])
+            + "</div>" + where + "<ol class='checks'>" + rows + "</ol><p class='note'>" + escape(state["text"]) + "</p></section>")
 
 
 # The licence type text of the Dev CE-only fill (build_ce_only_fill selects "Type"); pinned against the runner in tests.
@@ -7408,40 +7400,34 @@ def _sheet_result(row: dict[str, str | None] | None, *, match: dict[str, Any] | 
 
 def _onboarding_sheet_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None, ce_route: bool,
                            start_iso: str | None, country: str | None = None) -> str:
-    """The read-only "Production onboarding sheet" card of the review page (/onboard/CO-x): what to type in BackOffice Add Account.
+    """The read-only "Add Account values" card of the production CO page (/onboard/CO-x): the BackOffice Add Account values.
 
-    Guidance only: no form, button, link or script, and nothing is written. Every value is escaped; a value that cannot
-    be derived shows as unavailable on this server for that row only.
+    Shown once: its eligibility checks are the readiness card and its manual steps are not repeated (owner feedback
+    2026-10-18). No form, button, link or script, and nothing is written. Every value is escaped; a value that cannot be
+    derived shows as unavailable on this server for that row only.
     """
     sheet = _sheet_result(row, match=match, ce_route=ce_route, start_iso=start_iso, country=country)
     head = ("<section class='card sheet-card' aria-labelledby='co-sheet-title'><div class='card-head'>"
-            "<h2 id='co-sheet-title' class='pill'>Production onboarding sheet</h2></div>")
+            "<h2 id='co-sheet-title' class='pill'>Add Account values</h2></div>")
     state = sheet["state"]
     if state == "not_applicable":
         return head + "<p class='note'>Not applicable: this CO is not a CE-only New Product Onboarding.</p></section>"
     if state == "unavailable":
-        return head + "<p class='note'>The sheet is " + escape(production_views.UNAVAILABLE_ON_SERVER) + ".</p></section>"
+        return head + "<p class='note'>The values are " + escape(production_views.UNAVAILABLE_ON_SERVER) + ".</p></section>"
     snapshot = ("<p class='note'>" + _data_age_note(sheet["as_of"], _clone_info()) + "</p>" if sheet["as_of"] else "")
     stale_note = ("<p><strong>Warning:</strong> " + escape(sheet["stale_warning"]) + "</p>" if sheet["stale_warning"] else "")
-    before = snapshot + stale_note + "<h3 class='sub-h'>1. Before you start</h3><ul class='checks'>" + "".join(
-        _check_item(item["label"], escape(item["detail"]), _chip(*SHEET_CHECK_CHIPS[item["status"]])) for item in sheet["eligibility"]
-    ) + "</ul><p class='note'>" + escape(sheet["reminder"]) + "</p>"
     if state == "refused":
-        return (head + before + "<p><strong>Do not onboard this CO:</strong> "
-                + escape(production_views.SHEET_REFUSALS.get(sheet["reason"], "The values cannot be derived.")) + "</p>"
-                "<p class='note'>" + escape(production_views.SHEET_CLOSING) + "</p></section>")
+        return (head + snapshot + stale_note + "<p><strong>Do not onboard this CO:</strong> "
+                + escape(production_views.SHEET_REFUSALS.get(sheet["reason"], "The values cannot be derived.")) + "</p></section>")
     body = "".join(
         "<tr><td>" + escape(item["label"]) + "</td><td><code>" + escape(item["value"]) + "</code></td><td>"
         + _chip(*SHEET_ROW_CHIPS[item["status"]]) + (" <small>" + escape(item["note"]) + "</small>" if item["note"] else "")
         + "</td></tr>" for item in sheet["rows"])
-    after = "<ol>" + "".join("<li>" + escape(text) + "</li>" for text in sheet["after"]) + "</ol>"
     warning = "<p><strong>Warning:</strong> " + escape(sheet["warning"]) + "</p>" if sheet["warning"] else ""
-    return (head + before + warning + "<h3 class='sub-h'>2. Enter in Add Account</h3><p class='note'>BackOffice: <code>"
-            + escape(production_views.SHEET_BACKOFFICE) + "</code>, Tenant Management, Add Account. Type exactly these values, "
-            "in this order.</p><div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>Field</th>"
-            "<th scope='col'>Value</th><th scope='col'>Note</th></tr></thead><tbody>" + body + "</tbody></table></div>"
-            "<h3 class='sub-h'>3. After you click Confirm in BackOffice</h3>" + after
-            + "<p class='note'>" + escape(sheet["closing"]) + "</p></section>")
+    return (head + snapshot + stale_note + warning + "<p class='note'>BackOffice <code>"
+            + escape(production_views.SHEET_BACKOFFICE) + "</code>, Tenant Management, Add Account, in form order.</p>"
+            "<div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>Field</th>"
+            "<th scope='col'>Value</th><th scope='col'>Note</th></tr></thead><tbody>" + body + "</tbody></table></div></section>")
 
 
 def _prod_view_start(reference: str) -> str | None:
@@ -7462,7 +7448,8 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     blockers = list(summary["blockers"])
     values = summary["values"]
     check = summary["production_check"]
-    locked, _reason = _production_lock()
+    state = _production_page_state(ref, row)
+    locked = state["phase"] == "locked"
     plan = values.get("plan") if isinstance(values.get("plan"), dict) else {}
     # Salesforce facts.
     facts = [("Account", summary["account"] or "—"),
@@ -7486,7 +7473,7 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
                    + (_chip("chip-bad", str(problems) + " blocked") if problems else _chip("chip-ok", "All passed")) + "</div>"
                    "<ul class='checks'>" + clone_item + "</ul>"
                    "<h3 class='sub-h'>Duplicate validation: production only</h3><p class='note'>Checked against the Production "
-                   "BackOffice clone (Redash). Leonardo is not consulted.</p><ul class='checks'>" + duplicate_items + "</ul>"
+                   "BackOffice clone (Redash) only.</p><ul class='checks'>" + duplicate_items + "</ul>"
                    + ("<h3 class='sub-h'>Matched production tenants</h3><ul>" + candidates + "</ul>" if candidates else "")
                    + "<h3 class='sub-h'>Other checks</h3><ul class='checks'>" + other_items + "</ul>"
                    "<p class='note'>A missing match is never a clearance.</p></section>")
@@ -7495,31 +7482,15 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
                      "<h3 class='sub-h'>Summary approval (4 hours)</h3>" + _summary_approval_html(summary, digest, blockers)
                      + "<h3 class='sub-h'>Create approval (7 days, one use)</h3>" + _create_approval_html(ref)
                      + "<p class='note'>Approving the summary records your approval of exactly this summary (valid 4 hours, used once). "
-                       "It creates nothing: no Leonardo, BackOffice or Salesforce write. The create approval is a separate record, "
+                       "It creates nothing: no BackOffice or Salesforce write. The create approval is a separate record, "
                        "issued outside this page.</p></section>")
-    # Create, D2 record and UUID writeback: never a control.
+    # The create (and, after a verified create, the UUID write) is ONE card: the real gate. The D2 record stays read-only.
     records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=_state_not_published())
-    state = production_views.create_state(records, ref, locked=locked)
     found = ({"state": records["state"], "reason": records["reason"], "record": None} if records["state"] != "ok"
              else {"state": "found" if ref in records["by_co"] else "none", "reason": "", "record": records["by_co"].get(ref)})
-    create_note = ("The production runner is not supported in this build. Review only: no create control exists on this page."
-                   if locked else "Create is a separate step with its own owner go, outside this page.")
-    if state["code"] == "uncertain_submit":
-        create_note += " Never re-click Create after an uncertain submit: check BackOffice first."
-    create_card = ("<section class='card" + (" locked" if locked else "") + "'><div class='card-head'><h2 class='pill'>Create</h2>"
-                   + _chip(state["css"], state["label"]) + "</div>" + _create_steps_html(state["steps_done"], locked)
-                   + "<p class='note'>" + escape(create_note) + "</p></section>")
     record_chip, record_body = _record_html(found)
     record_card = ("<section class='card'><div class='card-head'><h2 class='pill'>D2 record</h2>" + record_chip + "</div>"
                    + record_body + "</section>")
-    verified = state["code"] == "readback_verified"
-    writeback_card = ("<section class='card" + ("" if verified else " locked") + "'><div class='card-head'><h2 class='pill'>"
-                      "UUID writeback to Salesforce</h2>" + _chip("chip-neutral", "Separate go needed" if verified else "Locked")
-                      + "</div><p class='note'>"
-                      + ("A verified create exists. The Account UUID writeback needs its own separate owner go and is not "
-                         "available in this dashboard." if verified else "Locked until a verified create.")
-                      + " Field <code>Account_UUID__c</code> only: it must be empty or equal, the revision unchanged, and verified "
-                        "by a read back from Salesforce.</p></section>")
     blocked = ""
     if blockers:
         blocked = ("<ul class='blockers'>" + "".join("<li>" + escape(REVIEW_BLOCKER_TEXT.get(code, code)) + "</li>" for code in blockers)
@@ -7531,16 +7502,17 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     head = ("<a class='crumb' href='/'>&larr; Onboarding</a><div class='page-head'><h1>" + escape(ref) + "</h1>"
             + ("<span class='acct'>" + escape(summary["account"]) + "</span>" if summary["account"] else "")
             + (_chip("chip-info", route_label) if route_label else _chip("chip-neutral", "No automated route"))
-            + (_chip("chip-bad", "Blocked") if blockers else _chip("chip-ok", "Checks clear")) + _lock_chip() + "</div>")
+            + (_chip("chip-bad", "Blocked") if blockers else _chip("chip-ok", "Checks clear"))
+            + _chip(*CREATE_PHASE_CHIPS[state["phase"]]) + "</div>")
     domains = values.get("domains")
-    onboard = _co_onboard_card(ref, row, match=check, domain_count=len(domains) if isinstance(domains, list) else None,
-                               start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE)
+    ready = _co_ready_card(ref, row, match=check, domain_count=len(domains) if isinstance(domains, list) else None,
+                           start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE, state=state)
     sheet = _onboarding_sheet_card(ref, row, match=check, ce_route=summary["route"] == CE_ENGINE,
                                    start_iso=str(plan.get("license_start") or ""), country=country)
-    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "") + onboard + sheet + _lock_banner() + _production_create_html(ref, row) + blocked
+    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
+            + _production_create_html(ref, row, state) + ready + blocked
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
-            + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + approval_card + create_card + record_card
-            + writeback_card)
+            + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + sheet + approval_card + record_card)
     return _app_shell("Review " + ref, main, active="prod_onboarding")
 
 
@@ -7649,13 +7621,23 @@ def _harden_ticket_folder(path: Path) -> None:
 create_ui.production_launch_ticket.HARDEN = _harden_ticket_folder
 
 
+def _salesforce_ready_for_create() -> bool:
+    """Salesforce ready for the create gate. A READY sign-in older than the start TTL is re-checked ONCE (read-only probe of
+    the pinned org) instead of refusing "sign in again" 15 minutes after a good sign-in; other states are never probed."""
+    try:
+        status = session_statuses()["salesforce"]
+        if readiness.effective(status, readiness_now(), readiness.START_SALESFORCE_TTL).state is SessionState.READY:
+            return True
+        if status.state is not SessionState.READY:
+            return False
+        return probe_salesforce_readiness().state is SessionState.READY
+    except Exception:  # noqa: BLE001 - fail closed
+        return False
+
+
 def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operator: str | None = None) -> create_ui.Inputs:
     """The plain facts for the create gate. A POST passes a row read inside that very request; a page shows the display read."""
-    try:
-        sf_ready = readiness.effective(session_statuses()["salesforce"], readiness_now(),
-                                       readiness.START_SALESFORCE_TTL).state is SessionState.READY
-    except Exception:  # noqa: BLE001 - fail closed
-        sf_ready = False
+    sf_ready = _salesforce_ready_for_create()
     return create_ui.Inputs(
         reference=reference, row=row, now=production_now(), environ=os.environ,
         operator=operator if operator is not None else (_current_operator.get() or None), vm=vm_mode(),
@@ -7663,13 +7645,38 @@ def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operato
         sf_ready=sf_ready, row_fresh=bool(row))
 
 
-def _production_create_html(reference: str, row: dict[str, str | None] | None) -> str:
-    """The create section of a production CO page ("" while locked and no record; any failure shows nothing)."""
+def _production_page_state(reference: str, row: dict[str, str | None] | None) -> dict[str, Any]:
+    """``create_ui.page_state`` of one CO: the one gate result every panel of its production page shows (fail closed)."""
+    try:
+        return create_ui.page_state(_create_ui_inputs(reference, row))
+    except Exception:  # noqa: BLE001 - fail closed
+        return {"phase": "blocked", "reason": "gate_unreadable", "text": create_ui.gate_text("gate_unreadable")}
+
+
+def _production_create_html(reference: str, row: dict[str, str | None] | None, state: dict[str, Any] | None = None) -> str:
+    """The create section of a production CO page. With ``state`` (the review page) a closed gate without a record shows a
+    read-only card naming that gate instead of nothing; without it, "" as before. Any failure shows no control."""
     try:
         inputs = _create_ui_inputs(reference, row)
-        return create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
+        html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
     except Exception:  # noqa: BLE001 - fail closed: no control
-        return ""
+        html = ""
+    if html or state is None:
+        return html
+    return create_ui.locked_card_html(state)
+
+
+def runner_log_dir() -> Path | None:
+    """%LOCALAPPDATA%/SurfaceOnboarding/runner-logs (created), else None (the run then starts without a log)."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return None
+    folder = Path(base) / "SurfaceOnboarding" / "runner-logs"
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return folder
 
 
 def _launch_production_create(reference: str, revision: str, env: dict[str, str]) -> Any:
@@ -7678,6 +7685,11 @@ def _launch_production_create(reference: str, revision: str, env: dict[str, str]
             or not ATTENDED_CE_ONLY_RUNNER.is_file()):
         return None
     child = {**os.environ, **{k: v for k, v in env.items() if k.startswith("SURFACE_ONBOARDING_PRODUCTION_")}}
+    child.pop(runner_child_log.LOG_ENV, None)
+    folder = runner_log_dir()
+    if folder is not None:  # the runner writes its own redacted, fixed-enum log there (codes and record names only)
+        child[runner_child_log.LOG_ENV] = str(folder / (reference + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                                                        + ".log"))
     try:
         return subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-create", "--co", reference,
                                  "--revision", revision, "--owner-go"], env=child, stdin=subprocess.DEVNULL,

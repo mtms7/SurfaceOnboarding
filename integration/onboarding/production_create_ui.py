@@ -100,6 +100,7 @@ GATE_TEXT = {
     "launch_failed": "The runner could not be started. Nothing was created.",
     "uuid_write_needs_review": "An earlier UUID write is uncertain: check Salesforce, then record your review.",
     "uuid_write_already_recorded": "A UUID write is already recorded for this CO.",
+    "gate_unreadable": "The create gate could not be evaluated: nothing is allowed.",
 }
 
 
@@ -317,15 +318,26 @@ def locked() -> bool:
     return not _both_constants()
 
 
+BUILD_LOCK_CODES = ("vm_read_only", "production_runner_not_supported", "production_dry_run_not_supported")
+
+
+def build_lock(vm: bool) -> str | None:
+    """The CO-independent first refusals of ``gate`` (this server and this build), else None. Pages without a CO use it."""
+    if vm is True:
+        return "vm_read_only"
+    if readiness.PRODUCTION_RUNNER_SUPPORTED is not True:
+        return "production_runner_not_supported"
+    if readiness.PRODUCTION_DRY_RUN_SUPPORTED is not True:
+        return "production_dry_run_not_supported"
+    return None
+
+
 def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
     """(first refusal code or None, context). Context: ``approval`` (the record), ``status`` (co_status), ``env``."""
     ctx: dict[str, Any] = {"approval": None, "status": None, "env": None}
-    if inputs.vm is True:
-        return "vm_read_only", ctx
-    if readiness.PRODUCTION_RUNNER_SUPPORTED is not True:
-        return "production_runner_not_supported", ctx
-    if readiness.PRODUCTION_DRY_RUN_SUPPORTED is not True:
-        return "production_dry_run_not_supported", ctx
+    lock = build_lock(inputs.vm)
+    if lock is not None:
+        return lock, ctx
     if not isinstance(inputs.row, Mapping) or not CO_PATTERN.fullmatch(inputs.reference):
         return "salesforce_not_fresh", ctx
     listing = production_views.list_approvals(inputs.approvals_path, inputs.now)
@@ -381,6 +393,32 @@ def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
     if inputs.launching is True or LAUNCHES.busy():
         return "launch_in_progress", ctx
     return None, ctx
+
+
+def page_state(inputs: Inputs) -> dict[str, Any]:
+    """The ONE create-gate result every panel of a production CO page shows (owner feedback 2026-10-18).
+
+    ``{"phase": "ready" | "blocked" | "locked", "reason": code | None, "text": plain sentence}``. ``locked`` is the build or
+    server lock (``BUILD_LOCK_CODES``); ``blocked`` names the first closed gate of an unlocked build. The session unlock is
+    judged inside ``gate`` with the approval record's own values, never from the process environment alone. A gate that
+    cannot be evaluated is ``blocked`` (fail closed) and never shows exception text.
+    """
+    try:
+        reason, _ctx = gate(inputs)
+    except Exception:  # noqa: BLE001 - fail closed
+        reason = "gate_unreadable"
+    if reason is None:
+        return {"phase": "ready", "reason": None,
+                "text": "Every gate passed: the create runs from the Create in production card on this page."}
+    return {"phase": "locked" if reason in BUILD_LOCK_CODES else "blocked", "reason": reason, "text": gate_text(reason)}
+
+
+def locked_card_html(state: Mapping[str, Any]) -> str:
+    """Read-only create section for a CO whose create card is empty (no record and a closed gate): chip and the reason."""
+    label = "Locked" if state.get("phase") == "locked" else "Blocked"
+    return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
+            "<h2 id='co-create-title' class='pill'>Production create</h2>" + _chip("chip-warn", label) + "</div>"
+            "<p class='note'>" + escape(str(state.get("text") or gate_text("gate_unreadable"))) + "</p></section>")
 
 
 # --- HTML -------------------------------------------------------------------------------------------------------------------------

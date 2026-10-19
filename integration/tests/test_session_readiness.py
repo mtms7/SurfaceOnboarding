@@ -343,7 +343,8 @@ class LeonardoWorkerTests(unittest.TestCase):
 
 
 class ConnectionPageTests(unittest.TestCase):
-    def test_page_shows_both_sessions_and_a_locked_production_choice(self):
+    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
+    def test_page_shows_the_sessions_and_a_locked_production_choice(self):
         with patch.object(dashboard, "load_runner_state", return_value={}):
             page = dashboard.page_salesforce_unavailable(failed=False)
         self.assertIn("Prepare sessions", page)
@@ -351,6 +352,8 @@ class ConnectionPageTests(unittest.TestCase):
         self.assertIn("value='leonardo_development'", page)
         self.assertNotIn("value='backoffice_production'", page)  # production cannot even be chosen
         self.assertIn("BackOffice production locked", page)
+        self.assertIn("<th>BackOffice production</th>", page)       # read-only status row (runner records only)
+        self.assertIn("<th>Leonardo Development (Dev)</th>", page)
         self.assertIn("Not signed in", page)
         self.assertNotIn("password", page.lower())
         self.assertNotIn("token", page.lower())

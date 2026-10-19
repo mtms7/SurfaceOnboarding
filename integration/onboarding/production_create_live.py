@@ -166,21 +166,30 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         self.create_matched: frozenset[str] = frozenset()       # identifying fields that equalled the expectation
 
     def install(self, page: Any) -> None:
-        """Route at CONTEXT level (``page.route`` does not cover popups or new pages) and count every popup / new page.
+        """Route the PAGE exactly like the dry-run guard (``page.route("**/*")``, proven live in dry runs #5-#7) and count
+        every popup / new page.
 
-        Raises when the context cannot be routed: the live create must not run with a guard that misses a page.
+        2026-10-19: the first live create (00:11Z) used a CONTEXT-level route, never exercised live, and ended on about:blank
+        with tenantManagement pending (``production_session_not_ready``). Popups and new pages are not covered by the page
+        route; they stay fail closed: any extra page before the click refuses (``pre_arm_problem``) and any after it makes
+        the outcome unknown (``post_click_problem``). A new page is also routed best effort. Raises when the page cannot be
+        routed: the live create must not run unguarded.
         """
-        context = page.context
-        context.route("**/*", self.handle)
-        for target, event, handler in ((context, "response", self.on_response), (page, "response", self.on_response),
-                                       (context, "page", self._on_popup), (page, "popup", self._on_popup)):
+        page.route("**/*", self.handle)
+        context = getattr(page, "context", None)
+        for target, event, handler in ((page, "response", self.on_response), (context, "page", self._on_popup),
+                                       (page, "popup", self._on_popup)):
             try:
                 target.on(event, handler)
             except Exception:
                 pass
 
-    def _on_popup(self, _page: Any) -> None:
+    def _on_popup(self, new_page: Any) -> None:
         self.popups += 1
+        try:
+            new_page.route("**/*", self.handle)
+        except Exception:
+            pass  # still counted: an extra page refuses before the click and makes the outcome unknown after it
 
     def arm(self) -> None:
         if not self.create_used:

@@ -14,6 +14,7 @@ from integration.onboarding import production_views as views
 from integration.tests import test_production_first_dashboard as base
 import tools.serve_attended_open_onboardings_dashboard as dashboard
 from integration.tests.locked_build import locked_create_build  # noqa: E402
+unlocked_build = base.unlocked_build
 
 REF = "CO-0798"
 COMMENTS = "DealHub subscription 2026-10-18 - 2027-10-17 approved"
@@ -48,11 +49,12 @@ class PageBase(unittest.TestCase):
 
 
 class LayoutTests(PageBase):
+    @unlocked_build
     def test_sections_in_order_and_ready_verdict(self):
         main = self.main(self.page())
         marks = ["<h1>" + REF, "Advanced Technology International", "CE-only", "Ready to onboard", "Before you start",
                  "Enter in BackOffice &gt; Add Account", "After you click Confirm",
-                 "Production create is locked in the dashboard: this page is guidance only.", "data age"]
+                 dashboard.PROD_VIEW_UNLOCKED_CLOSING, "data age"]   # unlocked build: the closing follows the create gate
         positions = [main.index(mark) for mark in marks]
         self.assertEqual(positions, sorted(positions))
         self.assertEqual(main.count("class='banner"), 1)   # exactly one verdict banner

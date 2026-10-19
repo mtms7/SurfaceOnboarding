@@ -248,12 +248,14 @@ class PreArmTests(unittest.TestCase):
         page = tl.MiniPage(guard)
         page.on = lambda event, handler: events.append(event)
         page.evaluate = lambda js, arg=None: {"count": 1}
-        routed = []
-        page.context = SimpleNamespace(pages=[page], route=lambda pattern, handler: routed.append(pattern),
+        routed, context_routed = [], []
+        page.route = lambda pattern, handler: routed.append(pattern)
+        page.context = SimpleNamespace(pages=[page], route=lambda pattern, handler: context_routed.append(pattern),
                                        on=lambda event, handler: events.append("ctx_" + event))
         guard.install(page)
         self.assertIn("popup", events)
-        self.assertEqual(routed, ["**/*"])  # context level, not page.route
+        self.assertEqual(routed, ["**/*"])  # page level, like the dry run (2026-10-19 fix)
+        self.assertEqual(context_routed, [])
         self.assertIn("ctx_page", events)
         clicks = live.LiveClickLog()
         self.assertEqual(live.click_confirm_once(page, guard, clicks), live.NOT_CLICKED)

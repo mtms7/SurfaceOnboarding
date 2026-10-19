@@ -35,6 +35,9 @@ LOCK_REASON_TEXT = {
     "production_approval_missing": "No valid production approval is configured.",
     "production_approval_expired": "The configured production approval is expired.",
     "production_runner_not_supported": "The production runner is not supported in this build.",
+    "production_dry_run_not_supported": "The production dry run is locked in this build.",
+    "vm_read_only": "The VM dashboard is read-only guidance; create runs from the owner's Windows desktop.",
+    "production_lock_unreadable": "The lock state cannot be read, so production create counts as locked.",
 }
 
 
@@ -208,6 +211,67 @@ def latest_create_record(parent_dir: Path, co_reference: str, *, missing_is_unav
         return {"state": found["state"], "reason": found["reason"], "record": None}
     record = found["by_co"].get(co_reference)
     return {"state": "found" if record else "none", "reason": "", "record": record}
+
+
+# --- BackOffice production session (Sessions page): from the runner's own records only --------------------------------
+
+BACKOFFICE_SESSION_CODES = frozenset({"production_dry_run_login_timeout", "production_session_expired",
+                                      "production_session_not_ready"})
+BACKOFFICE_SIGNED_IN_OUTCOMES = frozenset({"dry_run_passed", "readback_verified", "created_unverified", "uncertain_submit",
+                                           "attempt_started"})
+BACKOFFICE_SESSION_CHIPS = {
+    "signed_in": ("chip-ok", "Signed in at the last run"), "sign_in_failed": ("chip-warn", "Sign-in not completed"),
+    "not_confirmed": ("chip-neutral", "Sign-in not confirmed"), "none": ("chip-neutral", "No production run recorded"),
+    "unavailable": ("chip-neutral", "Unavailable on this server"), "unreadable": ("chip-warn", "Records unreadable")}
+BACKOFFICE_SESSION_NOTE = ("The production runner signs in to app.pentera.io itself, in its own automation profile, when a dry "
+                           "run or create starts (complete SSO and MFA there when it asks). This status comes only from the "
+                           "runner's recorded results; the dashboard never opens that profile or reads its sign-in data.")
+_OUTCOME_WORDS = {"dry_run_passed": "dry run passed", "readback_verified": "create verified",
+                  "created_unverified": "create not verified", "uncertain_submit": "create outcome unknown",
+                  "attempt_started": "create attempt started", "refused": "run refused"}
+
+
+def _session_view(state: str, detail: str = "") -> dict[str, Any]:
+    css, label = BACKOFFICE_SESSION_CHIPS[state]
+    return {"state": state, "css": css, "label": label, "detail": _text(detail)}
+
+
+def backoffice_session_status(parent_dir: Path, *, missing_is_unavailable: bool = False) -> dict[str, Any]:
+    """Read-only BackOffice production sign-in status from the newest runner record of any CO.
+
+    ``{"state", "css", "label", "detail"}``; state ``signed_in`` (the run reached the production form, so it was signed in),
+    ``sign_in_failed`` (a session code), ``not_confirmed`` (another refusal), ``none``, ``unavailable`` or ``unreadable``.
+    Owner review records are not runner results and are skipped. It is history, never a gate: the runner signs in again
+    when it starts. Nothing here opens a browser profile or reads a cookie.
+    """
+    folder = Path(parent_dir) / RECORDS_SUBDIR
+    try:
+        present = folder.is_dir()
+    except OSError:
+        return _session_view("unreadable")
+    if not present:
+        return _session_view("unavailable" if missing_is_unavailable else "none")
+    newest: dict[str, Any] | None = None
+    try:
+        for path in list_records(parent_dir):
+            record = load(path)
+            if record.get("outcome") == "owner_review_cleared":
+                continue
+            if newest is None or str(record["recorded_at"]) >= str(newest["recorded_at"]):
+                newest = record
+    except (ProductionCreateRecordError, OSError, ValueError, TypeError, KeyError):
+        return _session_view("unreadable")
+    if newest is None:
+        return _session_view("none")
+    outcome, reason = newest.get("outcome"), _text(newest.get("refusal_reason") or "")
+    when = str(newest["recorded_at"]).replace("T", " ")[:16] + " UTC"
+    words = _OUTCOME_WORDS.get(outcome, "run recorded") + (" (" + reason.replace("_", " ") + ")" if reason else "")
+    detail = _text(newest.get("co_reference")) + " " + words + " at " + when + "."
+    if outcome in BACKOFFICE_SIGNED_IN_OUTCOMES:
+        return _session_view("signed_in", detail)
+    if reason in BACKOFFICE_SESSION_CODES:
+        return _session_view("sign_in_failed", detail)
+    return _session_view("not_confirmed", detail)
 
 
 # --- Create state (landing "Create" column and the CO page steps) ---------------------------------------------------
@@ -385,31 +449,52 @@ def _item(key: str, status: str, detail: str) -> dict[str, str]:
     return {"key": key, "label": dict(CHECK_ORDER)[key], "status": status, "detail": _text(detail)}
 
 
-def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, session_ready: bool | None, clone: dict[str, Any] | None,
+# Codes of ``production_create_ui.gate`` (judged in this order). The session unlock is decided after these:
+_BEFORE_SESSION = frozenset({"salesforce_not_fresh", "approval_unreadable", "approval_missing", "approval_expired",
+                             "approval_consumed", "approval_superseded", "operator_not_owner", "gate_unreadable"})
+_APPROVAL_CODES = frozenset({"approval_unreadable", "approval_missing", "approval_expired", "approval_consumed",
+                             "approval_superseded", "operator_not_owner", "approval_revision_drift"})
+_DRY_RUN_CODES = frozenset({"dry_run_required", "dry_run_old"})
+_AFTER_DRY_RUN = frozenset({"prior_attempt_needs_review", "launch_in_progress"})
+_NOT_EVALUATED = "not_evaluated"
+
+
+def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone: dict[str, Any] | None,
                       match: dict[str, Any] | None, domain_count: int | None, uuid_state: str, ce_route: bool,
                       start_iso: str | None, today: date, days_before: int, approval: dict[str, Any] | None,
-                      create: dict[str, Any] | None) -> list[dict[str, str]]:
+                      create: dict[str, Any] | None, gate: dict[str, Any] | None = None,
+                      session: dict[str, Any] | None = None) -> list[dict[str, str]]:
     """The nine production onboarding checks as ``{"key", "label", "status", "detail"}``, in display order.
 
     ``status`` is ``locked``, ``ready``, ``blocked`` or ``unavailable``. Pure: every input is already read by the caller
-    (``clone`` from ``clone_status``, ``approval`` from ``approval_for_co``, ``create`` from ``create_state``). Anything that
+    (``clone`` from ``clone_status``, ``approval`` from ``approval_for_co``, ``create`` from ``create_state``, ``gate`` from
+    ``production_create_ui.page_state`` and ``session`` from ``backoffice_session_status``). The session, approval, dry
+    run and owner go rows follow ``gate`` (the real create gate), so no row contradicts the Create card. Anything that
     cannot be evaluated is ``unavailable``, never ``ready``; ``uuid_state`` is ``empty``, ``set`` or ``unread``.
     """
     items = []
+    reason = gate.get("reason", _NOT_EVALUATED) if isinstance(gate, dict) else _NOT_EVALUATED
+    gate_words = _text(gate.get("text") or "") if isinstance(gate, dict) else ""
     # 1 runner unlock
     if locked:
         items.append(_item("unlock", "locked", lock_reason_text(lock_reason)))
     else:
-        items.append(_item("unlock", "ready", "Runner unlocked by configuration."))
-    # 2 production session: nothing in this build records one, so it is never green without an explicit ready flag
+        items.append(_item("unlock", "ready", "Runner unlocked in this build."))
+    # 2 production session: unlocked by this CO's approval record inside the gate; the runner signs in when it starts
     if vm:
         items.append(_item("session", "unavailable", "Sessions: " + UNAVAILABLE_ON_SERVER + "."))
     elif locked:
-        items.append(_item("session", "locked", "Production sessions stay locked. See the Sessions page."))
-    elif session_ready is True:
-        items.append(_item("session", "ready", "Production session ready."))
+        items.append(_item("session", "locked", "Locked with the production runner."))
+    elif reason == _NOT_EVALUATED:
+        items.append(_item("session", "unavailable", "The create gate was not evaluated."))
+    elif reason in _BEFORE_SESSION:
+        items.append(_item("session", "blocked", "Unlocks with this CO's valid create approval. " + gate_words))
+    elif reason == "production_locked":
+        items.append(_item("session", "blocked", gate_words))
     else:
-        items.append(_item("session", "unavailable", "No production session status is recorded. See the Sessions page."))
+        last = session.get("detail") if isinstance(session, dict) else ""
+        items.append(_item("session", "ready", "Unlocked by the approval. The runner signs in to app.pentera.io when it starts."
+                           + (" Last run: " + _text(last) if last else "")))
     # 3 clone
     state = clone.get("state") if isinstance(clone, dict) else None
     if state == "fresh":
@@ -455,7 +540,9 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, sessio
         items.append(_item("timing", "unavailable", "Start date not available."))
     # 7 one-CO create approval
     a_state = approval.get("state") if isinstance(approval, dict) else None
-    if a_state == "valid":
+    if not locked and reason in _APPROVAL_CODES:
+        items.append(_item("approval", "blocked", gate_words))
+    elif a_state == "valid":
         items.append(_item("approval", "ready", "Valid to " + _text(str((approval.get("item") or {}).get("expires_at") or ""))[:10] + "."))
     elif a_state == "unavailable":
         items.append(_item("approval", "unavailable", "Create approvals: " + UNAVAILABLE_ON_SERVER + "."))
@@ -476,8 +563,21 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, sessio
     else:
         done = int(create.get("steps_done") or 0)
         pending = "locked" if locked else "blocked"
-        items.append(_item("dry_run", "ready" if done >= 1 else pending, "Dry run recorded." if done >= 1 else "No dry run recorded."))
-        items.append(_item("owner_go", "ready" if done >= 2 else pending, "Owner go recorded." if done >= 2 else "No owner go recorded."))
+        if not locked and reason in _DRY_RUN_CODES:
+            items.append(_item("dry_run", "blocked", gate_words))
+        elif not locked and (reason is None or reason in _AFTER_DRY_RUN):
+            items.append(_item("dry_run", "ready", "A passing dry run for this approval is recorded within 24 h."))
+        else:
+            items.append(_item("dry_run", "ready" if done >= 1 else pending,
+                               "Dry run recorded." if done >= 1 else "No dry run recorded."))
+        if done >= 2:
+            items.append(_item("owner_go", "ready", "Owner go recorded."))
+        elif locked:
+            items.append(_item("owner_go", "locked", "No owner go recorded."))
+        elif reason is None:
+            items.append(_item("owner_go", "ready", "Given by your typed, confirmed click in Create in production."))
+        else:
+            items.append(_item("owner_go", "blocked", "Waits for every other gate." + (" " + gate_words if gate_words else "")))
     return items
 
 
