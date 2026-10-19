@@ -79,13 +79,13 @@ class SheetRowTests(unittest.TestCase):
     def test_suffix_is_exactly_ce_only(self):
         self.assertTrue(rows_of(sheet())["Company name"]["value"].endswith(" - CE Only"))
 
-    # (range start, range end, expiry): the owner rule of 2026-09-25, ce_license_dates: min(start + 1 year - 1 day, range end)
+    # (range start, range end, expiry): owner decision 2026-10-19, ce_license_dates: the expiry is the range end
     EXPIRY_TABLE = (
         ("2026-10-18", "2027-10-17", "2027-10-17"),   # one-year deal
-        ("2026-06-22", "2029-06-21", "2027-06-21"),   # three-year deal: still one year, not the range end
-        ("2026-10-18", "2027-03-31", "2027-03-31"),   # shorter than a year: capped at the range end
-        ("2028-02-29", "2031-02-28", "2029-02-27"),   # start on Feb 29 (the runner's _add_one_year gives 2029-02-28)
-        ("2026-10-16", "2027-10-16", "2027-10-15"),   # a full year: minus one day
+        ("2026-06-22", "2029-06-21", "2029-06-21"),   # three-year deal (CO-0798): the range end, not one year
+        ("2026-10-18", "2027-03-31", "2027-03-31"),   # shorter than a year
+        ("2028-02-29", "2031-02-28", "2031-02-28"),   # start on Feb 29
+        ("2026-10-16", "2027-10-16", "2027-10-16"),   # a full year: the range end as given
     )
 
     def test_expiry_follows_the_runner_rule_over_a_table(self):
@@ -285,7 +285,7 @@ class RulesPinnedToTheRunnerTests(unittest.TestCase):
                                      date(2026, 6, 22), date(2029, 6, 21), "State Land Service - CE Only", "sls")
         plan = runner.build_ce_only_fill(source, TODAY)
         got = {item["label"]: item["value"] for item in sheet(comments="DealHub 2026-06-22 - 2029-06-21")["rows"]}
-        self.assertEqual(got["Expiration date"], "2027-06-21")           # a multi-year deal: the fixture no longer hides the rule
+        self.assertEqual(got["Expiration date"], "2029-06-21")           # a multi-year deal: the subscription end (owner rule 2026-10-19)
         self.assertEqual(got["Expiration date"], plan["license_end"].isoformat())
         self.assertEqual(got["Company name"], plan["texts"]["Company name"])
         self.assertEqual(got["Company primary domain"], plan["texts"]["Company primary domain"])

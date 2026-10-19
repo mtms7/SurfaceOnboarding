@@ -451,23 +451,24 @@ class SelectCeSubscriptionTests(unittest.TestCase):
 
 
 class CeLicenseDatesTests(unittest.TestCase):
-    def test_one_year_minus_one_day(self):
-        # Tango: 2026-10-24 -> 2029-10-23 gives CE 2026-10-24 -> 2027-10-23.
+    # Owner decision 2026-10-19 (CO-0798: a 3-year Core Plus deal was entered as one year, 2027-06-21, and corrected by
+    # hand to 2029-06-21): the CE expiration IS the Core Plus subscription end. It replaces the 2026-09-25 one-year rule.
+    def test_a_multi_year_deal_expires_at_the_subscription_end(self):
+        self.assertEqual(ce_license_dates(date(2026, 6, 22), date(2029, 6, 21)), (date(2026, 6, 22), date(2029, 6, 21)))
         self.assertEqual(ce_license_dates(date(2026, 10, 24), date(2029, 10, 23)),
-                         (date(2026, 10, 24), date(2027, 10, 23)))
+                         (date(2026, 10, 24), date(2029, 10, 23)))
 
-    def test_capped_at_subscription_end(self):
+    def test_a_short_deal_expires_at_the_subscription_end(self):
         self.assertEqual(ce_license_dates(date(2026, 10, 24), date(2026, 12, 31)),
                          (date(2026, 10, 24), date(2026, 12, 31)))
 
-    def test_subscription_end_exactly_at_annual_end(self):
+    def test_a_one_year_deal_expires_at_the_subscription_end(self):
         self.assertEqual(ce_license_dates(date(2026, 10, 24), date(2027, 10, 23)),
                          (date(2026, 10, 24), date(2027, 10, 23)))
 
-    def test_february_29_start_clamps_to_february_28(self):
-        # 2028-02-29 + 1 year is 2029-02-28; minus one day is 2029-02-27.
+    def test_february_29_start_keeps_the_subscription_end(self):
         self.assertEqual(ce_license_dates(date(2028, 2, 29), date(2031, 2, 28)),
-                         (date(2028, 2, 29), date(2029, 2, 27)))
+                         (date(2028, 2, 29), date(2031, 2, 28)))
 
 
 class CeFillSourceTests(unittest.TestCase):
@@ -648,15 +649,15 @@ class BuildCeOnlyFillTests(unittest.TestCase):
         # decision 2026-09-29); expiration keeps the contract rule.
         plan = build_ce_only_fill(self._source(), date(2026, 9, 29))
         self.assertEqual(plan["license_start"], date(2026, 9, 29))
-        self.assertEqual(plan["license_end"], date(2027, 9, 27))
+        self.assertEqual(plan["license_end"], date(2029, 9, 27))
 
     def test_future_contract_start_uses_run_day_and_contract_expiration(self):
         # CO-0679 shape: contract starts 2026-10-24, run happens 2026-09-29.
         self.assertEqual(runner.ce_run_license_dates(date(2026, 10, 24), date(2029, 10, 23), date(2026, 9, 29)),
-                         (date(2026, 9, 29), date(2027, 10, 23)))
+                         (date(2026, 9, 29), date(2029, 10, 23)))
 
     def test_expired_or_same_day_expiration_fails_closed(self):
-        for run_day in (date(2027, 9, 27), date(2027, 10, 1)):
+        for run_day in (date(2029, 9, 27), date(2029, 10, 1)):
             with self.subTest(run_day=run_day), self.assertRaises(ValueError):
                 runner.ce_run_license_dates(date(2026, 9, 28), date(2029, 9, 27), run_day)
 
@@ -1675,7 +1676,7 @@ class RunEndToEndTests(unittest.TestCase):
         # The fake date controls are typed text inputs (the live form uses the
         # picker path). Start = the run day; expiration = the contract rule.
         self.assertEqual(page.filled["Start date"], runner._run_day().isoformat())
-        self.assertEqual(page.filled["Expiration date"], "2027-09-27")
+        self.assertEqual(page.filled["Expiration date"], "2029-09-27")
 
     def _duplicate_check(self, page, tracker):
         state = self._temp_path("state.json")
@@ -1842,7 +1843,7 @@ class RunEndToEndTests(unittest.TestCase):
     def test_expired_license_stops_before_browser_launch(self):
         tracker: dict = {}
         page = self._install_fake_playwright(self._base(), tracker)
-        with patch.object(runner, "_run_day", return_value=date(2027, 9, 27)):
+        with patch.object(runner, "_run_day", return_value=date(2029, 9, 27)):
             result = self._run_scenario(page, tracker)
         self.assertEqual(result, "ce_license_dates_unavailable")
         self.assertFalse(tracker.get("launched", False))
@@ -3554,12 +3555,12 @@ CE_GOLDEN_PLAN = {
         "subDomainsNumberAllowed": True,
     },
     "license_start": date(2026, 9, 29),
-    "license_end": date(2027, 9, 27),
+    "license_end": date(2029, 9, 27),
 }
 # Captured from the pre-route-contract runner (HEAD 71bc251) on the fake form.
 CE_GOLDEN_EVENTS = [
     ["source_read", "start", "", ""], ["source_read", "ok", "", ""],
-    ["license_dates", "ok", "", "start=2026-09-29 end=2027-09-27"],
+    ["license_dates", "ok", "", "start=2026-09-29 end=2029-09-27"],
     # 2026-10-05: the production gate runs first on every Start (a fresh clone with one unrelated tenant here).
     ["production_gate", "production_clone_no_match", "", "blocks=False tenants=1 matches=0"],
     # 2026-10-04: the DEV inventory pre-check runs before any browser work (no snapshot here).

@@ -6888,7 +6888,10 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     guide["closing"] = _prod_view_closing(_production_page_state(reference, row))
     main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
                  + _production_guide_html(guide, match))
-    return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod")
+    progress = _production_run_progress(reference)
+    refresh = ("<meta http-equiv='refresh' content='5'>"
+               if progress is not None and not progress["done"] and not progress["failed"] else "")
+    return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod", refresh=refresh)
 
 
 # ---- Production-first pages (owner decision 2026-10-16, docs/46 + docs/47) ----------------------------------------
@@ -7657,6 +7660,9 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
     """The create section of a production CO page. With ``state`` (the review page) a closed gate without a record shows a
     read-only card naming that gate instead of nothing; without it, "" as before. Any failure shows no control."""
     try:
+        progress = _production_run_progress(reference)
+        if progress is not None:
+            return create_ui.progress_card_html(progress)
         inputs = _create_ui_inputs(reference, row)
         html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
     except Exception:  # noqa: BLE001 - fail closed: no control
@@ -7698,13 +7704,59 @@ def _launch_production_create(reference: str, revision: str, env: dict[str, str]
         return None
 
 
+# Same-page progress and the CE-only follow-up (owner decisions 2026-10-19): one entry per CO launched by THIS dashboard
+# process: {"since": launch time (UTC, records older than it never count), "follow": the follow-up result or None}.
+PRODUCTION_RUNS: dict[str, dict[str, Any]] = {}
+_PRODUCTION_RUNS_LOCK = Lock()
+
+
+def _launch_production_create_followed(reference: str, revision: str, env: dict[str, str]) -> Any:
+    """Start the runner (``_launch_production_create``) and a worker that runs the CE-only follow-up when it ends."""
+    since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    process = _launch_production_create(reference, revision, env)
+    if process is None:
+        return None
+    with _PRODUCTION_RUNS_LOCK:
+        PRODUCTION_RUNS[reference] = {"since": since, "follow": None}
+    Thread(target=_follow_production_create, args=(reference, process), daemon=True).start()
+    return process
+
+
+def _follow_production_create(reference: str, process: Any) -> None:
+    """When the runner ends: the automatic UUID write and Request Approved -> Account Scanning (create_ui gates both)."""
+    try:
+        process.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        inputs = _create_ui_inputs(reference, None)
+        follow = create_ui.after_verified_create(inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
+                                                 create_ui.PINNED_SF_ALIAS)
+    except Exception:  # noqa: BLE001 - recorded, never raised in the worker
+        follow = {"uuid": "follow_up_failed", "stage": "follow_up_failed"}
+    with _PRODUCTION_RUNS_LOCK:
+        if reference in PRODUCTION_RUNS:
+            PRODUCTION_RUNS[reference]["follow"] = follow
+
+
+def _production_run_progress(reference: str) -> dict[str, Any] | None:
+    """The progress of the create this dashboard started for ``reference`` (None when it started none)."""
+    with _PRODUCTION_RUNS_LOCK:
+        run = dict(PRODUCTION_RUNS.get(reference) or {})
+    if not run:
+        return None
+    running = create_ui.LAUNCHES.busy() or run.get("follow") is None
+    return create_ui.production_progress(production_records_parent(), reference, run["since"], running=running,
+                                         follow=run.get("follow"))
+
+
 def _read_production_writeback_row(reference: str) -> dict[str, str | None] | None:
     """Fresh fixed-field read of the one CO row for the guarded UUID write (None on any problem)."""
     if not REFERENCE.fullmatch(reference) or os.environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", create_ui.PINNED_SF_ALIAS):
         return None  # a production path ignores the alias override: it refuses instead
     try:
         response = sf_json(["data", "query", "--query", "SELECT Id, Name, LastModifiedDate, Onboarding_Product__c, "
-                            "Onboarding_Type__c, Account_UUID__c FROM Customer_Onboarding__c WHERE Name = '" + reference
+                            "Onboarding_Type__c, Account_UUID__c, Onboarding_Stage__c FROM Customer_Onboarding__c WHERE Name = '" + reference
                             + "' LIMIT 2", "--json"])
         records = response["result"]["records"]  # type: ignore[index]
         if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:  # type: ignore[index]
@@ -8622,12 +8674,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _post_production_create(self, path: str, reference: str, form: Any) -> None:
         """The guarded production create and UUID write posts (docs/53). Each re-checks every gate with a fresh CO read."""
-        back = "<p><a href='/onboard/" + escape(reference) + "'>Return to " + escape(reference) + "</a></p>"
+        co_page = "/co/" + escape(reference) + "?env=prod"
+        back = "<p><a href='" + co_page + "'>Return to " + escape(reference) + "</a></p>"
 
         def refuse(code: str) -> None:
-            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Not done</title><p><strong>Not done.</strong> "
-                           + escape(create_ui.gate_text(code)) + " Nothing was sent.</p><p>Code: <code>" + escape(code)
-                           + "</code></p>" + back)
+            body = ("<div class='banner banner-warn'><span class='chip chip-warn'>Not done</span> "
+                    + escape(create_ui.gate_text(code)) + " Nothing was sent.</div><p class='note'>Code: <code>"
+                    + escape(code) + "</code></p>" + back)
+            self.send_page(HTTPStatus.CONFLICT, _app_shell(reference + " not done", "<section class='card'>" + body
+                                                           + "</section>", active="prod_onboarding", env="prod"))
 
         try:
             row = detail_row(reference)
@@ -8636,13 +8691,10 @@ class Handler(BaseHTTPRequestHandler):
         inputs = _create_ui_inputs(reference, row, self.request_operator())
         values = form or {}
         if path == create_ui.CREATE_PATH:
-            code = create_ui.handle_create_post(values, inputs, _launch_production_create)
+            code = create_ui.handle_create_post(values, inputs, _launch_production_create_followed)
             if code != "launched":
                 refuse(code); return
-            self.send_page(HTTPStatus.OK, "<!doctype html><title>Production create started</title><p><strong>Started.</strong> "
-                           "The production runner window is opening for " + escape(reference) + ". Sign in with SSO and MFA "
-                           "there if asked and leave the window open. It checks BackOffice for duplicates, fills the form, "
-                           "clicks Confirm once and reads the tenant back. Do not start another run.</p>" + back)
+            self.send_redirect("/co/" + reference + "?env=prod")  # the CO page shows the progress (same dashboard)
             return
         if path == create_ui.UUID_REVIEW_PATH:
             code, view = create_ui.handle_uuid_review(values, inputs, _read_production_writeback_row(reference))
@@ -8662,8 +8714,7 @@ class Handler(BaseHTTPRequestHandler):
         code = create_ui.handle_uuid_confirm(values, inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
                                              create_ui.PINNED_SF_ALIAS)
         if code in create_ui.UUID_RESULT_TEXT:
-            self.send_page(HTTPStatus.OK, "<!doctype html><title>Salesforce UUID write</title><p><strong>"
-                           + escape(create_ui.UUID_RESULT_TEXT[code]) + "</strong></p>" + back)
+            self.send_redirect("/co/" + reference + "?env=prod")  # the create card shows the recorded result
             return
         refuse(code)
 

@@ -484,12 +484,18 @@ def _add_one_year(value: date) -> date:
 
 
 def ce_license_dates(subscription_start: date, subscription_end: date) -> tuple[date, date]:
-    """CE license dates per the owner-confirmed rule (2026-09-25).
+    """CE license dates per the owner rule of 2026-10-19 (replaces the 2026-09-25 one-year rule).
 
-    startDate is the Core Plus subscription start; expirationDate is one
-    year minus one day from the start, capped at the subscription end.
+    startDate is the Core Plus subscription start; expirationDate is the Core Plus subscription END. CO-0798 (a 3-year
+    deal, 2026-06-22 - 2029-06-21) was entered with the old one-year expiry 2027-06-21 and corrected by hand.
     (Future renewal rule: a CE renewal never modifies the start date.)
     """
+    return subscription_start, subscription_end
+
+
+def annual_license_dates(subscription_start: date, subscription_end: date) -> tuple[date, date]:
+    """The 2026-09-25 one-year rule, kept for the Surface-only and Case 3 routes (the 2026-10-19 owner decision covers
+    CE-only): expirationDate is one year minus one day from the start, capped at the subscription end."""
     annual_end = _add_one_year(subscription_start) - timedelta(days=1)
     return subscription_start, min(annual_end, subscription_end)
 
@@ -509,8 +515,18 @@ def ce_run_license_dates(subscription_start: date, subscription_end: date,
     ValueError ("ce_license_dates_unavailable") when that expiration is not
     after the run day, so the run stops before any browser work.
     """
+    return _run_dates(ce_license_dates, subscription_start, subscription_end, run_day)
+
+
+def annual_run_license_dates(subscription_start: date, subscription_end: date,
+                             run_day: date | None = None) -> tuple[date, date]:
+    """``ce_run_license_dates`` with the one-year rule (Surface-only and Case 3)."""
+    return _run_dates(annual_license_dates, subscription_start, subscription_end, run_day)
+
+
+def _run_dates(rule: Any, subscription_start: date, subscription_end: date, run_day: date | None) -> tuple[date, date]:
     day = run_day or _run_day()
-    _contract_start, expiration = ce_license_dates(subscription_start, subscription_end)
+    _contract_start, expiration = rule(subscription_start, subscription_end)
     if expiration <= day:
         raise ValueError("ce_license_dates_unavailable")
     return day, expiration
@@ -1189,7 +1205,7 @@ def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillS
 def case3_term_problem(source: Case3FillSource, run_day: date | None = None) -> str | None:
     """Plain-language explanation when the Surface and Core Plus terms disagree, else None."""
     surface_start, surface_end = surface_run_license_dates(source.surface, run_day)
-    ce_start, ce_end = ce_run_license_dates(source.ce_subscription_start, source.ce_subscription_end, run_day)
+    ce_start, ce_end = annual_run_license_dates(source.ce_subscription_start, source.ce_subscription_end, run_day)
     if surface_end == ce_end:
         return None
     return (f"The Surface licence would end {surface_end.isoformat()} but the Core Plus (Credential Exposure) "
@@ -1371,14 +1387,14 @@ def build_renewal_plan(product: Any, onboarding_type: Any, subscription_rows: li
 
 
 def surface_run_license_dates(source: SurfaceFillSource, run_day: date | None = None) -> tuple[date, date]:
-    """Surface license dates: the CE rule (start = run day; expiration =
-    min(subscription start + 1 year - 1 day, subscription end)).
+    """Surface license dates: the one-year rule (start = run day; expiration =
+    min(subscription start + 1 year - 1 day, subscription end)); CE-only uses the subscription end since 2026-10-19.
 
     Raises ValueError("surface_license_dates_unavailable") when that
     expiration is not after the run day.
     """
     try:
-        return ce_run_license_dates(source.subscription_start, source.subscription_end, run_day)
+        return annual_run_license_dates(source.subscription_start, source.subscription_end, run_day)
     except ValueError as exc:
         raise ValueError("surface_license_dates_unavailable") from exc
 

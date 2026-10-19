@@ -36,6 +36,7 @@ from typing import Any
 
 from . import production_approval, production_create, production_launch_ticket, production_views, salesforce_uuid_writeback
 from . import production_create_record as records
+from . import salesforce_stage_writeback as stage_wb
 from . import session_readiness as readiness
 
 CREATE_PATH = "/attended/production-create"
@@ -47,6 +48,7 @@ DRY_RUN_MAX_AGE = timedelta(hours=24)
 SALESFORCE_FRESH_SECONDS = 15 * 60
 SESSIONS_ENV = "SURFACE_ONBOARDING_PRODUCTION_SESSIONS"
 UUID_WRITES_FILE = "production-uuid-writes.jsonl"
+STAGE_WRITES_FILE = "production-stage-writes.jsonl"  # owner decision 2026-10-19: CE-only stage moves (append-only)
 PINNED_SF_ALIAS = "surface-onboarding"  # production paths never take the Salesforce alias from the environment
 CO_PATTERN = re.compile(r"CO-[0-9]{4,10}")
 
@@ -657,6 +659,14 @@ def handle_uuid_confirm(values: Mapping[str, Any], inputs: Inputs, read_row: Cal
     uuid, revision = blocked[1], blocked[2]
     if not TOKENS.consume("uuid", reference, _binding(reference, revision, uuid, "uuid"), token):
         return "confirmation_invalid"
+    return _write_uuid(inputs, read_row, run_argv, target_org, uuid, revision)
+
+
+def _write_uuid(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None], run_argv: Callable[[list[str]], bool],
+                target_org: str, uuid: str, revision: str) -> str:
+    """The guarded write itself (after ``_uuid_blocker`` passed): re-read, identical plan, intent line, ONE write,
+    read-after-write, result line. Shared by the owner's confirmation and the automatic CE-only follow-up."""
+    reference = inputs.reference
     status = co_status(load_co_records(inputs.records_parent, reference))
     result = production_create.CreateResult(production_create.OUTCOME_VERIFIED, "", None, None, uuid,
                                             status.get("revision"), status.get("route"))
@@ -698,3 +708,230 @@ def handle_uuid_confirm(values: Mapping[str, Any], inputs: Inputs, read_row: Cal
     except Exception:
         return "record_write_failed"  # the write_started line keeps blocking any further write
     return outcome
+
+
+# --- CE-only follow-up after a verified create (owner decision 2026-10-19) --------------------------------------------------
+
+def auto_uuid_write(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None],
+                    run_argv: Callable[[list[str]], bool], target_org: str) -> str:
+    """The UUID write without a second click: the same ``_uuid_blocker`` gate (verified create, both constants, empty
+    field, unchanged revision, no earlier write) and the same guarded write. Returns the result or the refusal code."""
+    try:
+        row = read_row()
+    except Exception:
+        row = None
+    blocked = _uuid_blocker(inputs, row)
+    if blocked[0] is not None:
+        return blocked[0]
+    return _write_uuid(inputs, read_row, run_argv, target_org, blocked[1], blocked[2])
+
+
+def record_stage_write(parent: Path, co: str, to_stage: str, result: str, now: datetime, reason: str = "") -> None:
+    """Append one stage-move line (never rewritten); raises on any failure."""
+    folder = Path(parent) / records.RECORDS_SUBDIR
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    line = json.dumps({"co_reference": co, "field": stage_wb.STAGE_FIELD, "to_stage": to_stage, "result": result,
+                       "reason": reason, "recorded_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+                      sort_keys=True)
+    fd = os.open(folder / STAGE_WRITES_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def last_stage_write(parent: Path, co: str) -> tuple[str, str] | None:
+    """(to_stage, result) of the newest stage line of one CO; ("", "write_uncertain") for an unreadable log; None if none."""
+    try:
+        lines = (Path(parent) / records.RECORDS_SUBDIR / STAGE_WRITES_FILE).read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return "", "write_uncertain"
+    last = None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return "", "write_uncertain"
+        if isinstance(item, dict) and item.get("co_reference") == co and isinstance(item.get("result"), str):
+            last = (str(item.get("to_stage") or ""), item["result"])
+    return last
+
+
+def _stage_move(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None], run_argv: Callable[[list[str]], bool],
+                target_org: str, to_stage: str) -> str:
+    """One guarded stage move: never after an uncertain earlier move; exact from-stage; intent line; ONE write; read back."""
+    if inputs.vm is True:
+        return "vm_read_only"
+    last = last_stage_write(inputs.records_parent, inputs.reference)
+    if last is not None and last[1] in ("write_started", "write_uncertain"):
+        return "stage_write_needs_review"
+    try:
+        row = read_row()
+    except Exception:
+        row = None
+    plan = stage_wb.plan(row, to_stage)
+    if plan.status == "already_present":
+        return "already_present"
+    if plan.status != "ready_to_write":
+        return plan.reason
+    try:
+        argv = stage_wb.update_argv(plan, (row or {}).get("Id"), target_org)
+    except ValueError:
+        return "write_blocked"
+    try:
+        record_stage_write(inputs.records_parent, inputs.reference, to_stage, "write_started", inputs.now)
+    except Exception:
+        return "record_write_failed"
+    try:
+        accepted = run_argv(argv)
+    except Exception:
+        accepted = None
+    if accepted is False:
+        outcome = "write_rejected"
+    elif accepted is not True:
+        outcome = "write_uncertain"
+    else:
+        try:
+            after = read_row()
+        except Exception:
+            after = None
+        outcome = "written_verified" if stage_wb.verify_after_write(after, to_stage) == "verified" else "write_uncertain"
+    try:
+        record_stage_write(inputs.records_parent, inputs.reference, to_stage, outcome, inputs.now)
+    except Exception:
+        return "record_write_failed"
+    return outcome
+
+
+def _uuid_on_co(inputs: Inputs, row: Mapping[str, Any] | None) -> bool:
+    """The verified readback UUID is the one on the CO (written_verified recorded and the row agrees)."""
+    try:
+        status = co_status(load_co_records(inputs.records_parent, inputs.reference))
+    except Exception:
+        return False
+    uuid = salesforce_uuid_writeback.normalise_uuid(status.get("uuid")) if status["code"] == CREATED_VERIFIED else None
+    return (uuid is not None and last_uuid_write(inputs.records_parent, inputs.reference) == "written_verified"
+            and salesforce_uuid_writeback.verify_after_write(row, uuid) == "verified")
+
+
+def after_verified_create(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None],
+                          run_argv: Callable[[list[str]], bool], target_org: str) -> dict[str, str]:
+    """CE-only follow-up run by the dashboard when the create runner ends: the UUID write, then Request Approved ->
+    Account Scanning only when the UUID on the CO is the verified one. Safe to call again: recorded results block repeats."""
+    uuid = auto_uuid_write(inputs, read_row, run_argv, target_org)
+    try:
+        row = read_row()
+    except Exception:
+        row = None
+    if not _uuid_on_co(inputs, row):
+        return {"uuid": uuid, "stage": "skipped_uuid_not_verified"}
+    return {"uuid": uuid, "stage": _stage_move(inputs, read_row, run_argv, target_org, "Account Scanning")}
+
+
+def after_scan_finished(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None],
+                        run_argv: Callable[[list[str]], bool], target_org: str, *, scan_state: str | None) -> list[str]:
+    """Account Scanning -> Scan Completed Successfully -> Onboarding Completed (CE-only skips User Created), only for a
+    ``scan_completed`` state from the runner's own read-only scan check and only with the verified UUID on the CO."""
+    if scan_state != "scan_completed":
+        return ["scan_not_finished"]
+    try:
+        row = read_row()
+    except Exception:
+        row = None
+    if not _uuid_on_co(inputs, row):
+        return ["uuid_not_on_co"]
+    results = []
+    for to_stage in ("Scan Completed Successfully", "Onboarding Completed"):
+        result = _stage_move(inputs, read_row, run_argv, target_org, to_stage)
+        results.append(result)
+        if result not in ("written_verified", "already_present"):
+            break
+    return results
+
+
+# --- Same-page progress of one production create (owner request 2026-10-19) -------------------------------------------------
+
+PROGRESS_STEPS = (
+    "Signing in to BackOffice and checking duplicates and the form (sign in with SSO + MFA in the app.pentera.io window)",
+    "Creating the tenant in BackOffice (one Confirm)",
+    "Reading the tenant back",
+    "Writing the Account UUID to Salesforce",
+    "Moving the Salesforce stage to Account Scanning",
+)
+_FOLLOW_OK = ("written_verified", "already_present")
+
+
+def production_progress(parent: Path, co: str, since: str, *, running: bool,
+                        follow: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Steps of the create started at ``since`` from recorded evidence only (records, UUID and stage logs, follow-up).
+
+    ``{"steps": [(label, done|active|pending|failed)], "percent", "current", "done", "failed": code | None}``. Records
+    older than ``since`` (an earlier attempt or the dry run) never count. Nothing is simulated.
+    """
+    try:
+        history = [r for r in load_co_records(parent, co) if str(r.get("recorded_at") or "") >= since]
+    except Exception:
+        history = []
+    outcomes = [r.get("outcome") for r in history]
+    reached, failed = 0, None
+    refusal = next((r for r in reversed(history) if r.get("outcome") == "refused"), None)
+    if "attempt_started" in outcomes:
+        reached = 1
+    if "readback_verified" in outcomes:
+        reached = 3
+        uuid_state = last_uuid_write(parent, co)
+        if uuid_state == "written_verified":
+            reached = 4
+            stage = last_stage_write(parent, co)
+            if stage == ("Account Scanning", "written_verified") or (follow or {}).get("stage") == "already_present":
+                reached = 5
+            elif stage is not None and stage[1] != "written_verified":
+                failed = stage[1]
+            elif follow is not None and follow.get("stage") not in _FOLLOW_OK:
+                failed = str(follow.get("stage"))
+        elif uuid_state in ("write_rejected", "write_uncertain", "write_started") and not running:
+            failed = uuid_state if follow is not None or uuid_state != "write_started" else None
+        elif follow is not None and follow.get("uuid") not in _FOLLOW_OK:
+            failed = str(follow.get("uuid"))
+    elif any(o in ("created_unverified", "uncertain_submit") for o in outcomes):
+        reached, failed = 2, "create_not_verified"
+    elif refusal is not None:
+        failed = str(refusal.get("refusal_reason") or "refused")
+    elif not running and reached == 0:
+        failed = "runner_ended_without_a_record"
+    steps = []
+    for index, label in enumerate(PROGRESS_STEPS):
+        if index < reached:
+            state = "done"
+        elif index == reached:
+            state = "failed" if failed else "active"
+        else:
+            state = "pending"
+        steps.append((label, state))
+    done = reached == len(PROGRESS_STEPS)
+    percent = 100 if done else min(95, 5 + reached * 18)
+    current = ("Onboarded: tenant created and verified, Account UUID written, stage Account Scanning" if done
+               else PROGRESS_STEPS[reached] if reached < len(PROGRESS_STEPS) else "")
+    return {"steps": steps, "percent": percent, "current": current, "done": done, "failed": failed}
+
+
+def progress_card_html(progress: Mapping[str, Any]) -> str:
+    """CSS-only progress card (no script, no form, no value): step labels, percent and state only."""
+    items = "".join("<li class='s-" + escape(state) + "'>" + escape(label) + (" (running)" if state == "active" else "")
+                    + "</li>" for label, state in progress["steps"])
+    if progress.get("done"):
+        chip, head = _chip("chip-ok", "Onboarded"), "Done"
+    elif progress.get("failed"):
+        chip, head = _chip("chip-bad", "Stopped"), "Stopped: " + gate_text(progress["failed"])
+    else:
+        chip, head = _chip("chip-warn", "Running"), "In progress"
+    percent = str(int(progress.get("percent") or 0))
+    return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
+            "<h2 id='co-create-title' class='pill'>Production create</h2>" + chip + "</div>"
+            "<div class='runprog' aria-live='polite'><div class='runprog-head'><span>" + escape(head) + ": "
+            + escape(str(progress.get("current") or "")) + "</span><span>" + percent + "%</span></div>"
+            "<div class='runprog-bar' role='progressbar' aria-label='Production create progress' aria-valuemin='0' "
+            "aria-valuemax='100' aria-valuenow='" + percent + "'><span class='runprog-fill' style='width:" + percent
+            + "%'></span></div><ol class='runprog-steps'>" + items + "</ol></div></section>")
