@@ -22,7 +22,6 @@ from integration.tests import test_dev_prod_areas as areas_module
 from integration.tests.test_redash_inventory import FAKE_KEY, GET, FakeOpener, result, row as clone_row
 import tools.redash_inventory_collector as collector
 import tools.serve_attended_open_onboardings_dashboard as dashboard
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 CE = {"Onboarding_Product__c": dashboard.CE_ROUTE_PRODUCT, "Onboarding_Type__c": dashboard.CE_ROUTE_TYPE}
 ROWS = [
@@ -403,7 +402,6 @@ class CoPageTests(unittest.TestCase):
     def heads(self, page):
         return [text(h) for h in re.findall(r"<h2[^>]*>(.*?)</h2>", page, flags=re.S)]
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_cards_in_the_mockup_order(self):
         page = self.page()
         self.assertEqual(self.heads(page), ["Onboard", "Production onboarding sheet", "Salesforce facts", "Production checks", "Approval", "Create", "D2 record",
@@ -480,7 +478,6 @@ class CoPageTests(unittest.TestCase):
         self.assertEqual(controls(page, allow=("/attended/review-approve", "Approve this summary")), [])
         self.assertIn("<span class='chip chip-warn'>Create locked</span>", page)
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_no_create_control_in_any_state_even_with_a_valid_approval_and_a_verified_record(self):
         self.env.write_approvals(approval())
         self.env.write_record(record("CO-0780", "readback_verified"))
@@ -581,7 +578,6 @@ class CoPageTests(unittest.TestCase):
         self.assertNotIn("RAW-SECRET-JSON", bad)
         self.assertNotIn("No create record", card[:card.index("UUID writeback")])
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_uuid_writeback_is_locked_until_a_verified_create(self):
         page = self.page()
         card = page[page.index("<h2 class='pill'>UUID writeback"):]
@@ -712,7 +708,6 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
                     self.assertEqual(request.pages[0][0], 200, path)
         self.assertEqual(areas_module.get("/tenants").redirects, ["/prod/tenants"])
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_production_pages_have_no_post_route_and_the_runner_stays_locked(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         # The guarded create/UUID routes (docs/53) are the ONLY allowed exception: they exist as POST routes but refuse

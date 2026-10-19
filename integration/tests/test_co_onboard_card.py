@@ -17,7 +17,6 @@ from integration.onboarding import production_views as views
 from integration.tests import test_dev_prod_areas as areas_module
 from integration.tests import test_production_first_dashboard as base
 import tools.serve_attended_open_onboardings_dashboard as dashboard
-from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 ITEM_LABELS = ["Production runner unlocked", "Production session", "Clone fresh under 6 h", "No duplicate in production",
                "Salesforce data valid", "Timing window", "One-CO create approval", "Dry run done", "Owner go"]
@@ -336,7 +335,6 @@ class HandlerRouteTests(CardBase):
         self.assertNotIn("co-onboard-title", prod[1])   # docs/50: the simplified page has no Onboard card
         self.assertIn("co-before-title", prod[1])
 
-    @locked_create_build  # unlock window 2026-10-18: runs as the locked build
     def test_the_card_adds_no_post_route_and_the_lock_holds(self):
         self.assertIs(dashboard.readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertFalse([route for route in dashboard.POST_ROUTES if "onboard-card" in route or route.startswith("/onboard")])
