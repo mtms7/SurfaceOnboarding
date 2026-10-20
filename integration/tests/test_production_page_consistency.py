@@ -299,11 +299,10 @@ class SessionsPageTests(unittest.TestCase):
         self.assertIn(views.BACKOFFICE_SESSION_CHIPS["signed_in"][1], page)
         self.assertIn("app.pentera.io", page)
 
-    def test_backoffice_row_comes_first_and_leonardo_is_labelled_dev(self):
+    def test_backoffice_row_comes_first_and_there_is_no_leonardo_row(self):
         page = self.page()
-        self.assertIn("<th>Leonardo Development (Dev)</th>", page)
+        self.assertNotIn("Leonardo", page)  # owner decision 2026-10-19
         self.assertLess(page.index("<th>BackOffice production</th>"), page.index("<th>Salesforce</th>"))
-        self.assertLess(page.index("<th>Salesforce</th>"), page.index("<th>Leonardo Development (Dev)</th>"))
 
     def test_the_backoffice_row_has_no_control_and_no_secret_words(self):
         page = self.page()

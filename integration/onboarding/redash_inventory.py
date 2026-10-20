@@ -108,6 +108,10 @@ _HOSTNAME = re.compile(r"[A-Za-z0-9*_.-]{1,253}")  # no '@', no spaces, at most 
 _COUNTRY_CODE = re.compile(r"[A-Z]{2}")
 _ENUM = re.compile(r"[A-Za-z0-9_ -]{1,32}")
 _STATUS_ENUM = re.compile(r"[A-Z][A-Z_]{0,31}")  # an execution status such as DONE, DONE_WITH_ERRORS, PENDING
+# Owner decision 2026-10-19 (option A): a list cell of these two query-253 columns that IS a list but fails the hostname
+# bounds (over 50 items, an entry with an "@" or an odd character) becomes unknown (omitted) and is counted; the rest of
+# the row and the clone still load. Any other problem, in these or any other column, still refuses the whole result.
+WITHHOLDABLE_LIST_COLUMNS = frozenset({"userEmailDomains", "leakedCredentialsScannedDomains"})
 MAX_ROW_LIST_CHARS = 1500  # all list items of one row together: bounds the worst-case row so 6,000 rows stay under 32 MB
 # Alternate domains have their own bounds (live 2026-10-18: 125 tenants over 50 items, max 1,622 items / ~28,500
 # characters in one row, ~567,000 characters in all): per row, and for the whole result so the file stays under 32 MB.
@@ -269,6 +273,7 @@ class NormalizedResult:
     missing_columns: tuple[str, ...]
     query_id: int = QUERY_ID
     v2_rows: Mapping[str, dict[str, Any]] = field(default_factory=dict)  # tenant id -> v2 values (query 253 only)
+    withheld_cells: Mapping[str, int] = field(default_factory=dict)  # column -> rows whose list cell was withheld (253 only)
 
 
 def parse_timestamp_ms(value: Any) -> int | None:
@@ -348,7 +353,8 @@ def _spycloud_flag(column: str, value: Any) -> bool | None:
     return value if type(value) is bool else None
 
 
-def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None,
+               withheld: list[str] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """(v1 row, v2 values). The v2 values are empty for query 251."""
     profile = profile or PROFILES[QUERY_ID]
     v2_profile = profile.row_schema == ROW_SCHEMA_V2
@@ -370,7 +376,19 @@ def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> t
         if column not in profile.known or column in IGNORED_COLUMNS:
             continue
         if v2_profile and column in V2_COLUMNS:
-            typed = _v2_value(V2_COLUMNS[column], value)
+            try:
+                typed = _v2_value(V2_COLUMNS[column], value)
+            except InventoryError:
+                if column not in WITHHOLDABLE_LIST_COLUMNS or withheld is None:
+                    raise
+                try:
+                    is_list = type(_domain_list(value)) is list
+                except InventoryError:
+                    is_list = False
+                if not is_list:
+                    raise  # unparseable text or a non-list stays a refusal
+                typed = None
+                withheld.append(column)
             if typed is not None:
                 v2[v2_key(column)] = typed
             if column != "operatorCount":  # operatorCount also keeps feeding the v1 "operator assigned" flag
@@ -401,6 +419,114 @@ def _build_row(raw: Mapping[str, Any], profile: QueryProfile | None = None) -> t
     if any(item is not None for item in license_.values()):
         row["accountLicense"] = license_
     return row, v2
+
+
+def failing_columns(result: Any, query_id: int = V2_QUERY_ID) -> dict[str, int]:
+    """Per column, how many rows fail that column's own check (names from the known list, counts only: no value, no row).
+
+    A diagnostic for the probe after a ``redash_schema_unavailable`` refusal; it never raises."""
+    try:
+        profile = profile_for(query_id)
+        table = result["query_result"]["data"]["rows"]
+    except (InventoryError, KeyError, TypeError):
+        return {}
+    counts: dict[str, int] = {}
+    for raw in table if type(table) is list else ():
+        if not isinstance(raw, dict):
+            continue
+        for column, value in _flat(raw).items():
+            if column not in profile.known or column in IGNORED_COLUMNS:
+                continue
+            try:
+                if column in V2_COLUMNS:
+                    _v2_value(V2_COLUMNS[column], value)
+                elif column in V2_LICENSE_COLUMNS:
+                    _v2_value(V2_LICENSE_COLUMNS[column], value)
+                elif column in DATE_COLUMNS:
+                    parse_timestamp_ms(value)
+                elif column in INT_COLUMNS:
+                    _whole_number(value)
+                elif column in LIST_COLUMNS:
+                    items = _domain_list(value)
+                    if items is not None:
+                        _alternate_domains(items)
+            except (InventoryError, OverflowError, ValueError, TypeError):
+                counts[column] = counts.get(column, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def failing_list_reasons(result: Any, query_id: int = V2_QUERY_ID) -> dict[str, int]:
+    """``"column:reason"`` -> rows, for the list columns that fail (fixed reason words, counts only; never raises)."""
+    try:
+        profile = profile_for(query_id)
+        table = result["query_result"]["data"]["rows"]
+    except (InventoryError, KeyError, TypeError):
+        return {}
+    counts: dict[str, int] = {}
+    for raw in table if type(table) is list else ():
+        if not isinstance(raw, dict):
+            continue
+        for column, value in _flat(raw).items():
+            if column not in profile.known or column not in LIST_COLUMNS and V2_COLUMNS.get(column) != "list":
+                continue
+            try:
+                items = _domain_list(value)
+            except InventoryError:
+                reason = "unparseable"
+            else:
+                if items is None:
+                    continue
+                if len(items) > (ALT_DOMAINS_MAX_ITEMS if column in LIST_COLUMNS else _MAX_LIST_ITEMS):
+                    reason = "too_many_items"
+                elif not all(type(item) is str for item in items):
+                    reason = "non_text_item"
+                elif not all(_HOSTNAME.fullmatch(item) or (column in LIST_COLUMNS and "," in item) for item in items):
+                    reason = "item_not_hostname"
+                else:
+                    continue
+            key = column + ":" + reason
+            counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def failing_list_detail(result: Any, query_id: int = V2_QUERY_ID) -> dict[str, Any]:
+    """Sizes only, for list columns that fail: ``{column: {"max_items", "item_flags": {class: items}}}`` plus
+    ``"max_row_list_chars"`` (all list characters of the largest row). No value is returned; never raises."""
+    try:
+        profile = profile_for(query_id)
+        table = result["query_result"]["data"]["rows"]
+    except (InventoryError, KeyError, TypeError):
+        return {}
+    detail: dict[str, Any] = {}
+    max_chars = 0
+    for raw in table if type(table) is list else ():
+        if not isinstance(raw, dict):
+            continue
+        row_chars = 0
+        for column, value in _flat(raw).items():
+            if column not in profile.known or column not in LIST_COLUMNS and V2_COLUMNS.get(column) != "list":
+                continue
+            try:
+                items = _domain_list(value)
+            except InventoryError:
+                continue
+            if items is None:
+                continue
+            row_chars += sum(len(item) for item in items if type(item) is str)
+            limit = ALT_DOMAINS_MAX_ITEMS if column in LIST_COLUMNS else _MAX_LIST_ITEMS
+            bad = [item for item in items if type(item) is str and not _HOSTNAME.fullmatch(item)]
+            if len(items) <= limit and not bad and all(type(item) is str for item in items):
+                continue
+            entry = detail.setdefault(column, {"max_items": 0, "item_flags": {}})
+            entry["max_items"] = max(entry["max_items"], len(items))
+            for item in bad:
+                flag = ("has_at" if "@" in item else "has_space" if " " in item else "over_253_chars" if len(item) > 253
+                        else "other_character")
+                entry["item_flags"][flag] = entry["item_flags"].get(flag, 0) + 1
+        max_chars = max(max_chars, row_chars)
+    if detail or max_chars:
+        detail["max_row_list_chars"] = max_chars
+    return {key: detail[key] for key in sorted(detail)}
 
 
 def _list_chars(row: Mapping[str, Any], v2: Mapping[str, Any]) -> int:
@@ -438,11 +564,15 @@ def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
     rows = []
     v2_rows: dict[str, dict[str, Any]] = {}
     alt_chars = alt_items = 0
+    withheld_counts: dict[str, int] = {}
     for raw in table:
         if not isinstance(raw, dict):
             raise InventoryError("redash_schema_unavailable")
         try:
-            row, v2 = _build_row(raw, profile)
+            withheld: list[str] = []
+            row, v2 = _build_row(raw, profile, withheld)
+            for column in withheld:
+                withheld_counts[column] = withheld_counts.get(column, 0) + 1
         except (OverflowError, ValueError, TypeError):  # huge or odd numbers: a clean refusal, never a traceback
             raise InventoryError("redash_schema_unavailable") from None
         if _list_chars(row, v2) > MAX_ROW_LIST_CHARS:
@@ -473,7 +603,7 @@ def normalize(result: Any, query_id: int = QUERY_ID) -> NormalizedResult:
         tuple(rows), retrieved_at, latest_modified,
         tuple(unexpected)[:20],
         tuple(sorted(name for name in optional - IGNORED_COLUMNS - UNREPORTED_COLUMNS if name not in names)),
-        profile.query_id, v2_rows)
+        profile.query_id, v2_rows, dict(sorted(withheld_counts.items())))
 
 
 def attach_v2(payload: dict[str, Any], normalized: NormalizedResult) -> dict[str, Any]:
@@ -499,6 +629,7 @@ def source_meta(normalized: NormalizedResult, collected_at: datetime, *, refresh
         "collected_at": collected_at.astimezone(timezone.utc).strftime(stamp),
         "data_latest_modified": normalized.latest_modified.strftime(stamp) if normalized.latest_modified else None,
         "refreshed_this_run": bool(refreshed),
+        "withheld_list_cells": dict(normalized.withheld_cells),
         "unexpected_columns": list(normalized.unexpected_columns),
         "missing_columns": list(normalized.missing_columns),
     }

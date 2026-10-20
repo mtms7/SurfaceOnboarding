@@ -168,7 +168,7 @@ def controls(page, allow=()):
 class NavigationTests(unittest.TestCase):
     PRODUCTION = [("/", "Onboarding"), ("/prod/tenants", "Tenants"), ("/history", "History"), ("/prod/approvals", "Approvals")]
     TOOLS = [("/connection", "Sessions")]
-    DEV = [("/dev", "Onboardings"), ("/dev/onboarded", "Onboarded on Dev"), ("/inventory", "Dev tenants")]
+    DEV = []  # owner decision 2026-10-19: the Dev - Leonardo group is not shown
 
     def aside(self, active="prod_onboarding"):
         shell = dashboard._app_shell("t", "<p>body</p>", active=active)
@@ -180,10 +180,8 @@ class NavigationTests(unittest.TestCase):
         self.assertEqual(links, self.PRODUCTION + self.TOOLS + self.DEV)
         heads = [re.sub(r"<[^>]+>", "", head) for head in re.findall(r"<div class='navhead'>(.*?)</div>", aside)]
         self.assertEqual(heads, ["PRODUCTIONread-only", "TOOLS"])
-        self.assertIn("<summary>DEV - LEONARDO</summary>", aside)
+        self.assertNotIn("LEONARDO", aside)
         self.assertLess(aside.index("navgroup prod"), aside.index("navgroup tools"))
-        self.assertLess(aside.index("navgroup tools"), aside.index("navgroup dev"))
-        self.assertLess(aside.index("navgroup tools"), aside.index("DEV - LEONARDO"))
 
     def test_no_matches_readiness_or_records_menu_items(self):
         aside = self.aside()
@@ -192,15 +190,13 @@ class NavigationTests(unittest.TestCase):
         self.assertNotIn("/prod/matches", aside)
         self.assertNotIn("href='/prod'", aside)
 
-    def test_dev_group_is_collapsed_unless_a_dev_page_is_active(self):
-        self.assertRegex(self.aside("prod_onboarding"), r"<details class='navgroup dev'>")
-        self.assertRegex(self.aside("history"), r"<details class='navgroup dev'>")
-        for active in ("onboardings", "dev_onboarded", "inventory"):
-            self.assertRegex(self.aside(active), r"<details class='navgroup dev' open>", active)
+    def test_there_is_no_dev_group_on_any_page(self):
+        for active in ("prod_onboarding", "history", "onboardings", "dev_onboarded", "inventory"):
+            self.assertNotIn("navgroup dev", self.aside(active), active)
 
     def test_one_active_link_and_the_right_environment_per_page(self):
         expected = {"prod_onboarding": "prod", "prod_tenants": "prod", "history": "prod", "prod_approvals": "prod",
-                    "connection": "tools", "onboardings": "dev", "dev_onboarded": "dev", "inventory": "dev"}
+                    "connection": "tools"}  # Dev pages have no menu entry any more (2026-10-19)
         pills = {"dev": "DEV · Leonardo", "prod": "PRODUCTION · read-only", "tools": "TOOLS"}
         for active, env in expected.items():
             shell = dashboard._app_shell("t", "<p>body</p>", active=active)
@@ -231,6 +227,23 @@ class LandingTests(unittest.TestCase):
     def row_of(self, page, ref):
         start = page.index(">" + ref + "</a>") if ">" + ref + "</a>" in page else page.index(">" + ref + "<")
         return page[page.rindex("<tr", 0, start):page.index("</tr>", start)]
+
+    def test_a_co_this_dashboard_onboarded_says_onboarded_with_its_stage_not_clear(self):
+        """The nightly clone does not hold a tenant created today, so the match says Clear; the recorded evidence wins."""
+        from integration.onboarding import production_create_ui as create_ui
+        self.env.write_record(record("CO-0785", "readback_verified"))
+        before = self.row_of(self.page(), "CO-0785")
+        self.assertIn("Created: UUID not written", before)
+        create_ui.record_uuid_write(self.env.parent, "CO-0785", "b" * 32, "written_verified", NOW)
+        create_ui.record_stage_write(self.env.parent, "CO-0785", "Account Scanning", "written_verified", NOW)
+        row = self.row_of(self.page(), "CO-0785")
+        self.assertIn("<span class='chip chip-ok'>Onboarded</span>", row)
+        self.assertIn("Salesforce stage Account Scanning", row)
+        self.assertIn("CE scan (clone)", row)
+        self.assertNotIn("chip-ok'>Clear", row)
+        self.assertNotIn("b" * 32, row)
+        other = self.row_of(self.page(), "CO-0780")
+        self.assertNotIn("Onboarded", other)  # a CO with no verified create is untouched
 
     def test_columns_in_the_owner_order(self):
         page = self.page()

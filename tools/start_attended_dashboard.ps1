@@ -11,8 +11,7 @@ Use -Restart only when you explicitly want to stop the loopback process that
 currently owns this dashboard port.
 
 The dashboard login is the operator's Salesforce SSO (no dashboard
-password): only the -AllowedUser address(es) may sign in, and signing in
-also starts the Leonardo Development sign-in and the preflight checks.
+password): only the -AllowedUser address(es) may sign in.
 Every Salesforce read is pinned to the -TargetOrg alias and must belong to
 the org Id in -ExpectedOrgId (or the first line of
 %LOCALAPPDATA%\SurfaceOnboarding\salesforce-expected-org-id.txt). The org Id
@@ -189,11 +188,10 @@ if (-not $NoBrowser) {
         $ErrorActionPreference = $previousErrorActionPreference
     }
     if ($opened -in @('dashboard_tab_opened', 'dashboard_tab_activated')) {
-        Write-Host 'The dashboard is open in the automation Chrome window; Leonardo tabs open next to it.'
+        Write-Host 'The dashboard is open in the automation Chrome window.'
     } else {
         Write-Warning "The automation window could not be opened ($opened). Opening the dashboard in the default browser instead."
         Start-Process "http://127.0.0.1:$Port/login"
     }
 }
 Write-Host "Next: select Sign in with Salesforce (OneLogin SSO and MFA) at http://127.0.0.1:$Port/login."
-Write-Host 'Signing in also starts the Leonardo Development sign-in in the automation window. Connect the RND VPN first.'

@@ -614,6 +614,19 @@ class OnboardedGuideTests(unittest.TestCase):
         uuid_check = next(item for item in result["checks"] if item["detail"] == "Set (matches tenant)")
         self.assertEqual((uuid_check["status"], uuid_check["label"]), ("ok", "Account UUID"))
 
+    def test_a_co_this_dashboard_onboarded_has_no_blocked_uuid_row(self):
+        """The nightly clone may not hold today's create, so the sheet says UUID "Already set": the recorded evidence wins."""
+        result = self.guide(match={"status": "uuid_not_in_clone", "reason": "x", "candidates": []})
+        uuid_check = next(item for item in result["checks"] if item["label"] in ("Account UUID", "Account UUID empty"))
+        self.assertEqual(uuid_check["status"], "blocked")
+        views.apply_own_onboarding(result, "Onboarded in production by this dashboard: x; stage Account Scanning")
+        self.assertEqual((result["verdict"], result["rows"], result["after"], result["leave"]), ("onboarded", [], [], ""))
+        self.assertTrue(result["headline"].endswith("stage Account Scanning"))
+        uuid_check = next(item for item in result["checks"] if item["label"] == "Account UUID")
+        self.assertEqual(uuid_check["status"], "ok")
+        self.assertIn("this dashboard", uuid_check["detail"])
+        self.assertNotIn("blocked", [item["status"] for item in result["checks"] if item["label"] == "Account UUID"])
+
     def test_onboarded_with_warnings_is_amber_review(self):
         match = {**self.ONBOARDED, "review": {"line": "Onboarded - check: SpyCloud off or unknown.", "warnings": ["spycloud_off"]}}
         result = self.guide(match)

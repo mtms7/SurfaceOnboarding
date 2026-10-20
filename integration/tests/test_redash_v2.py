@@ -98,6 +98,33 @@ class NormalizeTests(unittest.TestCase):
                 redash.normalize(reply([row253(1, **{column: bad})]), 253)
             self.assertEqual(raised.exception.reason, "redash_schema_unavailable")
 
+    def test_a_bad_domain_list_cell_is_withheld_not_the_whole_clone(self):
+        """Owner decision 2026-10-19 (option A): only userEmailDomains / leakedCredentialsScannedDomains cells that are real
+        lists but not hostname lists (too many items, an email, an odd character) become unknown; the count is recorded."""
+        many = ["host%d.example.com" % n for n in range(51)]
+        cases = (("userEmailDomains", ["ok.example.com", "SECRET person@example.com"]),
+                 ("userEmailDomains", many), ("leakedCredentialsScannedDomains", many),
+                 ("leakedCredentialsScannedDomains", ["bad!char.com"]))
+        for column, bad in cases:
+            with self.subTest(column=column, size=len(bad)):
+                normalized = redash.normalize(reply([row253(1), row253(2, **{column: bad})]), 253)
+                self.assertEqual(dict(normalized.withheld_cells), {column: 1})
+                self.assertEqual(len(normalized.rows), 2)
+                tenant = normalized.v2_rows[normalized.rows[1]["id"]]
+                self.assertNotIn(redash.v2_key(column), tenant)  # unknown: omitted, like any null
+                self.assertNotIn("SECRET", json.dumps([normalized.rows, dict(normalized.v2_rows)]))
+                self.assertEqual(redash.source_meta(normalized, NOW, refreshed=False)["withheld_list_cells"], {column: 1})
+
+    def test_only_those_two_list_cells_are_withheld_everything_else_stays_strict(self):
+        for column, bad in (("userEmailDomains", "not json"), ("leakedCredentialsScannedDomains", 5),
+                            ("subDomainsCount", True), ("lastLeakedCredentialsExecutionStatus", "done!")):
+            with self.subTest(column=column), self.assertRaises(inventory.InventoryError) as raised:
+                redash.normalize(reply([row253(1, **{column: bad})]), 253)
+            self.assertEqual(raised.exception.reason, "redash_schema_unavailable")
+        clean = redash.normalize(reply([row253(1)]), 253)
+        self.assertEqual(dict(clean.withheld_cells), {})
+        self.assertEqual(redash.source_meta(clean, NOW, refreshed=False)["withheld_list_cells"], {})
+
     def test_strict_columns_per_query(self):
         v251 = redash.normalize(reply([row253(1)]), 251)  # 253's extra columns are unexpected for 251
         self.assertIn("accountCountryCode", v251.unexpected_columns)  # (the report is capped at 20 names)
@@ -230,6 +257,50 @@ class CollectTests(unittest.TestCase):
         self.assertEqual((report["normalize"], report["query_id"], report["unexpected_columns"]), ("ok", 253, []))
         self.assertNotIn("customer.example.com", json.dumps(report))
 
+    def test_probe_reports_withheld_list_cells_as_counts(self):
+        path = ("GET", "/api/queries/253/results.json")
+        report = collector.probe(base.FakeOpener({path: reply([row253(1), row253(2, userEmailDomains=["a@b.example"])])}),
+                                 FAKE_KEY, now=NOW, query_id=253)
+        self.assertEqual((report["normalize"], report["withheld_list_cells"]), ("ok", {"userEmailDomains": 1}))
+        self.assertNotIn("a@b", json.dumps(report))
+
+    def test_probe_names_the_failing_columns_without_a_value(self):
+        path = ("GET", "/api/queries/253/results.json")
+        bad = row253(2)
+        bad["lastLeakedCredentialsExecutionStatus"] = "Done with SECRET value!"
+        bad["lastLeakedCredentialsExecutionEnd"] = "not a date SECRET"
+        report = collector.probe(base.FakeOpener({path: reply([row253(1), bad])}), FAKE_KEY, now=NOW, query_id=253)
+        self.assertEqual(report["normalize"], "redash_schema_unavailable")
+        self.assertEqual(report["failing_columns"], {"lastLeakedCredentialsExecutionEnd": 1, "lastLeakedCredentialsExecutionStatus": 1})
+        self.assertNotIn("SECRET", json.dumps(report))
+
+    def test_probe_says_why_a_list_column_fails_without_a_value(self):
+        path = ("GET", "/api/queries/253/results.json")
+        many, odd = row253(2), row253(3)
+        many["alternateDomains"] = ["host%d.example.com" % n for n in range(redash.ALT_DOMAINS_MAX_ITEMS + 1)]
+        odd["alternateDomains"] = ["ok.example.com", "SECRET person@example.com"]
+        report = collector.probe(base.FakeOpener({path: reply([row253(1), many, odd])}), FAKE_KEY, now=NOW, query_id=253)
+        self.assertEqual(report["failing_columns"], {"alternateDomains": 2})
+        self.assertEqual(report["failing_list_reasons"], {"alternateDomains:item_not_hostname": 1, "alternateDomains:too_many_items": 1})
+        self.assertNotIn("SECRET", json.dumps(report))
+
+    def test_probe_sizes_the_failing_lists_without_a_value(self):
+        path = ("GET", "/api/queries/253/results.json")
+        many, odd = row253(2), row253(3)
+        many["alternateDomains"] = ["host%d.example.com" % n for n in range(redash.ALT_DOMAINS_MAX_ITEMS + 70)]
+        odd["alternateDomains"] = ["ok.example.com", "person@example.com", "SECRET has space", "x" * 300, "bad!char.com"]
+        report = collector.probe(base.FakeOpener({path: reply([row253(1), many, odd])}), FAKE_KEY, now=NOW, query_id=253)
+        detail = report["failing_list_detail"]["alternateDomains"]
+        self.assertEqual(detail["max_items"], redash.ALT_DOMAINS_MAX_ITEMS + 70)
+        self.assertEqual(detail["item_flags"], {"has_at": 1, "has_space": 1, "over_253_chars": 1, "other_character": 1})
+        self.assertGreater(report["max_row_list_chars"], 0)
+        self.assertNotIn("SECRET", json.dumps(report))
+
+    def test_probe_of_a_good_result_has_no_failing_columns(self):
+        path = ("GET", "/api/queries/253/results.json")
+        report = collector.probe(base.FakeOpener({path: reply([row253(1)])}), FAKE_KEY, now=NOW, query_id=253)
+        self.assertNotIn("failing_columns", report)
+
 
 class PushTests(cp.Base):
     def v2_bundle(self, rows=20, mutate=None, created=NOW, age=timedelta(minutes=30)) -> bytes:
@@ -325,11 +396,21 @@ class ShapeTests(unittest.TestCase):
         return raised.exception.reason
 
     def test_hostname_lists_reject_pii_shaped_items_and_oversize(self):
-        for column in ("userEmailDomains", "leakedCredentialsScannedDomains", "alternateDomains", "accountLicense.allowedModules"):
+        for column in ("alternateDomains", "accountLicense.allowedModules"):
             many = redash.ALT_DOMAINS_MAX_ITEMS + 1 if column == "alternateDomains" else 51  # alternate domains: own bound
             for bad in (["jane@example.com"], ["two words.example.com"], ["a" * 254], ["ok.example.com"] * many, [5], ["tab	.example"]):
                 with self.subTest(column=column, bad=bad[:1]):
                     self.assertEqual(self.refused(**{column: bad}), "redash_schema_unavailable")
+        # owner decision 2026-10-19: these two lists are withheld (unknown + counted), never stored, never the whole clone
+        for column in sorted(redash.WITHHOLDABLE_LIST_COLUMNS):
+            for bad in (["jane@example.com"], ["two words.example.com"], ["a" * 254], ["ok.example.com"] * 51, [5], ["tab	.example"]):
+                with self.subTest(column=column, withheld=bad[:1]):
+                    normalized = redash.normalize(reply([row253(1, **{column: bad})]), 253)
+                    self.assertEqual(dict(normalized.withheld_cells), {column: 1})
+                    stored = json.dumps([normalized.rows, dict(normalized.v2_rows)])
+                    self.assertNotIn(redash.v2_key(column), dict(normalized.v2_rows)[normalized.rows[0]["id"]])
+                    for fragment in ("jane@", "two words", "aaaaaaaaaa", "tab\t"):
+                        self.assertNotIn(fragment, stored)
         redash.normalize(reply([row253(1, userEmailDomains=["ok.example.com"] * 3, alternateDomains=["Alt.Example.com."])]), 253)
 
     def test_country_enums_and_text_shapes(self):

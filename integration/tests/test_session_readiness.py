@@ -304,7 +304,7 @@ class PrepareSessionsRouteTests(unittest.TestCase):
                     patch.object(dashboard, "start_attended_salesforce_login", return_value=True) as login, \
                     patch.object(dashboard, "start_leonardo_session_worker") as worker:
                 dashboard.prepare_sessions()
-            worker.assert_called_once_with(sign_in=True)
+            worker.assert_not_called()  # owner decision 2026-10-19: no Leonardo work any more
             return login.called
         self.addCleanup(dashboard.set_session_status, "salesforce", r.NOT_SIGNED_IN)
         self.assertTrue(run(expired=True))
@@ -350,7 +350,7 @@ class ConnectionPageTests(unittest.TestCase):
         self.assertNotIn("value='backoffice_production'", page)  # production cannot even be chosen
         self.assertIn("BackOffice production locked", page)
         self.assertIn("<th>BackOffice production</th>", page)       # read-only status row (runner records only)
-        self.assertIn("<th>Leonardo Development (Dev)</th>", page)
+        self.assertNotIn("Leonardo", page)  # owner decision 2026-10-19
         self.assertIn("Not signed in", page)
         self.assertNotIn("password", page.lower())
         self.assertNotIn("token", page.lower())
@@ -497,7 +497,7 @@ class LoginFlowTests(unittest.TestCase):
         session = self._session(cookies)
         # A fresh SSO each time: the alias's previous CLI session was ended before the browser sign-in.
         self.assertEqual(self.quiet[0][:2], ("org", "logout"))
-        self.assertEqual(self.workers, [True])
+        self.assertEqual(self.workers, [])  # owner decision 2026-10-19: signing in starts no Leonardo work
         self.assertEqual(dashboard.session_statuses(include_runs=False)["salesforce"].state, SessionState.READY)
         status, _, _, body = self._request("GET", "/connection", [session])
         self.assertEqual(status, 200)

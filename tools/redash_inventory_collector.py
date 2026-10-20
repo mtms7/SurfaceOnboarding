@@ -471,8 +471,20 @@ def probe(opener: Any, key: str, *, now: datetime | None = None, query_id: int =
         report["normalize"] = "ok"
         report["unexpected_columns"] = list(normalized.unexpected_columns)
         report["missing_columns"] = list(normalized.missing_columns)
+        report["withheld_list_cells"] = dict(normalized.withheld_cells)  # column -> rows (query 253 only; counts, no value)
     except (inventory.InventoryError, CollectorError) as error:
         report["normalize"] = error.reason
+        failing = redash.failing_columns(result, query_id)
+        if failing:
+            report["failing_columns"] = failing  # column names and row counts only
+            reasons = redash.failing_list_reasons(result, query_id)
+            if reasons:
+                report["failing_list_reasons"] = reasons  # fixed reason words and row counts only
+            detail = redash.failing_list_detail(result, query_id)
+            if "max_row_list_chars" in detail:
+                report["max_row_list_chars"] = detail.pop("max_row_list_chars")
+            if detail:
+                report["failing_list_detail"] = detail  # item counts and character classes only
     return report
 
 

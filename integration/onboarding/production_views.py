@@ -851,6 +851,16 @@ def _guide_after(tenant: str) -> list[str]:
             "Write it into Salesforce Account_UUID__c for this CO, then move the Onboarding Stage yourself."]
 
 
+def apply_own_onboarding(guide: dict[str, Any], headline: str) -> None:
+    """A CO this dashboard onboarded (recorded create, UUID written and read back): neutral headline, nothing to enter, and
+    the Account UUID row reads OK (the clone may not hold today's create yet, so "Already set" is not a blocker here)."""
+    guide.update({"verdict": "onboarded", "headline": _text(headline), "rows": [], "after": [], "leave": ""})
+    for check in guide.get("checks") or []:
+        if check.get("label") in ("Account UUID", "Account UUID empty"):
+            check.update({"label": "Account UUID", "status": "ok",
+                          "detail": "Written by this dashboard and read back from Salesforce"})
+
+
 def production_co_guide(sheet: dict[str, Any], *, clone: dict[str, Any] | None,
                         recorded_duplicates: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """The simplified production CO page model from an ``onboarding_sheet`` result.

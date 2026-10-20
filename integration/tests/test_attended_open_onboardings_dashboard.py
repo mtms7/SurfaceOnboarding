@@ -883,7 +883,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         # Prepare sessions checks and (re-)establishes the Leonardo session (2026-10-03); Re-check only checks.
         self.assertIn("/attended/prepare-sessions", page)
         self.assertIn("/attended/session-recheck", page)
-        self.assertIn("/attended/leonardo-dev-session-reset", page)
+        self.assertNotIn("/attended/leonardo-dev-session-reset", page)  # owner decision 2026-10-19: no Leonardo controls
         self.assertNotIn("/attended/leonardo-dev-session-bootstrap", page)
 
     def test_vm_connection_page_has_no_leonardo_session_panel(self):
@@ -901,11 +901,11 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         kind, _message = dashboard.LEONARDO_SESSION_MESSAGES["leonardo_session_bootstrapped"]
         self.assertEqual(kind, "success")
 
-    def test_connection_page_offers_close_automation_browser_on_desktop_only(self):
+    def test_connection_page_has_no_leonardo_browser_controls(self):
         with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "desktop"}, clear=False):
             page = page_salesforce_unavailable()
-        self.assertIn("/attended/leonardo-dev-browser-close", page)
-        self.assertIn("Close automation browser", page)
+        self.assertNotIn("/attended/leonardo-dev-browser-close", page)  # owner decision 2026-10-19
+        self.assertNotIn("Close automation browser", page)
         with patch.dict(dashboard.os.environ, {"SURFACE_ONBOARDING_RUNTIME": "vm"}, clear=False):
             page = page_salesforce_unavailable()
         self.assertNotIn("leonardo-dev-browser-close", page)

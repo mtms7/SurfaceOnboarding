@@ -262,3 +262,64 @@ class TickTests(AutoScanTests):
             raise RuntimeError("x")
         self.assertEqual(self.tick(_create_ui_inputs=boom)[CO]["scan"], "follow_up_failed")
         self.assertEqual(self.writes, [])
+
+
+class OnboardedSummaryTests(base.Base):
+    """The lists and the CO page say which COs this dashboard already onboarded, from recorded evidence (never the clone alone:
+    the clone is a nightly snapshot, so a fresh create is not in it yet)."""
+
+    def done(self, stage=None, uuid=True):
+        self.record("readback_verified", account_uuid=UUID)
+        if uuid:
+            ui.record_uuid_write(self.dir, CO, UUID, "written_verified", NOW)
+        if stage:
+            ui.record_stage_write(self.dir, CO, stage, "written_verified", NOW)
+
+    def test_no_verified_create_is_not_onboarded(self):
+        self.assertIsNone(ui.onboarded_summary(self.dir, CO))
+        self.record("uncertain_submit")
+        self.assertIsNone(ui.onboarded_summary(self.dir, CO))
+
+    def test_created_but_uuid_not_written_is_a_warning_not_onboarded(self):
+        self.done(uuid=False)
+        summary = ui.onboarded_summary(self.dir, CO)
+        self.assertEqual((summary["css"], summary["label"]), ("chip-warn", "Created: UUID not written"))
+
+    def test_onboarded_shows_the_stage_and_the_clone_scan_state(self):
+        self.done("Account Scanning")
+        none = ui.onboarded_summary(self.dir, CO)
+        self.assertEqual((none["css"], none["label"], none["stage"]), ("chip-ok", "Onboarded", "Account Scanning"))
+        self.assertIn("Account Scanning", none["text"])
+        self.assertNotIn("CE scan", none["text"])  # no clone given: nothing guessed
+        cases = {"finished": FINISHED, "running": dict(ce_status="PENDING", ce_start=CREATED_MS + HOUR, ce_count=1),
+                 "not_yet": dict(ce_count=0)}
+        for expected, v2 in cases.items():
+            with self.subTest(expected):
+                summary = ui.onboarded_summary(self.dir, CO, clone(**v2))
+                self.assertEqual(summary["scan"], expected)
+                self.assertIn("CE scan (clone)", summary["text"])
+        missing = ui.onboarded_summary(self.dir, CO, {"row_schema": "v2", "tenants": []})
+        self.assertEqual(missing["scan"], "clone_row_unavailable")
+        self.assertIn("not in the clone yet", missing["text"])
+
+    def test_completed_is_labelled_completed(self):
+        self.done("Onboarding Completed")
+        summary = ui.onboarded_summary(self.dir, CO, clone(**FINISHED))
+        self.assertEqual(summary["label"], "Onboarded: completed")
+        self.assertNotIn("CE scan", summary["text"])
+
+    def test_nothing_sensitive_is_in_the_text(self):
+        self.done("Account Scanning")
+        self.assertNotIn(UUID, json.dumps(ui.onboarded_summary(self.dir, CO, clone(**FINISHED))))
+
+    def test_the_locked_create_card_says_where_the_onboarding_stands(self):
+        self.record("readback_verified", account_uuid=UUID)
+        html = ui.create_card_html(self.inputs())
+        self.assertIn("Next: write the Account UUID", html)  # nothing written yet
+        ui.record_uuid_write(self.dir, CO, UUID, "written_verified", NOW)
+        ui.record_stage_write(self.dir, CO, "Account Scanning", "written_verified", NOW)
+        html = ui.create_card_html(self.inputs())
+        self.assertNotIn("Next: write the Account UUID", html)
+        self.assertIn("Onboarded", html)
+        self.assertIn("Account Scanning", html)
+        self.assertFalse(self.has_control(html))

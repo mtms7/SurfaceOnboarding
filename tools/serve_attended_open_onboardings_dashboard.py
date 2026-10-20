@@ -480,11 +480,10 @@ def prepare_sessions_problem(environment: str | None) -> str | None:
 
 
 def prepare_sessions() -> None:
-    """Check both sessions; open the sign-in for any that needs the operator."""
+    """Check the Salesforce session and open its sign-in when it needs the operator (no Leonardo work any more)."""
     salesforce = probe_salesforce_readiness()
     if salesforce.state is SessionState.EXPIRED and start_attended_salesforce_login():
         set_session_status("salesforce", SessionStatus(SessionState.SIGNING_IN, "waiting_for_operator", readiness_now()))
-    start_leonardo_session_worker(sign_in=True)
 
 
 def action_readiness_problem(action: str) -> str | None:
@@ -4490,7 +4489,7 @@ def _environment_chip() -> str:
     locked, problem = _production_lock()
     production = ("<span class='chip chip-warn'><span title='" + escape(create_ui.gate_text(problem)) + "'>BackOffice "
                   "production locked</span></span>" if locked else "<span class='chip chip-warn'>BackOffice production</span>")
-    return production + " <span class='chip chip-neutral'>Dev: Leonardo Development</span>"
+    return production
 
 
 def _backoffice_session_row() -> str:
@@ -4509,22 +4508,14 @@ def _sessions_card(statuses: dict[str, SessionStatus], waiting: bool, busy: bool
     """One row per connection, then Prepare / Re-check; rare recovery actions stay folded away."""
     now = readiness_now()
     rows = _backoffice_session_row()
-    for system, label in (("salesforce", "Salesforce"), ("leonardo", "Leonardo Development (Dev)")):
+    for system, label in (("salesforce", "Salesforce"),):
         status = readiness.effective(statuses[system], now, readiness.READ_TTL)
         css, text = SESSION_CHIPS[status.state]
         detail = "" if status.state is SessionState.READY else escape(
             SESSION_REASON_TEXT.get(status.reason, status.reason.replace("_", " ")))
         rows += ("<tr><th>" + label + "</th><td><span class='chip " + css + "'>" + text + "</span></td><td>" + detail
                  + " <span class='note'>" + _age_text(status.checked_at, now) + "</span></td></tr>")
-    preflight = preflight_snapshot()
-    if preflight:
-        problems = [PREFLIGHT_LABELS.get(key, key) + ": " + value for key, value in preflight["results"].items()
-                    if value not in ("ok", "installed", "bundled")]
-        chip = ("<span class='chip chip-warn'>Check</span>" if problems else "<span class='chip chip-ok'>Passed</span>")
-        rows += ("<tr><th>Preflight</th><td>" + chip + "</td><td>" + escape("; ".join(problems))
-                 + " <span class='note'>" + _age_text(preflight["checked_at"], now) + "</span></td></tr>")
-    # Only a running Leonardo check disables the buttons; a Salesforce sign-in the
-    # operator abandoned must not lock the page.
+    # Owner decision 2026-10-19: no Leonardo or preflight row, no Leonardo buttons or wording; production only.
     disabled = " disabled" if busy else ""
     return (
         "<section class='card'><table class='sessions'>" + rows + "</table>"
@@ -4534,29 +4525,18 @@ def _sessions_card(statuses: dict[str, SessionStatus], waiting: bool, busy: bool
         "<form method='post' action='/attended/session-recheck'><button class='ghost' type='submit'" + disabled
         + ">Re-check</button></form></div>"
         "<p class='note'>" + escape(production_views.BACKOFFICE_SESSION_NOTE) + "</p>"
-        "<p class='note'>Prepare signs in to Salesforce and Leonardo Development (Dev) only where needed. Complete SSO/MFA on "
-        "the real Salesforce and Leonardo pages; the dashboard never receives credentials, MFA codes, or cookies."
-        + (" This page refreshes every 5 seconds while a sign-in or check runs." if waiting else "") + "</p>"
-        "<details class='trouble'><summary>Troubleshooting</summary><div class='actions'>"
-        "<form method='post' action='/attended/leonardo-dev-browser-close'><button class='ghost' type='submit'>"
-        "Close automation browser</button></form>"
-        "<form method='post' action='/attended/leonardo-dev-session-reset'><button class='ghost' type='submit'>"
-        "Reset Leonardo session</button></form></div>"
-        "<p class='note'>Close the automation browser at the end of the day; if this dashboard is open in that window, it "
-        "closes too (start it again with the launcher). Reset also wipes its profile and forces a fresh Leonardo "
-        "SSO/MFA.</p></details></section>"
+        "<p class='note'>Prepare signs in to Salesforce only where needed. Complete SSO/MFA on the real Salesforce page; "
+        "the dashboard never receives credentials, MFA codes, or cookies."
+        + (" This page refreshes every 5 seconds while a sign-in or check runs." if waiting else "") + "</p></section>"
     )
 
 
 def _session_chip() -> str:
-    """Sidebar chip: the worse of the two sessions, from memory only (no probe, no file read)."""
+    """Sidebar chip: the Salesforce session, from memory only (no probe, no file read)."""
     statuses = session_statuses(include_runs=False)
     now = readiness_now()
-    states = [readiness.effective(statuses[system], now, readiness.READ_TTL).state for system in ("salesforce", "leonardo")]
-    order = [SessionState.BLOCKED, SessionState.EXPIRED, SessionState.NOT_SIGNED_IN, SessionState.SIGNING_IN,
-             SessionState.STALE, SessionState.READY]
-    worst = min(states, key=order.index)
-    css, text = SESSION_CHIPS[worst]
+    state = readiness.effective(statuses["salesforce"], now, readiness.READ_TTL).state  # Leonardo is no longer shown
+    css, text = SESSION_CHIPS[state]
     return "<a class='session-chip' href='/connection'><span class='chip " + css + "'>Sessions: " + text + "</span></a>"
 
 
@@ -5204,10 +5184,8 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
         + ("<span class='ro'>" + note + "</span>" if note else "") + "</div>"
         + "".join(nav(*link) for link in links) + "</div>" for key, head, note, links in NAV_GROUPS
         if not (vm_mode() and key == "tools"))
-    # Leonardo Development is last and collapsed; it opens by itself when a Dev page is active.
-    dev_open = any(key == active for _href, _label, key in DEV_NAV_LINKS)
-    groups += ("<details class='navgroup dev'" + (" open" if dev_open else "") + "><summary>" + DEV_NAV_HEAD + "</summary>"
-               + "".join(nav(*link) for link in DEV_NAV_LINKS) + "</details>")
+    # Owner decision 2026-10-19: production is live, so the Leonardo (Dev) group is not shown. Its pages stay reachable only
+    # by typing the URL; nothing links to them.
     return (
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>" + refresh +
@@ -6898,7 +6876,11 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     except Exception:  # noqa: BLE001 - the normal verdict stays
         own = None
     if own:  # this dashboard onboarded the CO: never "Blocked: a tenant exists" for its own create
-        guide.update({"verdict": "onboarded", "headline": own, "rows": [], "after": [], "leave": ""})
+        try:
+            detail = (create_ui.onboarded_summary(production_records_parent(), reference, _clone_payload_for_job()) or {}).get("text")
+        except Exception:  # noqa: BLE001 - the stage line is optional
+            detail = None
+        production_views.apply_own_onboarding(guide, own + (" " + detail + "." if detail else ""))
     main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
                  + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)
@@ -7023,6 +7005,10 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
     approvals = production_views.list_approvals(PRODUCTION_APPROVAL_PATH, now, missing_is_unavailable=published)
     records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=published)
     locked = _production_lock()[0]
+    try:  # the verified clone, once per page, for the CE scan state of COs this dashboard onboarded
+        clone_payload: dict[str, Any] | None = _clone_payload_for_job()
+    except Exception:  # noqa: BLE001 - no clone: the scan state is simply not shown
+        clone_payload = None
     for row in rows:
         if route_for(row) == CE_ENGINE or route_for(row) in SURFACE_ROUTES:
             prefetch_display_read(production_match_display, str(row["Name"]), row.get("Onboarding_Product__c") or "",
@@ -7096,6 +7082,10 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             checks = (_chip(check["css"], check["label"])
                       + ("<span class='sub'>" + escape(check["reason"]) + "</span>"
                          if (check["blocked"] or check["code"] == "onboarded") and check["reason"] else ""))
+            if item["create"]["code"] in production_views.CREATED_OUTCOMES:
+                onboarded = create_ui.onboarded_summary(production_records_parent(), ref, clone_payload)
+                if onboarded is not None:  # recorded evidence beats "Clear": the nightly clone cannot hold today's create
+                    checks = _chip(onboarded["css"], onboarded["label"]) + "<span class='sub'>" + escape(onboarded["text"]) + "</span>"
             approval_cell = _create_approval_chip(item["approval"])
             create_cell = _chip(item["create"]["css"], item["create"]["label"])
             onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
@@ -8306,8 +8296,6 @@ def finish_dashboard_login(attempt_token: str | None) -> tuple[str, str | None]:
     with _login_lock:
         _dashboard_sessions[session] = (monotonic() + DASHBOARD_SESSION_SECONDS, operator)
     set_session_status("salesforce", SessionStatus(SessionState.READY, "salesforce_ready", readiness_now()))
-    # Leonardo sign-in (with the preflight first) starts right away in the automation browser.
-    start_leonardo_session_worker(sign_in=True)
     return "signed_in", session
 
 
@@ -8381,8 +8369,7 @@ def page_login(state: str = "", reason: str | None = None) -> str:
     body = (
         "<div class='page-head'><h1>Sign in</h1></div><section class='card'>" + banner +
         "<p>Sign in with your Pentera Salesforce account (SSO and MFA). Only the operators configured on this desktop "
-        "can use the dashboard. Signing in also starts the Leonardo Development sign-in in the automation browser and "
-        "runs the preflight checks (VPN reachability, Salesforce CLI, browser runtime).</p>" + form +
+        "can use the dashboard.</p>" + form +
         "<p class='note'>The dashboard has no password of its own and never receives credentials, MFA codes, cookies, "
         "or CLI output. Forgot your password? Use " + reset + ".</p></section>"
     )
@@ -8897,7 +8884,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.CONFLICT, session_gate_page(problem, "/connection"))
                 return
             probe_salesforce_readiness()
-            start_leonardo_session_worker(sign_in=False)
             self.send_redirect("/connection")
             return
         if path == "/attended/salesforce-login":

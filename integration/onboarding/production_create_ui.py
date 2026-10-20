@@ -469,6 +469,11 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
     status_html = ""
     if status is not None and status["code"] in STATUS_TEXT and status["code"] != DRY_RUN_PASSED:
         status_html = _status_html(status["code"])
+    summary = onboarded_summary(inputs.records_parent, reference) if status is not None and status["code"] == CREATED_VERIFIED else None
+    if summary is not None and summary["label"] != "Created: UUID not written":
+        status_html = ("<div class='card-head'><h2 id='co-create-title' class='pill'>Production create</h2>"
+                       + _chip(summary["css"], summary["label"]) + "</div><p class='note'>Created and verified in BackOffice. "
+                       + escape(summary["text"]) + ".</p>")
     if locked():
         return ("<section class='card' aria-labelledby='co-create-title'>" + status_html + "</section>") if status_html else ""
     if inputs.vm is True:
@@ -959,6 +964,46 @@ def auto_scan_finish(inputs: Inputs, load_clone: Callable[[], Mapping[str, Any] 
     if not ce_clone_scan.is_finished(state):
         return {"scan": state, "stages": []}
     return {"scan": state, "stages": after_scan_finished(inputs, read_row, run_argv, target_org, scan_state="scan_completed")}
+
+
+SCAN_WORDS = {"finished": "finished", "finished_with_errors": "finished with errors", "running": "running",
+              "not_yet": "no finished scan in the clone yet", "unknown": "status not recognised",
+              "clone_row_unavailable": "this tenant is not in the clone yet (it is a nightly snapshot)"}
+
+
+def onboarded_summary(parent: Path, co: str, clone_payload: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+    """What this dashboard recorded for a CO it created, or None when there is no verified create.
+
+    ``{"label", "css", "text", "stage", "scan"}`` from the create record, the UUID-write log and the stage log; with the
+    clone payload, also the CE scan state from the clone row (never guessed without it). A tenant created today is not in
+    the nightly clone yet, so the clone is never what makes a CO "onboarded"."""
+    from . import ce_clone_scan
+
+    try:
+        history = load_co_records(parent, co)
+    except Exception:
+        return None
+    status = co_status(history)
+    if status["code"] != CREATED_VERIFIED:
+        return None
+    if last_uuid_write(parent, co) != "written_verified":
+        return {"label": "Created: UUID not written", "css": "chip-warn", "stage": None, "scan": None,
+                "text": "Created and verified in BackOffice; the Account UUID is not written to Salesforce yet."}
+    last = last_stage_write(parent, co)
+    stage = last[0] if last is not None and last[1] == "written_verified" else None
+    parts = ["Account UUID written and read back"]
+    if stage:
+        parts.append("Salesforce stage " + stage)
+    scan = None
+    if stage != "Onboarding Completed" and clone_payload is not None:
+        uuid = salesforce_uuid_writeback.normalise_uuid(status.get("uuid"))
+        created = _created_ms(history)
+        v2 = ce_clone_scan.clone_v2_for_uuid(clone_payload, uuid) if uuid and created is not None else None
+        scan = "clone_row_unavailable" if v2 is None else ce_clone_scan.ce_scan_state(v2, created)
+        parts.append("CE scan (clone): " + SCAN_WORDS.get(scan, scan))
+    done = stage == "Onboarding Completed"
+    return {"label": "Onboarded: completed" if done else "Onboarded", "css": "chip-ok", "stage": stage, "scan": scan,
+            "text": "; ".join(parts)}
 
 
 # --- Same-page progress of one production create (owner request 2026-10-19) -------------------------------------------------

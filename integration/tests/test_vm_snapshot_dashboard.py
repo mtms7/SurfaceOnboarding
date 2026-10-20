@@ -488,7 +488,7 @@ class VmProductionFirstPagesTests(SnapshotDashboardCase):
         self.assertIn("CO-0001", body)
         aside = body[body.index("<aside"):body.index("</aside>")]
         self.assertIn("PRODUCTION", aside)
-        self.assertLess(aside.index("PRODUCTION"), aside.index("DEV - LEONARDO"))
+        self.assertNotIn("LEONARDO", aside)  # owner decision 2026-10-19: no Leonardo menu
         self.assertNotIn(">Sessions<", aside)  # no Sessions link on the VM
         self.assertEqual(self.calls, [])
 

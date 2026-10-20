@@ -44,7 +44,7 @@ class FormOnEveryPageTests(unittest.TestCase):
         self.assertIn("maxlength='80'", form)
         self.assertIn("placeholder='Search CO or account'", form)
         self.assertIn(">Search</button>", form)
-        self.assertLess(page.index(self.FORM), page.index("navgroup dev"))  # above the groups, inside the sidebar
+        self.assertLess(page.index(self.FORM), page.index("navgroup prod"))  # above the groups, inside the sidebar
         self.assertGreater(page.index(self.FORM), page.index("<aside"))
         self.assertNotIn("<script", page.lower())
 
