@@ -32,7 +32,8 @@ from integration.onboarding.leonardo_inventory import (
     PRODUCTION_GATE_MAX_AGE, InventoryError, _name_key, canonical_domain, duplicate_precheck, is_live_paid_tenant,
     load_latest)
 
-STATUSES = ("clone_unavailable", "not_checked", "onboarded", "uuid_not_in_clone", "not_in_production", "exists_other", "ambiguous", "exists_matches", "exists_differs")
+STATUSES = ("clone_unavailable", "not_checked", "onboarded", "uuid_not_in_clone", "not_in_production", "exists_other", "ambiguous", "exists_matches", "exists_differs",
+            "tenant_found", "tenant_missing")
 REQUIRED_FIELDS = ("tenant_name", "primary_domain", "alternate_domains", "license_type", "license_end")
 NOT_A_CLEARANCE = "No tenant found. This is not a clearance: the clone can lag up to a day."
 MAX_LISTED = 8
@@ -250,6 +251,73 @@ def review_onboarded(tenant: Mapping[str, Any], plan: Mapping[str, Any], *, ce_o
 def _result(status: str, reason: str = "", **extra: Any) -> dict[str, Any]:
     return {"status": status, "reason": reason, "fields": [], "differs": [], "candidates": [], "target": None,
             "captured_at": None, "age_seconds": None, "tenants_checked": 0, **extra}
+
+
+def identity_match(identity: Mapping[str, Any] | None, snapshot: Mapping[str, Any] | str | None, *,
+                   renewal: bool) -> dict[str, Any]:
+    """The clone check for a CO whose plan cannot be built (renewals, Surface + CE New, anything but CE-only New).
+
+    ``identity``: {"names": (...), "domains": (...), "uuid": str | None}, all from Salesforce. Same statuses as
+    ``production_match`` where they apply: ``onboarded`` (exactly one tenant carries the CO's Account UUID; the plan is NOT
+    reviewed), ``ambiguous``, ``uuid_not_in_clone``, ``not_in_production`` (new routes) or ``tenant_missing`` (a renewal
+    expects its tenant), ``exists_other``, ``exists_differs`` with ``differs == ["plan_not_compared"]`` (a live paid tenant has
+    the exact name: a duplicate of a new onboarding) or ``tenant_found`` (renewal). It can only block, never clear: a miss is
+    never a clearance. Pure; never raises on bad data (fails closed)."""
+    if not isinstance(snapshot, Mapping):
+        return _result("clone_unavailable", snapshot if isinstance(snapshot, str) and snapshot else "inventory_snapshot_missing")
+    tenants = [tenant for tenant in snapshot.get("tenants") or () if isinstance(tenant, dict)]
+    base = {"captured_at": snapshot.get("captured_at"), "age_seconds": snapshot.get("age_seconds"),
+            "tenants_checked": len(tenants), "identity_only": True}
+    if not any(isinstance(tenant.get("alternate_domains"), list) for tenant in tenants):
+        return _result("clone_unavailable", "alternate_domains_missing", **base)
+    ident = identity if isinstance(identity, Mapping) else {}
+    names = [name for name in ident.get("names") or () if isinstance(name, str) and _name_key(name)]
+    domains = [domain for domain in ident.get("domains") or () if canonical_domain(domain)]
+    account_uuid = ident.get("uuid")
+    uuid_set = isinstance(account_uuid, str) and bool(account_uuid.strip())
+    if not names and not domains and not uuid_set:
+        return _result("not_checked", "co_identity_unreadable", **base)
+    keys = {_name_key(name) for name in names}
+    first = names[0] if names else ""
+    candidates = []
+    for tenant in tenants:
+        if duplicate_precheck({"tenants": [tenant]}, first, domains)["matches"] or _name_key(tenant.get("account_name")) in keys:
+            candidates.append(tenant)
+    if uuid_set:
+        wanted = uuid_key(account_uuid)
+        owner = [tenant for tenant in tenants if wanted is not None and uuid_key(tenant.get("account_uuid")) == wanted]
+        if len(owner) > 1:
+            return _result("ambiguous", "More than one tenant carries this CO's Account UUID.",
+                           candidates=[_summary(tenant) for tenant in owner], **base)
+        if owner:
+            rivals = [tenant for tenant in candidates if tenant is not owner[0] and is_live_paid_tenant(tenant)]
+            if rivals:
+                return _result("ambiguous", "Another live, paid tenant matches this CO by name or domain besides the tenant "
+                               "that owns its Account UUID.", candidates=[_summary(tenant) for tenant in [owner[0], *rivals]], **base)
+            review = {"line": "Onboarded - tenant found by the CO's Account UUID (identity check only; the plan was not compared).",
+                      "warnings": []}
+            return _result("onboarded", review["line"], candidates=[_summary(owner[0])], target=_summary(owner[0]), review=review,
+                           **base)
+        if not candidates:
+            return _result("uuid_not_in_clone", "UUID set but tenant not found in clone (the clone may be older than the create).",
+                           **base)
+    if not candidates:
+        if renewal:
+            return _result("tenant_missing", "No tenant with this name or domain in the clone: a renewal expects its tenant "
+                           "(the clone can lag up to a day). Check BackOffice.", **base)
+        return _result("not_in_production", NOT_A_CLEARANCE, **base)
+    listed = [_summary(tenant) for tenant in candidates]
+    if renewal:
+        return _result("tenant_found", str(len(candidates)) + " tenant(s) match by name or domain (identity check only).",
+                       candidates=listed, target=listed[0] if len(listed) == 1 else None, **base)
+    exact = [tenant for tenant in candidates if is_live_paid_tenant(tenant) and _name_key(tenant.get("account_name")) in keys]
+    if not exact:
+        return _result("exists_other", "Only trial, evaluation, POV, disabled or deleted tenants match; migration is blocked "
+                       "until the owner resolves it.", candidates=listed, **base)
+    if len(exact) > 1:
+        return _result("ambiguous", str(len(exact)) + " live, paid tenants have the exact name.", candidates=listed, **base)
+    return _result("exists_differs", "A live, paid tenant has this CO's exact name; its plan was not compared (identity check only).",
+                   differs=["plan_not_compared"], candidates=listed, target=_summary(exact[0]), **base)
 
 
 def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any] | None,

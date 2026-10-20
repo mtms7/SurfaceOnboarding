@@ -342,6 +342,10 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
                 "blocked": False, "warnings": list(warnings or [])}
     if status == "uuid_not_in_clone":
         return {**base, "code": "uuid_not_in_clone", "css": "chip-warn", "label": "UUID set, not in clone"}
+    if status == "tenant_found":  # a renewal expects its tenant in production (identity check only)
+        return {**base, "code": "tenant_found", "css": "chip-ok", "label": "In production", "blocked": False}
+    if status == "tenant_missing":
+        return {**base, "code": "tenant_missing", "css": "chip-warn", "label": "Not in production"}
     if status == "not_in_production":
         return {**base, "code": "clear", "css": "chip-ok", "label": "Clear", "blocked": False}
     if status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):

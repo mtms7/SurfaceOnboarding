@@ -8099,6 +8099,28 @@ def _snapshot_account_uuid(reference: str) -> str | None:
     return value.strip() if isinstance(value, str) else ""
 
 
+def _identity_for(reference: str) -> dict[str, Any] | None:
+    """The CO's identity for the clone check, from ONE fixed read-only Salesforce read (names, domains, Account UUID).
+
+    Never raises; None when the CO is unreadable or ambiguous. The UUID stays in memory (never shown or logged)."""
+    if not REFERENCE.fullmatch(reference):
+        return None
+    try:
+        rows = _sf_records("SELECT Name, Account_Name__c, Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Account_UUID__c "
+                           "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+    except Exception:  # noqa: BLE001 - fail closed: the CO is then "not checked", never clear
+        return None
+    if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+        return None
+    row = rows[0]
+    name = row.get("Account_Name__c")
+    domains = tuple(dict.fromkeys(d for field in ("Main_Domain__c", "Alternate_Domains__c", "Email_Domains__c")
+                                  for d in _domain_tokens(row.get(field))))
+    uuid = row.get("Account_UUID__c")
+    return {"names": (" ".join(name.split()),) if isinstance(name, str) and name.strip() else (), "domains": domains,
+            "uuid": uuid.strip() if isinstance(uuid, str) and uuid.strip() else None}
+
+
 def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
     """Read-only production match of one CO (see ``integration.onboarding.production_match``).
 
@@ -8118,8 +8140,22 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
             engine, co_source, plan = _production_expectation(reference, product, onboarding_type)
         except (RuntimeError, ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.SubprocessError):
             co_source = plan = None
+    from integration.onboarding import state_paths
+
     uuid_value = _snapshot_account_uuid(reference)
-    result = match.production_match(co_source, plan, snapshot, account_uuid=uuid_value or None, ce_only=engine == CE_ENGINE)
+    identity = None
+    if not isinstance(snapshot, str) and REFERENCE.fullmatch(reference) and (co_source is None or plan is None):
+        if not state_paths.vm_mode():  # desktop: one fixed read of the CO itself (the VM has only the published snapshot)
+            identity = _identity_for(reference)
+    elif not state_paths.vm_mode() and not isinstance(snapshot, str):
+        identity = _identity_for(reference)  # the full match gets the CO's own UUID on the desktop too
+    if identity is not None and uuid_value is None:
+        uuid_value = identity["uuid"] or ""
+    if identity is not None and (co_source is None or plan is None):
+        renewal = "renewal" in str(onboarding_type or "").casefold()
+        result = match.identity_match(identity, snapshot, renewal=renewal)
+    else:
+        result = match.production_match(co_source, plan, snapshot, account_uuid=uuid_value or None, ce_only=engine == CE_ENGINE)
     result["uuid_checked"] = uuid_value is not None
     result["co_uuid_set"] = bool(uuid_value) if uuid_value is not None else None
     result["computed_at"] = datetime.now(timezone.utc).isoformat()  # lets a cached match be re-aged at read time

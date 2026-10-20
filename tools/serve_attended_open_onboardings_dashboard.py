@@ -6138,6 +6138,7 @@ MATCH_CHIPS = {"exists_matches": ("chip-ok", "Matches"), "exists_differs": ("chi
                "not_in_production": ("chip-neutral", "Not in production"), "exists_other": ("chip-bad", "Other tenants only"),
                "ambiguous": ("chip-bad", "Ambiguous"), "clone_unavailable": ("chip-warn", "Clone unavailable"),
                "onboarded": ("chip-ok", "Onboarded"), "uuid_not_in_clone": ("chip-warn", "UUID set, not in clone"),
+               "tenant_found": ("chip-ok", "In production"), "tenant_missing": ("chip-warn", "Not in production"),
                "not_checked": ("chip-neutral", "Not checked")}
 MATCH_FILTERS = {"matches": ("exists_matches",), "onboarded": ("onboarded",), "differs": ("exists_differs",), "not_in_production": ("not_in_production",),
                  "blocked": ("exists_other", "ambiguous"), "uuid_not_in_clone": ("uuid_not_in_clone",),
@@ -7009,17 +7010,15 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         clone_payload: dict[str, Any] | None = _clone_payload_for_job()
     except Exception:  # noqa: BLE001 - no clone: the scan state is simply not shown
         clone_payload = None
-    for row in rows:
-        if route_for(row) == CE_ENGINE or route_for(row) in SURFACE_ROUTES:
-            prefetch_display_read(production_match_display, str(row["Name"]), row.get("Onboarding_Product__c") or "",
-                                  row.get("Onboarding_Type__c") or "", _match_stamp())
+    for row in rows:  # every open CO is validated against the clone (owner request 2026-10-19), not only supported routes
+        prefetch_display_read(production_match_display, str(row["Name"]), row.get("Onboarding_Product__c") or "",
+                              row.get("Onboarding_Type__c") or "", _match_stamp())
     items = []
     for row in rows:
         ref = str(row["Name"])
         route = route_for(row)
         supported = route == CE_ENGINE or route in SURFACE_ROUTES
-        check = (production_views.production_check(_match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
-                 if supported else None)
+        check = production_views.production_check(_match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
         approval = production_views.pick_approval(approvals, ref)
         create = production_views.create_state(records, ref, locked=locked)
         created = create["code"] in production_views.CREATED_OUTCOMES or bool(check and check["code"] == "onboarded")
@@ -7089,8 +7088,11 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             approval_cell = _create_approval_chip(item["approval"])
             create_cell = _chip(item["create"]["css"], item["create"]["label"])
             onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
-        else:
-            checks = _chip("chip-neutral", "No automated route") + "<span class='sub'>Exact Product and Type pair not supported</span>"
+        else:  # no automated create route: the clone validation still shows, so the list says what is next for every CO
+            checks = (_chip(check["css"], check["label"]) + "<span class='sub'>No automated route · Exact Product and Type pair not "
+                      "supported · validated against the clone only"
+                      + (": " + escape(check["reason"]) if check["reason"] and (check["blocked"] or check["code"] in
+                                                                                 ("onboarded", "tenant_found")) else "") + "</span>")
             approval_cell = create_cell = "<span class='muted'>—</span>"
             onboarding = "<span class='co'>" + escape(ref) + "</span>"
         body += ("<tr" + ("" if item["supported"] else " class='locked'") + "><td class='c-start'>"
