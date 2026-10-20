@@ -27,6 +27,16 @@ from .web_activation import REFERENCE_PATTERN
 STATE_FILE_NAME = "production_create_approvals.json"
 ALLOWED_ROUTE = EngineValue.CASE_2.value
 SCOPE = "ce_only_single_co"
+# Owner decision 2026-10-20: CO-0800 (Surface & Credential Exposure New = Case 3) may be approved too. One CO, 7 days, revision
+# bound, consumed once, exactly as CE-only; the CREATE gates stay CE-only (they compare against ALLOWED_ROUTE).
+CASE3_ROUTE = EngineValue.CASE_3.value
+CASE3_SCOPE = "case3_single_co"
+ROUTE_SCOPES = {ALLOWED_ROUTE: SCOPE, CASE3_ROUTE: CASE3_SCOPE}
+
+
+def scope_for(route: Any) -> str | None:
+    """The scope an approval of ``route`` must carry, or None for a route that cannot be approved."""
+    return ROUTE_SCOPES.get(route) if isinstance(route, str) else None
 DEFAULT_LIFETIME = timedelta(days=7)
 REQUIRED_FIELDS = frozenset({"approval_ref", "co_reference", "route", "scope", "source_revision", "issued_by",
                              "issued_at", "expires_at"})
@@ -85,7 +95,7 @@ _valid_revision = valid_revision
 def _valid_record(key: Any, record: Any) -> bool:
     return (isinstance(record, dict) and REQUIRED_FIELDS <= set(record) <= RECORD_FIELDS
             and _valid_ref(key) and record["approval_ref"] == key and _valid_co(record["co_reference"])
-            and record["route"] == ALLOWED_ROUTE and record["scope"] == SCOPE
+            and scope_for(record["route"]) is not None and record["scope"] == scope_for(record["route"])
             and _valid_revision(record["source_revision"])
             and isinstance(record["issued_by"], str) and ISSUER.fullmatch(record["issued_by"]) is not None
             and _parse(record["issued_at"]) is not None and _parse(record["expires_at"]) is not None
@@ -123,8 +133,8 @@ def _write(path: Path, records: Mapping[str, Any]) -> None:
 
 def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_revision: str, issued_by: str,
           allowed_issuers: frozenset[str], now: datetime, lifetime: timedelta = DEFAULT_LIFETIME) -> dict[str, Any]:
-    """Record a one-CO CE-only production approval. Raises ApprovalRefused(reason) on anything invalid."""
-    if route != ALLOWED_ROUTE:
+    """Record a one-CO production approval (CE-only or Case 3). Raises ApprovalRefused(reason) on anything invalid."""
+    if scope_for(route) is None:
         raise ApprovalRefused("route_not_ce_only")
     if (not isinstance(allowed_issuers, frozenset) or not isinstance(issued_by, str)
             or issued_by not in allowed_issuers or not ISSUER.fullmatch(issued_by)):
@@ -140,7 +150,7 @@ def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_r
     if not _aware(now):
         raise ApprovalRefused("naive_datetime")
     moment = now.astimezone(timezone.utc).replace(microsecond=0)
-    record = {"approval_ref": approval_ref, "co_reference": co_reference, "route": route, "scope": SCOPE,
+    record = {"approval_ref": approval_ref, "co_reference": co_reference, "route": route, "scope": scope_for(route),
               "source_revision": source_revision, "issued_by": issued_by, "issued_at": _stamp(moment),
               "expires_at": _stamp(moment + lifetime)}
     with _lock:
@@ -199,7 +209,7 @@ def _problem(record: Mapping[str, Any] | None, co_reference: Any, route: Any, so
         return "approval_expired"
     if record.get("co_reference") != co_reference:
         return "approval_co_mismatch"
-    if record.get("route") != route or route != ALLOWED_ROUTE:
+    if record.get("route") != route or scope_for(route) is None or record.get("scope") != scope_for(route):
         return "approval_route_mismatch"
     if record.get("source_revision") != source_revision:
         return "approval_revision_drift"

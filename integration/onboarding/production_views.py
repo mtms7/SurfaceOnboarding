@@ -19,7 +19,7 @@ from . import leonardo_inventory as inventory
 from . import review_approval
 from phase1_validator.onboarding_comment_dates import extract_dealhub_dates
 from .production_approval import (
-    ALLOWED_ROUTE, CO_REFERENCE, ISSUER, RECORD_FIELDS, REQUIRED_FIELDS, SCOPE, valid_revision)
+    ALLOWED_ROUTE, CO_REFERENCE, ISSUER, RECORD_FIELDS, REQUIRED_FIELDS, SCOPE, scope_for, valid_revision)
 from .production_create_record import (
     RECORDS_SUBDIR, ProductionCreateRecordError, editable_parameters, list_records, load)
 
@@ -82,7 +82,7 @@ def _valid_approval(key: Any, record: Any) -> bool:
     return (isinstance(key, str) and isinstance(record, dict) and REQUIRED_FIELDS <= set(record) <= RECORD_FIELDS
             and record["approval_ref"] == key and isinstance(record["co_reference"], str)
             and CO_REFERENCE.fullmatch(record["co_reference"]) is not None
-            and record["route"] == ALLOWED_ROUTE and record["scope"] == SCOPE
+            and scope_for(record["route"]) is not None and record["scope"] == scope_for(record["route"])
             and isinstance(record["issued_by"], str) and ISSUER.fullmatch(record["issued_by"]) is not None
             and _parse(record["issued_at"]) is not None and _parse(record["expires_at"]) is not None
             and valid_revision(record["source_revision"])

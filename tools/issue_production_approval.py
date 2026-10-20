@@ -33,6 +33,9 @@ STATE_FILE_NAME = production_approval.STATE_FILE_NAME
 CE_PRODUCT = "Credential Exposure"
 CE_TYPE = "New Product Onboarding"
 CE_ENGINE = production_approval.ALLOWED_ROUTE
+CASE3_PRODUCT = "Surface & Credential Exposure"
+CASE3_TYPE = "New Product Onboarding"
+CASE3_ENGINE = production_approval.CASE3_ROUTE
 APPROVED = "Approved"
 ISSUERS_ENV = "SURFACE_ONBOARDING_APPROVAL_ISSUERS"
 ALLOWED_USERS_ENV = "SURFACE_DASHBOARD_ALLOWED_USERS"  # fallback only when it holds exactly one address
@@ -99,8 +102,21 @@ def issuer_allow_list(environ: Mapping[str, str]) -> frozenset[str]:
     return fallback
 
 
-def default_approval_ref(co: str, now: datetime) -> str:
-    return "PROD-CE-" + co.removeprefix("CO-") + "-" + now.astimezone(timezone.utc).strftime("%Y%m%d")
+def default_approval_ref(co: str, now: datetime, route: str = CE_ENGINE) -> str:
+    prefix = "PROD-C3-" if route == CASE3_ENGINE else "PROD-CE-"
+    return prefix + co.removeprefix("CO-") + "-" + now.astimezone(timezone.utc).strftime("%Y%m%d")
+
+
+def route_for_row(row: Mapping[str, Any] | None) -> str | None:
+    """The approvable route of a CO row (CE-only New or Case 3), else None."""
+    if not isinstance(row, Mapping):
+        return None
+    pair = (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+    if pair == (CE_PRODUCT, CE_TYPE):
+        return CE_ENGINE
+    if pair == (CASE3_PRODUCT, CASE3_TYPE):
+        return CASE3_ENGINE
+    return None
 
 
 def _one_domain(raw: Any) -> bool:
@@ -111,18 +127,25 @@ def _one_domain(raw: Any) -> bool:
 
 
 def eligibility_problem(row: Mapping[str, Any] | None, co: str) -> str | None:
-    """None when the row is the CE-only New route, Approved, one valid domain, no UUID, with a revision."""
+    """None when the row is the CE-only New route or Case 3 (Surface & Credential Exposure New), Approved, one valid email
+    domain (Case 3 also a valid main domain), no UUID (Case 3 also no Surface Account ID), with a revision."""
     if not isinstance(row, Mapping) or row.get("Name") != co:
         return "co_not_found"
-    if row.get("Onboarding_Product__c") != CE_PRODUCT or row.get("Onboarding_Type__c") != CE_TYPE:
+    route = route_for_row(row)
+    if route is None:
         return "route_not_ce_only"
     if row.get("Onboarding_Approval_Status__c") != APPROVED:
         return "approval_status_not_approved"
+    if route == CASE3_ENGINE and not _one_domain(row.get("Main_Domain__c")):
+        return "main_domain_missing"
     if not _one_domain(row.get("Email_Domains__c")):
         return "email_domain_not_single"
     uuid = row.get("Account_UUID__c")
     if uuid is not None and (not isinstance(uuid, str) or uuid.strip()):
         return "account_uuid_present"
+    surface_id = row.get("Surface_Account_ID__c")
+    if route == CASE3_ENGINE and surface_id is not None and (not isinstance(surface_id, str) or surface_id.strip()):
+        return "surface_account_id_present"
     revision = row.get("LastModifiedDate")
     if not isinstance(revision, str) or not revision.strip():
         return "source_revision_missing"
@@ -174,8 +197,7 @@ def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], en
         raise Refuse("desktop_only")
     if not 1 <= args.lifetime_days <= MAX_LIFETIME_DAYS:
         raise Refuse("invalid_lifetime")
-    ref = args.approval_ref or default_approval_ref(co, now)
-    if not production_approval._valid_ref(ref):
+    if args.approval_ref is not None and not production_approval._valid_ref(args.approval_ref):
         raise Refuse("invalid_approval_ref")
     allowed = issuer_allow_list(environ)
     if args.issuer is not None:
@@ -196,11 +218,15 @@ def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], en
     problem = eligibility_problem(row, co)
     if problem is not None:
         raise Refuse(problem)
+    route = route_for_row(row) or CE_ENGINE
+    ref = args.approval_ref or default_approval_ref(co, now, route)
+    if not production_approval._valid_ref(ref):
+        raise Refuse("invalid_approval_ref")
     revision = str(row["LastModifiedDate"]).strip()  # type: ignore[index]
     lifetime = timedelta(days=args.lifetime_days)
     expires = (now + lifetime).strftime(_STAMP)
     print(f"CO: {co}", file=out)
-    print(f"Route: {CE_ENGINE}", file=out)
+    print(f"Route: {route}", file=out)
     print(f"Source revision: {revision}", file=out)
     print(f"Issuer: {issuer}", file=out)
     print(f"Approval ref: {ref}", file=out)
@@ -216,7 +242,7 @@ def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], en
     if input_fn(f"Type ISSUE {co} to record this approval: ") != f"ISSUE {co}":
         raise Refuse("confirmation_phrase_mismatch")
     try:
-        record = build_approval(path=state_path, approval_ref=ref, co_reference=co, route=CE_ENGINE,
+        record = build_approval(path=state_path, approval_ref=ref, co_reference=co, route=route,
                                 source_revision=revision, issued_by=issuer, allowed_issuers=allowed, now=now,
                                 lifetime=lifetime)
     except production_approval.ApprovalRefused as refused:

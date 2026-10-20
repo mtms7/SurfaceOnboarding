@@ -73,8 +73,9 @@ class ProductionApprovalTests(unittest.TestCase):
         self.assertTrue(set(stored[REF]) <= pa.RECORD_FIELDS)
         self.assertIn("consumed_at", stored[REF])
 
-    def test_route_must_be_ce_only(self):
-        for route in (EngineValue.CASE_1.value, EngineValue.CASE_3.value, "case_2_ce_only", "", None, 5):
+    def test_only_the_ce_only_and_case3_routes_can_be_approved(self):
+        """Owner decision 2026-10-20: Case 3 (CO-0800) may be approved too; see test_case3_approval.py."""
+        for route in (EngineValue.CASE_1.value, "case_4_renew_surface_new_ce", "case_2_ce_only", "", None, 5):
             self.assertEqual(self.refusal(route=route), "route_not_ce_only")
         self.assertFalse(self.path.exists())
 

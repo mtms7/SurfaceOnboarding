@@ -4149,7 +4149,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
         self.assertEqual(plan["advanced_texts"], {"Maximum scan Duration (hours)": "90"})
         self.assertEqual(plan["blank_texts"], ("Networks (Comma Separated Values)", "Phone number", "Job title"))
         self.assertTrue(plan["operator_account_empty"])
-        self.assertEqual((plan["license_start"], plan["license_end"]), (RUN_DAY, date(2027, 8, 31)))
+        self.assertEqual((plan["license_start"], plan["license_end"]), (RUN_DAY, date(2029, 8, 31)))  # subscription end (owner 2026-10-20)
         # The two form-disabled toggles are never touched; LC interval/domains are not filled.
         for key in ("subDomainsMultipleAttackStacksEnabled", "webAiAttackerEnabled"):
             self.assertNotIn(key, plan["checkboxes"])
@@ -4195,7 +4195,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
 
     def test_expired_license_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "surface_license_dates_unavailable"):
-            runner.build_surface_only_fill(_surface_source(), date(2027, 8, 31))
+            runner.build_surface_only_fill(_surface_source(), date(2029, 9, 1))
 
     def test_scope_summary_is_counts_only(self):
         summary = runner.surface_scope_summary(_surface_source(addons=250, core_plus=True), RUN_DAY)
@@ -4203,7 +4203,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
             "tier": "go", "scanning_interval": "Monthly", "main_domains": 1, "alternate_root_domains": 1,
             "requested_subdomains": 1, "number_of_domains": 750, "baseline_subdomains": 500,
             "addon_subdomains": 250, "licensed_subdomains": 750, "product_domains": None, "assets": 10000,
-            "license_start": "2026-09-29", "license_end": "2027-08-31", "large_scope": True,
+            "license_start": "2026-09-29", "license_end": "2029-08-31", "large_scope": True,
             "core_plus_present": True,
             "subscription_start": "2026-09-01", "production_onboarding_day": "2026-08-30",
         })
@@ -5038,7 +5038,7 @@ class ScanStatusTests(unittest.TestCase):
 CASE3_EMAIL = "mail-sample.example"
 
 
-def _case3_source(*, ce_end=date(2027, 8, 31), surface_source=None) -> "runner.Case3FillSource":
+def _case3_source(*, ce_end=date(2029, 8, 31), surface_source=None) -> "runner.Case3FillSource":
     return runner.Case3FillSource(surface_source or _surface_source(core_plus=True), CASE3_EMAIL,
                                   date(2026, 9, 1), ce_end)
 
@@ -5078,7 +5078,7 @@ class Case3RouteTests(unittest.TestCase):
     def test_term_mismatch_fails_closed_with_a_plain_message(self):
         source = _case3_source(ce_end=date(2027, 6, 30))
         message = runner.case3_term_problem(source, RUN_DAY)
-        self.assertIn("Surface licence would end 2027-08-31", message)
+        self.assertIn("Surface licence would end 2029-08-31", message)
         self.assertIn("Core Plus (Credential Exposure) licence would end 2027-06-30", message)
         with self.assertRaisesRegex(ValueError, "case3_term_mismatch"):
             runner.case3_license_dates(source, RUN_DAY)

@@ -494,10 +494,10 @@ def ce_license_dates(subscription_start: date, subscription_end: date) -> tuple[
 
 
 def annual_license_dates(subscription_start: date, subscription_end: date) -> tuple[date, date]:
-    """The 2026-09-25 one-year rule, kept for the Surface-only and Case 3 routes (the 2026-10-19 owner decision covers
-    CE-only): expirationDate is one year minus one day from the start, capped at the subscription end."""
-    annual_end = _add_one_year(subscription_start) - timedelta(days=1)
-    return subscription_start, min(annual_end, subscription_end)
+    """Surface-only and Case 3 licence dates. Owner decision 2026-10-20: the expiration is the subscription END for every
+    onboarding (the same rule as CE-only since 2026-10-19); the one-year rule of 2026-09-25 is retired. The name is kept
+    because the Surface routes still call it."""
+    return subscription_start, subscription_end
 
 
 def _run_day() -> date:

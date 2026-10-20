@@ -6430,6 +6430,7 @@ REVIEW_CLONE_MAX_AGE_SECONDS = 6 * 3600
 REVIEW_BLOCKER_TEXT = {
     "no_automated_route": "This CO has no automated route (exact Product and Type pair not supported).",
     "summary_source_unreadable": "The values to be sent could not be read from Salesforce.",
+    "salesforce_not_approved": "Salesforce does not show this CO as Approved yet (Onboarding Approval Status): it cannot be approved here.",
     "source_revision_missing": "The Salesforce source revision could not be determined.",
     "production_clone_stale": "The production clone (Redash) is older than 6 hours: collect it again.",
     "production_clone_age_unknown": "The age of the production clone is unknown: collect it again.",
@@ -6475,6 +6476,8 @@ def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]
     if route != CE_ENGINE and route not in SURFACE_ROUTES:
         blockers.append("no_automated_route")
         return summary, extras
+    if route in SURFACE_ROUTES and row.get("Onboarding_Approval_Status__c") != "Approved":
+        blockers.append("salesforce_not_approved")  # owner 2026-10-20: Case 3 (CO-0800) waits for Salesforce Approved
     evaluation = (evaluate_ce_only_fill_preflight(reference) if route == CE_ENGINE
                   else evaluate_surface_fill_preflight(reference, route))
     summary["source_revision"] = str(evaluation.source_revision or "")
@@ -7189,6 +7192,20 @@ def _other_checks(summary: dict[str, Any], row: dict[str, str | None] | None) ->
         email = _check_item("Email domain", "Exactly one valid domain is required for CE-only.",
                             _chip("chip-ok" if len(domains) == 1 else "chip-warn", str(len(domains))))
         failed += int(len(domains) != 1)
+    elif route == CASE3_ENGINE:  # owner decision 2026-10-20: Case 3 needs a main domain and exactly one CE email domain
+        primary = str(plan.get("primary_domain") or "")
+        known = {primary, *[str(item) for item in plan.get("alternate_domains") or ()]}
+        extra = list(dict.fromkeys(str(item) for item in domains if str(item) not in known))
+        if len(extra) > 1:
+            failed += 1
+            email = _check_item("Email domain", "Exactly one CE email domain is required; found " + str(len(extra)) + ".",
+                                _chip("chip-bad", str(len(extra))))
+        elif extra:  # a warning to see BEFORE approving, never a blocker
+            email = _check_item("Email domain", "Warning: the main domain " + escape(primary) + " differs from the CE email "
+                                "domain " + escape(extra[0]) + ". Check that both are right before approving.",
+                                _chip("chip-warn", "Main differs from email domain"))
+        else:
+            email = _check_item("Email domain", "The CE email domain is the main domain.", _chip("chip-ok", "Same as main"))
     else:
         email = _check_item("Email domain", "Not required for this route.", _chip("chip-neutral", "Not required"))
     if row is None or "Account_UUID__c" not in row:
