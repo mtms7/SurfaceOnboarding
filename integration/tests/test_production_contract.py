@@ -82,6 +82,17 @@ def row_flat(**over):
     return flat
 
 
+class SalesforceAccountIdTests(unittest.TestCase):
+    def test_none_when_salesforce_has_none_else_a_flag(self):
+        self.assertIsNone(contract.salesforce_account_id_matches("", ROW_ID))
+        self.assertIsNone(contract.salesforce_account_id_matches(None, ROW_ID))
+        self.assertIs(contract.salesforce_account_id_matches(ROW_ID, ROW_ID), True)
+        self.assertIs(contract.salesforce_account_id_matches(" " + ROW_ID.upper() + " ", ROW_ID), True)
+        for other in ("fedcba9876543210fedcba98", None, "short", 5):
+            self.assertIs(contract.salesforce_account_id_matches(ROW_ID, other), False)
+        self.assertIs(contract.salesforce_account_id_matches("not-an-id", ROW_ID), False)
+
+
 class PinnedAgainstRunnerTests(unittest.TestCase):
     """The contract constants are the Dev runner's values, not a second copy that can drift."""
 

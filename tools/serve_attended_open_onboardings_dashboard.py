@@ -6217,6 +6217,11 @@ def _match_stamp() -> str:
         parts.append(str(vm_snapshot.current_name(root)) if root is not None else "")
     except Exception:  # noqa: BLE001 - a stamp never breaks a page
         parts.append("snapshot-unreadable")
+    try:  # a new production record (a verified readback) must show at once, not after the 5 minute display cache
+        folder = production_records_parent() / "production-create-records"
+        parts.append(max((path.name for path in folder.glob("*.json")), default="no-records"))
+    except Exception:  # noqa: BLE001
+        parts.append("records-unreadable")
     return "|".join(parts)
 
 
@@ -7509,6 +7514,27 @@ def _tenant_name_form_html(reference: str, form: dict[str, Any]) -> str:
             "name and has at most 40 characters. Nothing is sent to BackOffice or Salesforce.</p>")
 
 
+def _created_co_name_card(reference: str, row: dict[str, str | None] | None) -> str:
+    """The tenant name form for a Case 3 CO that already has its Account UUID or Surface Account ID. "" for a short account name."""
+    account = row.get("Account_Name__c") if isinstance(row, dict) else None
+    if not isinstance(account, str) or not " ".join(account.split()):
+        return ""
+    try:
+        full = attended_runner.surface_names(account).tenant_name
+        resolved = tenant_name_decision.resolve(attended_runner.TENANT_NAMES_PATH, reference, full)
+        proposal = case3_summary.account_name_shortener.propose(full)
+    except Exception:  # noqa: BLE001 - no form rather than a guessed name
+        return ""
+    if len(full) <= case3_summary.account_name_shortener.LIMIT:
+        return ""
+    value = resolved.name if resolved.confirmed else (proposal.get("proposed") or "")
+    note = ("Confirmed: " + resolved.name) if resolved.confirmed else "Not confirmed yet."
+    return ("<section class='card sheet-card' aria-labelledby='co-name-title'><div class='card-head'>"
+            "<h2 id='co-name-title' class='pill'>Tenant name</h2></div><p class='note'>The tenant already exists. Confirm the name it "
+            "was created with, so scan status and validation can find it. " + escape(note) + "</p>"
+            + _tenant_name_form_html(reference, {"show": True, "value": value}) + "</section>")
+
+
 def _case3_summary_html(result: dict[str, Any], reference: str = "") -> str:
     """The "Tenant creation summary" card: Salesforce facts and the tenant values side by side, read-only, every value escaped."""
     attention = "".join("<li>" + escape(line) + "</li>" for line in result["attention"])
@@ -7533,8 +7559,11 @@ def _case3_values_card(reference: str, row: dict[str, str | None] | None) -> str
 
     def refused(code: str) -> str:
         explained = CASE3_VALUES_REFUSALS.get(code) or ("The values cannot be derived.")
-        return (head + "<p><strong>Do not onboard this CO:</strong> " + escape(explained) + " <code>" + escape(code)
-                + "</code></p></section>")
+        out = (head + "<p><strong>Do not onboard this CO:</strong> " + escape(explained) + " <code>" + escape(code)
+               + "</code></p></section>")
+        if code in ("account_uuid_set", "surface_account_id_set"):
+            out += _created_co_name_card(reference, row)  # the tenant exists: its name must still be found by name (docs/60)
+        return out
 
     if "Account_UUID__c" not in row or "Surface_Account_ID__c" not in row:
         return refused("values_unavailable")

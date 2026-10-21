@@ -96,6 +96,50 @@ class CardTests(unittest.TestCase):
         self.assertIn("/attended/tenant-name-confirm", dashboard.POST_ROUTES)
 
 
+class CreatedCoTests(unittest.TestCase):
+    """A CO that already has its Account UUID / Surface Account ID keeps a name form: scan status and validation find the tenant by name."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / decision.STATE_FILE_NAME
+        patcher = mock.patch.object(runner, "TENANT_NAMES_PATH", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def card(self, **over):
+        with mock.patch.object(dashboard, "case3_values", mock.Mock(side_effect=AssertionError("no plan for a created CO"))):
+            return dashboard._case3_values_card("CO-0800", base.row(**over))
+
+    def test_a_created_co_still_says_do_not_onboard_and_shows_the_prefilled_form(self):
+        html = self.card(Account_Name__c=FULL, Account_UUID__c="a" * 32)
+        self.assertIn("Do not onboard", html)
+        self.assertIn("action='/attended/tenant-name-confirm'", html)
+        self.assertIn("name='tenant_name' value='" + SHORT + "'", html)
+        self.assertIn("Confirm tenant name", html)
+
+    def test_it_also_shows_for_a_surface_account_id_and_prefills_the_confirmed_name(self):
+        decision.confirm(self.path, "CO-0800", FULL, "Barmherzige Brüder gemeinnützige Träger", "owner@example.test",
+                         datetime(2026, 10, 21, tzinfo=timezone.utc))
+        html = self.card(Account_Name__c=FULL, Surface_Account_ID__c="b" * 24)
+        self.assertIn("Do not onboard", html)
+        self.assertIn("name='tenant_name' value='Barmherzige Brüder gemeinnützige Träger'", html)
+
+    def test_a_short_account_name_other_blockers_and_a_missing_name_show_no_form(self):
+        for over in (dict(Account_Name__c="Advanced Technology International", Account_UUID__c="a" * 32),
+                     dict(Account_Name__c=FULL, Onboarding_Approval_Status__c="Pending"),
+                     dict(Account_UUID__c="a" * 32)):
+            html = self.card(**over)
+            self.assertIn("Do not onboard", html, over)
+            self.assertNotIn("tenant-name-confirm", html, over)
+
+    def test_the_prefill_is_escaped(self):
+        with mock.patch.object(dashboard.case3_summary.account_name_shortener, "propose",
+                               return_value={"proposed": "x' onfocus='alert(1)", "changed": True, "steps": [], "reason": "shortened"}):
+            html = self.card(Account_Name__c=FULL, Account_UUID__c="a" * 32)
+        self.assertNotIn("onfocus='alert", html)
+
+
 class PostTests(unittest.TestCase):
     """``_post_tenant_name_confirm`` through a minimal handler double."""
 

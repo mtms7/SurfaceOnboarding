@@ -335,6 +335,19 @@ def salesforce_uuid_matches(salesforce_uuid: Any, tenant_uuid: Any) -> bool | No
     return salesforce_uuid.strip().replace("-", "").casefold() == tenant
 
 
+_ACCOUNT_ID = re.compile(r"[0-9a-f]{24}")
+
+
+def salesforce_account_id_matches(salesforce_id: Any, tenant_id: Any) -> bool | None:
+    """None when Salesforce holds no Surface Account ID; else whether it equals the tenant's 24-hex id. Never returns either."""
+    if not isinstance(salesforce_id, str) or not salesforce_id.strip():
+        return None
+    if not isinstance(tenant_id, str):
+        return False
+    ours, theirs = salesforce_id.strip().casefold(), tenant_id.strip().casefold()
+    return _ACCOUNT_ID.fullmatch(ours) is not None and _ACCOUNT_ID.fullmatch(theirs) is not None and ours == theirs
+
+
 # --- (4) One row, by exact name AND domain -------------------------------------------------------------------------------
 def _identity(row: Mapping[str, Any]) -> tuple[Any, Any]:
     return _lookup(row, "accountUuid"), _lookup(row, "id")

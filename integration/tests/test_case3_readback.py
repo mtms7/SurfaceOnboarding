@@ -25,8 +25,8 @@ SHORT = "Example Klinik gemeinnuetzige TG"
 SF_UUID = fx.UUID
 
 
-def source(uuid=SF_UUID):
-    return dataclasses.replace(c3.make_case3_source(), salesforce_account_uuid=uuid)
+def source(uuid=SF_UUID, account_id=""):
+    return dataclasses.replace(c3.make_case3_source(), salesforce_account_uuid=uuid, salesforce_surface_account_id=account_id)
 
 
 def case3_row(**over):
@@ -87,19 +87,26 @@ class IntendedTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
+    sf_account_id = ""
+
     def run_case3(self, reply=None, tenant_name=None, loader=None, **page_kw):
         h = rb.Harness(self, **page_kw)
         if reply is not None:
             h.page.reply = reply
 
         def load(_reference):
-            return source()
+            return source(account_id=self.sf_account_id)
 
+        h.records = h.tmp / "records"
         with mock.patch("builtins.print"):
             line = runner.run_production_readback(
                 "CO-0800", environ=dict(rb.GOOD_ENV), now=rb.NOW, report_base=h.tmp, load_source=loader or load,
-                open_page=h.open_page, route=runner.CASE3_ENGINE, tenant_name=tenant_name)
+                open_page=h.open_page, route=runner.CASE3_ENGINE, tenant_name=tenant_name, records_parent=h.records)
         return h, json.loads(line), line
+
+    def records(self, h):
+        folder = h.records / "production-create-records"
+        return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(folder.glob("CO-0800-*.json"))] if folder.exists() else []
 
     def test_a_matching_case_3_tenant_is_compared_with_zero_clicks_and_no_write(self):
         h, line, text = self.run_case3(reply=rb.good_reply([case3_row()]), tenant_name=SHORT)
@@ -153,6 +160,72 @@ class RunTests(unittest.TestCase):
     def test_a_write_attempt_is_blocked_and_reported(self):
         _h, line, _ = self.run_case3(reply=rb.good_reply([case3_row()]), tenant_name=SHORT, attempt_write=True)
         self.assertEqual(line["reason"], "write_request_blocked")
+
+
+class VerifiedRecordTests(RunTests):
+    """A fully matching Case 3 readback leaves ONE ``readback_verified`` record with the ids (owner request 2026-10-21); nothing else does."""
+
+    def test_a_fully_matching_readback_records_the_verified_tenant_with_its_ids(self):
+        h, line, text = self.run_case3(reply=rb.good_reply([case3_row()]), tenant_name=SHORT)
+        self.assertEqual(line["mismatches"], [])
+        found = self.records(h)
+        self.assertEqual(len(found), 1)
+        record = found[0]
+        self.assertEqual((record["outcome"], record["route"], record["tenant_name"]), ("readback_verified", runner.CASE3_ENGINE, SHORT))
+        self.assertEqual((record["account_id"], record["account_uuid"]), (fx.ROW_ID, SF_UUID))
+        self.assertEqual(record["domains"], [c3.MAIN])
+        for secret in (fx.ROW_ID, SF_UUID, SHORT):
+            self.assertNotIn(secret, text)  # the printed line still carries no identifier
+        self.assertNotIn(fx.ROW_ID, h.report()[1])
+        self.assertNotIn(SF_UUID, h.report()[1])
+
+    def test_the_salesforce_surface_account_id_is_compared_with_the_tenant_id_by_flag_only(self):
+        for sf_value, want, recorded in ((fx.ROW_ID, True, 1), (fx.ROW_ID.upper(), True, 1), ("", None, 1),
+                                         ("ffffffffffffffffffffffff", False, 0)):
+            with self.subTest(sf_value=sf_value):
+                self.sf_account_id = sf_value
+                h, line, text = self.run_case3(reply=rb.good_reply([case3_row()]), tenant_name=SHORT)
+                self.assertIs(line["salesforce_account_id_matches"], want)
+                self.assertEqual(len(self.records(h)), recorded)
+                self.assertNotIn(fx.ROW_ID, text)
+                self.assertNotIn("ffffffffffffffffffffffff", text)
+
+    def test_the_ce_only_line_has_no_account_id_key(self):
+        h = rb.Harness(self)
+        with mock.patch("builtins.print"):
+            line = json.loads(runner.run_production_readback("CO-0797", environ=dict(rb.GOOD_ENV), now=rb.NOW, report_base=h.tmp,
+                                                             load_source=lambda _r: rb.make_source(), open_page=h.open_page))
+        self.assertNotIn("salesforce_account_id_matches", line)
+
+    def test_nothing_is_recorded_unless_everything_matches(self):
+        cases = (("mismatch", case3_row(leakedCredentialsScanningInterval="NO_SCHEDULE")),
+                 ("other_uuid", case3_row(accountUuid=fx.OTHER_UUID)),
+                 ("bad_uuid", case3_row(accountUuid="not-a-uuid")))
+        for label, row in cases:
+            with self.subTest(label):
+                h, _line, _ = self.run_case3(reply=rb.good_reply([row]), tenant_name=SHORT)
+                self.assertEqual(self.records(h), [], label)
+        h, _line, _ = self.run_case3(reply=rb.good_reply([case3_row()]))  # default name: tenant not found
+        self.assertEqual(self.records(h), [])
+
+    def test_a_record_that_cannot_be_written_never_changes_the_outcome(self):
+        h = rb.Harness(self)
+        h.page.reply = rb.good_reply([case3_row()])
+        blocker = h.tmp / "not-a-folder"
+        blocker.write_text("x", encoding="utf-8")
+        with mock.patch("builtins.print"):
+            line = json.loads(runner.run_production_readback(
+                "CO-0800", environ=dict(rb.GOOD_ENV), now=rb.NOW, report_base=h.tmp, load_source=lambda _r: source(),
+                open_page=h.open_page, route=runner.CASE3_ENGINE, tenant_name=SHORT, records_parent=blocker))
+        self.assertEqual((line["result"], line["mismatches"]), ("production_readback_complete", []))
+
+    def test_the_ce_only_readback_writes_no_record(self):
+        h = rb.Harness(self)
+        records = h.tmp / "records"
+        with mock.patch("builtins.print"):
+            runner.run_production_readback("CO-0797", environ=dict(rb.GOOD_ENV), now=rb.NOW, report_base=h.tmp,
+                                           load_source=lambda _r: rb.make_source(), open_page=h.open_page, records_parent=records)
+        self.assertFalse((records / "production-create-records").exists())
 
 
 class CommandLineTests(unittest.TestCase):

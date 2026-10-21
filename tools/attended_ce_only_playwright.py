@@ -68,7 +68,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from integration.onboarding import (  # noqa: E402
     production_approval, production_case3_contract as case3_contract, production_contract, production_create,
     production_create_record, production_dry_run, production_probe, run_progress, runner_child_log,
-    tenant_name_decision)
+    tenant_name_decision, verified_tenant)
 from integration.onboarding.run_target import (  # noqa: E402
     ProductionLocked, RunTarget, development_target, production_dry_run_target, production_target)
 from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
@@ -1163,6 +1163,8 @@ class Case3FillSource:
     # The CO's Account_UUID__c text, kept only for the read-only production readback comparison (never printed, never in a repr,
     # never part of equality), as on CeFillSource.
     salesforce_account_uuid: str = field(default="", repr=False, compare=False)
+    # The CO's Surface_Account_ID__c, for the same read-only readback comparison (never printed, never in a repr).
+    salesforce_surface_account_id: str = field(default="", repr=False, compare=False)
     # The Account's "Technical Advisor" (Delivery_Engineer__c, a User lookup) name, shown on the dashboard only (owner 2026-10-21);
     # "" when absent or odd, never a guess.
     technical_advisor: str = field(default="", repr=False, compare=False)
@@ -1213,6 +1215,8 @@ def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillS
         uuid = row.get("Account_UUID__c")
         return Case3FillSource(surface, email_domain, ce_start, ce_end, salesforce_id_present=present,
                                salesforce_account_uuid=uuid.strip() if isinstance(uuid, str) else "",
+                               salesforce_surface_account_id=(row.get("Surface_Account_ID__c") or "").strip()
+                               if isinstance(row.get("Surface_Account_ID__c"), str) else "",
                                technical_advisor=_person_name(row))
     except SurfaceSourceError:
         raise
@@ -8174,6 +8178,19 @@ def _identity_for(reference: str) -> dict[str, Any] | None:
             "uuid": uuid.strip() if isinstance(uuid, str) and uuid.strip() else None}
 
 
+def _apply_verified_tenant(result: dict[str, Any], reference: str, uuid_value: Any, parent: Path | None = None) -> dict[str, Any]:
+    """``uuid_not_in_clone`` becomes ``onboarded`` when a Case 3 readback verified exactly this CO's tenant (owner request
+    2026-10-21). Any problem reading the records leaves the match untouched (fail closed)."""
+    if result.get("status") != "uuid_not_in_clone" or not uuid_value:
+        return result
+    try:
+        folder = parent or _pdr_records_parent()
+        history = [production_create_record.load(path) for path in production_create_record.list_records(folder, reference)]
+    except Exception:  # noqa: BLE001 - an unreadable record folder never makes a CO look onboarded
+        return result
+    return verified_tenant.apply(result, verified_tenant.latest_verified(history, reference, uuid_value))
+
+
 def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
     """Read-only production match of one CO (see ``integration.onboarding.production_match``).
 
@@ -8215,7 +8232,7 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     if result["status"] == "not_checked" and result["reason"] == "co_source_unreadable":
         result["reason"] = "production_inputs_not_prepared"
     result["route"] = engine
-    return result
+    return _apply_verified_tenant(result, reference, uuid_value)
 
 
 def _combine_duplicate(ui: str, api: str) -> str:
@@ -10120,6 +10137,22 @@ def _readback_blocked_writes(guard: production_probe.RequestGuard) -> int:
     return sum(count for (method, _where), count in guard.blocked.items() if method not in production_probe.SAFE_METHODS)
 
 
+def readback_identity(reply: Any, tenant_name: str, domain: str) -> dict[str, str] | None:
+    """The Account ID and Account UUID of the ONE row that matches name and domain, or None. For the verified-tenant record only:
+    they are never printed or put in the redacted line."""
+    rows = reply.get("rows") if isinstance(reply, dict) else None
+    if not isinstance(rows, list):
+        return None
+    row, _code = production_contract.select_unique_row(rows, tenant_name, domain)
+    if row is None:
+        return None
+    account_id, uuid = row.get("id"), row.get("accountUuid")
+    if (isinstance(account_id, str) and re.fullmatch(r"[0-9a-f]{24}", account_id)
+            and isinstance(uuid, str) and production_contract.uuid_well_formed(uuid)):
+        return {"account_id": account_id, "account_uuid": uuid}
+    return None
+
+
 def readback_variants(reader: ProductionPageReader, primary: Any, tenant_name: str, domain: str) -> dict[str, dict[str, Any]]:
     """Names-only diagnostic summaries for variants A and B (docs/53 note 2026-10-18). Never raises.
 
@@ -10148,7 +10181,7 @@ READBACK_ROUTES = (CE_ENGINE, CASE3_ENGINE)
 def run_production_readback(reference: str, *, environ: Any | None = None, now: datetime | None = None,
                             wait_seconds: float = MAX_WAIT_SECONDS, report_base: Path | None = None,
                             load_source: Any = None, open_page: Any = None, route: str = CE_ENGINE,
-                            tenant_name: str | None = None) -> str:
+                            tenant_name: str | None = None, records_parent: Path | None = None) -> str:
     """One attended READ-ONLY production readback of one CE-only or Case 3 tenant. Returns the printed line.
 
     ``route`` picks the intended values and the row contract (CE-only, or Case 3 since 2026-10-21); ``tenant_name`` overrides the
@@ -10176,6 +10209,7 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
         return json.dumps(_readback_refused("origin_not_approved"), separators=(",", ":"))
     guard: production_probe.RequestGuard | None = None
     variants: dict[str, dict[str, Any]] | None = None
+    verified_identity: dict[str, str] | None = None
     try:
         try:
             source = (load_source or (CASE3_ROUTE if case3 else CE_ROUTE).load_source)(reference)
@@ -10215,6 +10249,14 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
                                            getattr(source, "salesforce_account_uuid", "") or "")
                 # Diagnostic (docs/53 note 2026-10-18): which read variant returns the compared paths; names only, verdict untouched.
                 variants = readback_variants(reader, reply, intended["tenant_name"], intended["primary_domain"])
+                if case3 and outcome["result"] == READBACK_RESULT_COMPLETE and outcome["tenant_found"]:
+                    found_identity = readback_identity(reply, intended["tenant_name"], intended["primary_domain"])
+                    id_match = production_contract.salesforce_account_id_matches(
+                        getattr(source, "salesforce_surface_account_id", ""), (found_identity or {}).get("account_id"))
+                    outcome = {**outcome, "salesforce_account_id_matches": id_match}  # Case 3 only: a flag, never the id
+                    if (not outcome["mismatches"] and outcome["uuid_ok"] and outcome["salesforce_uuid_matches"] is True
+                            and id_match is not False and not _readback_blocked_writes(guard)):
+                        verified_identity = found_identity
                 if _readback_blocked_writes(guard):
                     outcome = _readback_refused("write_request_blocked", tenant_found=outcome["tenant_found"],
                                                 mismatches=outcome["mismatches"], uuid_ok=outcome["uuid_ok"],
@@ -10227,6 +10269,14 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
             raise _ReadbackStop("readback_crashed") from None
     except _ReadbackStop as stop:
         outcome = _readback_refused(stop.reason)
+    if verified_identity is not None:
+        try:  # a verified Case 3 tenant leaves ONE local record (names and ids); a failure here never changes the outcome
+            production_create_record.record(records_parent or _pdr_records_parent(), {
+                "co_reference": reference, "outcome": production_create.OUTCOME_VERIFIED, "route": CASE3_ENGINE,
+                "tenant_name": intended["tenant_name"], "domains": [intended["primary_domain"]],
+                "approval_ref": probe_reference, **verified_identity}, now)
+        except Exception:
+            pass
     variant_fields = production_contract.variant_line_fields(variants) if variants is not None else {}
     report = {"schema": 1, "kind": "production_readonly_readback", "reference": probe_reference, "co_reference": reference,
               "captured_at": now.astimezone(timezone.utc).isoformat(timespec="seconds"),
