@@ -35,6 +35,10 @@ CE_CAMPAIGN = "LEAKED_CREDENTIALS_DISCOVERY"
 EXEC_DONE = frozenset({"DONE", "DONE_WITH_ERRORS"})
 EXEC_RUNNING = frozenset({"PENDING"})
 _EXEC_KEYS = ("campaign_type", "execution_type", "status", "start", "end", "duration_ms")
+# Why the Duration Per Scan executions read failed: the step of ``read_scan_executions`` (a fixed word, never free text).
+PROBLEM_STEPS = frozenset({"details_open", "tab_wait", "tab_click", "reply_wait", "reply_status", "id_mismatch", "parse_failed",
+                           "other"})
+SURFACE_RUNNING = frozenset({"RUNNING", "IN_PROGRESS", "PENDING", "STARTED"})
 
 
 def _safe(value: Any) -> Any:
@@ -100,6 +104,9 @@ def record(parent: Path, co: str, reply: Mapping[str, Any], now: datetime) -> Pa
     stamp = now.astimezone(timezone.utc)
     data = {"co_reference": co, "recorded_at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"), "state": reply["state"],
             "found": bool(reply.get("found")), "fields": fields}
+    problem = reply.get("executions_problem")
+    if isinstance(problem, str) and problem in PROBLEM_STEPS:
+        data["executions_problem"] = problem
     execs = reply.get("executions")
     if isinstance(execs, list):
         data["executions"] = [{k: _safe(e.get(k)) for k in _EXEC_KEYS} for e in execs[:50] if isinstance(e, Mapping)]
@@ -133,6 +140,29 @@ def latest(parent: Path, co: str) -> dict[str, Any] | None:
             if best is None or str(item.get("recorded_at")) >= str(best.get("recorded_at")):
                 best = item
     return best
+
+
+def _iso_from_ms(value: Any) -> str | None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 4_102_444_800_000:
+        return None
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def surface_scan_state(observation: Any) -> dict[str, Any] | None:
+    """The SURFACE scan state of a tenant from its scan observation: ``{"state": completed | running | unknown, "last_scan",
+    "checked_at"}``, or None when there is no readable observation of a found row. It uses only the tenant row's own
+    ``lastScanStatusEnum`` (never the CE executions list, which can be unreadable while the row says COMPLETED)."""
+    if not isinstance(observation, Mapping) or observation.get("found") is not True:
+        return None
+    fields = observation.get("fields")
+    if not isinstance(fields, Mapping):
+        return None
+    status = fields.get("lastScanStatusEnum")
+    state = ("completed" if status == "COMPLETED" else "running" if isinstance(status, str) and status in SURFACE_RUNNING
+             else "unknown")
+    stamp = observation.get("recorded_at")
+    return {"state": state, "last_scan": _iso_from_ms(fields.get("lastReconScan")),
+            "checked_at": stamp if isinstance(stamp, str) else None}
 
 
 def executions_state(parsed: Any) -> str:

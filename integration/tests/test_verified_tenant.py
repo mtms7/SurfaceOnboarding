@@ -65,7 +65,8 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(result["target"]["id"], ROW_ID)
         self.assertEqual(result["target"]["name"], "Example TG")
         self.assertEqual(result["verified_live"], {"recorded_at": "2026-10-21T21:00:00Z", "account_id": ROW_ID,
-                                                   "account_uuid": UUID, "tenant_name": "Example TG"})
+                                                   "account_uuid": UUID, "tenant_name": "Example TG",
+                                                   "surface_scan": None})
         self.assertEqual(result["tenants_checked"], 5449)  # the clone facts stay as they were
 
     def test_every_other_status_is_left_untouched(self):

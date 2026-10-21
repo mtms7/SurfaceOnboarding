@@ -47,16 +47,41 @@ def latest_verified(records: Any, co_reference: str, salesforce_uuid: Any) -> di
             "tenant_name": best["tenant_name"].strip()}
 
 
-def apply(result: Mapping[str, Any], verified: Mapping[str, Any] | None) -> dict[str, Any]:
-    """``result`` with ``uuid_not_in_clone`` replaced by ``onboarded`` when ``verified`` is the live evidence; else a copy."""
+def _stamp_text(value: Any) -> str:
+    moment = _STAMP.fullmatch(value) if isinstance(value, str) else None
+    return (moment.group(1) + " " + moment.group(2) + " UTC") if moment else ""
+
+
+def _scan_text(scan: Mapping[str, Any] | None) -> str:
+    if not isinstance(scan, Mapping):
+        return " Surface scan: not checked yet."
+    state = scan.get("state")
+    when = _stamp_text(scan.get("last_scan"))
+    checked = _stamp_text(scan.get("checked_at"))
+    tail = (" (last scan " + when + (", checked " + checked if checked else "") + ")") if when else (
+        " (checked " + checked + ")" if checked else "")
+    if state == "completed":
+        return " Surface scan: completed" + tail + "."
+    if state == "running":
+        return " Surface scan: running" + tail + "."
+    return " Surface scan: status unclear" + tail + "."
+
+
+def apply(result: Mapping[str, Any], verified: Mapping[str, Any] | None,
+          scan: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """``result`` with ``uuid_not_in_clone`` replaced by ``onboarded`` when ``verified`` is the live evidence; else a copy.
+
+    ``scan`` is ``production_scan_check.surface_scan_state`` of the newest scan observation (None: not checked yet); its state is
+    appended to the line."""
     out = dict(result)
     if verified is None or out.get("status") != "uuid_not_in_clone":
         return out
     moment = _STAMP.fullmatch(verified["recorded_at"])
     when = (moment.group(1) + " " + moment.group(2) + " UTC") if moment else verified["recorded_at"]
-    line = ("Onboarded - tenant verified live in BackOffice by a read-only readback (" + when + "); the clone has not caught up yet.")
+    line = ("Onboarded - tenant verified live in BackOffice by a read-only readback (" + when + "); the clone has not caught up yet."
+            + _scan_text(scan))
     out.update(status="onboarded", reason=line, review={"line": line, "warnings": []},
                target={"id": verified["account_id"], "name": verified["tenant_name"], "domain": None, "created": None,
                        "deleted": False, "enabled": True, "live_paid": True, "license_type": None},
-               verified_live=dict(verified))
+               verified_live={**verified, "surface_scan": scan.get("state") if isinstance(scan, Mapping) else None})
     return out

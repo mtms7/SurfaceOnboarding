@@ -5594,7 +5594,9 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str, origin: 
         _log().event("scan_executions", "reply", detail=f"replies={len(seen)}")
     except Exception as exc:
         _log().error("scan_executions", step, exc)
-        raise RuntimeError("scan_status_executions_unavailable") from exc
+        problem = RuntimeError("scan_status_executions_unavailable")
+        problem.step = step if step in ("details_open", "tab_wait", "tab_click", "reply_wait") else "other"  # type: ignore[attr-defined]
+        raise problem from exc
     finally:
         try:
             page.remove_listener("response", on_response)
@@ -5607,12 +5609,16 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str, origin: 
     match = SCAN_EXEC_PATH.fullmatch(_url_path(response.url))
     if match is None or match.group(1) != expected_id:
         _log().event("scan_executions", "id_mismatch")
-        raise RuntimeError("scan_status_executions_id_mismatch")
+        problem = RuntimeError("scan_status_executions_id_mismatch")
+        problem.step = "id_mismatch"  # type: ignore[attr-defined]
+        raise problem
     if response.status in (401, 403):
         raise LeonardoSessionExpired()
     if not 200 <= response.status < 300:
         _log().event("scan_executions", "reply_status", detail=str(response.status))
-        raise RuntimeError("scan_status_executions_unavailable")
+        problem = RuntimeError("scan_status_executions_unavailable")
+        problem.step = "reply_status"  # type: ignore[attr-defined]
+        raise problem
     try:
         body = response.json()
         parsed = parse_scan_executions(body)
@@ -5623,7 +5629,9 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str, origin: 
         # Shape only (key names / row count), never values: tells an envelope change from too many rows.
         keys = sorted(body)[:8] if isinstance(body, dict) else type(body).__name__
         _log().event("scan_executions", "parse_failed", detail=f"keys={keys}")
-        raise RuntimeError("scan_status_executions_unavailable")
+        problem = RuntimeError("scan_status_executions_unavailable")
+        problem.step = "parse_failed"  # type: ignore[attr-defined]
+        raise problem
     _log().event("scan_executions", "parsed", detail=f"executions={len(parsed['executions'])} "
                                                        f"state={parsed['execution_state']}")
     return parsed
@@ -8188,7 +8196,16 @@ def _apply_verified_tenant(result: dict[str, Any], reference: str, uuid_value: A
         history = [production_create_record.load(path) for path in production_create_record.list_records(folder, reference)]
     except Exception:  # noqa: BLE001 - an unreadable record folder never makes a CO look onboarded
         return result
-    return verified_tenant.apply(result, verified_tenant.latest_verified(history, reference, uuid_value))
+    verified = verified_tenant.latest_verified(history, reference, uuid_value)
+    if verified is None:
+        return result
+    from integration.onboarding import production_scan_check as scan
+
+    try:
+        state = scan.surface_scan_state(scan.latest(folder, reference))
+    except Exception:  # noqa: BLE001 - the scan line is optional
+        state = None
+    return verified_tenant.apply(result, verified, state)
 
 
 def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
@@ -10776,8 +10793,9 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
                                  "executions": list((parsed or {}).get("executions") or [])}
                     except LeonardoSessionExpired:
                         reply = {**reply, "state": "production_session_expired"}
-                    except Exception:
-                        reply = {**reply, "state": "executions_unavailable"}
+                    except Exception as error:
+                        reply = {**reply, "state": "executions_unavailable",
+                                 "executions_problem": getattr(error, "step", "other")}
     except RuntimeError as error:
         result = "production_sign_in_timeout" if str(error) == "production_dry_run_login_timeout" else "scan_check_failed"
     except Exception:

@@ -6220,6 +6220,8 @@ def _match_stamp() -> str:
     try:  # a new production record (a verified readback) must show at once, not after the 5 minute display cache
         folder = production_records_parent() / "production-create-records"
         parts.append(max((path.name for path in folder.glob("*.json")), default="no-records"))
+        parts.append(max((path.name for path in (production_records_parent() / "production-scan-checks").glob("*.json")),
+                         default="no-scan-checks"))
     except Exception:  # noqa: BLE001
         parts.append("records-unreadable")
     return "|".join(parts)

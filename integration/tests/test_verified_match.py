@@ -64,6 +64,19 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(self.apply()["status"], "uuid_not_in_clone")
 
 
+class ScanStampTests(unittest.TestCase):
+    def test_a_new_scan_observation_changes_the_cache_stamp(self):
+        from integration.onboarding import production_scan_check as scan
+
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp)
+            with mock.patch.object(dashboard, "production_records_parent", return_value=parent):
+                before = dashboard._match_stamp()
+                scan.record(parent, "CO-0800", {"state": "executions_unavailable", "found": True, "fields": {}}, NOW)
+                after = dashboard._match_stamp()
+        self.assertNotEqual(before, after)
+
+
 class StampTests(unittest.TestCase):
     def test_a_new_record_changes_the_cache_stamp(self):
         with tempfile.TemporaryDirectory() as tmp:
