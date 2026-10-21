@@ -38,6 +38,9 @@ _EXEC_KEYS = ("campaign_type", "execution_type", "status", "start", "end", "dura
 # Why the Duration Per Scan executions read failed: the step of ``read_scan_executions`` (a fixed word, never free text).
 PROBLEM_STEPS = frozenset({"details_open", "tab_wait", "tab_click", "reply_wait", "reply_status", "id_mismatch", "parse_failed",
                            "other"})
+ROW_STAGES = frozenset({"row", "menu", "item"})
+COUNT_KEYS = ("rows", "matching_rows", "menu_buttons")
+_MENU_ITEM = re.compile(r"Button-Grid_[A-Za-z0-9_]{1,40}")
 SURFACE_RUNNING = frozenset({"RUNNING", "IN_PROGRESS", "PENDING", "STARTED"})
 
 
@@ -107,6 +110,17 @@ def record(parent: Path, co: str, reply: Mapping[str, Any], now: datetime) -> Pa
     problem = reply.get("executions_problem")
     if isinstance(problem, str) and problem in PROBLEM_STEPS:
         data["executions_problem"] = problem
+    stage = reply.get("executions_stage")
+    if isinstance(stage, str) and stage in ROW_STAGES:
+        data["executions_stage"] = stage
+    counts = reply.get("executions_counts")
+    if isinstance(counts, Mapping):
+        data["executions_counts"] = {key: counts[key] for key in COUNT_KEYS
+                                     if isinstance(counts.get(key), int) and not isinstance(counts.get(key), bool)
+                                     and 0 <= counts[key] <= 100000}
+    items = reply.get("executions_menu_items")
+    if isinstance(items, list):
+        data["executions_menu_items"] = [i for i in items[:12] if isinstance(i, str) and _MENU_ITEM.fullmatch(i)]
     execs = reply.get("executions")
     if isinstance(execs, list):
         data["executions"] = [{k: _safe(e.get(k)) for k in _EXEC_KEYS} for e in execs[:50] if isinstance(e, Mapping)]

@@ -5447,6 +5447,7 @@ def scan_status_from_row(row: dict[str, Any]) -> dict[str, Any]:
 # that request. Only the stable Details item is clicked; the hazard items
 # (Grid_Access, _Scan_Now, _Stop_Scan, _Delete) are never touched.
 SCAN_EXEC_ROW_MENU_SELECTOR = ".rowMenuActionsContainer .list-trigger"
+ROW_MENU_ITEMS_SELECTOR = '[data-am^="Button-Grid_"]'  # the row-menu items (read only to name them when a click fails)
 SCAN_EXEC_DETAILS_SELECTOR = '[data-am="Button-Grid_Details"]'
 SCAN_EXEC_DURATION_TEXT = "Duration Per Scan"
 SCAN_EXEC_PATH = re.compile(r"/api/v1/backoffice/account/([A-Za-z0-9_-]{1,64})/campaign/executions")
@@ -5596,6 +5597,9 @@ def read_scan_executions(page: Any, tenant_name: str, expected_id: str, origin: 
         _log().error("scan_executions", step, exc)
         problem = RuntimeError("scan_status_executions_unavailable")
         problem.step = step if step in ("details_open", "tab_wait", "tab_click", "reply_wait") else "other"  # type: ignore[attr-defined]
+        problem.stage = getattr(exc, "row_action_stage", None)  # type: ignore[attr-defined]
+        problem.counts = getattr(exc, "row_action_counts", None) or {}  # type: ignore[attr-defined]
+        problem.menu_items = getattr(exc, "row_action_menu_items", None) or []  # type: ignore[attr-defined]
         raise problem from exc
     finally:
         try:
@@ -6282,9 +6286,32 @@ def _open_row_action(page: Any, tenant_name: str, item_selector: str) -> None:
     """Select the tenant row, open its row menu, click one allow-listed item (never a hazard item)."""
     if item_selector not in ROW_ACTIONS_ALLOWED:
         raise ValueError("row_action_not_allowed")
-    page.locator("tr, [role='row']").filter(has_text=tenant_name).first.click(timeout=FIELD_TIMEOUT_MS)
-    page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
-    page.locator(item_selector).first.click(timeout=FIELD_TIMEOUT_MS)
+    stage = "row"
+    try:
+        page.locator("tr, [role='row']").filter(has_text=tenant_name).first.click(timeout=FIELD_TIMEOUT_MS)
+        stage = "menu"
+        page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
+        stage = "item"
+        page.locator(item_selector).first.click(timeout=FIELD_TIMEOUT_MS)
+    except Exception as exc:
+        exc.row_action_stage = stage  # type: ignore[attr-defined]  # which click failed (live 2026-10-21: details_open for CO-0800)
+        try:  # integers only: how many rows, matching rows and row-menu buttons the page shows; never a name or an id
+            rows = page.locator("tr, [role='row']")
+            exc.row_action_counts = {  # type: ignore[attr-defined]
+                "rows": int(rows.count()), "matching_rows": int(rows.filter(has_text=tenant_name).count()),
+                "menu_buttons": int(page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).count())}
+        except Exception:
+            exc.row_action_counts = {}  # type: ignore[attr-defined]
+        exc.row_action_menu_items = []  # type: ignore[attr-defined]
+        if stage == "item":  # the menu was open: name its items (data-am tokens such as Button-Grid_Details), never row text
+            try:
+                items = page.locator(ROW_MENU_ITEMS_SELECTOR)
+                names = [items.nth(index).get_attribute("data-am") for index in range(min(int(items.count()), 12))]
+                exc.row_action_menu_items = [n for n in names  # type: ignore[attr-defined]
+                                             if isinstance(n, str) and re.fullmatch(r"Button-Grid_[A-Za-z0-9_]{1,40}", n)]
+            except Exception:
+                pass
+        raise
 
 
 def _spycloud_cancel(page: Any) -> bool:
@@ -10795,7 +10822,10 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
                         reply = {**reply, "state": "production_session_expired"}
                     except Exception as error:
                         reply = {**reply, "state": "executions_unavailable",
-                                 "executions_problem": getattr(error, "step", "other")}
+                                 "executions_problem": getattr(error, "step", "other"),
+                                 "executions_stage": getattr(error, "stage", None),
+                                 "executions_counts": getattr(error, "counts", None),
+                                 "executions_menu_items": getattr(error, "menu_items", None)}
     except RuntimeError as error:
         result = "production_sign_in_timeout" if str(error) == "production_dry_run_login_timeout" else "scan_check_failed"
     except Exception:
