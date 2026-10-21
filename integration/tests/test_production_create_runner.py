@@ -261,7 +261,7 @@ class Base(unittest.TestCase):
 class LockTests(Base):
     def test_constants_are_hard_coded_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked
 
     def test_both_locks_false_reaches_nothing(self):
         h = self.harness()
@@ -289,7 +289,7 @@ class LockTests(Base):
         out = runner.run_production_create(CO, REV, owner_go=True, environ=dict(dry.UNLOCK), now=NOW,
                                            records_parent=h.records, approval_path=h.approval_path,
                                            load_source=h.load_source, open_page=h.open_page)
-        self.assertIn("production_locked_production_dry_run_not_supported", out)
+        self.assertIn("production_locked_production_runner_not_supported", out)  # the dry-run constant is True, the create is not
         self.no_external_activity(h)
 
     def test_the_old_dry_run_stubs_still_refuse_to_confirm(self):
