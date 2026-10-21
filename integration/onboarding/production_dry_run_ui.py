@@ -167,7 +167,8 @@ def findings(observations: Any) -> list[str]:
         if isinstance(value, str) and value:
             extra = ""
             if key == "max_scan_duration_control" and isinstance(observations.get("max_scan_duration_default"), str):
-                extra = " (default " + observations["max_scan_duration_default"] + " h)"
+                # The form's own starting value (Guru: "defaults to 24 hours, but should be set to 90"), never the value set.
+                extra = " (form default " + observations["max_scan_duration_default"] + " h)"
             lines.append(label + ": " + value + extra)
     return lines
 
@@ -182,6 +183,9 @@ def _result_html(parent: Path, co: str) -> str:
     head = ("Last dry run (" + when + "): " + ("passed. Nothing was created." if passed else "stopped: "
             + create_ui.gate_text(last.get("refusal_reason") or "refused") + " (" + str(last.get("refusal_reason") or "refused") + ")"))
     lines = findings(last.get("observations"))
+    checked = last.get("form_fields_checked")
+    if passed and isinstance(checked, Mapping) and checked.get("advanced_text.maximum_scan_duration_hours") == "pass":
+        lines.insert(0, "Maximum scan Duration set to 90 h and read back")  # only a passing run verified the value
     return ("<p class='note'>" + escape(head) + "</p>"
             + ("<ul class='note'>" + "".join("<li>" + escape(line) + "</li>" for line in lines) + "</ul>" if lines else ""))
 

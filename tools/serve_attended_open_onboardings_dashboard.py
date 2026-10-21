@@ -40,8 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import state_paths
+from integration.onboarding import production_approval
 from integration.onboarding import production_views
 from integration.onboarding import production_create_ui as create_ui
+from integration.onboarding import production_case3_sheet as case3_sheet
+from integration.onboarding import production_case3_summary as case3_summary
 from integration.onboarding import production_dry_run_ui as dry_ui
 from integration.onboarding import review_approval
 from integration.onboarding import runner_child_log
@@ -94,6 +97,7 @@ from tools.attended_ce_only_playwright import (
     case3_fill_source,
     case3_scope_summary,
     case3_term_problem,
+    case3_values,
     build_renewal_plan,
     renewal_case,
     RENEWAL_ENGINES,
@@ -6808,13 +6812,25 @@ def _guide_matches(match: dict[str, Any]) -> str:
     return html + "</section>"
 
 
+def _case3_guide(guide: dict[str, Any], reference: str, *, case3: bool = True) -> dict[str, Any]:
+    """The production CO page guide of a Case 3 CO: the CE-only guide says "Not applicable" in red, which is wrong for Case 3, whose
+    values and steps are on the review page (owner decision 2026-10-21). Any other CO keeps its guide unchanged."""
+    if not case3:
+        return guide
+    return {**guide, "verdict": "info", "checks": [], "rows": [], "after": [], "recorded_duplicates": None,
+            "headline": "Case 3 (Surface + Credential Exposure): the values to enter and the steps are on the review page.",
+            "review_href": "/onboard/" + reference}
+
+
 def _production_guide_html(guide: dict[str, Any], match: dict[str, Any]) -> str:
     """Everything below the header of the production CO page: verdict, strip, details, one flat table, steps, footer."""
     ready = guide["verdict"] == "ready"
     tone = ("banner-ok" if ready or guide["verdict"] == "onboarded" else "banner-warn" if guide["verdict"] == "onboarded_review"
-            else "banner-bad")
+            else "" if guide["verdict"] == "info" else "banner-bad")  # "info": the plain, neutral banner (Case 3 pointer)
     verdict = ("<div class='banner " + tone + "' role='status'><strong>"
-               + escape(guide["headline"]) + "</strong></div>")
+               + escape(guide["headline"]) + "</strong>"
+               + ("<br><a href='" + escape(guide["review_href"]) + "'>Open the review page</a>" if guide.get("review_href") else "")
+               + "</div>")
     strip = ""
     if guide["checks"]:
         strip = ("<section class='card' aria-labelledby='co-before-title'><h2 id='co-before-title' class='pill'>Before you start</h2>"
@@ -6877,6 +6893,7 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     sheet = _sheet_result(row, match=match, ce_route=ce_route, start_iso=_prod_view_start(reference), country=country, clone=clone)
     guide = production_views.production_co_guide(sheet, clone=clone, recorded_duplicates=_recorded_duplicates(reference))
     guide["closing"] = _prod_view_closing(_production_page_state(reference, row))
+    guide = _case3_guide(guide, reference, case3=route_for(row) == CASE3_ENGINE)
     try:
         own = create_ui.own_onboarding(production_records_parent(), reference, row)
     except Exception:  # noqa: BLE001 - the normal verdict stays
@@ -7265,6 +7282,10 @@ def _summary_approval_html(summary: dict[str, Any], digest: str, blockers: list[
     return status + form
 
 
+_APPROVAL_SCOPE_LABELS = {production_approval.SCOPE: "One CO, CE-only",
+                          production_approval.CASE3_SCOPE: "One CO, Surface & Credential Exposure"}
+
+
 def _create_approval_html(reference: str) -> str:
     view = production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, production_now(),
                                             missing_is_unavailable=_state_not_published())
@@ -7280,7 +7301,7 @@ def _create_approval_html(reference: str) -> str:
     note = {"valid": "Bound to one CO, one route and the revision seen at approval. Used once by the create.",
             "expired": "Expired: a new create approval is needed.", "consumed": "Used once: a new create approval is needed."}[state]
     return ("<p>" + _chip(css, word) + "</p>" + _kv_grid([
-        ("Reference", item["approval_ref"]), ("Scope", "One CO, CE-only"), ("Issued by", item["issued_by"]),
+        ("Reference", item["approval_ref"]), ("Scope", _APPROVAL_SCOPE_LABELS.get(item["scope"], "One CO")), ("Issued by", item["issued_by"]),
         ("Expires", item["expires_at"][:10] + " (7 days)"), ("Consumed", "Yes" if item["consumed_at"] else "No")],
         frozenset({"Reference"})) + "<p class='note'>" + escape(note) + "</p>")
 
@@ -7467,6 +7488,77 @@ def _onboarding_sheet_card(reference: str, row: dict[str, str | None] | None, *,
             "<th scope='col'>Value</th><th scope='col'>Note</th></tr></thead><tbody>" + body + "</tbody></table></div></section>")
 
 
+CASE3_VALUES_REFUSALS = {
+    "salesforce_not_approved": "Onboarding Approval Status is not Approved in Salesforce.",
+    "account_uuid_set": "The CO already has an Account UUID.",
+    "surface_account_id_set": "The CO already has a Surface Account ID.",
+    "values_unavailable": "The values cannot be derived right now: check the CO in Salesforce.",
+}
+
+
+def _case3_summary_html(result: dict[str, Any]) -> str:
+    """The "Tenant creation summary" card: Salesforce facts and the tenant values side by side, read-only, every value escaped."""
+    attention = "".join("<li>" + escape(line) + "</li>" for line in result["attention"])
+    return ("<section class='card sheet-card' aria-labelledby='co-summary-title'><div class='card-head'>"
+            "<h2 id='co-summary-title' class='pill'>Tenant creation summary</h2></div>"
+            "<h3 class='sub-h'>From Salesforce (only what the create needs)</h3>" + _kv_grid(result["salesforce"])
+            + "<h3 class='sub-h'>The tenant will be created with</h3>" + _kv_grid(result["tenant"])
+            + "<h3 class='sub-h'>Check before you click Confirm</h3><ul>" + attention + "</ul></section>")
+
+
+def _case3_values_card(reference: str, row: dict[str, str | None] | None) -> str:
+    """The read-only Case 3 "Add Account values" card (owner decision 2026-10-21, path A: the owner creates the tenant by hand).
+
+    The values are the plan the production dry run verified (``case3_values``); the card also lists the manual steps and the HAR
+    capture. "" for any other CO. No form, button, link or script; every value is escaped; any failure shows "do not onboard".
+    """
+    if dry_ui.route_for_row(row) is None or not isinstance(row, dict):
+        return ""
+    head = ("<section class='card sheet-card' aria-labelledby='co-sheet-title'><div class='card-head'>"
+            "<h2 id='co-sheet-title' class='pill'>Add Account values</h2></div>")
+
+    def refused(code: str) -> str:
+        explained = CASE3_VALUES_REFUSALS.get(code) or ("The values cannot be derived.")
+        return (head + "<p><strong>Do not onboard this CO:</strong> " + escape(explained) + " <code>" + escape(code)
+                + "</code></p></section>")
+
+    if "Account_UUID__c" not in row or "Surface_Account_ID__c" not in row:
+        return refused("values_unavailable")
+    if row.get("Onboarding_Approval_Status__c") != "Approved":
+        return refused("salesforce_not_approved")
+    if str(row.get("Account_UUID__c") or "").strip():
+        return refused("account_uuid_set")
+    if str(row.get("Surface_Account_ID__c") or "").strip():
+        return refused("surface_account_id_set")
+    try:
+        _revision, plan = case3_values(reference)
+        rows = case3_sheet.rows(plan)
+        steps = case3_sheet.after_steps(str(plan["texts"]["Company name"]), reference)
+        overview = _case3_summary_html(case3_summary.build(plan))
+    except Exception as error:  # noqa: BLE001 - a stable code or "unavailable"; never exception text
+        code = str(error)
+        return refused(code if re.fullmatch(r"[a-z][a-z0-9_]{2,80}", code) else "values_unavailable")
+    body = "".join(
+        "<tr><td>" + escape(item["label"]) + "</td><td><code>" + escape(item["value"]) + "</code></td><td>"
+        + _chip(*SHEET_ROW_CHIPS[item["status"]]) + (" <small>" + escape(item["note"]) + "</small>" if item["note"] else "")
+        + "</td></tr>" for item in rows)
+    return (overview + head + "<p class='note'>BackOffice <code>" + escape(case3_sheet.BACKOFFICE) + "</code>, Tenant Management, Add Account, "
+            "in form order. These are the exact values the production dry run typed and read back (nothing was submitted). Open "
+            "<em>Advanced options</em> for the switches and the Maximum scan Duration.</p>"
+            "<div class='tbl-wrap'><table class='dense'><thead><tr><th scope='col'>Field</th><th scope='col'>Value</th>"
+            "<th scope='col'>Note</th></tr></thead><tbody>" + body + "</tbody></table></div>"
+            "<h3 class='sub-h'>Around the create</h3><ol>" + "".join("<li>" + escape(step) + "</li>" for step in steps)
+            + "</ol></section>")
+
+
+def _add_account_values_card(reference: str, row: dict[str, str | None] | None, route: str | None, *, match: dict[str, Any] | None,
+                             start_iso: str | None, country: str | None = None) -> str:
+    """The "Add Account values" card of the production review page: Case 3 has its own, everything else the CE-only sheet."""
+    if route == CASE3_ENGINE:
+        return _case3_values_card(reference, row)
+    return _onboarding_sheet_card(reference, row, match=match, ce_route=route == CE_ENGINE, start_iso=start_iso, country=country)
+
+
 def _prod_view_start(reference: str) -> str | None:
     try:
         return queue_start_dates((reference,)).get(reference)
@@ -7544,8 +7636,8 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     domains = values.get("domains")
     ready = _co_ready_card(ref, row, match=check, domain_count=len(domains) if isinstance(domains, list) else None,
                            start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE, state=state)
-    sheet = _onboarding_sheet_card(ref, row, match=check, ce_route=summary["route"] == CE_ENGINE,
-                                   start_iso=str(plan.get("license_start") or ""), country=country)
+    sheet = _add_account_values_card(ref, row, summary["route"], match=check, start_iso=str(plan.get("license_start") or ""),
+                                     country=country)
     main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
             + _production_create_html(ref, row, state) + _production_dry_run_html(ref, row) + ready + blocked
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"

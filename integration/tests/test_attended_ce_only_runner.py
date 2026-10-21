@@ -4128,7 +4128,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
             "Last name": "Stevenson",
             "Organization Email": "milton.stevenson+ssc@pentera.io",
             "Number of assets": "10000",
-            "Number of domains": "750",  # owner rule 2026-09-30: = licensed subdomains
+            "Number of domains": "10000",  # owner rule 2026-10-21: creates type 10000; subdomains = the licence
             "Number of subdomains": "750",
         })
         self.assertEqual(plan["selects"], {"Account Type": "Customer", "Country": "France",
@@ -4162,7 +4162,8 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
         self.assertNotIn("SubDomains (Comma Separated Values)", plan["texts"])
         self.assertEqual(plan["blank_texts"][:2], ("Alternate Domains (Comma Separated Values)",
                                                    "SubDomains (Comma Separated Values)"))
-        self.assertEqual(plan["texts"]["Number of domains"], plan["texts"]["Number of subdomains"])
+        self.assertEqual(plan["texts"]["Number of domains"], "10000")  # owner 2026-10-21; subdomains keep the licence
+        self.assertEqual(plan["texts"]["Number of subdomains"], "500")
 
     def test_prime_interval_and_multiple_values_csv(self):
         source = _surface_source(alternates=("a-sample.example", "b-sample.example"),
@@ -4173,7 +4174,7 @@ class BuildSurfaceOnlyFillTests(unittest.TestCase):
         self.assertEqual(plan["texts"]["Alternate Domains (Comma Separated Values)"], "a-sample.example, b-sample.example")
         self.assertEqual(plan["texts"]["SubDomains (Comma Separated Values)"],
                          "x.surface-sample.example, y.surface-sample.example")
-        self.assertEqual((plan["texts"]["Number of domains"], plan["texts"]["Number of subdomains"]), ("1000", "1000"))
+        self.assertEqual((plan["texts"]["Number of domains"], plan["texts"]["Number of subdomains"]), ("10000", "1000"))
 
     def test_core_plus_on_the_account_keeps_leaked_credentials_off(self):
         plan = runner.build_surface_only_fill(_surface_source(core_plus=True), RUN_DAY)

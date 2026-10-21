@@ -66,8 +66,8 @@ import urllib.request
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import (  # noqa: E402
-    production_approval, production_contract, production_create, production_create_record, production_dry_run,
-    production_probe, run_progress, runner_child_log)
+    production_approval, production_case3_contract as case3_contract, production_contract, production_create,
+    production_create_record, production_dry_run, production_probe, run_progress, runner_child_log)
 from integration.onboarding.run_target import (  # noqa: E402
     ProductionLocked, RunTarget, development_target, production_dry_run_target, production_target)
 from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
@@ -714,6 +714,7 @@ def onboarding_allowed_now(subscription_start: date, run_day: date, *, environme
         return True
     return run_day >= earliest_onboarding_day(subscription_start)
 SURFACE_LICENSE_ASSETS = "10000"
+SURFACE_LICENSE_DOMAINS = "10000"  # owner 2026-10-21: Surface creates type 10000 domains; subdomains stay the licence (baseline + add-ons)
 RENEWAL_CASE5_ENGINE = "case_5_renew_ce_new_surface"
 SURFACE_MAX_SCAN_DURATION_LABEL = "Maximum scan Duration (hours)"
 SURFACE_MAX_SCAN_DURATION_HOURS = "90"
@@ -1152,6 +1153,9 @@ class Case3FillSource:
     ce_subscription_start: date
     ce_subscription_end: date
     salesforce_id_present: bool = False
+    # The CO's Account_UUID__c text, kept only for the read-only production readback comparison (never printed, never in a repr,
+    # never part of equality), as on CeFillSource.
+    salesforce_account_uuid: str = field(default="", repr=False, compare=False)
 
     def __getattr__(self, name: str) -> Any:
         # Surface fields (reference, source_revision, tenant_name, ...) by delegation.
@@ -1195,7 +1199,9 @@ def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillS
         except RuntimeError as error:
             raise SurfaceSourceError(str(error)) from error
         present = any((row.get(field) or "").strip() for field in ("Surface_Account_ID__c", "Account_UUID__c"))
-        return Case3FillSource(surface, email_domain, ce_start, ce_end, salesforce_id_present=present)
+        uuid = row.get("Account_UUID__c")
+        return Case3FillSource(surface, email_domain, ce_start, ce_end, salesforce_id_present=present,
+                               salesforce_account_uuid=uuid.strip() if isinstance(uuid, str) else "")
     except SurfaceSourceError:
         raise
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -1239,6 +1245,15 @@ def case3_scope_summary(source: Case3FillSource, run_day: date | None = None) ->
     scope.update({"license_start": start.isoformat(), "license_end": end.isoformat(),
                   "leaked_credentials_domains": 1, "leaked_credentials_interval": "Weekly"})
     return scope
+
+
+def case3_values(reference: str, run_day: date | None = None) -> tuple[str, dict[str, Any]]:
+    """(source revision, fill plan) of one Case 3 CO for the read-only "Add Account values" card.
+
+    The same source read and plan the production dry run uses (``build_case3_fill``), so the card shows exactly the values the dry
+    run typed and verified. Raises like ``case3_fill_source`` / ``build_case3_fill`` (stable value-free codes)."""
+    source = case3_fill_source(reference)
+    return source.source_revision, build_case3_fill(source, run_day or _run_day())
 
 
 # --- Renewal plan (Cases 4-6), read-only, 2026-10-02 -------------------------
@@ -1447,7 +1462,7 @@ def build_surface_only_fill(source: SurfaceFillSource, run_day: date | None = No
         "Last name": CE_PRIMARY_USER_LAST_NAME,
         "Organization Email": surface_primary_user_email(source),
         "Number of assets": SURFACE_LICENSE_ASSETS,
-        "Number of domains": str(source.number_of_domains),
+        "Number of domains": SURFACE_LICENSE_DOMAINS,
         "Number of subdomains": str(source.entitlement.licensed_subdomains),
     })
     blank_texts.extend((NETWORKS_LABEL, "Phone number", "Job title"))
@@ -10017,6 +10032,18 @@ def ce_production_intended(source: CeFillSource, run_day: date | None = None) ->
     }
 
 
+def case3_production_intended(source: Case3FillSource, run_day: date | None = None) -> dict[str, Any]:
+    """The intended Case 3 values for the production readback, taken from the Case 3 fill plan (no second copy)."""
+    plan = build_case3_fill(source, run_day)
+    texts = {" ".join(str(key).split()): value for key, value in plan["texts"].items()}
+    return {
+        "tenant_name": texts["Company name"], "primary_domain": texts["Company primary domain"],
+        "email_domain": texts["User email domains (Comma Separated Values)"],
+        "first_name": texts["First name"], "last_name": texts["Last name"], "organization_email": texts["Organization Email"],
+        "license_start": plan["license_start"], "license_end": plan["license_end"],
+    }
+
+
 def _readback_fields(result: str, reason: str, tenant_found: bool = False, mismatches: Any = (), uuid_ok: bool = False,
                      sf_match: bool | None = None) -> dict[str, Any]:
     return {"result": result, "reason": reason, "tenant_found": tenant_found, "mismatches": list(mismatches),
@@ -10075,10 +10102,17 @@ def readback_variants(reader: ProductionPageReader, primary: Any, tenant_name: s
     return summaries
 
 
+READBACK_ROUTES = (CE_ENGINE, CASE3_ENGINE)
+
+
 def run_production_readback(reference: str, *, environ: Any | None = None, now: datetime | None = None,
                             wait_seconds: float = MAX_WAIT_SECONDS, report_base: Path | None = None,
-                            load_source: Any = None, open_page: Any = None) -> str:
-    """One attended READ-ONLY production readback of one CE-only tenant. Returns the printed line.
+                            load_source: Any = None, open_page: Any = None, route: str = CE_ENGINE,
+                            tenant_name: str | None = None) -> str:
+    """One attended READ-ONLY production readback of one CE-only or Case 3 tenant. Returns the printed line.
+
+    ``route`` picks the intended values and the row contract (CE-only, or Case 3 since 2026-10-21); ``tenant_name`` overrides the
+    searched name (Case 3 only: the short name, docs/60).
 
     Order: probe-class gate and exact origin; the fixed Salesforce read of the Dev runner (intended values and the CO's
     Account_UUID__c) BEFORE any browser; then in the signed-in page (sign-in wait: 3 consecutive authenticated polls,
@@ -10089,6 +10123,9 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
     now = now or datetime.now(timezone.utc)
     if not isinstance(reference, str) or not REFERENCE.fullmatch(reference):
         return json.dumps(_readback_refused("invalid_co_reference"), separators=(",", ":"))
+    if route not in READBACK_ROUTES or (tenant_name is not None and route != CASE3_ENGINE):
+        return json.dumps(_readback_refused("route_not_supported"), separators=(",", ":"))
+    case3 = route == CASE3_ENGINE
     try:
         probe_reference = production_probe.probe_gate(environ)
         target = production_probe.probe_target()
@@ -10101,14 +10138,23 @@ def run_production_readback(reference: str, *, environ: Any | None = None, now: 
     variants: dict[str, dict[str, Any]] | None = None
     try:
         try:
-            source = (load_source or CE_ROUTE.load_source)(reference)
+            source = (load_source or (CASE3_ROUTE if case3 else CE_ROUTE).load_source)(reference)
         except RouteMismatch:
             raise _ReadbackStop("route_not_ce_only_new") from None
+        except SurfaceSourceError as error:
+            raise _ReadbackStop("route_not_case3_new" if str(error) == "case3_route_mismatch"
+                                else "salesforce_read_failed") from None
         except Exception:
             raise _ReadbackStop("salesforce_read_failed") from None
         try:
-            intended = ce_production_intended(source)
-            expected_row = production_contract.expected_readback_row(intended)
+            if case3:
+                intended = case3_production_intended(source)
+                if tenant_name is not None:
+                    intended["tenant_name"] = " ".join(str(tenant_name).split())
+                expected_row = case3_contract.expected_case3_readback_row(intended)
+            else:
+                intended = ce_production_intended(source)
+                expected_row = production_contract.expected_readback_row(intended)
             production_contract.build_readback_body(intended["tenant_name"])  # validates the search value
         except Exception:
             raise _ReadbackStop("intended_unavailable") from None
@@ -10282,7 +10328,7 @@ def main() -> int:
                 or args.diagnose_confirm or args.readback_only):
             parser.error("--production-readback is a separate read-only run (no --revision, --dry-run, --confirm-write, "
                          "--production-probe, --production-dry-run, --diagnose-confirm or --readback-only)")
-        print(run_production_readback(args.co))
+        print(run_production_readback(args.co, route=args.route, tenant_name=args.tenant_name))
         return 0
     if args.production_dry_run:
         if not args.co or not args.revision:

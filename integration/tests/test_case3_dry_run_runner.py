@@ -140,7 +140,7 @@ class PassingRunTests(unittest.TestCase):
         self.assertEqual(texts["Company primary domain"], MAIN)
         self.assertEqual(texts["Leaked Credentials scanned domains (Comma Separated Values)"], EMAIL)
         self.assertEqual(texts["User email domains (Comma Separated Values)"], "pentera.io")
-        self.assertEqual((texts["Number of assets"], texts["Number of domains"], texts["Number of subdomains"]), ("10000", "500", "500"))
+        self.assertEqual((texts["Number of assets"], texts["Number of domains"], texts["Number of subdomains"]), ("10000", "10000", "500"))
         self.assertEqual(h.page.selects["scanningInterval"].value, "Monthly")  # Go tier
         self.assertEqual(h.page.selects["leakedCredentialsScanningInterval"].value, "Weekly")
         self.assertEqual(h.page.advanced_state["subDomainsReconEnabled"], True)

@@ -173,17 +173,29 @@ class CardTests(Base):
 
     def test_the_last_result_and_the_learn_only_findings_are_shown_in_plain_words(self):
         self.unlocked()
-        self.record("dry_run_passed", when=NOW - timedelta(hours=1), form_fields_checked={"text.company_name": "pass"},
+        self.record("dry_run_passed", when=NOW - timedelta(hours=1),
+                    form_fields_checked={"text.company_name": "pass", "advanced_text.maximum_scan_duration_hours": "pass"},
                     observations={"max_scan_duration_control": "present", "max_scan_duration_default": "24",
                                   "scan_now_control": "absent"})
         html = ui.card_html(self.inputs())
-        for word in ("passed. Nothing was created", "Maximum scan Duration control: present", "default 24", "Scan now"):
+        for word in ("passed. Nothing was created", "Maximum scan Duration control: present", "form default 24 h", "Scan now"):
             self.assertIn(word, html)
+        self.assertNotIn("(default 24 h)", html)  # 24 h is the FORM's default, never the value that is set
+        self.assertIn("Maximum scan Duration set to 90 h and read back", html)  # from the passing advanced_text field
         self.record("refused", when=NOW - timedelta(minutes=5), refusal_reason="max_scan_duration_control_absent",
                     observations={"max_scan_duration_control": "absent"})
         html = ui.card_html(self.inputs())
         self.assertIn("max_scan_duration_control_absent", html)
         self.assertIn("control: absent", html)
+
+    def test_the_90_hour_line_needs_the_passing_field_and_a_passing_run(self):
+        self.unlocked()
+        self.record("refused", refusal_reason="advanced_mismatch", form_fields_checked={
+            "advanced_text.maximum_scan_duration_hours": "pass"}, observations={"max_scan_duration_default": "24"})
+        self.assertNotIn("read back", ui.card_html(self.inputs()))  # a refused run proves nothing was verified
+        self.record("dry_run_passed", when=NOW + timedelta(minutes=1), form_fields_checked={
+            "advanced_text.maximum_scan_duration_hours": "fail"})
+        self.assertNotIn("set to 90 h", ui.card_html(self.inputs()))
 
     def test_a_started_run_shows_the_progress_bar_and_no_form(self):
         self.unlocked()

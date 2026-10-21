@@ -409,7 +409,7 @@ class WiringTests(unittest.TestCase):
                 mock.patch.object(runner.sys, "argv", ["runner", "--production-readback", "--co", CO]), \
                 mock.patch("builtins.print"):
             self.assertEqual(runner.main(), 0)
-        ran.assert_called_once_with(CO)
+        ran.assert_called_once_with(CO, route=runner.CE_ENGINE, tenant_name=None)  # Case 3 added route and short name (2026-10-21)
         bad = (["--production-readback"], ["--production-readback", "--co", CO, "--revision", "x"],
                ["--production-readback", "--co", CO, "--dry-run"], ["--production-readback", "--co", CO, "--confirm-write"],
                ["--production-readback", "--co", CO, "--production-probe"],
