@@ -67,7 +67,7 @@ PRODUCTION_RUNNER_SUPPORTED = False
 # until the owner says go, so this stays False until a separate, reviewed change after that go. It never unlocks the
 # create: `production_unlock_problem` and `production_target` ignore it, and the dry-run target ignores
 # PRODUCTION_RUNNER_SUPPORTED.
-PRODUCTION_DRY_RUN_SUPPORTED = True  # owner go 2026-10-20 for the CO-0800 (Case 3) attended dry run; relock right after
+PRODUCTION_DRY_RUN_SUPPORTED = False
 
 
 def _production_session_problem(environ: Mapping[str, str], now: datetime) -> str | None:

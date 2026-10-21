@@ -78,7 +78,7 @@ class Base(unittest.TestCase):
 class LockedTests(Base):
     def test_constants_are_false_in_this_build(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only; the create needs BOTH
+        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
         self.assertTrue(ui.locked())
 
     def test_no_html_at_all_while_locked_without_records(self):

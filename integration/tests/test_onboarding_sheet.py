@@ -380,7 +380,7 @@ class CardTests(PageBase):
     def test_supported_flags_untouched(self):
         from integration.onboarding import session_readiness
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
         self.assertIs(dashboard.readiness.PRODUCTION_RUNNER_SUPPORTED, False)
 
     def test_escaping(self):

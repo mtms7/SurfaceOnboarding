@@ -135,9 +135,9 @@ LINE_KEYS = BASE_LINE_KEYS | {"variant_result", "variant_absent"}  # the readbac
 class GateTests(unittest.TestCase):
     def test_flags_stay_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
         text = Path(session_readiness.__file__).read_text(encoding="utf-8")
-        self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = True\b")
+        self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = False$")
         self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = False$")
 
     def test_missing_gate_reads_nothing_and_opens_nothing(self):
