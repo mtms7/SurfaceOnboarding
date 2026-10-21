@@ -1367,7 +1367,12 @@ class MainTests(unittest.TestCase):
         with mock.patch.object(runner, "run_production_dry_run", return_value='{"result":"x"}') as ran, \
                 mock.patch.object(runner.sys, "argv", ["runner", "--production-dry-run", "--co", CO, "--revision", REV]):
             self.assertEqual(runner.main(), 0)
-        ran.assert_called_once_with(CO, REV)
+        ran.assert_called_once_with(CO, REV, route="case_2_new_ce_only")  # the default route stays CE-only
+        with mock.patch.object(runner, "run_production_dry_run", return_value='{"result":"x"}') as ran, \
+                mock.patch.object(runner.sys, "argv", ["runner", "--production-dry-run", "--co", CO, "--revision", REV,
+                                                       "--route", "case_3_combined_baseline"]):
+            self.assertEqual(runner.main(), 0)
+        ran.assert_called_once_with(CO, REV, route="case_3_combined_baseline")  # owner decision 2026-10-20
         for extra in ([], ["--co", CO], ["--co", CO, "--revision", REV, "--dry-run"],
                       ["--co", CO, "--revision", REV, "--confirm-write"],
                       ["--co", CO, "--revision", REV, "--route", "case_1_new_surface_only"],

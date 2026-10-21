@@ -42,6 +42,7 @@ from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import state_paths
 from integration.onboarding import production_views
 from integration.onboarding import production_create_ui as create_ui
+from integration.onboarding import production_dry_run_ui as dry_ui
 from integration.onboarding import review_approval
 from integration.onboarding import runner_child_log
 from integration.onboarding import run_progress
@@ -53,6 +54,7 @@ from integration.onboarding.production_approval import STATE_FILE_NAME as PRODUC
 from integration.onboarding.renewal_mirror import mirror_tenant_ids
 from integration.onboarding import session_readiness as readiness
 from integration.onboarding.session_readiness import SessionState, SessionStatus
+from tools import clone_autorefresh
 from phase1_validator.onboarding_comment_dates import extract_dealhub_dates
 from phase1_validator.surface_source_readiness import evaluate_new_surface_source
 from phase2_leonardo.case4_comment_validation import (
@@ -6886,10 +6888,10 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
             detail = None
         production_views.apply_own_onboarding(guide, own + (" " + detail + "." if detail else ""))
     main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
-                 + _production_guide_html(guide, match))
+                 + _production_dry_run_html(reference, row) + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)
     refresh = ("<meta http-equiv='refresh' content='5'>"
-               if progress is not None and not progress["done"] and not progress["failed"] else "")
+               if progress is not None and not progress["done"] and not progress["failed"] else "") or _dry_run_refresh(reference)
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod", refresh=refresh)
 
 
@@ -6965,6 +6967,8 @@ def _clone_strip() -> str:
                 else "<span class='chip chip-warn'>" + escape(words) + " &middot; stale, not trusted</span>")
     note = ("" if info["state"] == "fresh" else
             "<p class='note'>No production check is trusted until the clone is fresh. Refresh it with " + _collect_hint_html() + ".</p>")
+    if info["state"] != "fresh" and clone_autorefresh.describe():
+        note += "<p class='note'>" + escape(clone_autorefresh.describe()) + "</p>"
     return ("<div class='strip'>" + chip + "<span class='chip chip-neutral'>Source: Redash, personal data removed</span></div>" + note)
 
 
@@ -7200,6 +7204,11 @@ def _other_checks(summary: dict[str, Any], row: dict[str, str | None] | None) ->
             failed += 1
             email = _check_item("Email domain", "Exactly one CE email domain is required; found " + str(len(extra)) + ".",
                                 _chip("chip-bad", str(len(extra))))
+        elif extra and row is not None and row.get("Onboarding_Approval_Status__c") == "Approved":
+            # Owner 2026-10-20: Approved in Salesforce means the CO was checked by hand and is ready; no warning.
+            email = _check_item("Email domain", "The main domain " + escape(primary) + " differs from the CE email domain "
+                                + escape(extra[0]) + "; accepted, the CO is Approved in Salesforce.",
+                                _chip("chip-neutral", "Differs, accepted (Approved)"))
         elif extra:  # a warning to see BEFORE approving, never a blocker
             email = _check_item("Email domain", "Warning: the main domain " + escape(primary) + " differs from the CE email "
                                 "domain " + escape(extra[0]) + ". Check that both are right before approving.",
@@ -7538,10 +7547,10 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     sheet = _onboarding_sheet_card(ref, row, match=check, ce_route=summary["route"] == CE_ENGINE,
                                    start_iso=str(plan.get("license_start") or ""), country=country)
     main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
-            + _production_create_html(ref, row, state) + ready + blocked
+            + _production_create_html(ref, row, state) + _production_dry_run_html(ref, row) + ready + blocked
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
             + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + sheet + approval_card + record_card)
-    return _app_shell("Review " + ref, main, active="prod_onboarding")
+    return _app_shell("Review " + ref, main, active="prod_onboarding", refresh=_dry_run_refresh(ref))
 
 
 _APPROVAL_STATE_CHIPS = {"valid": ("chip-ok", "Valid"), "expired": ("chip-warn", "Expired"), "consumed": ("chip-neutral", "Used")}
@@ -7779,6 +7788,70 @@ def _production_run_progress(reference: str) -> dict[str, Any] | None:
     running = create_ui.LAUNCHES.busy() or run.get("follow") is None
     return create_ui.production_progress(production_records_parent(), reference, run["since"], running=running,
                                          follow=run.get("follow"))
+
+
+# ---- Case 3 production DRY RUN (owner decision 2026-10-20): a launch button with a progress bar -------------------------------
+# Keyed on PRODUCTION_DRY_RUN_SUPPORTED only; it fills the real production form and Cancels. It never creates anything, never
+# writes to Salesforce and never uses up the approval. One entry per CO started by THIS dashboard process:
+# {"since": launch time (UTC; milestones and records older than it never count), "process": the runner process}.
+PRODUCTION_DRY_RUNS: dict[str, dict[str, Any]] = {}
+
+
+def _launch_production_dry_run(reference: str, revision: str, route: str, env: dict[str, str]) -> Any:
+    """Start the one visible production DRY RUN process (desktop only); None when it cannot be started."""
+    if (route != CASE3_ENGINE or not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
+            or not ATTENDED_CE_ONLY_RUNNER.is_file()):
+        return None
+    child = {**os.environ, **{k: v for k, v in env.items() if k.startswith("SURFACE_ONBOARDING_PRODUCTION_")}}
+    child.pop(runner_child_log.LOG_ENV, None)
+    folder = runner_log_dir()
+    if folder is not None:  # the runner writes its own redacted, fixed-enum log there (codes and record names only)
+        child[runner_child_log.LOG_ENV] = str(folder / (reference + "-dryrun-" + datetime.now(timezone.utc)
+                                                        .strftime("%Y%m%dT%H%M%SZ") + ".log"))
+    since = dry_ui.now_stamp()
+    try:
+        process = subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-dry-run", "--co", reference,
+                                    "--revision", revision, "--route", route], env=child, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    with _PRODUCTION_RUNS_LOCK:
+        PRODUCTION_DRY_RUNS[reference] = {"since": since, "process": process}
+    return process
+
+
+def _production_dry_run_state(reference: str) -> dict[str, Any] | None:
+    """``{"since", "running", "events"}`` of the dry run this dashboard started for ``reference``, else None."""
+    with _PRODUCTION_RUNS_LOCK:
+        run = dict(PRODUCTION_DRY_RUNS.get(reference) or {})
+    if not run:
+        return None
+    try:
+        running = run["process"].poll() is None
+    except Exception:  # noqa: BLE001 - an unreadable handle counts as still running (fail closed)
+        running = True
+    try:
+        import tools.attended_ce_only_playwright as runner_module
+        events = run_progress.read_milestones(runner_module.PROGRESS_PATH, reference, run["since"])
+    except Exception:  # noqa: BLE001 - no milestone is shown rather than a guess
+        events = []
+    return {"since": run["since"], "running": running, "events": events}
+
+
+def _dry_run_refresh(reference: str) -> str:
+    """The page-refresh meta while this dashboard's dry run for ``reference`` is running, else ''."""
+    state = _production_dry_run_state(reference)
+    return "<meta http-equiv='refresh' content='5'>" if state is not None and state["running"] else ""
+
+
+def _production_dry_run_html(reference: str, row: dict[str, str | None] | None) -> str:
+    """The Case 3 dry-run section of a production CO page ('' for any other CO). Any failure shows no control."""
+    if dry_ui.route_for_row(row) is None:  # not a Case 3 CO: no card, and no Salesforce-readiness probe for it
+        return ""
+    try:
+        return dry_ui.card_html(_create_ui_inputs(reference, row), _production_dry_run_state(reference))
+    except Exception:  # noqa: BLE001 - fail closed: no control
+        return ""
 
 
 _STAGE_MOVE_LOCK = Lock()  # one CE stage move at a time: the BackOffice check's follow-up and the background job
@@ -8421,7 +8494,7 @@ POST_ROUTES = frozenset({
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
     "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
-    "/attended/review-approve",
+    "/attended/review-approve", dry_ui.DRY_RUN_PATH,
     *sorted(create_ui.POST_PATHS),
 })
 
@@ -8789,6 +8862,23 @@ class Handler(BaseHTTPRequestHandler):
                            "recorded. Nothing was started.</p><p><a href='/onboard/" + escape(reference) + "'>Return</a></p>"); return
         self.send_redirect("/onboard/" + reference + "?notice=approved")
 
+    def _post_production_dry_run(self, reference: str, form: Any) -> None:
+        """The Case 3 production DRY RUN post (owner decision 2026-10-20). Re-checks every gate with a fresh CO read."""
+        back = "<p><a href='/co/" + escape(reference) + "?env=prod'>Return to " + escape(reference) + "</a></p>"
+        try:
+            row = detail_row(reference)
+        except ReadUnavailable:
+            self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
+        code = dry_ui.handle_post(form or {}, _create_ui_inputs(reference, row, self.request_operator()),
+                                  _launch_production_dry_run)
+        if code != "launched":
+            body = ("<div class='banner banner-warn'><span class='chip chip-warn'>Not done</span> " + escape(dry_ui.text(code))
+                    + " Nothing was sent.</div><p class='note'>Code: <code>" + escape(code) + "</code></p>" + back)
+            self.send_page(HTTPStatus.CONFLICT, _app_shell(reference + " not done", "<section class='card'>" + body + "</section>",
+                                                           active="prod_onboarding", env="prod"))
+            return
+        self.send_redirect("/co/" + reference + "?env=prod")  # the CO page shows the progress bar (same dashboard)
+
     def _post_production_create(self, path: str, reference: str, form: Any) -> None:
         """The guarded production create and UUID write posts (docs/53). Each re-checks every gate with a fresh CO read."""
         co_page = "/co/" + escape(reference) + "?env=prod"
@@ -8982,6 +9072,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/attended/review-approve":
             self._post_review_approve(reference, form); return
+        if path == dry_ui.DRY_RUN_PATH:
+            self._post_production_dry_run(reference, form); return
         if path in create_ui.POST_PATHS:
             self._post_production_create(path, reference, form); return
         gated_action = SESSION_GATED_ROUTES.get(path)
@@ -9331,4 +9423,6 @@ if __name__ == "__main__":
     _timing_logger.setLevel(logging.INFO)
     if not vm_mode():
         Thread(target=_auto_scan_loop, name="auto-scan", daemon=True).start()
+        if clone_autorefresh.enabled(vm=vm_mode()):
+            Thread(target=clone_autorefresh.run_loop, name="clone-autorefresh", daemon=True).start()
     ThreadingHTTPServer((listener_host, listener_port), Handler).serve_forever()

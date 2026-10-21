@@ -99,9 +99,19 @@ class ApprovalPairTests(unittest.TestCase):
         """The create stays CE-only: even a valid Case 3 approval is refused by the create gate's route rule."""
         self.issue()
         self.assertEqual(production_create.production_approval.ALLOWED_ROUTE, CE)
-        gate_source = Path(production_create.__file__).read_text(encoding="utf-8")
-        self.assertIn("if inputs.route != production_approval.ALLOWED_ROUTE:", gate_source)
-        self.assertIn('return "route_not_ce_only_new"', gate_source)
+        # Behaviour, not source text: a live gate (the default, or dry_run anything but exactly True) refuses Case 3; only a
+        # dry run accepts it (integration/tests/test_case3_dry_run_route.py covers the dry-run side).
+        inputs = production_create.CreateInputs(
+            co_reference=CO, route=CASE3, approval_ref=REF, approval_path=self.path, source_revision=REV,
+            source_revision_now=REV, now=NOW, environ={production_create.SESSION_REF_ENV: REF}, sf_email_domains=("a.example",),
+            sf_source_consistent=True, prior_account_uuid=None, clone_collected_at=NOW, clone_matches=True,
+            duplicate_found=False, live_paid_tenant_count=0, timing_allowed=True, csm_request_recorded=False,
+            sessions_ready=True, schema_ok=True, expected_tenant_name="Customer", expected_domains=("a.example",))
+        open_target = lambda environ, now: None  # noqa: E731 - the target gate is not what this test is about
+        for flag in (False, None, 1):
+            self.assertEqual(production_create.evaluate_gate(inputs, open_target, pa.check, dry_run=flag),
+                             "route_not_ce_only_new")
+        self.assertEqual(production_create.evaluate_gate(inputs, open_target, pa.check), "route_not_ce_only_new")
 
 
 class IssueToolCase3Tests(unittest.TestCase):
@@ -172,13 +182,16 @@ class Case3ApprovalStatusTests(unittest.TestCase):
 class DomainWarningTests(unittest.TestCase):
     """Case 3: the main domain and the CE email domain; orange (not a blocker) when they differ."""
 
-    def checks(self, domains, *, route=None, plan_primary="customer.example", alternates=()):
+    def checks(self, domains, *, route=None, plan_primary="customer.example", alternates=(), status=None):
         summary = {"route": route or dashboard.CASE3_ENGINE,
                    "values": {"domains": list(domains),
                               "plan": {"license_start": "2026-10-19", "primary_domain": plan_primary,
                                        "alternate_domains": tuple(alternates)}}}
+        row = {"Account_UUID__c": None}
+        if status is not None:
+            row["Onboarding_Approval_Status__c"] = status
         with mock.patch.object(dashboard, "production_now", return_value=NOW):
-            return dashboard._other_checks(summary, {"Account_UUID__c": None})
+            return dashboard._other_checks(summary, row)
 
     def test_same_domain_is_ok_and_not_a_warning(self):
         html, failed = self.checks(["customer.example", "customer.example"])
@@ -197,6 +210,24 @@ class DomainWarningTests(unittest.TestCase):
         self.assertIn("customer.example", block)
         self.assertIn("customer-mail.example", block)
         self.assertEqual(failed, 0)  # a warning to see before approving, never a blocker
+
+    def test_an_approved_co_was_checked_by_hand_so_a_different_email_domain_is_accepted_not_a_warning(self):
+        """Owner 2026-10-20: Approved in Salesforce means manually checked and ready; the page must not nag about the domains."""
+        html, failed = self.checks(["customer.example", "customer-mail.example"], status="Approved")
+        block = html[html.index("Email domain"):]
+        self.assertNotIn("chip-warn", block.split("</li>")[0])
+        self.assertIn("accepted", block)
+        self.assertIn("Approved", block)
+        self.assertNotIn("before approving", block)
+        self.assertEqual(failed, 0)
+        for status in ("Pending", None, "Rejected"):  # anything else keeps the orange warning
+            html, failed = self.checks(["customer.example", "customer-mail.example"], status=status)
+            self.assertIn("chip-warn", html[html.index("Email domain"):], status)
+            self.assertEqual(failed, 0)
+
+    def test_an_approved_co_with_more_than_one_email_domain_is_still_a_blocker(self):
+        _html, failed = self.checks(["customer.example", "a.example", "b.example"], status="Approved")
+        self.assertEqual(failed, 1)
 
     def test_more_than_one_email_domain_is_a_blocker(self):
         html, failed = self.checks(["customer.example", "a.example", "b.example"])

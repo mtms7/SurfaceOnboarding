@@ -1324,8 +1324,11 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         routed = set(_re.findall(r'"(/attended/[a-z0-9-]+)"', source))
         # The guarded production create routes (docs/53) are dispatched as a set (create_ui.POST_PATHS), not by literal.
         from integration.onboarding import production_create_ui as _create_ui
-        self.assertEqual(routed | set(_create_ui.POST_PATHS), set(dashboard.POST_ROUTES))
+        from integration.onboarding import production_dry_run_ui as _dry_ui
+        # The Case 3 production dry run (owner decision 2026-10-20) is dispatched by its constant, a separate action.
+        self.assertEqual(routed | set(_create_ui.POST_PATHS) | {_dry_ui.DRY_RUN_PATH}, set(dashboard.POST_ROUTES))
         self.assertIn("create_ui.POST_PATHS", source)
+        self.assertIn("dry_ui.DRY_RUN_PATH", source)
 
     def test_removed_check_routes_launch_nothing(self):
         # Called on a fake request (no socket): an unknown route must return

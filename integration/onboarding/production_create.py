@@ -135,9 +135,15 @@ def _clone_problem(inputs: CreateInputs) -> str | None:
     return None
 
 
+CASE3_ROUTE = "case_3_combined_baseline"
+# Owner decision 2026-10-20: the production DRY RUN may also cover Case 3 (CO-0800); the live create stays CE-only.
+DRY_RUN_ROUTES = (production_approval.ALLOWED_ROUTE, CASE3_ROUTE)
+
+
 def evaluate_gate(inputs: CreateInputs,
                   production_target_fn: Callable[[Mapping[str, str], datetime], Any] = production_target,
-                  approval_check_fn: Callable[..., str | None] = production_approval.check) -> str | None:
+                  approval_check_fn: Callable[..., str | None] = production_approval.check,
+                  *, dry_run: bool = False) -> str | None:
     """The first refusal reason, in exactly this order, or None when every gate is open. Pure: no side effect.
 
     1. production target: session unlock values and the runner flag (``production_locked:<reason>``);
@@ -146,7 +152,7 @@ def evaluate_gate(inputs: CreateInputs,
        (``approval_revision_drift``);
     4. approval check: unreadable, missing, consumed, expired, wrong CO, wrong route, or drifted revision, judged
        against the CURRENT revision;
-    5. route must be CE-only new; 6. exactly one valid email domain; 7. Salesforce source consistent; 8. no prior
+    5. route must be CE-only new (a dry run, ``dry_run=True``, also accepts Case 3; the live create never does); 6. exactly one valid email domain; 7. Salesforce source consistent; 8. no prior
     Account UUID; 9. clone present, fresh and matching; 10. no duplicate in production; 11. at most one live paid
     tenant; 12. timing window or recorded CSM request; 13. sessions ready; 14. schema as expected.
     """
@@ -163,7 +169,9 @@ def evaluate_gate(inputs: CreateInputs,
                                 current, inputs.now)
     if problem is not None:
         return problem
-    if inputs.route != production_approval.ALLOWED_ROUTE:
+    # ``dry_run`` must be exactly True to widen the route set; any other value is a live create (CE-only).
+    allowed = DRY_RUN_ROUTES if dry_run is True else (production_approval.ALLOWED_ROUTE,)
+    if inputs.route not in allowed:
         return "route_not_ce_only_new"
     if _domain_problem(inputs.sf_email_domains):
         return "salesforce_email_domain_not_single"
@@ -363,7 +371,7 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     # A dry run is gated by its own target (PRODUCTION_DRY_RUN_SUPPORTED); a live create only by production_target.
     if _production_target_fn is None:
         _production_target_fn = production_dry_run_target if dry_run is True else production_target
-    reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn)
+    reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn, dry_run=dry_run is True)
     if reason is not None:
         return _refuse(write_record, inputs, reason)
     if not isinstance(dry_run, bool):

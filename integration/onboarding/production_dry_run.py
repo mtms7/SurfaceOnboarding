@@ -136,7 +136,14 @@ KNOWN_REASONS = frozenset({
     "unmapped_select", "selects_incomplete", "unmapped_toggle", "toggles_incomplete", "license_dates_invalid",
     "plan_shape_unexpected", "value_has_control_character", "leonardo_profile_unavailable", "browser_cdp_unavailable",
     "browser_tab_unavailable", "production_dry_run_form_not_reached", "dry_run_line_not_redacted",
-    "invalid_co_reference", "confirm_preflight_failed", "unexpected_error", *(f"production_locked_{s}" for s in _LOCKED_SUFFIXES)})
+    "invalid_co_reference", "confirm_preflight_failed", "unexpected_error", *(f"production_locked_{s}" for s in _LOCKED_SUFFIXES),
+    # Case 3 (Surface & Credential Exposure) dry run, owner decision 2026-10-20: the source's own fixed codes, never free text.
+    "case3_alternate_domains_not_supported", "case3_term_mismatch", "case3_route_mismatch", "case3_ce_email_domain_invalid",
+    "case3_core_plus_missing", "case3_source_unavailable", "max_scan_duration_control_absent", "ce_subscription_ambiguous", "ce_subscription_unavailable",
+    "surface_route_mismatch", "surface_source_unavailable", "surface_subscription_invalid", "surface_product_unrecognized",
+    "surface_baseline_unavailable", "surface_baseline_ambiguous", "surface_tier_unknown", "surface_main_domain_invalid",
+    "surface_domains_invalid", "surface_networks_not_supported", "surface_domains_exceed_license",
+    "surface_license_dates_unavailable"})
 
 
 def known_reason(code: object) -> str:
@@ -323,8 +330,14 @@ ADVANCED_NAMES = ("automatedDiscoveryEnabled", "subDomainsReconEnabled", "webDic
 # Read only and informational: no Dev target exists for it (SpyCloud ON is the server default, docs/48 section 2).
 INFO_ADVANCED_NAMES = ("spyCloudEnabled",)
 ADVANCED_BUTTON_TEXT = "Advanced options"
+# Surface / Case 3 only (owner answer 2026-10-20: 90 h in production): a number input under "Advanced options" that the CE-only
+# plan never carries. The dry run reads its default, sets the value and reads it back (nothing is submitted).
+MAX_SCAN_DURATION_LABEL = "Maximum scan Duration (hours)"
+ADVANCED_TEXT_LABELS = (MAX_SCAN_DURATION_LABEL,)
+_DURATION_VALUE = re.compile(r"[1-9][0-9]{0,2}")
 
-_KNOWN_LABELS = frozenset(label_key(x) for x in (*TEXT_LABELS, *BLANK_LABELS, OPERATOR_LABEL, SCAN_NOW_LABEL))
+_KNOWN_LABELS = frozenset(label_key(x) for x in (*TEXT_LABELS, *BLANK_LABELS, OPERATOR_LABEL, SCAN_NOW_LABEL,
+                                                 *ADVANCED_TEXT_LABELS))
 _KNOWN_NAMES = frozenset((*SELECT_NAMES, *TOGGLE_NAMES))
 _KNOWN_ADVANCED = frozenset((*ADVANCED_NAMES, *INFO_ADVANCED_NAMES))
 _KNOWN_DATA_AM = frozenset(DATA_AM.values())
@@ -345,6 +358,7 @@ class IntendedForm:
     advanced_targets: tuple[tuple[str, bool], ...]
     dates: tuple[tuple[str, date], ...]
     scan_now: bool | None
+    advanced_texts: tuple[tuple[str, str], ...] = ()  # Surface plans only: (label, value); empty for CE-only
 
 
 def map_plan(plan: Mapping[str, Any], select_names: Mapping[str, str], early_labels: tuple[str, ...]) -> IntendedForm:
@@ -393,8 +407,18 @@ def map_plan(plan: Mapping[str, Any], select_names: Mapping[str, str], early_lab
         raise MappingError("toggles_incomplete")
     if not isinstance(start, date) or not isinstance(end, date):
         raise MappingError("license_dates_invalid")
+    raw_advanced = plan.get("advanced_texts") or {}
+    if not isinstance(raw_advanced, Mapping):
+        raise MappingError("plan_shape_unexpected")
+    advanced_texts = []
+    for label, value in raw_advanced.items():
+        if label not in ADVANCED_TEXT_LABELS:
+            raise MappingError("unmapped_text_label")
+        if not isinstance(value, str) or not _DURATION_VALUE.fullmatch(value):
+            raise MappingError("fill_value_invalid")
+        advanced_texts.append((label, value))
     return IntendedForm(tuple(texts), BLANK_LABELS, tuple(selects), tuple(toggles), tuple(targets),
-                        (("license_start", start), ("license_end", end)), scan_now)
+                        (("license_start", start), ("license_end", end)), scan_now, tuple(advanced_texts))
 
 
 def field_keys(intended: IntendedForm) -> list[str]:
@@ -404,6 +428,7 @@ def field_keys(intended: IntendedForm) -> list[str]:
     keys += [f"select.{name}" for name, _o, _e in intended.selects]
     keys += [f"toggle.{name}" for name, _t in intended.toggles]
     keys += [f"date.{key}" for key, _ in intended.dates]
+    keys += [f"advanced_text.{slug(label)}" for label, _ in intended.advanced_texts]
     keys += ["operator_account_empty"]
     if intended.scan_now is not None:
         keys.append("toggle.scan_now")
@@ -436,6 +461,10 @@ def compare_reads(intended: IntendedForm, reads: Mapping[str, Any],
         result[f"toggle.{name}"] = "pass" if toggles.get(name) is target else "fail"
     for key, _value in intended.dates:
         result[f"date.{key}"] = "pass" if dates.get(key) is True else "fail"
+    advanced = _mapping(reads.get("advanced_texts"))
+    for label, expected in intended.advanced_texts:
+        actual = advanced.get(label)
+        result[f"advanced_text.{slug(label)}"] = "pass" if isinstance(actual, str) and actual == expected else "fail"
     result["operator_account_empty"] = "pass" if reads.get("operator_empty") is True else "fail"
     if intended.scan_now is not None:
         result["toggle.scan_now"] = "pass" if reads.get("scan_now") is intended.scan_now else "fail"

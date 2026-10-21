@@ -22,7 +22,7 @@ Task Scheduler shows 1 and 2 as a failed last run.
 param(
     [string]$PythonPath = 'C:\Users\Milton Stevenson\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe',
     [ValidateRange(15, 1440)][int]$IntervalMinutes = 60,
-    [ValidateSet(251, 253)][int]$QueryId = 251,
+    [ValidateSet(251, 253)][int]$QueryId = 253,
     [switch]$Remove
 )
 

@@ -9282,8 +9282,24 @@ def _pdr_duplicate_problem(page: Any, tenant_name: str, domains: tuple[str, ...]
     return production_dry_run.duplicate_verdict(replies, reader.demo_reply(domains), tenant_name, domains)
 
 
-def _pdr_clone_facts(source: Any, now: datetime) -> dict[str, Any]:
-    """Facts from the production-clone snapshot (Redash, read only): captured time, usable, duplicate, live paid count."""
+def _pdr_plan(route: str, source: Any, run_day: date) -> dict[str, Any]:
+    """The Dev fill plan for a production dry run of ``route`` (CE-only, or Case 3 from the owner's 2026-10-20 decision).
+
+    Case 3 refuses alternate domains and subdomains explicitly (CO-0800 lists none; the production fill does not type them),
+    starts the licence on the run day and ends it on the subscription end (``case3_license_dates``).
+    """
+    if route == CASE3_ENGINE:
+        if source.alternate_domains or source.subdomains:
+            raise production_dry_run.MappingError("case3_alternate_domains_not_supported")
+        return build_case3_fill(source, run_day)
+    return build_ce_only_fill(source, source.subscription_start)
+
+
+def _pdr_clone_facts(source: Any, now: datetime, route: str = CE_ENGINE) -> dict[str, Any]:
+    """Facts from the production-clone snapshot (Redash, read only): captured time, usable, duplicate, live paid count.
+
+    The duplicate check covers every domain the route brings: the CE email domain for CE-only; the main domain and the CE
+    email domain for Case 3."""
     from integration.onboarding import leonardo_inventory as inventory
 
     facts: dict[str, Any] = {"collected_at": None, "clone_matches": False, "duplicate_found": False,
@@ -9293,7 +9309,7 @@ def _pdr_clone_facts(source: Any, now: datetime) -> dict[str, Any]:
         facts["collected_at"] = datetime.strptime(payload["captured_at"], PDR_STAMP).replace(tzinfo=timezone.utc)
     except (inventory.InventoryError, KeyError, ValueError, TypeError, OSError):
         return facts
-    gate = inventory.production_duplicate_gate(clone_root(), source.tenant_name, _co_domains(CE_ROUTE, source), now=now,
+    gate = inventory.production_duplicate_gate(clone_root(), source.tenant_name, _co_domains(ROUTES[route], source), now=now,
                                                max_age=PDR_CLONE_MAX_AGE_FOREVER)
     facts["duplicate_found"] = gate["result"] == "duplicate_production_clone_match"
     facts["clone_matches"] = gate["result"] in ("production_clone_no_match", "duplicate_production_clone_match")
@@ -9416,6 +9432,65 @@ def _pdr_text(page: Any, label: str) -> Any | None:
         return control if control.count() == 1 else None
     except Exception:
         return None
+
+
+def _pdr_advanced_text(page: Any, label: str) -> Any | None:
+    """The one Advanced-options input with ``label`` (Maximum scan Duration), else None.
+
+    Dev's proven lookup (live probe 2026-09-29): the accessible label first, then the label of the enclosing
+    ``.MuiFormControl-root`` (the number input has no name, id or data-am). Exactly one match; never a click, never forced.
+    """
+    control = _pdr_text(page, label)
+    if control is not None:
+        return control
+    try:
+        escaped = label.replace("\\", "\\\\").replace('"', '\\"')
+        found = page.locator(f'.MuiFormControl-root:has(> label:text-is("{escaped}")) input:not([type=hidden])')
+        return found if found.count() == 1 else None
+    except Exception:
+        return None
+
+
+def _pdr_advanced_text_value(page: Any, label: str) -> str | None:
+    control = _pdr_advanced_text(page, label)
+    try:
+        value = control.first.input_value() if control is not None else None
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _pdr_learn_and_set_advanced_texts(page: Any, intended: Any, extras: dict[str, Any]) -> None:
+    """Surface plans only: read the Maximum scan Duration default, set the planned value, read it back (nothing is submitted).
+
+    The findings go to ``extras["observations"]`` as names and short tokens only. A missing, disabled or unreadable control
+    refuses with ``max_scan_duration_control_absent`` (that refusal is the finding); a value that does not stick refuses with
+    ``fill_value_mismatch``. The caller cancels the form in every case."""
+    refusal = production_create.FormRefusal
+    notes = extras.setdefault("observations", {})
+    for label, expected in intended.advanced_texts:
+        control = _pdr_advanced_text(page, label)
+        if control is None:
+            notes["max_scan_duration_control"] = "absent"
+            raise refusal("max_scan_duration_control_absent")
+        try:
+            if not control.first.is_enabled():
+                notes["max_scan_duration_control"] = "disabled"
+                raise refusal("max_scan_duration_control_absent")
+            default = control.first.input_value()
+            notes["max_scan_duration_default"] = default if isinstance(default, str) and re.fullmatch(r"[0-9]{1,6}", default) \
+                else "unreadable"
+            control.first.fill(expected, timeout=FIELD_TIMEOUT_MS)
+            actual = control.first.input_value()
+        except production_create.FormRefusal:
+            raise
+        except Exception:
+            notes["max_scan_duration_control"] = "unreadable"
+            raise refusal("max_scan_duration_control_absent") from None
+        if actual != expected:
+            notes["max_scan_duration_control"] = "present"
+            raise refusal("fill_value_mismatch")
+        notes["max_scan_duration_control"] = "present"
 
 
 def _pdr_checkbox(page: Any, key: str) -> Any | None:
@@ -9547,7 +9622,7 @@ def _pdr_read_advanced(page: Any, clicks: Any, targets: dict[str, bool], set_tar
 
 def _pdr_form_reads(page: Any, intended: Any, date_kept: Any) -> dict[str, Any]:
     """Read (never change) every verified control of the open form, in the shape ``production_dry_run.compare_reads`` takes."""
-    return {
+    reads = {
         "texts": {label: _pdr_input_value(page, label) for label, _v in intended.texts},
         "blanks": {label: _pdr_input_value(page, label) for label in intended.blanks},
         "selects": {name: _pdr_read_selected(page, name) for name, _o, _e in intended.selects},
@@ -9556,6 +9631,9 @@ def _pdr_form_reads(page: Any, intended: Any, date_kept: Any) -> dict[str, Any]:
         "operator_empty": _verify_operator_account_empty(page) is None,
         "scan_now": _pdr_read_checked(page, "scan_now") if intended.scan_now is not None else None,
     }
+    if intended.advanced_texts:  # Surface plans only: the CE-only read keeps its exact shape
+        reads["advanced_texts"] = {label: _pdr_advanced_text_value(page, label) for label, _v in intended.advanced_texts}
+    return reads
 
 
 def _pdr_form_signature(form: Any) -> list[tuple[str, str, str, str]] | None:
@@ -9624,6 +9702,9 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
                 failure, _target = _pdr_select_by_name(page, name, option)
                 if failure:
                     raise refusal(failure)
+        if intended.advanced_texts:  # Surface plans only (learn-only): does "Scan now" exist once an interval is chosen?
+            extras.setdefault("observations", {})["scan_now_control"] = (
+                "present" if _pdr_text(page, production_dry_run.SCAN_NOW_LABEL) is not None else "absent")
         if intended.scan_now is not None and not _pdr_set_toggle(page, clicks, "scan_now", intended.scan_now):
             raise refusal("fill_form_schema_unavailable")
         for key, target in intended.toggles:
@@ -9647,6 +9728,8 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
             if not fill_date(page, key, value):
                 raise refusal("fill_form_schema_unavailable")
         extras.update(_pdr_read_advanced(page, clicks, dict(intended.advanced_targets), set_targets=True))
+        if intended.advanced_texts:  # the Advanced section is open now: Maximum scan Duration (Surface plans only)
+            _pdr_learn_and_set_advanced_texts(page, intended, extras)
         after = production_probe.sanitize_form(page.evaluate(production_probe.FORM_JS))
         problem = production_dry_run.schema_problem(after, after_advanced=True) or production_dry_run.advanced_problem(extras)
         if problem:
@@ -9713,12 +9796,15 @@ def _pdr_browser_page(target: RunTarget, wait_seconds: float):
                 _close_automation_browser_at(tab.profile_dir)
 
 
-def run_production_dry_run(reference: str, acknowledged_revision: str, *, environ: Any | None = None,
+def run_production_dry_run(reference: str, acknowledged_revision: str, *, route: str = CE_ENGINE,
+                           environ: Any | None = None,
                            now: datetime | None = None, records_parent: Path | None = None,
                            approval_path: Path | None = None, wait_seconds: float = MAX_WAIT_SECONDS,
                            load_source: Any = None, clone_facts: Any = None, open_page: Any = None,
                            fill_date: Any = None, date_kept: Any = None, clock: Any = None, org_probe: Any = None) -> str:
-    """One attended production DRY RUN for one CE-only New CO. Returns the printed line; never creates anything.
+    """One attended production DRY RUN for one CO of ``route``: CE-only New (default) or, since the owner's decision of
+    2026-10-20, Case 3 (Surface & Credential Exposure, New; CO-0800). Any other route is refused before a source read or a
+    browser. Returns the printed line; never creates anything.
 
     Every external step is injectable (tests): ``load_source`` (the fixed Salesforce read), ``clone_facts`` (the Redash
     clone helpers), ``open_page`` (a context manager yielding the signed-in page) and the two date helpers. Order: the
@@ -9749,8 +9835,10 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
             merged["refusal_reason"] = _pdr_reason(merged["refusal_reason"])
         return production_create_record.record(parent, merged, stamp())
 
+    record_route = route if route in ROUTES else CE_ENGINE  # a record never carries free text as its route
+
     def refused(reason: str) -> str:
-        data = {"co_reference": reference, "route": CE_ENGINE, "outcome": production_create.OUTCOME_REFUSED,
+        data = {"co_reference": reference, "route": record_route, "outcome": production_create.OUTCOME_REFUSED,
                 "refusal_reason": _pdr_reason(reason),
                 "salesforce_revision": acknowledged_revision}
         if production_approval.REFERENCE_PATTERN.fullmatch(reference_value):
@@ -9760,6 +9848,23 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
         except Exception:
             name = None
         return _pdr_line(data["refusal_reason"], outcome="refused", record=name)
+
+    # 0. Only the CE-only and Case 3 routes have a production dry run: anything else is refused before a read or a browser.
+    if route not in production_create.DRY_RUN_ROUTES:
+        return refused("route_not_ce_only_new")
+    case3 = route == CASE3_ENGINE
+    run_day = given_now.date() if given_now else _run_day()  # Case 3 licence start = the run day (local), owner 2026-10-20
+
+    def note(step: str) -> None:
+        """Case 3 only (the CE-only dry run writes none): one real milestone for the dashboard progress bar. Best effort:
+        a progress file that cannot be written never changes the run."""
+        if case3:
+            try:
+                run_progress.record_milestone(PROGRESS_PATH, reference, {"t": stamp().strftime(PDR_STAMP), "step": step,
+                                                                         "outcome": "ok"})
+            except Exception:
+                pass
+
 
     # 1. The unlock target first: while PRODUCTION_DRY_RUN_SUPPORTED is False nothing below runs (no read, no browser).
     if reference_value and not (environ.get(PDR_ENV_ISSUED) and environ.get(PDR_ENV_EXPIRES)):
@@ -9782,8 +9887,8 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
 
     # 2. Source of the intended values: the fixed Salesforce reads of the Dev runner (no new query).
     try:
-        source = (load_source or CE_ROUTE.load_source)(reference)
-        plan = build_ce_only_fill(source, source.subscription_start)
+        source = (load_source or ROUTES[route].load_source)(reference)
+        plan = _pdr_plan(route, source, run_day)
         intended = production_dry_run.map_plan(plan, SELECT_NAMES, EARLY_SELECTS)
     except production_dry_run.MappingError as error:
         return refused(str(error))
@@ -9793,23 +9898,28 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
         return refused(_pdr_reason(str(error)))
     except Exception:
         return refused("salesforce_fill_source_unavailable")
+    note("pdr_source")
+    # The domains the duplicate check searches besides the tenant name: the CE email domain for CE-only; the main domain and
+    # the single CE email domain for Case 3 (one search each, deduplicated when they are the same).
+    email_domain = source.ce_email_domain if case3 else source.email_domain
+    domains = tuple(dict.fromkeys(_co_domains(ROUTES[route], source)))
     try:
-        facts = (clone_facts or _pdr_clone_facts)(source, now)
+        facts = (clone_facts or (lambda src, moment: _pdr_clone_facts(src, moment, route)))(source, now)
     except Exception:
         facts = {}
     facts = facts if isinstance(facts, dict) else {}
     inputs = production_create.CreateInputs(
-        co_reference=reference, route=CE_ENGINE, approval_ref=reference_value, approval_path=approval_file,
+        co_reference=reference, route=route, approval_ref=reference_value, approval_path=approval_file,
         source_revision=acknowledged_revision, source_revision_now=source.source_revision, now=now, environ=environ,
-        sf_email_domains=(source.email_domain,), sf_source_consistent=True,
+        sf_email_domains=(email_domain,), sf_source_consistent=True,
         prior_account_uuid="present" if source.salesforce_id_present else None,
         clone_collected_at=facts.get("collected_at"), clone_matches=facts.get("clone_matches") is True,
         duplicate_found=facts.get("duplicate_found") is not False,
         live_paid_tenant_count=facts.get("live_paid_tenant_count", 99),
         timing_allowed=onboarding_allowed_now(source.subscription_start, now.date(), environment="prod"),
         csm_request_recorded=False, sessions_ready=True, schema_ok=True,
-        expected_tenant_name=source.tenant_name, expected_domains=(source.email_domain,),
-        plan_summary="Credential Exposure CE-only dry run")
+        expected_tenant_name=source.tenant_name, expected_domains=domains,
+        plan_summary=("Surface and Credential Exposure (Case 3) dry run" if case3 else "Credential Exposure CE-only dry run"))
 
     def no_fill(_inputs: Any) -> Any:
         raise RuntimeError("production_dry_run_form_not_reached")
@@ -9818,9 +9928,10 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
 
     # 3. The ordered gate BEFORE any browser: a refusal here opens nothing. The session and duplicate facts only the
     #    browser can learn are passed as "no problem yet" here and judged for real by run() below.
-    if production_create.evaluate_gate(inputs, production_dry_run_target) is not None:
+    if production_create.evaluate_gate(inputs, production_dry_run_target, dry_run=True) is not None:
         return finish(production_create.run(inputs, True, no_fill, _pdr_click_confirm, _pdr_read_back, write_record,
                                              prior_records=()))
+    note("pdr_gate")
 
     # 4. The browser: session check, duplicate pre-check, form fill and read-back, Cancel; one record via run().
     try:
@@ -9839,7 +9950,11 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
             if worker_problem:
                 return refused(worker_problem)
             session = _pdr_session_problem(page)
-            duplicate = None if session else _pdr_duplicate_problem(page, source.tenant_name, (source.email_domain,))
+            if not session:
+                note("pdr_signed_in")
+            duplicate = None if session else _pdr_duplicate_problem(page, source.tenant_name, domains)
+            if not session and not duplicate:
+                note("pdr_duplicates")
             problem = session or duplicate
             final = dataclasses.replace(inputs, sessions_ready=session is None, duplicate_found=duplicate is not None,
                                         precheck_reason=problem or "")
@@ -9851,10 +9966,14 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, enviro
                 late = _pdr_end_problem(final, environ, (clock or stamp)())
                 if late:
                     raise production_create.FormRefusal(late, fields)
+                note("pdr_form")
                 return fields
 
-            return finish(production_create.run(final, True, fill, _pdr_click_confirm, _pdr_read_back, write_record,
-                                                 prior_records=()))
+            result = production_create.run(final, True, fill, _pdr_click_confirm, _pdr_read_back, write_record,
+                                           prior_records=())
+            if result.outcome == production_create.OUTCOME_DRY_RUN:
+                note("pdr_recorded")  # only a passing, recorded run: a refusal never marks this step as reached
+            return finish(result)
     except production_dry_run.ClickRefused:
         return refused("production_dry_run_click_not_allowed")
     except RuntimeError as error:
@@ -10169,9 +10288,10 @@ def main() -> int:
         if not args.co or not args.revision:
             parser.error("--co and --revision are required with --production-dry-run")
         if (args.dry_run or args.confirm_write or args.production_probe or args.diagnose_confirm
-                or args.route != CE_ENGINE):
-            parser.error("--production-dry-run is a separate run (CE-only route; no --dry-run, --confirm-write, --production-probe or --diagnose-confirm)")
-        print(run_production_dry_run(args.co, args.revision))
+                or args.route not in production_create.DRY_RUN_ROUTES):
+            parser.error("--production-dry-run is a separate run (route case_2_new_ce_only or case_3_combined_baseline; "
+                         "no --dry-run, --confirm-write, --production-probe or --diagnose-confirm)")
+        print(run_production_dry_run(args.co, args.revision, route=args.route))
         return 0
     if args.production_probe:
         if args.co or args.revision or args.dry_run or args.confirm_write:

@@ -36,7 +36,7 @@ _LIST_FIELDS = ("domains", "response_shape", "readback_mismatches", "payload_mis
 ADVANCED_SECTION_VALUES = ("found", "not_found")
 ADVANCED_CONTROL_STATES = ("on", "off", "absent")
 _ALLOWED = frozenset({"co_reference", "outcome", "recorded_at", "redactions", "form_fields_checked",
-                      "advanced_section", "advanced_controls", "advanced_mismatches",
+                      "advanced_section", "advanced_controls", "advanced_mismatches", "observations",
                       *_SCALAR_FIELDS, *_LIST_FIELDS})
 _CO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,39}")
 _STAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
@@ -48,6 +48,7 @@ _BLOB_RE = re.compile(r"[A-Za-z0-9+/=_-]{40,}")
 # instead of the secret keywords, so "approval_token_missing" and "access_token" survive. A field name that also
 # looks like a JWT or a long opaque blob is still redacted.
 _REASON_RE = re.compile(r"[a-z][a-z0-9_]{2,80}")
+_OBSERVATION_TOKEN_RE = re.compile(r"[a-z0-9_]{1,24}")
 _NAME_RE = re.compile(r"[A-Za-z0-9_.-]{1,80}")
 _PAYLOAD_NAME_RE = re.compile(r"(?:unexpected:)?[A-Za-z0-9_.-]{1,80}")  # a create-body field name, ``unexpected:`` prefix allowed
 # A request the dry-run guard aborted (live 2026-10-18): HTTP method and the path TEMPLATE only (ids already replaced).
@@ -165,6 +166,16 @@ def _sanitize(data: dict[str, Any]) -> tuple[dict[str, Any], int]:
     if isinstance(mismatches, (list, tuple)):
         names = [_clean_name(v, counter) for v in list(mismatches)[:MAX_LIST_ITEMS]]
         out["advanced_mismatches"] = [n for n in names if n and n != REDACTED]
+    # Learn-only findings of a Surface dry run (Case 3): an observation name and a short lower-case token (a control state such
+    # as present/absent, or a small number such as a default duration). Anything else is dropped, never stored.
+    observed = data.get("observations")
+    if isinstance(observed, dict):
+        notes: dict[str, str] = {}
+        for key, token in list(observed.items())[:MAX_DICT_ITEMS]:
+            if (isinstance(key, str) and _REASON_RE.fullmatch(key) and isinstance(token, str)
+                    and _OBSERVATION_TOKEN_RE.fullmatch(token)):
+                notes[key] = token
+        out["observations"] = notes
     return out, counter[0]
 
 

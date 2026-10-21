@@ -42,7 +42,19 @@ _RENEWAL_STEPS: tuple[tuple[str, tuple[tuple[str, frozenset[str] | None], ...]],
     ("Applying the renewal in Leonardo Dev", (("renewal_apply", None),)),
 )
 
-MILESTONE_STEPS = frozenset(step for table in (_CREATE_STEPS, _RENEWAL_STEPS)
+# The production DRY RUN of a Case 3 CO (owner decision 2026-10-20). Each step is done only when its own milestone was really
+# recorded by the runner (tools/attended_ce_only_playwright.py ``_pdr_note``); the sign-in step is the one that waits for the human.
+PRODUCTION_DRY_RUN_ROUTE = "production_dry_run_case3"
+_PRODUCTION_DRY_RUN_STEPS: tuple[tuple[str, tuple[tuple[str, frozenset[str] | None], ...]], ...] = (
+    ("Reading the CO from Salesforce and building the Case 3 values", (("pdr_source", None),)),
+    ("Checking the approval, the clone and every gate", (("pdr_gate", None),)),
+    ("Signing in to BackOffice production (SSO and MFA in the app.pentera.io window)", (("pdr_signed_in", None),)),
+    ("Checking production for duplicates (tenant name and both domains)", (("pdr_duplicates", None),)),
+    ("Filling and reading back the Add Account form (nothing is submitted)", (("pdr_form", None),)),
+    ("Recording the result", (("pdr_recorded", None),)),
+)
+
+MILESTONE_STEPS = frozenset(step for table in (_CREATE_STEPS, _RENEWAL_STEPS, _PRODUCTION_DRY_RUN_STEPS)
                             for _label, matchers in table for step, _outcomes in matchers)
 
 PENDING, ACTIVE, DONE, FAILED = "pending", "active", "done", "failed"
@@ -63,6 +75,8 @@ class RunProgress:
 
 
 def _steps_for(route: str | None):
+    if route == PRODUCTION_DRY_RUN_ROUTE:
+        return _PRODUCTION_DRY_RUN_STEPS
     return _RENEWAL_STEPS if route in RENEWAL_ROUTES else _CREATE_STEPS
 
 

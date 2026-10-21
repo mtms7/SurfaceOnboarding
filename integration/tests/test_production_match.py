@@ -267,7 +267,9 @@ class RunnerGlueTests(unittest.TestCase):
     def test_an_unreadable_co_source_is_not_checked_never_a_clearance(self):
         self.collect(row(1))
         for error in (RuntimeError("salesforce_fill_source_unavailable"), ValueError(), KeyError("x")):
-            with self.subTest(error=error), patch.object(runner, "_production_expectation", side_effect=error), self.clock():
+            # _identity_for reads the live CO from Salesforce on the desktop; CO-0801 exists there now, so pin it unreadable
+            with self.subTest(error=error), patch.object(runner, "_production_expectation", side_effect=error), \
+                    patch.object(runner, "_identity_for", return_value=None), self.clock():
                 found = runner.production_match_for("CO-0801", "Credential Exposure", "New Product Onboarding")
                 self.assertEqual((found["status"], found["reason"]), ("not_checked", "production_inputs_not_prepared"))
         with self.clock():
