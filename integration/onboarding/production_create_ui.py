@@ -311,6 +311,7 @@ class Inputs:
     sf_ready: bool
     row_fresh: bool
     launching: bool = False
+    tenant_names_path: Path | None = None  # the confirmed short tenant names (docs/60); None = none confirmed
 
 
 def _owner_ok(operator: str | None, record: Mapping[str, Any]) -> bool:

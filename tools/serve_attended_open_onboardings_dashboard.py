@@ -45,6 +45,7 @@ from integration.onboarding import production_views
 from integration.onboarding import production_create_ui as create_ui
 from integration.onboarding import production_case3_sheet as case3_sheet
 from integration.onboarding import production_case3_summary as case3_summary
+from integration.onboarding import tenant_name_decision
 from integration.onboarding import production_dry_run_ui as dry_ui
 from integration.onboarding import review_approval
 from integration.onboarding import runner_child_log
@@ -57,6 +58,7 @@ from integration.onboarding.production_approval import STATE_FILE_NAME as PRODUC
 from integration.onboarding.renewal_mirror import mirror_tenant_ids
 from integration.onboarding import session_readiness as readiness
 from integration.onboarding.session_readiness import SessionState, SessionStatus
+from tools import attended_ce_only_playwright as attended_runner
 from tools import clone_autorefresh
 from phase1_validator.onboarding_comment_dates import extract_dealhub_dates
 from phase1_validator.surface_source_readiness import evaluate_new_surface_source
@@ -7496,13 +7498,25 @@ CASE3_VALUES_REFUSALS = {
 }
 
 
-def _case3_summary_html(result: dict[str, Any]) -> str:
+def _tenant_name_form_html(reference: str, form: dict[str, Any]) -> str:
+    """The one-field form that confirms the short tenant name (docs/60). Nothing for a name of 40 characters or fewer."""
+    if not form.get("show"):
+        return ""
+    return ("<form method='post' action='/attended/tenant-name-confirm'><input type='hidden' name='reference' value='"
+            + escape(reference, quote=True) + "'><label>Tenant name <input type='text' name='tenant_name' value='"
+            + escape(str(form.get("value") or ""), quote=True) + "' maxlength='40' size='44'></label> "
+            "<button type='submit'>Confirm tenant name</button></form><p class='note'>It keeps the first two words of the account "
+            "name and has at most 40 characters. Nothing is sent to BackOffice or Salesforce.</p>")
+
+
+def _case3_summary_html(result: dict[str, Any], reference: str = "") -> str:
     """The "Tenant creation summary" card: Salesforce facts and the tenant values side by side, read-only, every value escaped."""
     attention = "".join("<li>" + escape(line) + "</li>" for line in result["attention"])
     return ("<section class='card sheet-card' aria-labelledby='co-summary-title'><div class='card-head'>"
             "<h2 id='co-summary-title' class='pill'>Tenant creation summary</h2></div>"
             "<h3 class='sub-h'>From Salesforce (only what the create needs)</h3>" + _kv_grid(result["salesforce"])
             + "<h3 class='sub-h'>The tenant will be created with</h3>" + _kv_grid(result["tenant"])
+            + _tenant_name_form_html(reference, result.get("name_form") or {})
             + "<h3 class='sub-h'>Check before you click Confirm</h3><ul>" + attention + "</ul></section>")
 
 
@@ -7534,7 +7548,7 @@ def _case3_values_card(reference: str, row: dict[str, str | None] | None) -> str
         _revision, plan = case3_values(reference)
         rows = case3_sheet.rows(plan)
         steps = case3_sheet.after_steps(str(plan["texts"]["Company name"]), reference)
-        overview = _case3_summary_html(case3_summary.build(plan))
+        overview = _case3_summary_html(case3_summary.build(plan), reference)
     except Exception as error:  # noqa: BLE001 - a stable code or "unavailable"; never exception text
         code = str(error)
         return refused(code if re.fullmatch(r"[a-z][a-z0-9_]{2,80}", code) else "values_unavailable")
@@ -7771,7 +7785,7 @@ def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operato
         reference=reference, row=row, now=production_now(), environ=os.environ,
         operator=operator if operator is not None else (_current_operator.get() or None), vm=vm_mode(),
         approvals_path=PRODUCTION_APPROVAL_PATH, records_parent=production_records_parent(), clone=_clone_status(),
-        sf_ready=sf_ready, row_fresh=bool(row))
+        sf_ready=sf_ready, row_fresh=bool(row), tenant_names_path=attended_runner.TENANT_NAMES_PATH)
 
 
 def _production_page_state(reference: str, row: dict[str, str | None] | None) -> dict[str, Any]:
@@ -8586,7 +8600,7 @@ POST_ROUTES = frozenset({
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
     "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
-    "/attended/review-approve", dry_ui.DRY_RUN_PATH,
+    "/attended/review-approve", "/attended/tenant-name-confirm", dry_ui.DRY_RUN_PATH,
     *sorted(create_ui.POST_PATHS),
 })
 
@@ -8954,6 +8968,30 @@ class Handler(BaseHTTPRequestHandler):
                            "recorded. Nothing was started.</p><p><a href='/onboard/" + escape(reference) + "'>Return</a></p>"); return
         self.send_redirect("/onboard/" + reference + "?notice=approved")
 
+    def _post_tenant_name_confirm(self, reference: str, form: Any) -> None:
+        """Record the owner's confirmed short tenant name (docs/60). Validated against a FRESH Salesforce read; starts nothing."""
+        try:
+            row = detail_row(reference)
+        except ReadUnavailable:
+            self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
+        if dry_ui.route_for_row(row) is None and not (isinstance(row, dict) and row.get("Onboarding_Product__c") == "Surface"
+                                                      and row.get("Onboarding_Type__c") == "New Product Onboarding"):
+            self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>"); return
+        back = "<p><a href='/onboard/" + escape(reference) + "'>Return</a></p>"
+        account = row.get("Account_Name__c") if isinstance(row, dict) else None
+        if not isinstance(account, str) or not " ".join(account.split()):
+            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Name not recorded</title><p>The account name could not be read. "
+                           "Nothing was recorded.</p><p><code>account_name_unavailable</code></p>" + back); return
+        operator = (dashboard_operator(self.headers.get("Cookie")) if login_required() else "") or "desktop-operator"
+        try:
+            tenant_name_decision.confirm(attended_runner.TENANT_NAMES_PATH, reference, attended_runner.surface_names(account).tenant_name,
+                                         exact_form_value(form, "tenant_name"), operator, datetime.now(timezone.utc))
+        except (tenant_name_decision.TenantNameRefused, tenant_name_decision.TenantNameUnavailable, ValueError, OSError) as error:
+            code = str(error) if re.fullmatch(r"[a-z][a-z0-9_]{2,60}", str(error)) else "tenant_name_not_recorded"
+            self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Name not recorded</title><p>The tenant name was not recorded. "
+                           "Nothing was sent anywhere.</p><p><code>" + escape(code) + "</code></p>" + back); return
+        self.send_redirect("/onboard/" + reference + "?notice=name_confirmed")
+
     def _post_production_dry_run(self, reference: str, form: Any) -> None:
         """The Case 3 production DRY RUN post (owner decision 2026-10-20). Re-checks every gate with a fresh CO read."""
         back = "<p><a href='/co/" + escape(reference) + "?env=prod'>Return to " + escape(reference) + "</a></p>"
@@ -9164,6 +9202,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/attended/review-approve":
             self._post_review_approve(reference, form); return
+        if path == "/attended/tenant-name-confirm":
+            self._post_tenant_name_confirm(reference, form); return
         if path == dry_ui.DRY_RUN_PATH:
             self._post_production_dry_run(reference, form); return
         if path in create_ui.POST_PATHS:

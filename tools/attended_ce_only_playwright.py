@@ -67,7 +67,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from integration.onboarding import (  # noqa: E402
     production_approval, production_case3_contract as case3_contract, production_contract, production_create,
-    production_create_record, production_dry_run, production_probe, run_progress, runner_child_log)
+    production_create_record, production_dry_run, production_probe, run_progress, runner_child_log,
+    tenant_name_decision)
 from integration.onboarding.run_target import (  # noqa: E402
     ProductionLocked, RunTarget, development_target, production_dry_run_target, production_target)
 from integration.onboarding.state_paths import state_file  # noqa: E402  (docs/40 section 5: one state-folder helper)
@@ -236,6 +237,8 @@ ADVANCED_TOGGLES_OFF = (
 )
 ADVANCED_EXPAND_POLLS = 20  # x 100 ms
 RUN_LOG_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_run_log.json")
+# The owner-confirmed short tenant names (docs/60; owner decision 2026-10-21): one record per CO, bound to the account name.
+TENANT_NAMES_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / tenant_name_decision.STATE_FILE_NAME)
 # Milestone steps of a run in progress (no values), read by the dashboard's progress bar; the run log above is
 # written only when a run ends.
 PROGRESS_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / "attended_ce_only_progress.json")
@@ -1040,6 +1043,8 @@ class SurfaceFillSource:
     primary_user_alias: str
     # True when Surface_Account_ID__c already holds a value (pre-create gate).
     salesforce_id_present: bool = False
+    # True for an account name over 40 characters without an owner-confirmed short name (docs/60): the production dry run refuses it.
+    tenant_name_unconfirmed: bool = field(default=False, repr=False, compare=False)
 
     @property
     def listed_domains(self) -> int:
@@ -1120,6 +1125,7 @@ def _surface_source_from_row(reference: str, row: dict[str, Any],
         raise ValueError()
     main, roots, subdomains = classify_surface_domains(row.get("Main_Domain__c"), row.get("Alternate_Domains__c"))
     names = surface_names(account_name)
+    resolved = tenant_name_decision.resolve(TENANT_NAMES_PATH, reference, names.tenant_name)
     subscription_rows = _sf_records(
         "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
         "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
@@ -1130,7 +1136,8 @@ def _surface_source_from_row(reference: str, row: dict[str, Any],
         raise SurfaceSourceError("surface_domains_exceed_license")
     return SurfaceFillSource(
         reference, revision, account_id, " ".join(account_name.split()), " ".join(country.split()),
-        main, roots, subdomains, entitlement, names.tenant_name, names.primary_user_alias), subscription_rows
+        main, roots, subdomains, entitlement, resolved.name, names.primary_user_alias,
+        tenant_name_unconfirmed=resolved.needs_confirmation), subscription_rows
 
 
 # --- Combined route (Case 3, engine case_3_combined_baseline) ----------------
@@ -1156,6 +1163,9 @@ class Case3FillSource:
     # The CO's Account_UUID__c text, kept only for the read-only production readback comparison (never printed, never in a repr,
     # never part of equality), as on CeFillSource.
     salesforce_account_uuid: str = field(default="", repr=False, compare=False)
+    # The Account's "Technical Advisor" (Delivery_Engineer__c, a User lookup) name, shown on the dashboard only (owner 2026-10-21);
+    # "" when absent or odd, never a guess.
+    technical_advisor: str = field(default="", repr=False, compare=False)
 
     def __getattr__(self, name: str) -> Any:
         # Surface fields (reference, source_revision, tenant_name, ...) by delegation.
@@ -1178,7 +1188,8 @@ def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillS
         rows = _sf_records(
             "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
             "Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Onboarding_Product__c, Onboarding_Type__c, "
-            "Surface_Account_ID__c, Account_UUID__c, Onboarding_Approval_Status__c "
+            "Surface_Account_ID__c, Account_UUID__c, Onboarding_Approval_Status__c, "
+            "Account__r.Delivery_Engineer__r.Name "
             "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
             raise ValueError()
@@ -1201,7 +1212,8 @@ def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillS
         present = any((row.get(field) or "").strip() for field in ("Surface_Account_ID__c", "Account_UUID__c"))
         uuid = row.get("Account_UUID__c")
         return Case3FillSource(surface, email_domain, ce_start, ce_end, salesforce_id_present=present,
-                               salesforce_account_uuid=uuid.strip() if isinstance(uuid, str) else "")
+                               salesforce_account_uuid=uuid.strip() if isinstance(uuid, str) else "",
+                               technical_advisor=_person_name(row))
     except SurfaceSourceError:
         raise
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -1247,13 +1259,28 @@ def case3_scope_summary(source: Case3FillSource, run_day: date | None = None) ->
     return scope
 
 
+def _person_name(row: dict[str, Any]) -> str:
+    """The Account's Technical Advisor name from a CO row ("" unless it is one short single-line text)."""
+    account = row.get("Account__r")
+    person = account.get("Delivery_Engineer__r") if isinstance(account, dict) else None
+    name = person.get("Name") if isinstance(person, dict) else None
+    if not isinstance(name, str) or re.search(r"[\x00-\x1f\x7f]", name):
+        return ""
+    name = " ".join(name.split())
+    return name if 1 <= len(name) <= 80 else ""
+
+
 def case3_values(reference: str, run_day: date | None = None) -> tuple[str, dict[str, Any]]:
     """(source revision, fill plan) of one Case 3 CO for the read-only "Add Account values" card.
 
     The same source read and plan the production dry run uses (``build_case3_fill``), so the card shows exactly the values the dry
     run typed and verified. Raises like ``case3_fill_source`` / ``build_case3_fill`` (stable value-free codes)."""
     source = case3_fill_source(reference)
-    return source.source_revision, build_case3_fill(source, run_day or _run_day())
+    plan = build_case3_fill(source, run_day or _run_day())
+    # Display only (the dry run uses the plain plan): the Technical Advisor and the full account name (the plan's Company name is the
+    # owner-confirmed short name once there is one).
+    return source.source_revision, {**plan, "technical_advisor": source.technical_advisor,
+                                    "tenant_full_name": surface_names(source.account_name).tenant_name}
 
 
 # --- Renewal plan (Cases 4-6), read-only, 2026-10-02 -------------------------
@@ -5636,6 +5663,17 @@ def _verified_mirror_for(reference: str, readback: dict[str, Any]) -> bool:
                             and uuid.casefold() == readback["account_uuid"].casefold())
 
 
+def existing_tenant_names(account_name: str, reference: str) -> tuple[str, ...]:
+    """The names to search for a Surface / Case 3 tenant that may already exist: the owner-confirmed short name (docs/60) first,
+    then the full account name. An unreadable decision file falls back to the full name only."""
+    full = surface_names(account_name).tenant_name
+    try:
+        confirmed = tenant_name_decision.confirmed_name(TENANT_NAMES_PATH, reference, full)
+    except tenant_name_decision.TenantNameUnavailable:
+        confirmed = None
+    return (confirmed, full) if confirmed and confirmed != full else (full,)
+
+
 def _scan_status_tenant_names(reference: str, surface_only: bool = False,
                               readback: dict[str, Any] | None = None) -> tuple[str, ...]:
     """Tenant name(s) to search, from one fixed, minimal Salesforce read (values stay in memory).
@@ -5656,9 +5694,9 @@ def _scan_status_tenant_names(reference: str, surface_only: bool = False,
         raise ValueError()
     product, onboarding_type = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
     if product == SURFACE_ROUTE_PRODUCT and onboarding_type == SURFACE_ROUTE_TYPE:
-        return (surface_names(account_name).tenant_name,)
+        return existing_tenant_names(account_name, reference)
     if product == CASE3_ROUTE_PRODUCT and onboarding_type == CASE3_ROUTE_TYPE:
-        return (surface_names(account_name).tenant_name,)
+        return existing_tenant_names(account_name, reference)
     if product == CE_ROUTE_PRODUCT and onboarding_type == CE_ROUTE_TYPE:
         if surface_only:
             raise SurfaceSourceError("scan_status_not_applicable")  # CE-only tenants never scan
@@ -6055,9 +6093,9 @@ def _validation_route(reference: str) -> tuple[str, str]:
         raise ValueError()
     pair = (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
     if pair == (SURFACE_ROUTE_PRODUCT, SURFACE_ROUTE_TYPE):
-        return SURFACE_ENGINE, surface_names(account_name).tenant_name
+        return SURFACE_ENGINE, existing_tenant_names(account_name, reference)[0]
     if pair == (CASE3_ROUTE_PRODUCT, CASE3_ROUTE_TYPE):
-        return CASE3_ENGINE, surface_names(account_name).tenant_name
+        return CASE3_ENGINE, existing_tenant_names(account_name, reference)[0]
     if pair == (CE_ROUTE_PRODUCT, CE_ROUTE_TYPE):
         return CE_ENGINE, ce_only_names(account_name).tenant_name
     raise SurfaceSourceError("validation_route_unsupported")
@@ -9913,6 +9951,8 @@ def run_production_dry_run(reference: str, acknowledged_revision: str, *, route:
         return refused(_pdr_reason(str(error)))
     except Exception:
         return refused("salesforce_fill_source_unavailable")
+    if getattr(source, "tenant_name_unconfirmed", False):
+        return refused("tenant_name_not_confirmed")  # docs/60: a long account name needs the owner's confirmed short name first
     note("pdr_source")
     # The domains the duplicate check searches besides the tenant name: the CE email domain for CE-only; the main domain and
     # the single CE email domain for Case 3 (one search each, deduplicated when they are the same).

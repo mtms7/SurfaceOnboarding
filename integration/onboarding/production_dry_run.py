@@ -143,7 +143,7 @@ KNOWN_REASONS = frozenset({
     "surface_route_mismatch", "surface_source_unavailable", "surface_subscription_invalid", "surface_product_unrecognized",
     "surface_baseline_unavailable", "surface_baseline_ambiguous", "surface_tier_unknown", "surface_main_domain_invalid",
     "surface_domains_invalid", "surface_networks_not_supported", "surface_domains_exceed_license",
-    "surface_license_dates_unavailable"})
+    "surface_license_dates_unavailable", "tenant_name_not_confirmed"})
 
 
 def known_reason(code: object) -> str:

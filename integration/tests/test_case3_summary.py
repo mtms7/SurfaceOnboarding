@@ -72,6 +72,27 @@ class SummaryTests(unittest.TestCase):
         self.assertIn("domains 500", flat(flagged["tenant"])["Licence"])  # shown as is, never silently changed
         self.assertTrue([a for a in flagged["attention"] if "Number of domains" in a])
 
+    def test_a_long_name_gets_a_short_name_proposal_to_confirm(self):
+        long_plan = plan()
+        long_plan["texts"]["Company name"] = "Barmherzige Brüder gemeinnützige Träger GmbH"
+        result = summary.build(long_plan)
+        tenant = flat(result["tenant"])
+        self.assertEqual(tenant["Tenant name"], "Barmherzige Brüder gemeinnützige Träger GmbH")  # the plan is never changed
+        self.assertEqual(tenant["Short name (docs/60)"], "Proposed: Barmherzige Brüder gemeinnützige TG. Confirm or edit it before create.")
+        self.assertTrue([a for a in result["attention"] if "short name" in a.lower()])
+
+    def test_a_short_name_needs_no_proposal(self):
+        result = summary.build(plan())
+        self.assertEqual(flat(result["tenant"])["Short name (docs/60)"], "Not needed (40 characters or fewer).")
+        self.assertFalse([a for a in result["attention"] if "short name" in a.lower()])
+
+    def test_a_name_that_cannot_be_shortened_is_flagged_for_the_owner(self):
+        odd = plan()
+        odd["texts"]["Company name"] = "B" * 30 + " " + "C" * 30
+        result = summary.build(odd)
+        self.assertIn("No proposal", flat(result["tenant"])["Short name (docs/60)"])
+        self.assertTrue([a for a in result["attention"] if "short name" in a.lower()])
+
     def test_the_operator_is_always_listed_for_attention(self):
         self.assertTrue([a for a in summary.build(plan())["attention"] if "Technical Advisor" in a])
 

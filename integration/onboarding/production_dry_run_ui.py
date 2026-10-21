@@ -24,6 +24,7 @@ from typing import Any
 from . import production_approval, production_create, production_views, run_progress
 from . import production_create_ui as create_ui
 from . import session_readiness as readiness
+from . import tenant_name_decision
 
 DRY_RUN_PATH = "/attended/production-dry-run"
 CASE3_ROUTE = production_create.CASE3_ROUTE
@@ -50,6 +51,7 @@ GATE_TEXT = {
     "salesforce_not_approved": "Onboarding Approval Status is not Approved in Salesforce.",
     "salesforce_session_not_ready": "The Salesforce session is not ready: sign in again.",
     "salesforce_prior_uuid_present": "The CO already has an Account UUID or a Surface Account ID.",
+    "tenant_name_not_confirmed": "The account name is over 40 characters: confirm the short tenant name on the CO page first (docs/60).",
     "clone_stale": "The Redash clone is older than 6 hours, its data older than 36 hours, or unusable: refresh it.",
     "launch_in_progress": "A production run is already in progress.",
     "confirmation_invalid": "The confirmation was missing, expired or already used. Review the page again.",
@@ -129,6 +131,17 @@ def gate(inputs: create_ui.Inputs) -> tuple[str | None, dict[str, Any]]:
     for field in ("Account_UUID__c", "Surface_Account_ID__c"):
         if field not in inputs.row or str(inputs.row.get(field) or "").strip():
             return "salesforce_prior_uuid_present", ctx
+    account = inputs.row.get("Account_Name__c")
+    if isinstance(account, str) and " ".join(account.split()):
+        full = " ".join(account.split()).rstrip(". ")
+        if full and tenant_name_decision.needs_confirmation(full):
+            try:
+                confirmed = (tenant_name_decision.confirmed_name(inputs.tenant_names_path, inputs.reference, full)
+                             if inputs.tenant_names_path is not None else None)
+            except tenant_name_decision.TenantNameUnavailable:
+                confirmed = None
+            if confirmed is None:
+                return "tenant_name_not_confirmed", ctx
     if not create_ui._clone_fresh(inputs.clone):
         return "clone_stale", ctx
     if inputs.launching is True or create_ui.LAUNCHES.busy():
