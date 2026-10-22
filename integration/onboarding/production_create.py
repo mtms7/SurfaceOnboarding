@@ -143,7 +143,8 @@ DRY_RUN_ROUTES = (production_approval.ALLOWED_ROUTE, CASE3_ROUTE)
 def evaluate_gate(inputs: CreateInputs,
                   production_target_fn: Callable[[Mapping[str, str], datetime], Any] = production_target,
                   approval_check_fn: Callable[..., str | None] = production_approval.check,
-                  *, dry_run: bool = False) -> str | None:
+                  *, dry_run: bool = False, case3_create: bool = False,
+                  approval_name_fn: Callable[..., str | None] = production_approval.tenant_name_problem) -> str | None:
     """The first refusal reason, in exactly this order, or None when every gate is open. Pure: no side effect.
 
     1. production target: session unlock values and the runner flag (``production_locked:<reason>``);
@@ -169,8 +170,15 @@ def evaluate_gate(inputs: CreateInputs,
                                 current, inputs.now)
     if problem is not None:
         return problem
+    # Path B step (b): a live Case 3 create needs the approval to be bound to the exact tenant name it would type.
+    if case3_create is True and inputs.route == production_approval.CASE3_ROUTE:
+        problem = approval_name_fn(inputs.approval_path, inputs.approval_ref, inputs.co_reference, inputs.route,
+                                   inputs.expected_tenant_name)
+        if problem is not None:
+            return problem
     # ``dry_run`` must be exactly True to widen the route set; any other value is a live create (CE-only).
-    allowed = DRY_RUN_ROUTES if dry_run is True else (production_approval.ALLOWED_ROUTE,)
+    # Owner go 2026-10-22 (path B step a): a live Case 3 create opens only for the exact boolean ``case3_create=True``.
+    allowed = DRY_RUN_ROUTES if (dry_run is True or case3_create is True) else (production_approval.ALLOWED_ROUTE,)
     if inputs.route not in allowed:
         return "route_not_ce_only_new"
     if _domain_problem(inputs.sf_email_domains):
@@ -346,7 +354,7 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         clock: Callable[[], datetime] | None = None,
         live_duplicate_check: Callable[[CreateInputs], str | None] | None = None,
         live_source_check: Callable[[CreateInputs], tuple[Any, Any]] | None = None,
-        live_form_recheck: Callable[[CreateInputs], Any] | None = None,
+        live_form_recheck: Callable[[CreateInputs], Any] | None = None, case3_create: bool = False,
         _production_target_fn: Callable[[Mapping[str, str], datetime], Any] | None = None,
         _approval_check_fn: Callable[..., str | None] = production_approval.check) -> CreateResult:
     """Run one guarded create attempt. See the module docstring; every path writes at least one record.
@@ -371,7 +379,8 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     # A dry run is gated by its own target (PRODUCTION_DRY_RUN_SUPPORTED); a live create only by production_target.
     if _production_target_fn is None:
         _production_target_fn = production_dry_run_target if dry_run is True else production_target
-    reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn, dry_run=dry_run is True)
+    reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn, dry_run=dry_run is True,
+                           case3_create=case3_create is True)
     if reason is not None:
         return _refuse(write_record, inputs, reason)
     if not isinstance(dry_run, bool):
@@ -404,7 +413,8 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
         return _refuse(write_record, inputs, "clock_unavailable", checked)
     if not _aware(moment):
         return _refuse(write_record, inputs, "clock_unavailable", checked)
-    reason = evaluate_gate(dataclasses.replace(inputs, now=moment), _production_target_fn, _approval_check_fn)
+    reason = evaluate_gate(dataclasses.replace(inputs, now=moment), _production_target_fn, _approval_check_fn,
+                           case3_create=case3_create is True)
     if reason is not None:
         return _refuse(write_record, inputs, reason, checked)
 
@@ -437,7 +447,7 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
     if not _aware(moment):
         return _refuse(write_record, inputs, "clock_unavailable", checked)
     inputs = dataclasses.replace(inputs, now=moment, source_revision_now=fresh_revision)
-    reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn)
+    reason = evaluate_gate(inputs, _production_target_fn, _approval_check_fn, case3_create=case3_create is True)
     if reason is not None:
         return _refuse(write_record, inputs, reason, checked)
 
@@ -464,8 +474,10 @@ def run(inputs: CreateInputs, dry_run: bool, fill_form: Callable[[CreateInputs],
 
     # Consume first (one approval, one create), then click exactly once.
     try:
+        consume_kwargs = ({"tenant_name": inputs.expected_tenant_name}
+                          if inputs.route == production_approval.CASE3_ROUTE else {})
         consumed = production_approval.consume(inputs.approval_path, inputs.approval_ref, inputs.co_reference,
-                                               inputs.route, inputs.source_revision_now, moment)
+                                               inputs.route, inputs.source_revision_now, moment, **consume_kwargs)
     except Exception:
         return _refuse(write_record, inputs, "approval_consume_failed", checked)
     if consumed is not None:

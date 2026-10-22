@@ -43,6 +43,7 @@ from integration.onboarding import state_paths
 from integration.onboarding import production_approval
 from integration.onboarding import production_views
 from integration.onboarding import production_create_ui as create_ui
+from integration.onboarding import case3_followup
 from integration.onboarding import production_case3_sheet as case3_sheet
 from integration.onboarding import production_case3_summary as case3_summary
 from integration.onboarding import tenant_name_decision
@@ -7809,6 +7810,20 @@ def _salesforce_ready_for_create() -> bool:
         return False
 
 
+def _case3_tenant_name(reference: str, row: dict[str, str | None] | None) -> str | None:
+    """Case 3 only: the exact tenant name the create would type (the account display name, or the owner-confirmed short name of
+    a long one, docs/60); None for any other route, an unconfirmed long name or an unreadable name file. Never a guess."""
+    if not row or (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")) != (
+            "Surface & Credential Exposure", "New Product Onboarding"):
+        return None
+    try:
+        display = attended_runner.surface_names(str(row.get("Account_Name__c") or "")).tenant_name
+        resolved = tenant_name_decision.resolve(attended_runner.TENANT_NAMES_PATH, reference, display)
+    except Exception:  # noqa: BLE001 - fail closed
+        return None
+    return None if resolved.unavailable or resolved.needs_confirmation else resolved.name
+
+
 def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operator: str | None = None) -> create_ui.Inputs:
     """The plain facts for the create gate. A POST passes a row read inside that very request; a page shows the display read."""
     sf_ready = _salesforce_ready_for_create()
@@ -7816,7 +7831,8 @@ def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operato
         reference=reference, row=row, now=production_now(), environ=os.environ,
         operator=operator if operator is not None else (_current_operator.get() or None), vm=vm_mode(),
         approvals_path=PRODUCTION_APPROVAL_PATH, records_parent=production_records_parent(), clone=_clone_status(),
-        sf_ready=sf_ready, row_fresh=bool(row), tenant_names_path=attended_runner.TENANT_NAMES_PATH)
+        sf_ready=sf_ready, row_fresh=bool(row), tenant_names_path=attended_runner.TENANT_NAMES_PATH,
+        case3_tenant_name=_case3_tenant_name(reference, row))
 
 
 def _production_page_state(reference: str, row: dict[str, str | None] | None) -> dict[str, Any]:
@@ -7862,8 +7878,12 @@ def runner_log_dir() -> Path | None:
     return folder
 
 
-def _launch_production_create(reference: str, revision: str, env: dict[str, str]) -> Any:
-    """Start the one visible production runner process (desktop only); None when it cannot be started."""
+def _launch_production_create(reference: str, revision: str, env: dict[str, str], route: str | None = None) -> Any:
+    """Start the one visible production runner process (desktop only); None when it cannot be started.
+
+    ``route`` is None for CE-only (the argument list is unchanged) or the Case 3 route (``--route`` is added)."""
+    if route not in (None, "case_3_combined_baseline"):
+        return None
     if (not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
             or not ATTENDED_CE_ONLY_RUNNER.is_file()):
         return None
@@ -7874,9 +7894,11 @@ def _launch_production_create(reference: str, revision: str, env: dict[str, str]
         child[runner_child_log.LOG_ENV] = str(folder / (reference + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                                                         + ".log"))
     try:
-        return subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-create", "--co", reference,
-                                 "--revision", revision, "--owner-go"], env=child, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        argv = [sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-create", "--co", reference,
+                "--revision", revision, "--owner-go"]
+        if route is not None:
+            argv += ["--route", route]
+        return subprocess.Popen(argv, env=child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         return None
 
@@ -7887,15 +7909,20 @@ PRODUCTION_RUNS: dict[str, dict[str, Any]] = {}
 _PRODUCTION_RUNS_LOCK = Lock()
 
 
-def _launch_production_create_followed(reference: str, revision: str, env: dict[str, str]) -> Any:
-    """Start the runner (``_launch_production_create``) and a worker that runs the CE-only follow-up when it ends."""
+def _launch_production_create_followed(reference: str, revision: str, env: dict[str, str], route: str | None = None) -> Any:
+    """Start the runner (``_launch_production_create``) and, for CE-only, a worker that runs the follow-up when it ends.
+
+    A Case 3 run (``route`` given) starts NO automatic follow-up: after a verified create the IDs and the stage are written only
+    by the owner's separate review and confirmation on the CO page (``case3_followup``)."""
     since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    process = _launch_production_create(reference, revision, env)
+    process = (_launch_production_create(reference, revision, env, route=route) if route is not None
+               else _launch_production_create(reference, revision, env))
     if process is None:
         return None
     with _PRODUCTION_RUNS_LOCK:
-        PRODUCTION_RUNS[reference] = {"since": since, "follow": None}
-    Thread(target=_follow_production_create, args=(reference, process), daemon=True).start()
+        PRODUCTION_RUNS[reference] = {"since": since, "follow": None, **({"route": route} if route is not None else {})}
+    if route is None:
+        Thread(target=_follow_production_create, args=(reference, process), daemon=True).start()
     return process
 
 
@@ -7922,6 +7949,8 @@ def _production_run_progress(reference: str) -> dict[str, Any] | None:
         run = dict(PRODUCTION_RUNS.get(reference) or {})
     if not run:
         return None
+    if run.get("route") == "case_3_combined_baseline":
+        return case3_followup.progress(production_records_parent(), reference, run["since"], running=create_ui.LAUNCHES.busy())
     running = create_ui.LAUNCHES.busy() or run.get("follow") is None
     return create_ui.production_progress(production_records_parent(), reference, run["since"], running=running,
                                          follow=run.get("follow"))
@@ -8088,6 +8117,25 @@ def _read_production_writeback_row(reference: str) -> dict[str, str | None] | No
         response = sf_json(["data", "query", "--query", "SELECT Id, Name, LastModifiedDate, Onboarding_Product__c, "
                             "Onboarding_Type__c, Account_UUID__c, Onboarding_Stage__c FROM Customer_Onboarding__c WHERE Name = '" + reference
                             + "' LIMIT 2", "--json"])
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:  # type: ignore[index]
+            return None
+        record = records[0]
+        if record.get("Name") != reference:
+            return None
+        return {key: (value if isinstance(value, str) else None) for key, value in record.items() if key != "attributes"}
+    except (ReadUnavailable, KeyError, TypeError, AttributeError):
+        return None
+
+
+def _read_case3_followup_row(reference: str) -> dict[str, str | None] | None:
+    """Fresh fixed-field read of the one Case 3 CO row for the guarded ID write and stage move (None on any problem)."""
+    if not REFERENCE.fullmatch(reference) or os.environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", create_ui.PINNED_SF_ALIAS):
+        return None  # a production path ignores the alias override: it refuses instead
+    try:
+        response = sf_json(["data", "query", "--query", "SELECT Id, Name, LastModifiedDate, Onboarding_Product__c, "
+                            "Onboarding_Type__c, Surface_Account_ID__c, Account_UUID__c, Onboarding_Stage__c "
+                            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2", "--json"])
         records = response["result"]["records"]  # type: ignore[index]
         if response["status"] != 0 or not isinstance(records, list) or len(records) != 1:  # type: ignore[index]
             return None
@@ -9058,6 +9106,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
         inputs = _create_ui_inputs(reference, row, self.request_operator())
         values = form or {}
+        if path in (create_ui.FOLLOWUP_REVIEW_PATH, create_ui.FOLLOWUP_CONFIRM_PATH):
+            self._post_case3_followup(path, reference, values, inputs, refuse, back)
+            return
         if path == create_ui.CREATE_PATH:
             code = create_ui.handle_create_post(values, inputs, _launch_production_create_followed)
             if code != "launched":
@@ -9098,6 +9149,48 @@ class Handler(BaseHTTPRequestHandler):
             self.send_redirect("/co/" + reference + "?env=prod")  # the create card shows the recorded result
             return
         refuse(code)
+
+    def _post_case3_followup(self, path: str, reference: str, values: Any, inputs: create_ui.Inputs, refuse: Any, back: str) -> None:
+        """The Case 3 review (reads and shows, writes nothing) and the owner's confirmation of the guarded ID write and stage move."""
+        follow_inputs = case3_followup.FollowupInputs(reference=reference, records_parent=inputs.records_parent, now=inputs.now,
+                                                      vm=inputs.vm, sf_ready=inputs.sf_ready)
+        try:
+            verified = create_ui.load_co_records(inputs.records_parent, reference)
+        except Exception:  # noqa: BLE001 - fail closed
+            refuse("records_unreadable"); return
+
+        def read_row() -> dict[str, str | None] | None:
+            return _read_case3_followup_row(reference)
+
+        if path == create_ui.FOLLOWUP_REVIEW_PATH:
+            lock = case3_followup.build_lock(follow_inputs)
+            if lock is not None:
+                refuse(lock); return  # before any Salesforce read
+            code, view = case3_followup.review(follow_inputs, verified, read_row())
+            if code != "ready":
+                refuse(code); return
+            body = ("<h2>Write the Account ID and UUID to Salesforce, then move the stage</h2><dl><dt>CO</dt><dd>" + escape(reference)
+                    + "</dd><dt>Salesforce fields (currently empty ones only)</dt><dd><code>" + escape(view["fields"][0])
+                    + "</code> ends with <code>" + escape(view["id_tail"]) + "</code>; <code>" + escape(view["fields"][1])
+                    + "</code> ends with <code>" + escape(view["uuid_tail"]) + "</code></dd><dt>Then, as a separate write</dt><dd>"
+                    "<code>Onboarding_Stage__c</code>: " + escape(view["stage_from"]) + " &rarr; " + escape(view["stage_to"])
+                    + "</dd></dl><p class='note'>The values come from the verified production create of this CO. Each write is read back; "
+                      "a failed or uncertain write stops here and is never repeated by this page. No other field changes. The "
+                      "confirmation expires in 10 minutes and any change to the CO invalidates it.</p>"
+                      "<form method='post' action='" + create_ui.FOLLOWUP_CONFIRM_PATH + "'><input type='hidden' name='reference' "
+                      "value='" + escape(reference) + "'><input type='hidden' name='nonce' value='" + escape(view["token"])
+                    + "'><div class='confirm'><label>Type the CO reference <code>" + escape(reference) + "</code> to confirm "
+                      "<input type='text' name='confirm_reference' autocomplete='off' required maxlength='16'></label></div>"
+                      "<div class='confirm'><label><input type='checkbox' name='case3_followup_authorized' value='1' required> "
+                      "I authorize these two Salesforce writes for this CO</label></div>"
+                      "<button type='submit'>Confirm write to Salesforce</button></form>" + back)
+            self.send_page(HTTPStatus.OK, _app_shell(reference + " Salesforce IDs", "<section class='card'>" + body + "</section>",
+                                                     active="prod_onboarding", env="prod"))
+            return
+        result = case3_followup.confirm(values, follow_inputs, verified, read_row, _run_sf_argv, create_ui.PINNED_SF_ALIAS)
+        if result.get("result") == "refused":
+            refuse(str(result.get("reason") or "write_blocked")); return
+        self.send_redirect("/co/" + reference + "?env=prod")  # the create card shows the recorded result
 
     def do_POST(self) -> None:
         # Any action may change Salesforce or local state; later pages read fresh.

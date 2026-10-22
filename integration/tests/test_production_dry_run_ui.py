@@ -47,7 +47,8 @@ class Base(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.dir = Path(tmp.name)
         self.approvals = self.dir / "approvals.json"
-        approval.issue(self.approvals, REF, CO, CASE3, REV, OWNER, frozenset({OWNER}), NOW - timedelta(hours=1))
+        approval.issue(self.approvals, REF, CO, CASE3, REV, OWNER, frozenset({OWNER}), NOW - timedelta(hours=1),
+                       tenant_name="Test Tenant")
         # Explicit lock state (False/False) so these tests do not depend on the build's constants: ``unlocked()`` overrides it.
         for patch in (mock.patch.object(create_ui, "TOKENS", create_ui.OneTimeTokens()),
                       mock.patch.object(create_ui, "LAUNCHES", create_ui.LaunchRegistry()),
@@ -123,12 +124,13 @@ class GateTests(Base):
             self.setUp()
             self.unlocked()
             self.approvals.unlink()
-            approval.issue(self.approvals, "PROD-CE-0800-20261020", CO, other, REV, OWNER, frozenset({OWNER}), NOW - timedelta(hours=1))
+            approval.issue(self.approvals, "PROD-CE-0800-20261020", CO, other, REV, OWNER, frozenset({OWNER}), NOW - timedelta(hours=1),
+                           tenant_name=("Test Tenant" if other == "case_3_combined_baseline" else None))
             self.assertEqual(ui.gate(self.inputs())[0], "approval_route_mismatch")
 
     def test_expired_and_consumed_approvals_are_named(self):
         self.assertEqual(ui.gate(self.inputs(now=NOW + timedelta(days=8)))[0], "approval_expired")
-        approval.consume(self.approvals, REF, CO, CASE3, REV, NOW)
+        approval.consume(self.approvals, REF, CO, CASE3, REV, NOW, tenant_name="Test Tenant")
         self.assertEqual(ui.gate(self.inputs())[0], "approval_consumed")
 
     def test_a_case_3_co_never_opens_the_create_even_with_both_constants_true(self):

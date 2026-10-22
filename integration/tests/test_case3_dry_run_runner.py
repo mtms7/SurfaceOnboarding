@@ -89,7 +89,7 @@ class C3Harness(dry.Harness):
         if approval_route != CE:
             self.approval_path.unlink()
             approval.issue(self.approval_path, REF, CO, approval_route, REV, "milton", frozenset({"milton"}),
-                           NOW.replace(hour=11))
+                           NOW.replace(hour=11), tenant_name=("Test Tenant" if approval_route == "case_3_combined_baseline" else None))
         self.source = make_case3_source()
         self.date_calls = []
 
@@ -262,8 +262,9 @@ class CliTests(unittest.TestCase):
             self.assertNotEqual(code, None)
             called.assert_not_called()
 
-    def test_the_live_create_cli_stays_ce_only(self):
-        argv = ["runner", "--production-create", "--co", CO, "--revision", REV, "--route", CASE3, "--owner-go"]
+    def test_the_live_create_cli_takes_only_the_ce_only_and_case_3_routes(self):
+        # Path B (owner go 2026-10-22): Case 3 is selectable for the guarded live create (the locks still decide); any other is not.
+        argv = ["runner", "--production-create", "--co", CO, "--revision", REV, "--route", "case_1_new_surface_only", "--owner-go"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(runner, "run_production_create") as called:
             with self.assertRaises(SystemExit):
                 runner.main()

@@ -84,7 +84,7 @@ class RunRouteTests(unittest.TestCase):
 
     def issue(self, route):
         approval.issue(self.approval_path, REF, "CO-0797", route, "r29", "milton", frozenset({"milton"}),
-                       NOW.replace(hour=11))
+                       NOW.replace(hour=11), tenant_name=("Test Tenant" if route == "case_3_combined_baseline" else None))
 
     def harness(self):
         return base.Harness(self.state, self.approval_path)

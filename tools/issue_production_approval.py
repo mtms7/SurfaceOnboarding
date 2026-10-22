@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from integration.onboarding import production_approval  # noqa: E402
 from integration.onboarding import production_views  # noqa: E402
 from integration.onboarding import session_readiness as readiness  # noqa: E402
+from integration.onboarding import tenant_name_decision  # noqa: E402
 from integration.onboarding.state_paths import state_file  # noqa: E402
 
 STATE_FILE_NAME = production_approval.STATE_FILE_NAME
@@ -152,6 +153,26 @@ def eligibility_problem(row: Mapping[str, Any] | None, co: str) -> str | None:
     return None
 
 
+def default_tenant_names_path() -> Path:
+    return state_file(Path(__file__).resolve().parents[1] / "integration" / tenant_name_decision.STATE_FILE_NAME)
+
+
+def case3_tenant_name(row: Mapping[str, Any], co: str, names_path: Path) -> str:
+    """The tenant name a Case 3 create would type: the account display name, or the owner-confirmed short name when the
+    full name is over the limit. Refuses (nothing guessed) when a long name is unconfirmed or the name file is unreadable."""
+    from tools.attended_ce_only_playwright import surface_names  # same display-name rule as the create (lazy: heavy module)
+    try:
+        display = surface_names(str(row.get("Account_Name__c") or "")).tenant_name
+    except ValueError:
+        raise Refuse("account_name_unavailable") from None
+    resolved = tenant_name_decision.resolve(names_path, co, display)
+    if resolved.unavailable:
+        raise Refuse("tenant_names_unreadable")
+    if resolved.needs_confirmation:
+        raise Refuse("tenant_name_unconfirmed")
+    return resolved.name
+
+
 def build_approval(**kwargs: Any) -> dict[str, Any]:
     return production_approval.issue(**kwargs)
 
@@ -185,7 +206,7 @@ def _status(path: Path, co: str, now: datetime, out: Any) -> int:
 
 def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], environ: Mapping[str, str],
          input_fn: Callable[[str], str], isatty_fn: Callable[[], bool], state_path: Path, out: Any,
-         org_probe: OrgProbe) -> int:
+         org_probe: OrgProbe, tenant_names_path: Path | None = None) -> int:
     args = _parse_args(argv)
     co = args.co
     if not CO_PATTERN.fullmatch(co):
@@ -223,6 +244,8 @@ def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], en
     if not production_approval._valid_ref(ref):
         raise Refuse("invalid_approval_ref")
     revision = str(row["LastModifiedDate"]).strip()  # type: ignore[index]
+    tenant_name = (case3_tenant_name(row, co, tenant_names_path or default_tenant_names_path())  # type: ignore[arg-type]
+                   if route == CASE3_ENGINE else None)
     lifetime = timedelta(days=args.lifetime_days)
     expires = (now + lifetime).strftime(_STAMP)
     print(f"CO: {co}", file=out)
@@ -230,6 +253,8 @@ def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], en
     print(f"Source revision: {revision}", file=out)
     print(f"Issuer: {issuer}", file=out)
     print(f"Approval ref: {ref}", file=out)
+    if tenant_name is not None:
+        print(f"Tenant name: {tenant_name}", file=out)
     print(f"Issued (UTC): {now.strftime(_STAMP)}", file=out)
     print(f"Expires (UTC): {expires}", file=out)
     print(f"State file: {state_path.name}", file=out)
@@ -244,7 +269,7 @@ def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], en
     try:
         record = build_approval(path=state_path, approval_ref=ref, co_reference=co, route=route,
                                 source_revision=revision, issued_by=issuer, allowed_issuers=allowed, now=now,
-                                lifetime=lifetime)
+                                lifetime=lifetime, **({"tenant_name": tenant_name} if tenant_name is not None else {}))
     except production_approval.ApprovalRefused as refused:
         raise Refuse(refused.reason) from None
     _emit(out, {"result": "issued", "approval_ref": record["approval_ref"], "expires_at": record["expires_at"]})
@@ -254,13 +279,14 @@ def _run(argv: Sequence[str], reader: Reader, now_fn: Callable[[], datetime], en
 def main(argv: Sequence[str] | None = None, *, reader: Reader | None = None,
          now_fn: Callable[[], datetime] | None = None, environ: Mapping[str, str] | None = None,
          input_fn: Callable[[str], str] | None = None, isatty_fn: Callable[[], bool] | None = None,
-         state_path: Path | None = None, org_probe: OrgProbe | None = None) -> int:
+         state_path: Path | None = None, org_probe: OrgProbe | None = None,
+         tenant_names_path: Path | None = None) -> int:
     out = sys.stdout
     try:
         return _run(sys.argv[1:] if argv is None else argv, reader or default_reader,
                     now_fn or (lambda: datetime.now(timezone.utc)), os.environ if environ is None else environ,
                     input_fn or input, isatty_fn or sys.stdin.isatty, state_path or default_state_path(), out,
-                    org_probe or default_org_probe)
+                    org_probe or default_org_probe, tenant_names_path)
     except Refuse as refused:
         _emit(out, {"result": "refused", "reason": refused.reason})
     except BaseException as error:  # noqa: BLE001 - fail closed; never print values or a traceback

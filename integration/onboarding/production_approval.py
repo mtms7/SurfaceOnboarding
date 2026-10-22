@@ -40,7 +40,9 @@ def scope_for(route: Any) -> str | None:
 DEFAULT_LIFETIME = timedelta(days=7)
 REQUIRED_FIELDS = frozenset({"approval_ref", "co_reference", "route", "scope", "source_revision", "issued_by",
                              "issued_at", "expires_at"})
-RECORD_FIELDS = REQUIRED_FIELDS | {"consumed_at", "superseded_at"}
+# Path B step (b), owner go 2026-10-22: a Case 3 record also carries the owner-confirmed tenant name it was approved for.
+RECORD_FIELDS = REQUIRED_FIELDS | {"consumed_at", "superseded_at", "tenant_name"}
+TENANT_NAME_MAX = 80
 CO_REFERENCE = re.compile(r"CO-[0-9]{4,10}")
 ISSUER = re.compile(r"[^\s<>'\"]{1,254}")
 _TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -84,6 +86,12 @@ def _valid_co(value: Any) -> bool:
     return isinstance(value, str) and CO_REFERENCE.fullmatch(value) is not None
 
 
+def valid_tenant_name(value: Any) -> bool:
+    """A clean single-line tenant name: no control characters, no padding or doubled spaces, at most 80 characters."""
+    return (isinstance(value, str) and 0 < len(value) <= TENANT_NAME_MAX and value == " ".join(value.split())
+            and not re.search(r"[\x00-\x1f\x7f]", value))
+
+
 def valid_revision(value: Any) -> bool:
     """The one revision validator (shared by the issuer, the record check and the dashboard view)."""
     return isinstance(value, str) and 0 < len(value) <= 128
@@ -97,6 +105,8 @@ def _valid_record(key: Any, record: Any) -> bool:
             and _valid_ref(key) and record["approval_ref"] == key and _valid_co(record["co_reference"])
             and scope_for(record["route"]) is not None and record["scope"] == scope_for(record["route"])
             and _valid_revision(record["source_revision"])
+            and ("tenant_name" not in record
+                 or (record["route"] == CASE3_ROUTE and valid_tenant_name(record["tenant_name"])))
             and isinstance(record["issued_by"], str) and ISSUER.fullmatch(record["issued_by"]) is not None
             and _parse(record["issued_at"]) is not None and _parse(record["expires_at"]) is not None
             and ("consumed_at" not in record or _parse(record["consumed_at"]) is not None)
@@ -132,10 +142,18 @@ def _write(path: Path, records: Mapping[str, Any]) -> None:
 
 
 def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_revision: str, issued_by: str,
-          allowed_issuers: frozenset[str], now: datetime, lifetime: timedelta = DEFAULT_LIFETIME) -> dict[str, Any]:
-    """Record a one-CO production approval (CE-only or Case 3). Raises ApprovalRefused(reason) on anything invalid."""
+          allowed_issuers: frozenset[str], now: datetime, lifetime: timedelta = DEFAULT_LIFETIME,
+          tenant_name: str | None = None) -> dict[str, Any]:
+    """Record a one-CO production approval (CE-only or Case 3). Raises ApprovalRefused(reason) on anything invalid.
+
+    A Case 3 approval needs the confirmed ``tenant_name`` it is bound to; a CE-only approval takes none."""
     if scope_for(route) is None:
         raise ApprovalRefused("route_not_ce_only")
+    if route == CASE3_ROUTE:
+        if not valid_tenant_name(tenant_name):
+            raise ApprovalRefused("invalid_tenant_name")
+    elif tenant_name is not None:
+        raise ApprovalRefused("tenant_name_not_allowed")
     if (not isinstance(allowed_issuers, frozenset) or not isinstance(issued_by, str)
             or issued_by not in allowed_issuers or not ISSUER.fullmatch(issued_by)):
         raise ApprovalRefused("issuer_not_allowed")
@@ -153,6 +171,8 @@ def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_r
     record = {"approval_ref": approval_ref, "co_reference": co_reference, "route": route, "scope": scope_for(route),
               "source_revision": source_revision, "issued_by": issued_by, "issued_at": _stamp(moment),
               "expires_at": _stamp(moment + lifetime)}
+    if route == CASE3_ROUTE:
+        record["tenant_name"] = tenant_name
     with _lock:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,8 +212,16 @@ def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_r
     return dict(record)
 
 
+def _name_problem(record: Mapping[str, Any], tenant_name: Any) -> str | None:
+    """The record's bound tenant name against the name the create would type (Case 3 records only)."""
+    bound = record.get("tenant_name")
+    if not valid_tenant_name(bound):
+        return "approval_tenant_name_missing"
+    return None if valid_tenant_name(tenant_name) and tenant_name == bound else "approval_tenant_name_drift"
+
+
 def _problem(record: Mapping[str, Any] | None, co_reference: Any, route: Any, source_revision: Any,
-             now: Any) -> str | None:
+             now: Any, tenant_name: Any = None, require_name: bool = False) -> str | None:
     if record is None:
         return "approval_missing"
     if record.get("consumed_at"):
@@ -213,18 +241,40 @@ def _problem(record: Mapping[str, Any] | None, co_reference: Any, route: Any, so
         return "approval_route_mismatch"
     if record.get("source_revision") != source_revision:
         return "approval_revision_drift"
+    if route == CASE3_ROUTE and (require_name or tenant_name is not None):
+        if tenant_name is None:
+            return "approval_tenant_name_missing"  # the caller named no tenant: a Case 3 approval is never consumed blind
+        return _name_problem(record, tenant_name)
     return None
 
 
+def tenant_name_problem(path: Path, approval_ref: str, co_reference: str, route: str, tenant_name: Any) -> str | None:
+    """None when the Case 3 approval is bound to exactly ``tenant_name``; else a reason code (fails closed). Read only."""
+    try:
+        records = _load(path)
+    except _Unreadable:
+        return "approval_unreadable"
+    record = records.get(approval_ref) if isinstance(approval_ref, str) else None
+    if record is None:
+        return "approval_missing"
+    if record.get("co_reference") != co_reference:
+        return "approval_co_mismatch"
+    if route != CASE3_ROUTE or record.get("route") != CASE3_ROUTE:
+        return "approval_route_mismatch"
+    return _name_problem(record, tenant_name)
+
+
 def check(path: Path, approval_ref: str, co_reference: str, route: str, source_revision: str,
-          now: datetime) -> str | None:
-    """None when the approval is valid and unused for exactly this CO, route and revision; else a reason code."""
+          now: datetime, *, tenant_name: str | None = None) -> str | None:
+    """None when the approval is valid and unused for exactly this CO, route and revision; else a reason code.
+
+    The bound tenant name of a Case 3 approval is compared only when ``tenant_name`` is given."""
     try:
         records = _load(path)
     except _Unreadable:
         return "approval_unreadable"
     return _problem(records.get(approval_ref) if isinstance(approval_ref, str) else None, co_reference, route,
-                    source_revision, now)
+                    source_revision, now, tenant_name)
 
 
 def _acquire_file_lock(path: Path) -> tuple[int | None, str | None]:
@@ -245,8 +295,10 @@ def _acquire_file_lock(path: Path) -> tuple[int | None, str | None]:
 
 
 def consume(path: Path, approval_ref: str, co_reference: str, route: str, source_revision: str,
-            now: datetime) -> str | None:
-    """Validate and mark the approval used (one approval, one create). None on success, else a reason code."""
+            now: datetime, *, tenant_name: str | None = None) -> str | None:
+    """Validate and mark the approval used (one approval, one create). None on success, else a reason code.
+
+    A Case 3 approval is consumed only for exactly its bound ``tenant_name`` (none given: refused)."""
     with _lock:
         fd, locked = _acquire_file_lock(path)
         if fd is None:
@@ -258,7 +310,7 @@ def consume(path: Path, approval_ref: str, co_reference: str, route: str, source
             except _Unreadable:
                 return "approval_unreadable"
             found = _problem(records.get(approval_ref) if isinstance(approval_ref, str) else None, co_reference,
-                             route, source_revision, now)
+                             route, source_revision, now, tenant_name, require_name=True)
             if found is not None:
                 return found
             records[approval_ref] = {**records[approval_ref], "consumed_at": _stamp(now)}
@@ -295,3 +347,52 @@ def unlock_environ(record: Mapping[str, Any]) -> dict[str, str]:
     return {"SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF": reference,
             "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_ISSUED": issued.isoformat(),
             "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_EXPIRES": expires.isoformat()}
+
+
+def revocable_problem(record: Mapping[str, Any] | None, now: datetime) -> str | None:
+    """None when ``record`` is a live approval (not consumed, superseded or expired at ``now``); else the reason code."""
+    if record is None:
+        return "approval_missing"
+    if record.get("consumed_at"):
+        return "approval_consumed"
+    if record.get("superseded_at"):
+        return "approval_superseded"
+    expires = _parse(record.get("expires_at"))
+    if expires is None or expires <= now.astimezone(timezone.utc):
+        return "approval_expired"
+    return None
+
+
+def revoke(path: Path, approval_ref: str, now: datetime) -> dict[str, Any]:
+    """Retire ONE live approval (owner request 2026-10-22): sets ``superseded_at`` and changes nothing else.
+
+    Same cross-process lock and atomic write as ``issue`` / ``consume``. Raises ``ApprovalRefused(reason)`` for an unreadable file,
+    an unknown, consumed, superseded or expired approval, a naive time or a held lock; nothing is written then.
+    """
+    if not _valid_ref(approval_ref):
+        raise ApprovalRefused("invalid_approval_ref")
+    if not _aware(now):
+        raise ApprovalRefused("naive_datetime")
+    moment = now.astimezone(timezone.utc).replace(microsecond=0)
+    with _lock:
+        fd, locked = _acquire_file_lock(path)
+        if fd is None:
+            raise ApprovalRefused(locked or "approval_locked")
+        lock_path = path.with_name(path.name + LOCK_SUFFIX)
+        try:
+            try:
+                records = _load(path)  # re-read under the lock
+            except _Unreadable:
+                raise ApprovalRefused("approval_unreadable") from None
+            problem = revocable_problem(records.get(approval_ref), moment)
+            if problem is not None:
+                raise ApprovalRefused(problem)
+            records[approval_ref] = {**records[approval_ref], "superseded_at": _stamp(moment)}
+            _write(path, records)
+            return dict(records[approval_ref])
+        finally:
+            os.close(fd)
+            try:
+                os.unlink(lock_path)
+            except OSError:
+                pass

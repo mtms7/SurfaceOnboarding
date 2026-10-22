@@ -199,7 +199,7 @@ class DryRunButtonGateTests(unittest.TestCase):
         self.names = Path(self.dir.name) / decision.STATE_FILE_NAME
         self.approvals = Path(self.dir.name) / "approvals.json"
         base.approval.issue(self.approvals, base.REF, base.CO, base.CASE3, REV, base.OWNER, frozenset({base.OWNER}),
-                            base.NOW - base.timedelta(hours=1))
+                            base.NOW - base.timedelta(hours=1), tenant_name="Test Tenant")
         for patch in (mock.patch.object(base.create_ui, "TOKENS", base.create_ui.OneTimeTokens()),
                       mock.patch.object(base.create_ui, "LAUNCHES", base.create_ui.LaunchRegistry()),
                       mock.patch.object(base.readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True),

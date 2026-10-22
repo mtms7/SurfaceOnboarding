@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from . import production_approval, production_create, production_launch_ticket, production_views, salesforce_uuid_writeback
+from . import salesforce_case3_ids_writeback as case3_ids
 from . import production_create_record as records
 from . import salesforce_stage_writeback as stage_wb
 from . import session_readiness as readiness
@@ -43,7 +44,10 @@ CREATE_PATH = "/attended/production-create"
 UUID_REVIEW_PATH = "/attended/production-uuid-review"
 UUID_CONFIRM_PATH = "/attended/production-uuid-confirm"
 SCAN_CHECK_PATH = "/attended/production-scan-check"  # build 3: the owner's read-only CE scan check
-POST_PATHS = frozenset({CREATE_PATH, UUID_REVIEW_PATH, UUID_CONFIRM_PATH, SCAN_CHECK_PATH})
+FOLLOWUP_REVIEW_PATH = "/attended/production-case3-followup-review"  # Case 3 (path B step d): the owner's review ...
+FOLLOWUP_CONFIRM_PATH = "/attended/production-case3-followup-confirm"  # ... and confirmation of the ID write and stage move
+POST_PATHS = frozenset({CREATE_PATH, UUID_REVIEW_PATH, UUID_CONFIRM_PATH, SCAN_CHECK_PATH, FOLLOWUP_REVIEW_PATH,
+                        FOLLOWUP_CONFIRM_PATH})
 TOKEN_TTL_SECONDS = 10 * 60
 DRY_RUN_MAX_AGE = timedelta(hours=24)
 SALESFORCE_FRESH_SECONDS = 15 * 60
@@ -111,6 +115,22 @@ GATE_TEXT = {
     "uuid_write_needs_review": "An earlier UUID write is uncertain: check Salesforce, then record your review.",
     "uuid_write_already_recorded": "A UUID write is already recorded for this CO.",
     "gate_unreadable": "The create gate could not be evaluated: nothing is allowed.",
+    "tenant_name_not_confirmed": "The tenant name is not confirmed: confirm the short name on the CO page first (long account names).",
+    "approval_tenant_name_drift": "The tenant name differs from the one the approval was issued for: issue a new approval.",
+    "approval_tenant_name_missing": "This approval has no tenant name bound to it: issue a new approval.",
+    "surface_account_id_present": "The CO already has a Surface Account ID (or it could not be read).",
+    "approval_route_mismatch": "The approval is for another route than this CO.",
+    "tenant_not_verified": "There is no verified production create of this CO to take the IDs from.",
+    "tenant_ids_invalid": "The verified tenant's Account ID or UUID is not in the expected format.",
+    "different_value": "The CO already holds a different value in one of these fields: nothing is overwritten.",
+    "ids_write_needs_review": "An earlier ID write is uncertain: check Salesforce by hand before anything else.",
+    "ids_write_already_recorded": "An ID write is already recorded for this CO and is not repeated.",
+    "already_complete": "The IDs and the stage are already in Salesforce.",
+    "record_write_failed": "The write result could not be recorded: check the CO in Salesforce; further writes stay blocked.",
+    "route_not_case3_new": "This CO is not a Surface & Credential Exposure (Case 3) New onboarding.",
+    "co_row_unreadable": "The CO row could not be read completely: nothing is written.",
+    "revision_changed": "The CO changed in Salesforce since it was read: review the page again.",
+    "write_blocked": "The Salesforce write could not be prepared: nothing was sent.",
 }
 
 
@@ -312,6 +332,7 @@ class Inputs:
     row_fresh: bool
     launching: bool = False
     tenant_names_path: Path | None = None  # the confirmed short tenant names (docs/60); None = none confirmed
+    case3_tenant_name: str | None = None   # Case 3 only: the exact tenant name the create would type (confirmed), else None
 
 
 def _owner_ok(operator: str | None, record: Mapping[str, Any]) -> bool:
@@ -356,9 +377,30 @@ def _clone_fresh(clone: Mapping[str, Any] | None) -> bool:
     return True
 
 
+def _row_route(row: Mapping[str, Any] | None) -> str | None:
+    """The approvable route of a CO row (CE-only New or Case 3 New), else None."""
+    if not isinstance(row, Mapping):
+        return None
+    pair = (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+    if pair == (salesforce_uuid_writeback.CE_ROUTE_PRODUCT, salesforce_uuid_writeback.CE_ROUTE_TYPE):
+        return production_approval.ALLOWED_ROUTE
+    if pair == (case3_ids.CASE3_PRODUCT, case3_ids.CASE3_TYPE):
+        return production_approval.CASE3_ROUTE
+    return None
+
+
+def _create_binding(reference: str, revision: str, approval_ref: str, ctx: Mapping[str, Any]) -> str:
+    """The one-time create token binding; a Case 3 token is also bound to the exact tenant name."""
+    parts = [reference, revision, approval_ref, "create"]
+    if ctx.get("route") == production_approval.CASE3_ROUTE:
+        parts.append(str(ctx.get("tenant_name")))
+    return _binding(*parts)
+
+
 def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
-    """(first refusal code or None, context). Context: ``approval`` (the record), ``status`` (co_status), ``env``."""
-    ctx: dict[str, Any] = {"approval": None, "status": None, "env": None}
+    """(first refusal code or None, context). Context: ``approval`` (the record), ``status`` (co_status), ``env``, ``route``
+    (CE-only or Case 3) and ``tenant_name`` (Case 3 only)."""
+    ctx: dict[str, Any] = {"approval": None, "status": None, "env": None, "route": None, "tenant_name": None}
     lock = build_lock(inputs.vm)
     if lock is not None:
         return lock, ctx
@@ -385,19 +427,30 @@ def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
     revision = inputs.row.get("LastModifiedDate")
     if not isinstance(revision, str) or not revision or revision != record.get("source_revision"):
         return "approval_revision_drift", ctx
-    problem = production_approval.check(inputs.approvals_path, record["approval_ref"], inputs.reference,
-                                        production_approval.ALLOWED_ROUTE, revision, inputs.now)
+    route = _row_route(inputs.row)
+    if route is None:
+        return "route_not_ce_only_new", ctx
+    ctx["route"] = route
+    case3 = route == production_approval.CASE3_ROUTE
+    name_args: dict[str, Any] = {}
+    if case3:
+        name = inputs.case3_tenant_name
+        if not production_approval.valid_tenant_name(name):
+            return "tenant_name_not_confirmed", ctx
+        ctx["tenant_name"] = name
+        name_args = {"tenant_name": name}  # the approval must be bound to exactly this name
+    problem = production_approval.check(inputs.approvals_path, record["approval_ref"], inputs.reference, route, revision,
+                                        inputs.now, **name_args)
     if problem is not None:
         return problem, ctx
-    if (inputs.row.get("Onboarding_Product__c") != salesforce_uuid_writeback.CE_ROUTE_PRODUCT
-            or inputs.row.get("Onboarding_Type__c") != salesforce_uuid_writeback.CE_ROUTE_TYPE):
-        return "route_not_ce_only_new", ctx
     if inputs.row_fresh is not True:
         return "salesforce_not_fresh", ctx
     if inputs.sf_ready is not True:
         return "salesforce_session_not_ready", ctx
     if "Account_UUID__c" not in inputs.row or str(inputs.row.get("Account_UUID__c") or "").strip():
         return "salesforce_prior_uuid_present", ctx
+    if case3 and ("Surface_Account_ID__c" not in inputs.row or str(inputs.row.get("Surface_Account_ID__c") or "").strip()):
+        return "surface_account_id_present", ctx
     if not _clone_fresh(inputs.clone):
         return "clone_stale", ctx
     try:
@@ -448,8 +501,14 @@ def _chip(css: str, text: str) -> str:
     return "<span class='chip " + css + "'>" + escape(text) + "</span>"
 
 
-def _status_html(code: str) -> str:
+CASE3_VERIFIED_NOTE = ("The tenant exists and the readback matches the contract (Case 3). The Account ID and Account UUID are "
+                       "written to Salesforce only by your review and confirmation on this page (or already entered by hand).")
+
+
+def _status_html(code: str, route: object = None) -> str:
     css, label, note = STATUS_TEXT[code]
+    if code == CREATED_VERIFIED and route == production_approval.CASE3_ROUTE:
+        note = CASE3_VERIFIED_NOTE  # the CE-only text tells to write the UUID, which is not this route's next step
     return ("<div class='card-head'><h2 id='co-create-title' class='pill'>Production create</h2>" + _chip(css, label)
             + "</div><p class='note'>" + escape(note) + "</p>")
 
@@ -469,7 +528,7 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
     status = co_status(history) if history is not None else None
     status_html = ""
     if status is not None and status["code"] in STATUS_TEXT and status["code"] != DRY_RUN_PASSED:
-        status_html = _status_html(status["code"])
+        status_html = _status_html(status["code"], status.get("route"))
     summary = onboarded_summary(inputs.records_parent, reference) if status is not None and status["code"] == CREATED_VERIFIED else None
     if summary is not None and summary["label"] != "Created: UUID not written":
         status_html = ("<div class='card-head'><h2 id='co-create-title' class='pill'>Production create</h2>"
@@ -483,10 +542,15 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
     if reason is None:
         approval = ctx["approval"]
         revision = str(inputs.row["LastModifiedDate"])
-        token = TOKENS.issue("create", reference, _binding(reference, revision, approval["approval_ref"], "create"))
+        token = TOKENS.issue("create", reference, _create_binding(reference, revision, approval["approval_ref"], ctx))
+        route_note = ""
+        if ctx.get("route") == production_approval.CASE3_ROUTE:
+            route_note = ("<p class='note'>Route: Surface &amp; Credential Exposure (Case 3). The tenant is created with the name "
+                          "<code>" + escape(str(ctx.get("tenant_name"))) + "</code>, the one this approval is bound to. After a verified "
+                          "create nothing is written to Salesforce until you review and confirm it on this page.</p>")
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
                 "<h2 id='co-create-title' class='pill'>Create in production</h2>" + _chip("chip-warn", "Production")
-                + "</div><p class='note'>Every gate passed: fresh clone, fresh Salesforce data, a valid one-CO approval bound to "
+                + "</div>" + route_note + "<p class='note'>Every gate passed: fresh clone, fresh Salesforce data, a valid one-CO approval bound to "
                   "this revision and a passing dry run. One click creates ONE tenant in BackOffice production, checks it by "
                   "readback and consumes the approval. There is no retry.</p>"
                   "<form class='start-form' method='post' action='" + CREATE_PATH + "'>"
@@ -497,6 +561,13 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
                   "<div class='confirm'><label><input type='checkbox' name='production_create_authorized' value='1' required> "
                   "I authorize ONE production create for this CO and approval</label></div>"
                   "<button type='submit'>Create in production</button></form></section>")
+    if status is not None and status["code"] == CREATED_VERIFIED and _row_route(inputs.row) == production_approval.CASE3_ROUTE:
+        from . import case3_followup  # lazy: case3_followup imports this module
+        return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
+                "<h2 id='co-create-title' class='pill'>Production create</h2>" + _chip("chip-ok", "Created and verified")
+                + "</div><p class='note'>The tenant exists and the readback matches the contract (Case 3). Next: review and "
+                  "confirm the Salesforce write of the Account ID and Account UUID, then the stage move to Account Scanning."
+                  "</p>" + case3_followup.followup_card_html(inputs.records_parent, reference) + "</section>")
     if status is not None and status["code"] == CREATED_VERIFIED:
         if uuid_write_state == "written_verified":
             status_html = ("<div class='card-head'><h2 id='co-create-title' class='pill'>Production create</h2>"
@@ -598,7 +669,7 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
         return reason
     approval = ctx["approval"]
     revision = str(inputs.row["LastModifiedDate"])
-    if not TOKENS.consume("create", reference, _binding(reference, revision, approval["approval_ref"], "create"), token):
+    if not TOKENS.consume("create", reference, _create_binding(reference, revision, approval["approval_ref"], ctx), token):
         return "confirmation_invalid"
     if _form(values, "confirm_reference") != reference:
         return "typed_reference_mismatch"
@@ -610,7 +681,9 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
             production_launch_ticket.mint(root, reference, revision, approval["approval_ref"], str(inputs.operator), inputs.now)
         except (OSError, ValueError, production_launch_ticket.TicketRootError):
             return None
-        handle = launch(reference, revision, ctx["env"])
+        # CE-only keeps its three-argument call; a Case 3 launch also names the route (the runner needs it).
+        handle = (launch(reference, revision, ctx["env"], route=ctx["route"])
+                  if ctx.get("route") == production_approval.CASE3_ROUTE else launch(reference, revision, ctx["env"]))
         if handle is None:
             production_launch_ticket.discard(root, reference)  # a failed launch leaves no usable ticket
         return handle

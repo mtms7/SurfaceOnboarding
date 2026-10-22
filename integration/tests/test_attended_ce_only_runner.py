@@ -254,6 +254,13 @@ class CeOnlyNamingTests(unittest.TestCase):
         self.assertEqual(len(name), 15)
         self.assertEqual(ce_only_names(name).primary_user_alias, "abcdefghijklmno")
 
+    def test_alias_keeps_the_first_letter_of_words_with_umlauts(self):
+        # Owner decision 2026-10-22: an umlaut never splits a word ("Brüder" -> "b", not "br" + "der").
+        # The alias always comes from the full Salesforce account name, never from the shortened tenant name.
+        self.assertEqual(ce_only_names("Barmherzige Brüder gemeinnützige Träger GmbH").primary_user_alias, "bbgtg")
+        self.assertEqual(ce_only_names("Äpfel Öl Übung Gesellschaft").primary_user_alias, "aoug")
+        self.assertEqual(ce_only_names("Müller").primary_user_alias, "muller")
+
     def test_alias_uses_word_initials_beyond_fifteen_chars(self):
         name = "Abcdefghijklmnop"
         self.assertEqual(len(name), 16)

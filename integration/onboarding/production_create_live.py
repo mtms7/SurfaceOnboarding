@@ -47,6 +47,9 @@ LIVE_REASONS = frozenset({
     "approval_revision_drift", "salesforce_prior_uuid_present", "live_source_check_missing", "service_worker_present", "service_worker_check_failed",
     "readback_payload_mismatch", "readback_payload_unchecked", "form_changed_during_checks", "form_recheck_missing",
     "duplicate_check_stale",
+    # Case 3 live create (path B, owner go 2026-10-22): the approval bound to the tenant name, the IDs, the tier rule.
+    "approval_tenant_name_drift", "approval_tenant_name_missing", "tenant_name_not_confirmed", "surface_account_id_present",
+    "approval_route_mismatch", "approval_co_mismatch", "approval_ref_mismatch", "case3_tier_values_mismatch", "tier_unknown",
 })
 
 

@@ -48,6 +48,8 @@ class ApprovalPairTests(unittest.TestCase):
     def issue(self, route=CASE3, ref=REF, **over):
         args = dict(approval_ref=ref, co_reference=CO, route=route, source_revision=REV, issued_by=OWNER,
                     allowed_issuers=ISSUERS, now=NOW)
+        if route == CASE3:
+            args["tenant_name"] = "Test Tenant"  # step (b): a Case 3 approval is bound to its tenant name
         args.update(over)
         return pa.issue(self.path, **args)
 
@@ -63,7 +65,7 @@ class ApprovalPairTests(unittest.TestCase):
         self.assertIsNone(self.check())
         self.assertEqual(self.check(source_revision="other"), "approval_revision_drift")
         self.assertEqual(self.check(co_reference="CO-0801"), "approval_co_mismatch")
-        self.assertIsNone(pa.consume(self.path, REF, CO, CASE3, REV, NOW))
+        self.assertIsNone(pa.consume(self.path, REF, CO, CASE3, REV, NOW, tenant_name="Test Tenant"))
         self.assertEqual(self.check(), "approval_consumed")
 
     def test_a_ce_only_approval_never_authorizes_case3_and_the_reverse(self):

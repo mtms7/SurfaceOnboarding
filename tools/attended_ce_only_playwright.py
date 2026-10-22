@@ -51,6 +51,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import json
 import os
+import unicodedata
 from pathlib import Path
 import re
 import shutil
@@ -301,7 +302,9 @@ def _account_display_name_and_alias(account_name: str) -> tuple[str, str]:
     display_name = compact.rstrip(". ")
     if not display_name:
         raise ValueError("account_name_unavailable")
-    alphanumeric = re.findall(r"[A-Za-z0-9]+", compact)
+    # Owner decision 2026-10-22: an umlaut never splits a word ("Brüder" -> "Bruder"), so the alias keeps one initial per word.
+    folded = "".join(ch for ch in unicodedata.normalize("NFKD", compact) if not unicodedata.combining(ch))
+    alphanumeric = re.findall(r"[A-Za-z0-9]+", folded)
     if not alphanumeric:
         raise ValueError("account_name_unavailable")
     if len(compact) <= 15:
@@ -10451,9 +10454,14 @@ def main() -> int:
         if not args.co or not args.revision:
             parser.error("--co and --revision are required with --production-create")
         if (args.dry_run or args.confirm_write or args.production_probe or args.production_dry_run
-                or args.production_readback or args.diagnose_confirm or args.readback_only or args.route != CE_ENGINE):
-            parser.error("--production-create is a separate run (CE-only route; no other run flag)")
-        print(run_production_create(args.co, args.revision, owner_go=args.owner_go))
+                or args.production_readback or args.diagnose_confirm or args.readback_only
+                or args.route not in (CE_ENGINE, CASE3_ENGINE)):
+            parser.error("--production-create is a separate run (route case_2_new_ce_only or case_3_combined_baseline; "
+                         "no other run flag)")
+        if args.route == CASE3_ENGINE:
+            print(run_production_create(args.co, args.revision, owner_go=args.owner_go, route=CASE3_ENGINE))
+        else:
+            print(run_production_create(args.co, args.revision, owner_go=args.owner_go))
         return 0
     if args.production_readback:
         if not args.co:
@@ -10736,6 +10744,40 @@ def _pcr_live_duplicate_problem(page: Any, tenant_name: str, primary_domain: str
                                           primary_domain)
 
 
+def _pcr_live_duplicate_problems(page: Any, tenant_name: str, domains: tuple[str, ...], control: Any = None,
+                                 extras: dict[str, Any] | None = None) -> str | None:
+    """``_pcr_live_duplicate_problem`` for the name and each domain in turn (CE-only: one domain, so one call); the first reason."""
+    for domain in domains:
+        problem = _pcr_live_duplicate_problem(page, tenant_name, domain, control, extras)
+        if problem is not None:
+            return problem
+    return None
+
+
+def case3_live_intended(source: Case3FillSource, plan: dict[str, Any], run_day: date | None = None) -> dict[str, Any]:
+    """The Case 3 ``intended`` values of the live create: ``case3_intended`` fed from the SAME fill plan the form is typed from.
+
+    The tier comes from the plan's scanning interval (Monthly = Go, Weekly = Prime) and the subdomain count the form will type must be
+    the one the tier rule gives, so the typed form, the expected create body and the expected readback can never disagree.
+    Raises ValueError with a fixed code (never a value).
+    """
+    texts = {" ".join(str(key).split()): value for key, value in plan["texts"].items()}
+    tier = {"Monthly": "Go", "Weekly": "Prime"}.get(plan["selects"].get("Scanning interval"))
+    end = plan["license_end"]
+    built = case3_contract.case3_intended(
+        tenant_name=texts["Company name"], main_domain=texts["Company primary domain"],
+        ce_email_domains=texts["Leaked Credentials scanned domains (Comma Separated Values)"],
+        user_email_domain=texts["User email domains (Comma Separated Values)"],
+        license_end=end.isoformat() if isinstance(end, date) else end, tier=tier,
+        first_name=texts.get("First name"), last_name=texts.get("Last name"),
+        organization_email=texts.get("Organization Email"))
+    if texts.get("Number of subdomains") != str(built["subdomains_number"]) or texts["Company name"] != source.tenant_name:
+        raise ValueError("case3_tier_values_mismatch")  # also: the typed name is the one the approval is bound to
+    if built["leaked_domain"] != source.ce_email_domain or texts.get("User email domains (Comma Separated Values)") != built["email_domain"]:
+        raise ValueError("case3_tier_values_mismatch")  # the typed form and the contract values must agree
+    return built
+
+
 def _pcr_finish_line(result: Any) -> str:
     """The one printed line of a live run: a result word or reason from the fixed enums and a record name only."""
     from integration.onboarding import production_create_live as live
@@ -10844,8 +10886,15 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                           approval_path: Path | None = None, wait_seconds: float = MAX_WAIT_SECONDS,
                           load_source: Any = None, clone_facts: Any = None, open_page: Any = None,
                           fill_date: Any = None, date_kept: Any = None, clock: Any = None,
-                          run_day: date | None = None, ticket_parent: Path | None = None, org_probe: Any = None) -> str:
-    """One guarded LIVE production CE-only create for one CO. Returns the printed line (result word, record name only).
+                          run_day: date | None = None, ticket_parent: Path | None = None, org_probe: Any = None,
+                          route: str = CE_ENGINE) -> str:
+    """One guarded LIVE production create for one CO (CE-only; Case 3 with ``route=CASE3_ENGINE``, path B, owner go 2026-10-22).
+    Returns the printed line (result word, record name only).
+
+    Case 3 differs from CE-only only where the contract does: the Case 3 source and fill plan, the intended values built by
+    ``production_case3_contract.case3_intended`` (tier rule), the approval bound to the exact tenant name, a duplicate check over the
+    name and both domains, the create body and the readback compared with the Case 3 contract. The gates, the single Confirm click and
+    the approval consume are the same code.
 
     Order: arguments; the dry-run constant; the live production target (runner constant, sessions flag, approval
     reference, exact origin); Salesforce source and clone; the ordered gate (approval bound to CO, route and the CURRENT
@@ -10865,6 +10914,9 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference)
             or not production_dry_run.revision_ok(acknowledged_revision)):
         return _pcr_line("production_create_arguments_invalid")
+    if route not in (CE_ENGINE, CASE3_ENGINE):
+        return _pcr_line("production_create_arguments_invalid")
+    case3 = route == CASE3_ENGINE
     if environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", PINNED_SF_ALIAS):  # the env override is ignored: refuse instead
         return _pcr_line("salesforce_alias_not_pinned")
     parent = records_parent or _pdr_records_parent()
@@ -10882,7 +10934,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         return production_create_record.record(parent, merged, stamp())
 
     def refused(reason: str) -> str:
-        data = {"co_reference": reference, "route": CE_ENGINE, "outcome": production_create.OUTCOME_REFUSED,
+        data = {"co_reference": reference, "route": route, "outcome": production_create.OUTCOME_REFUSED,
                 "refusal_reason": live.live_known_reason(str(reason).replace(":", "_")),
                 "salesforce_revision": acknowledged_revision}
         if production_approval.REFERENCE_PATTERN.fullmatch(reference_value):
@@ -10934,12 +10986,18 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     # 2. Intended values: the fixed Salesforce reads of the Dev runner; start date = the day of creation.
     day = run_day or _run_day()
     try:
-        source = (load_source or CE_ROUTE.load_source)(reference)
-        plan = build_ce_only_fill(source, day)
+        source = (load_source or ROUTES[route].load_source)(reference)
+        if case3 and getattr(source, "tenant_name_unconfirmed", False):
+            raise production_dry_run.MappingError("tenant_name_not_confirmed")  # docs/60: the owner confirms a long name first
+        plan = _pdr_plan(route, source, day) if case3 else build_ce_only_fill(source, day)
         intended = production_dry_run.map_plan(plan, SELECT_NAMES, EARLY_SELECTS)
-        contract_intended = ce_production_intended(source, day)
-        production_contract.expected_readback_row(contract_intended)  # validates the intended values; the STRICT row (exact
-        # country code read from the filled form) is built after the fill
+        if case3:
+            contract_intended = case3_live_intended(source, plan, day)
+            case3_contract.expected_case3_readback_row(contract_intended)  # validates the intended values
+        else:
+            contract_intended = ce_production_intended(source, day)
+            production_contract.expected_readback_row(contract_intended)  # validates the intended values; the STRICT row (exact
+            # country code read from the filled form) is built after the fill
         production_contract.build_readback_body(contract_intended["tenant_name"])  # validates the search value
     except production_dry_run.MappingError as error:
         return refused(str(error))
@@ -10949,23 +11007,28 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         return refused(_pdr_reason(str(error)))
     except Exception:
         return refused("salesforce_fill_source_unavailable")
+    live_email_domain = source.ce_email_domain if case3 else source.email_domain
+    # The domains the live duplicate check searches besides the name: the CE email domain for CE-only; the main domain and the
+    # single CE email domain for Case 3 (deduplicated).
+    live_domains = tuple(dict.fromkeys((contract_intended["primary_domain"], live_email_domain))) if case3 else (live_email_domain,)
     try:
-        facts = (clone_facts or _pdr_clone_facts)(source, now)
+        facts = (clone_facts or ((lambda src, moment: _pdr_clone_facts(src, moment, route)) if case3 else _pdr_clone_facts))(source, now)
     except Exception:
         facts = {}
     facts = facts if isinstance(facts, dict) else {}
     inputs = production_create.CreateInputs(
-        co_reference=reference, route=CE_ENGINE, approval_ref=reference_value, approval_path=approval_file,
+        co_reference=reference, route=route, approval_ref=reference_value, approval_path=approval_file,
         source_revision=acknowledged_revision, source_revision_now=source.source_revision, now=now, environ=environ,
-        sf_email_domains=(source.email_domain,), sf_source_consistent=True,
+        sf_email_domains=(live_email_domain,), sf_source_consistent=True,
         prior_account_uuid="present" if source.salesforce_id_present else None,
         clone_collected_at=facts.get("collected_at"), clone_matches=facts.get("clone_matches") is True,
         duplicate_found=facts.get("duplicate_found") is not False,
         live_paid_tenant_count=facts.get("live_paid_tenant_count", 99),
         timing_allowed=onboarding_allowed_now(source.subscription_start, now.date(), environment="prod"),
         csm_request_recorded=False, sessions_ready=True, schema_ok=True,
-        expected_tenant_name=source.tenant_name, expected_domains=(source.email_domain,),
-        plan_summary="Credential Exposure CE-only create")
+        expected_tenant_name=source.tenant_name,
+        expected_domains=(contract_intended["primary_domain"],) if case3 else (source.email_domain,),
+        plan_summary=("Surface and Credential Exposure (Case 3) create" if case3 else "Credential Exposure CE-only create"))
     prior = _pcr_prior_records(parent, reference)
     if prior is not None:
         dry_problem = create_ui.dry_run_problem(prior, reference_value, now)  # the 24 h age and the approval binding
@@ -10982,17 +11045,17 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
 
     def source_check(_inputs: Any) -> tuple[str, bool]:
         """Re-read the CO from Salesforce (the guarded fixed read): current revision and whether an Account UUID exists."""
-        again = (load_source or CE_ROUTE.load_source)(reference)
+        again = (load_source or ROUTES[route].load_source)(reference)
         return again.source_revision, bool(again.salesforce_id_present)
 
     def run_live(candidate: Any, fill: Any, click: Any, read: Any, duplicate_check: Any, recheck: Any = None) -> Any:
         return production_create.run(candidate, False, fill, click, read, write_record, owner_go=owner_go is True,
                                      prior_records=prior, prior_review_cleared_by_owner=cleared, clock=clock or stamp,
                                      live_duplicate_check=duplicate_check, live_source_check=source_check,
-                                     live_form_recheck=recheck)
+                                     live_form_recheck=recheck, case3_create=case3)
 
     # 3. The ordered gate BEFORE any browser: a refusal here opens nothing.
-    if production_create.evaluate_gate(inputs, production_target) is not None:
+    if production_create.evaluate_gate(inputs, production_target, case3_create=case3) is not None:
         return _pcr_finish_line(run_live(inputs, no_fill, live_unreached_click, live_unreached_readback, no_duplicate_check))
 
     # 4. The browser. ``clicks`` counts the Confirm click; ``guard`` allows exactly one armed create POST.
@@ -11011,7 +11074,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
             if worker_problem:
                 return refused(worker_problem)
             control = facts.get("control")
-            early = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
+            early = _pcr_live_duplicate_problems(page, source.tenant_name, live_domains, control, extras)
             session_codes = ("production_session_expired", "production_session_not_ready")
             if early in session_codes:
                 extras["form_fields_checked"] = _pdr_session_stage_fields(page)  # names which read stage failed
@@ -11025,7 +11088,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 # Owner decision 2026-10-18: the live BackOffice reads (session, control, name, domain, demo list) run HERE,
                 # with the form closed, immediately before it opens; none runs while it is open.
                 started = (clock or stamp)()  # stamped BEFORE the reads: the age covers the oldest of them
-                problem = _pcr_live_duplicate_problem(page, source.tenant_name, source.email_domain, control, extras)
+                problem = _pcr_live_duplicate_problems(page, source.tenant_name, live_domains, control, extras)
                 pre_form.update(at=started, problem=problem)
                 if problem is not None:
                     raise production_create.FormRefusal(problem, _pdr_session_stage_fields(page)
@@ -11036,12 +11099,15 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 code = _pcr_selected_country_code(page)  # the exact value the form submits, compared exactly in the readback
                 strict_state["code"] = code
                 try:
-                    strict_state["expected"] = production_contract.expected_readback_row(
-                        {**contract_intended, "country_code": code}, strict=True)
+                    strict_state["expected"] = (
+                        case3_contract.expected_case3_readback_row({**contract_intended, "country_code": code}) if case3
+                        else production_contract.expected_readback_row({**contract_intended, "country_code": code}, strict=True))
                 except ValueError:
                     raise production_create.FormRefusal("country_code_unavailable", fields) from None
                 try:  # docs/49 s.1: what the one create POST body must contain (the guard compares it after the click)
-                    guard.expected_payload = production_contract.expected_create_payload({**contract_intended, "country_code": code})
+                    guard.expected_payload = (
+                        case3_contract.expected_case3_create_payload({**contract_intended, "country_code": code}) if case3
+                        else production_contract.expected_create_payload({**contract_intended, "country_code": code}))
                 except ValueError:
                     guard.expected_payload = None  # payload_expectation_unavailable: never verifies, nothing pre-send aborted
                 return fields
