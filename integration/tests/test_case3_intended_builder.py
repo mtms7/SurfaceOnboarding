@@ -166,7 +166,7 @@ class BuilderIsolationTests(unittest.TestCase):
             self.assertNotIn(word, source)
         from integration.onboarding import session_readiness
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked
 
 
 if __name__ == "__main__":

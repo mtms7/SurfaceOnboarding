@@ -96,7 +96,7 @@ class WordingTests(Base):
 class LockedTests(Base):
     def test_the_locks_are_false_and_a_case_3_co_shows_and_launches_nothing(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked
         self.assertEqual(ui.create_card_html(self.inputs()), "")
         launch = mock.Mock()
         values = {"reference": CO, "nonce": "x", "confirm_reference": CO, "production_create_authorized": "1"}

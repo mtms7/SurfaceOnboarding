@@ -150,7 +150,7 @@ class LockedTests(unittest.TestCase):
 
     def test_the_constants_in_the_build_are_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked
 
 
 class PassingRunTests(unittest.TestCase):

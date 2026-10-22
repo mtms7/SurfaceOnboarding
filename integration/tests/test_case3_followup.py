@@ -299,7 +299,7 @@ class IsolationTests(unittest.TestCase):
 
     def test_the_locks_stay_false(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
-        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, False)
+        self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked
 
 
 if __name__ == "__main__":
