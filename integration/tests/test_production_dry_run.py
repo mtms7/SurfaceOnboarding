@@ -386,7 +386,7 @@ class LockTests(unittest.TestCase):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         text = Path(session_readiness.__file__).read_text(encoding="utf-8")
         self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = True\b")
-        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = True  # owner go 2026-10-22")  # unlock window: pinned by test_unlock_state
+        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = True  # RELEASED 2026-10-23")  # unlock window: pinned by test_unlock_state
 
     def test_dry_run_target_is_locked_with_its_own_reason(self):
         with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", False), \

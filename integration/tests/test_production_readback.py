@@ -140,7 +140,7 @@ class GateTests(unittest.TestCase):
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked
         text = Path(session_readiness.__file__).read_text(encoding="utf-8")
         self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = True\b")
-        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = True  # owner go 2026-10-22")  # unlock window: pinned by test_unlock_state
+        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = True  # RELEASED 2026-10-23")  # unlock window: pinned by test_unlock_state
 
     def test_missing_gate_reads_nothing_and_opens_nothing(self):
         for env, reason in (({}, "gate_missing"), ({probe.GATE_ENV: "0", probe.REF_ENV: "PROBE-D4-20261016"}, "gate_missing"),

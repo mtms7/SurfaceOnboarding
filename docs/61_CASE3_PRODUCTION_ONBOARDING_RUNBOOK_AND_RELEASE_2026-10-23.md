@@ -174,7 +174,11 @@ Benefits:
 
 Costs:
 - Two commits to unlock and two reverts to relock for every CO.
-- A forgotten relock leaves Option A's risks in place without the review. CO-0802's relock is still open today.
+- A forgotten relock leaves Option A's risks in place without the review.
+
+### 3.3 Decision (owner, 2026-10-23): option A, released
+
+Both constants stay True in `main` (commit 'RELEASED 2026-10-23'). The Case 3 create and dry run are available from the dashboard under per-CO approvals: every create still needs a fresh one-CO approval (`tools/issue_production_approval.py`, one live approval at a time, `tools/revoke_production_approval.py` to retire an unused one), a passing dry run under 24 h, a clone under 6 h, the typed confirmation and the owner's MFA. Note that the CE-only route shares the same two constants and the same per-CO approval gate, so it is available the same way. The tests pin the real state in `integration/tests/test_unlock_state.py`; the locked-path tests run with `integration/tests/locked_build.py`. To relock: `git revert --no-edit` the release commit, then `02191d1` and `f18821a`, and restart the dashboard.
 - The dashboard must be restarted after each change.
 - More owner steps per CO.
 

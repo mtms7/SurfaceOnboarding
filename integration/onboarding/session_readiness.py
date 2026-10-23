@@ -58,16 +58,15 @@ ENVIRONMENTS: dict[str, SessionEnvironment] = {
     BACKOFFICE_PRODUCTION: SessionEnvironment(BACKOFFICE_PRODUCTION, "BackOffice production",
                                               PRODUCTION_BACKOFFICE_ORIGIN, "backoffice-production-automation", True),
 }
-# The runner opens only Leonardo Development URLs today; an environment-aware
-# runner is a separate, reviewed change. Until then production stays locked
-# whatever the configuration says.
-PRODUCTION_RUNNER_SUPPORTED = True  # owner go 2026-10-22 for ONE attended CO-0802 (Case 3) create; relock right after
-# A SEPARATE hard-coded lock for the production CE-only DRY RUN (docs/42 section 6.2): the dry run opens the real
-# production form, types into it and cancels, never clicking Confirm. Owner decision 2026-10-16: no production run
-# until the owner says go, so this stays False until a separate, reviewed change after that go. It never unlocks the
-# create: `production_unlock_problem` and `production_target` ignore it, and the dry-run target ignores
+# Production create lock. RELEASED 2026-10-23 (owner decision, docs/61 option A): True lets the dashboard offer the guarded live
+# create, but every create still needs a fresh one-CO approval, a passing dry run (24 h), a fresh clone (6 h), the typed
+# confirmation and the owner's MFA (see production_create_ui.gate). Set False (git revert) to lock production again.
+PRODUCTION_RUNNER_SUPPORTED = True  # RELEASED 2026-10-23 (owner decision, docs/61): Case 3 create under per-CO approvals; relock = git revert
+# A SEPARATE hard-coded lock for the production DRY RUN (docs/42 section 6.2): the dry run opens the real production
+# form, types into it and cancels, never clicking Confirm. RELEASED 2026-10-23 together with the create (docs/61). It never
+# unlocks the create: `production_unlock_problem` and `production_target` ignore it, and the dry-run target ignores
 # PRODUCTION_RUNNER_SUPPORTED.
-PRODUCTION_DRY_RUN_SUPPORTED = True  # owner go 2026-10-22 for the CO-0802 (Case 3) attended dry run; relock right after
+PRODUCTION_DRY_RUN_SUPPORTED = True  # RELEASED 2026-10-23 (owner decision, docs/61): Case 3 dry run under per-CO approvals; relock = git revert
 
 
 def _production_session_problem(environ: Mapping[str, str], now: datetime) -> str | None:
