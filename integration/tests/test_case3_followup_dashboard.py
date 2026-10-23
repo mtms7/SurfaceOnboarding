@@ -101,6 +101,28 @@ class ProgressTests(Fixture):
         self.assertIn("Writing the Account UUID", progress["steps"][3][0])
 
 
+class PageTests(Fixture):
+    def setUp(self):
+        super().setUp()
+        self.unlocked()
+        self.record(outcome="readback_verified", account_id=ACCOUNT_ID, account_uuid=UUID, tenant_name=NAME)
+        for patch in (mock.patch.object(dashboard, "_create_ui_inputs", lambda ref, row, operator=None: self.inputs()),
+                      mock.patch.object(dashboard.create_ui, "scan_check_problem", lambda *a: "no_verified_create")):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_the_review_button_is_on_the_page_while_the_case_3_bar_waits_for_it(self):
+        dashboard.PRODUCTION_RUNS[CO] = {"since": "2026-10-22T11:00:00Z", "follow": None, "route": CASE3}
+        html = dashboard._production_create_html(CO, base.row())
+        self.assertIn("runprog", html)  # the progress bar
+        self.assertIn(create_ui.FOLLOWUP_REVIEW_PATH, html)  # and the owner's way forward
+        self.assertEqual(html.count("<form"), 1)
+
+    def test_a_ce_only_run_keeps_the_progress_card_alone(self):
+        dashboard.PRODUCTION_RUNS[CO] = {"since": "2026-10-22T11:00:00Z", "follow": None}
+        self.assertNotIn(create_ui.FOLLOWUP_REVIEW_PATH, dashboard._production_create_html(CO, base.row()))
+
+
 class InputsTests(Fixture):
     def setUp(self):
         super().setUp()

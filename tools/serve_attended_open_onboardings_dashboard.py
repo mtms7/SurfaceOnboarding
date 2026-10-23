@@ -7855,6 +7855,11 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
                      else "")
         progress = _production_run_progress(reference)
         if progress is not None:
+            if (PRODUCTION_RUNS.get(reference) or {}).get("route") == "case_3_combined_baseline" and not progress["done"]:
+                # Case 3: nothing is written automatically, so the owner's review button must stay reachable under the bar.
+                inputs = _create_ui_inputs(reference, row)
+                return create_ui.progress_card_html(progress) + create_ui.create_card_html(
+                    inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
             return create_ui.progress_card_html(progress) + (scan_html if progress["done"] else "")
         inputs = _create_ui_inputs(reference, row)
         html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference)) + scan_html
