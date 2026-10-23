@@ -17,6 +17,7 @@ from integration.onboarding import production_create_ui as ui
 from integration.onboarding import production_views as views
 from integration.tests import test_ce_after_create as after
 from integration.tests import test_production_create_ui as base
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 CO, UUID, NOW = base.CO, base.UUID, base.NOW
 CREATED_MS = int(NOW.timestamp() * 1000)  # the create record below is written at NOW
@@ -312,6 +313,7 @@ class OnboardedSummaryTests(base.Base):
         self.done("Account Scanning")
         self.assertNotIn(UUID, json.dumps(ui.onboarded_summary(self.dir, CO, clone(**FINISHED))))
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_locked_create_card_says_where_the_onboarding_stands(self):
         self.record("readback_verified", account_uuid=UUID)
         html = ui.create_card_html(self.inputs())

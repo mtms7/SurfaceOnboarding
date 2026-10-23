@@ -16,6 +16,7 @@ from integration.onboarding import production_views as views
 from integration.tests import test_production_first_dashboard as base
 import tools.attended_ce_only_playwright as runner
 import tools.serve_attended_open_onboardings_dashboard as dashboard
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 TODAY = date(2026, 10, 16)
 FRESH = {"state": "fresh", "age_seconds": 7800, "reason": ""}
@@ -377,6 +378,7 @@ class CardTests(PageBase):
                 for tag in ("<form", "<button", "<input", "<script"):
                     self.assertNotIn(tag, self.card(page), (name, tag))
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_supported_flags_untouched(self):
         from integration.onboarding import session_readiness
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)

@@ -15,6 +15,7 @@ from integration.onboarding import production_probe as probe
 from integration.onboarding import session_readiness
 from integration.onboarding.run_target import ProductionLocked, development_target
 import tools.attended_ce_only_playwright as runner
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 GOOD_ENV = {probe.GATE_ENV: "1", probe.REF_ENV: "PROBE-D4-20261016"}
@@ -179,6 +180,7 @@ class GateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             probe.start_url(development_target())
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_probe_does_not_unlock_production_writes(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         env = {**GOOD_ENV, "SURFACE_ONBOARDING_PRODUCTION_SESSIONS": "1"}
@@ -483,6 +485,7 @@ class RunnerWiringTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"SURFACE_LEONARDO_PROFILE_DIR": str(self.base / "dev")}):
             self.assertEqual(runner.leonardo_profile(), (self.base / "dev", True))
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_production_write_target_cannot_be_built(self):
         good = {"SURFACE_ONBOARDING_PRODUCTION_SESSIONS": "1", "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF": "APPROVAL-2026-10-16",
                 "SURFACE_ONBOARDING_PRODUCTION_APPROVAL_ISSUED": (NOW - timedelta(days=1)).isoformat(),

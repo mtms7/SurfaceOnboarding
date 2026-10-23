@@ -21,6 +21,7 @@ from integration.onboarding import production_approval as approval
 from integration.onboarding import production_create_record as pcr
 from integration.onboarding import production_create_ui as ui
 from integration.onboarding import session_readiness as readiness
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc)
 CO = "CO-0802"
@@ -80,6 +81,7 @@ class Base(unittest.TestCase):
 
 
 class WordingTests(Base):
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_a_verified_case_3_create_never_says_to_write_the_uuid_the_ce_only_way(self):
         # While locked (the build default) the card is one read-only status; for Case 3 it must not carry the CE-only next step.
         self.record(outcome="readback_verified", account_id=ACCOUNT_ID, account_uuid=UUID, tenant_name=NAME)
@@ -94,6 +96,7 @@ class WordingTests(Base):
 
 
 class LockedTests(Base):
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_locks_are_false_and_a_case_3_co_shows_and_launches_nothing(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked

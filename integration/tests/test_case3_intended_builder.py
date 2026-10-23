@@ -10,6 +10,7 @@ import unittest
 
 from integration.onboarding import production_case3_contract as c3
 from integration.tests.test_case3_create_contract import INTENDED, observed_body
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 FACTS = dict(tenant_name="Example Klinik gGmbH", main_domain="Example-Klinik.example",
              ce_email_domains="@Example-Klinik-Ost.example", user_email_domain="pentera.io",
@@ -159,6 +160,7 @@ class BuilderRefusalTests(unittest.TestCase):
 
 
 class BuilderIsolationTests(unittest.TestCase):
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_builder_touches_no_lock_runner_or_external_module(self):
         import inspect
         source = inspect.getsource(c3.case3_intended)

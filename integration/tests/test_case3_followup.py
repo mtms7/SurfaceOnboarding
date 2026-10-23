@@ -18,6 +18,7 @@ from integration.onboarding import production_create_record as records
 from integration.onboarding import salesforce_stage_writeback as stage_wb
 from integration.onboarding import session_readiness as readiness
 from integration.onboarding.production_create_ui import OneTimeTokens
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 22, 14, 0, 0, tzinfo=timezone.utc)
 CO = "CO-0802"
@@ -297,6 +298,7 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(fu.stage_plan(dict(ROW, Onboarding_Product__c="Credential Exposure")).status, "blocked")
         self.assertEqual(fu.stage_plan({}).status, "blocked")
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_locks_stay_false(self):
         self.assertIs(readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked

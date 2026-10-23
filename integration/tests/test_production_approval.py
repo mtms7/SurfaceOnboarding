@@ -12,6 +12,7 @@ from pathlib import Path
 from integration.onboarding import production_approval as pa
 from integration.onboarding import session_readiness
 from integration.onboarding.models import EngineValue
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc)
 REF = "PROD-CE-0797-20261016"
@@ -376,6 +377,7 @@ class ProductionApprovalTests(unittest.TestCase):
         self.assertNotIn("SURFACE_ONBOARDING_PRODUCTION_SESSIONS", env)
         self.assertEqual(env["SURFACE_ONBOARDING_PRODUCTION_APPROVAL_REF"], REF)
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_unlock_environ_feeds_session_readiness(self):
         env = pa.unlock_environ(self.issue())
         full = {**env, "SURFACE_ONBOARDING_PRODUCTION_SESSIONS": "1"}

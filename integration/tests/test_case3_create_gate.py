@@ -12,6 +12,7 @@ from integration.onboarding import production_create as pc
 from integration.onboarding import session_readiness
 from integration.tests import test_production_create as base
 from integration.tests.test_production_create import NOW, make_inputs, target_ok
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 CASE3 = "case_3_combined_baseline"
 CE = "case_2_new_ce_only"
@@ -68,6 +69,7 @@ class Case3CreateGateTests(unittest.TestCase):
         self.assertEqual(pc.evaluate_gate(make_inputs(route=CASE3), production_target_fn=target_ok,
                                           approval_check_fn=wrong_scope, case3_create=True), "approval_route_mismatch")
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_production_locks_stay_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked

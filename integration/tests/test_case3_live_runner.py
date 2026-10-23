@@ -28,6 +28,7 @@ from integration.tests import test_production_dry_run as dry
 from integration.tests.test_case3_dry_run_runner import EMAIL, MAIN, NAME, MAX_SCAN_LABEL, Recorder, make_case3_source
 from integration.tests.test_production_create_live import contract_row
 import tools.attended_ce_only_playwright as runner
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 CASE3 = "case_3_combined_baseline"
 CE = "case_2_new_ce_only"
@@ -148,6 +149,7 @@ class LockedTests(unittest.TestCase):
                 self.assertEqual((h.opened, h.page.confirm_clicks, h.page.fetches), (0, 0, []))
                 self.assertFalse(h.consumed())
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_constants_in_the_build_are_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # dry run only unlocked for the CO-0802 dry run; the create stays locked

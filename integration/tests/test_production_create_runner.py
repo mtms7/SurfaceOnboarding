@@ -26,6 +26,7 @@ from integration.onboarding import session_readiness
 from integration.tests import test_production_dry_run as dry
 from integration.tests.test_production_create_live import contract_row, reply
 import tools.attended_ce_only_playwright as runner
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 CO, REF, REV, NOW, ORIGIN = dry.CO, dry.REF, dry.REV, dry.NOW, dry.ORIGIN
 ROUTE = "case_2_new_ce_only"
@@ -259,6 +260,7 @@ class Base(unittest.TestCase):
 
 
 class LockTests(Base):
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_constants_are_hard_coded_false(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked
@@ -283,6 +285,7 @@ class LockTests(Base):
                          "production_locked_production_dry_run_not_supported")
         self.no_external_activity(h)
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_real_constants_refuse_without_any_patch(self):
         h = self.harness()
         h.seed_dry_run()

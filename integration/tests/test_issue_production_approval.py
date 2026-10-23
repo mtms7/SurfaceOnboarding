@@ -14,6 +14,7 @@ from pathlib import Path
 from integration.onboarding import production_approval as pa
 from integration.onboarding import session_readiness
 from tools import issue_production_approval as tool
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc)
 OWNER = "owner@example.test"
@@ -381,6 +382,7 @@ class IssueToolTests(unittest.TestCase):
         self.assertEqual(tool.STATE_FILE_NAME, "production_create_approvals.json")
         self.assertEqual(tool.default_state_path().name, "production_create_approvals.json")
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_locks_stay_false_and_the_tool_does_not_reference_them(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked

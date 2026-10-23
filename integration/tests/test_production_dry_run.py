@@ -24,6 +24,7 @@ from integration.onboarding import session_readiness
 from integration.tests import page_own_table as pot
 from integration.onboarding.run_target import ProductionLocked, production_dry_run_target, production_target
 import tools.attended_ce_only_playwright as runner
+from integration.tests.locked_build import locked_create_build  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)
 ORIGIN = "https://app.pentera.io"
@@ -379,12 +380,13 @@ class Harness:
 # --- the separate lock ----------------------------------------------------------------------------------------------
 
 class LockTests(unittest.TestCase):
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_flags_are_hard_coded_false_and_separate(self):
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         text = Path(session_readiness.__file__).read_text(encoding="utf-8")
         self.assertRegex(text, r"(?m)^PRODUCTION_DRY_RUN_SUPPORTED = True\b")
-        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = False$")
+        self.assertRegex(text, r"(?m)^PRODUCTION_RUNNER_SUPPORTED = True  # owner go 2026-10-22")  # unlock window: pinned by test_unlock_state
 
     def test_dry_run_target_is_locked_with_its_own_reason(self):
         with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", False), \
@@ -392,6 +394,7 @@ class LockTests(unittest.TestCase):
             production_dry_run_target({**UNLOCK, **approval.unlock_environ(_record())}, NOW)
         self.assertEqual(caught.exception.reason, "production_dry_run_not_supported")
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_dry_run_flag_never_opens_the_live_target(self):
         env = {**UNLOCK, **approval.unlock_environ(_record())}
         with mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True):
@@ -423,6 +426,7 @@ class LockTests(unittest.TestCase):
                     production_dry_run_target(env, NOW)
                 self.assertEqual(caught.exception.reason, reason)
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_pc_run_uses_the_dry_run_target_only_for_a_dry_run(self):
         harness = Harness(self)
         records = []
@@ -1322,6 +1326,7 @@ class FlowTests(unittest.TestCase):
         self.assertNotRegex(glue, r"\.click\([^)]*Confirm")
         self.assertNotIn("account/add", glue.replace("docs", ""))
 
+    @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_live_create_stays_locked(self):
         self.assertIs(session_readiness.PRODUCTION_RUNNER_SUPPORTED, False)
         self.assertIs(session_readiness.PRODUCTION_DRY_RUN_SUPPORTED, True)  # unlocked for the CO-0800 dry run only; the create stays locked
