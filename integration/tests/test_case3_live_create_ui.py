@@ -288,6 +288,19 @@ class AfterCreateCardTests(Base):
         self.assertIn("Account Scanning", html)
         self.assertFalse(self.has_control(html))
 
+    def test_the_manual_backoffice_steps_are_shown_with_the_review_and_after_it(self):
+        # CO-0800 and CO-0802 both showed Maximum scan Duration 24 after a create that carried 90: the owner sets 90 by hand.
+        before = ui.create_card_html(self.inputs(row=row()))
+        self.assertIn("Maximum scan Duration", before)
+        self.assertIn("90", before)
+        self.assertIn("Operator Account", before)
+        for step in ("ids", "stage"):
+            fu._record(self.dir, CO, step, "write_started", NOW)
+            fu._record(self.dir, CO, step, "written_verified", NOW)
+        after = ui.create_card_html(self.inputs(row=row()))
+        self.assertIn("Maximum scan Duration", after)
+        self.assertFalse(self.has_control(after))
+
     def test_an_uncertain_step_shows_its_text_and_no_form(self):
         fu._record(self.dir, CO, "ids", "write_started", NOW)
         fu._record(self.dir, CO, "ids", "write_uncertain", NOW)

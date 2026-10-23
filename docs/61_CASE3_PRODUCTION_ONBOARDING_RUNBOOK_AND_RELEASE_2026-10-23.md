@@ -26,7 +26,7 @@ Legend: **AUTO** = the code does it. **OWNER** = your click, your typed words or
 | 9 | Confirm the write | OWNER typed + click, then AUTO | Type the CO reference, tick the authorization, click "Confirm write to Salesforce". The code writes the two IDs, reads them back, and only then makes ONE separate write: Request Approved -> Account Scanning. Each write has an intent line on disk first and is never repeated. The IDs come from the verified readback, never from the create response (it carries none). |
 | 10 | Card says "Onboarded" | AUTO | Both writes read back as verified. |
 | 11 | Operator account | MANUAL | The automated create leaves Operator Account empty. The Technical Advisor assigns the operator in BackOffice (CO-0802: the owner's notes say Ryan Slosser). The Technical Advisor -> operator mapping is not built. |
-| 12 | Maximum scan Duration check | MANUAL | Open Edit Account in BackOffice and read the value. See section 4 (open item). |
+| 12 | Maximum scan Duration = 90 | MANUAL | Open Edit Account in BackOffice, set Maximum scan Duration (hours) to 90 and Confirm. The create does not keep it (section 4, item 3). |
 | 13 | Next-day scan check | MANUAL | There is no automated Case 3 scan check. The scan runs for hours. Next day, read Duration Per Scan by hand, as for CO-0800. |
 | 14 | Primary user and "User Created" | MANUAL | Create the primary user and set the User Created stage by hand. The automation stops at Account Scanning. Later stages stay manual. |
 
@@ -188,7 +188,7 @@ Each item below is from the code or the plan. Nothing here is guessed.
 
 1. **Operator account is empty at create.** The Technical Advisor -> BackOffice operator mapping is not built (plan, path B). The Technical Advisor assigns the operator by hand after the create.
 2. **No automated Case 3 scan check.** The CE scan check is built for CE-only. For Case 3 the owner reads Duration Per Scan by hand the next day. The executions UI read failed on CO-0800 (plan, 2026-10-21) and was not fixed.
-3. **Maximum scan Duration: OPEN.** The runner types 90 (`SURFACE_MAX_SCAN_DURATION_HOURS = "90"`) and the create body carried 90 (`campaignsTimeoutInHours`, docs/59: 90, form default 24). The owner saw 24 in BackOffice's Edit Account for CO-0802. The root cause is under investigation. It is not known whether the value was not stored, was reset, or is shown from another field. The readback does not compare this field (row path unverified). Until it is closed, check this value by hand after every create (step 12).
+3. **Maximum scan Duration: SET BY HAND AFTER EVERY CREATE (owner check 2026-10-23).** The owner opened Edit Account for CO-0802 (automated create) AND for CO-0800 (manual create): both showed 24, although the form and the create body carried 90. So the backend does not keep the value at create (or the dialog shows its default); this is not an automation bug. The owner sets 90 in Edit Account after each create; the CO page now reminds of it. A guarded edit step or a readback comparison needs a captured Edit Account request and a read-only look at the stored value first (not built). Earlier text of this item: The runner types 90 (`SURFACE_MAX_SCAN_DURATION_HOURS = "90"`) and the create body carried 90 (`campaignsTimeoutInHours`, docs/59: 90, form default 24). The owner saw 24 in BackOffice's Edit Account for CO-0802. The root cause is under investigation. It is not known whether the value was not stored, was reset, or is shown from another field. The readback does not compare this field (row path unverified). Until it is closed, check this value by hand after every create (step 12).
 4. **Subdomain add-ons make a Go CO refuse.** The typed subdomain count includes add-ons, and the builder knows only the tier base (500 Go, 1000 Prime). A mismatch refuses `case3_tier_values_mismatch` before the click. This is deliberately conservative.
 5. **A mismatch after the click gives `created_unverified`.** The create body and the readback are compared only after the click (same as CE-only). The approval is already consumed. The tenant exists. Do not create again.
 6. **The approval is consumed before the click.** A failure between the consume and the click costs a new approval and a new dry run.
@@ -266,7 +266,7 @@ Note: the current `COMMAND_TO_PASTE.md` does not contain the three environment v
 
 **H. Manual steps in BackOffice**
 - [ ] Technical Advisor assigns the Operator Account.
-- [ ] Open Edit Account and read Maximum scan Duration. Note the value (open item 3). Expected 90.
+- [ ] Open Edit Account, set Maximum scan Duration (hours) to 90 and Confirm (the create leaves 24; section 4, item 3).
 - [ ] Next day: read Duration Per Scan and the last scan state.
 - [ ] Create the primary user. Set the User Created stage in Salesforce.
 

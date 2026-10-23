@@ -326,14 +326,19 @@ FOLLOWUP_TEXT = {
 }
 
 
+MANUAL_AFTER_TEXT = ("Still manual in BackOffice after the create: Edit Account, set Maximum scan Duration (hours) to 90 (the create "
+                     "does not keep it: CO-0800 and CO-0802 both showed 24), then pick the Operator Account of the Technical Advisor.")
+
+
 def followup_card_html(parent: Path, co: str) -> str:
     """The Case 3 follow-up part of the create card after a verified create: one review button, or the recorded state."""
     from html import escape
 
     ids, stage = _last(parent, co, "ids"), _last(parent, co, "stage")
+    manual = "<p class='note'>" + escape(MANUAL_AFTER_TEXT) + "</p>"
     if ids == "written_verified" and stage == "written_verified":
         return ("<p class='note'><strong>Onboarded:</strong> the Account ID and UUID are written to Salesforce and read back, "
-                "and the stage is Account Scanning.</p>")
+                "and the stage is Account Scanning.</p>" + manual)
     for result, text in ((ids, "ids"), (stage, "stage")):
         if result in ("write_started", "write_uncertain"):
             return "<p class='note'>" + escape(FOLLOWUP_TEXT[text + "_uncertain"]) + "</p>"
@@ -343,7 +348,7 @@ def followup_card_html(parent: Path, co: str) -> str:
             return "<p class='note'>" + escape(FOLLOWUP_TEXT["record_failed"]) + "</p>"
     from .production_create_ui import FOLLOWUP_REVIEW_PATH
 
-    return ("<form class='start-form' method='post' action='" + FOLLOWUP_REVIEW_PATH + "'>"
+    return (manual + "<form class='start-form' method='post' action='" + FOLLOWUP_REVIEW_PATH + "'>"
             "<input type='hidden' name='reference' value='" + escape(co) + "'>"
             "<button type='submit'>Review the Salesforce write</button></form>")
 
