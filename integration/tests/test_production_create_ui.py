@@ -136,9 +136,11 @@ class GateTests(Base):
 
     def test_all_gates_pass_shows_the_form_with_the_typed_reference_and_a_token(self):
         html = ui.create_card_html(self.inputs())
-        for fragment in ("Create in production", "action='/attended/production-create'", "name='confirm_reference'",
-                         "name='production_create_authorized'", "name='nonce'", "name='reference' value='CO-0798'"):
+        for fragment in ("Onboard in production", "action='/attended/production-create'", "name='nonce'",
+                         "name='reference' value='CO-0798'"):
             self.assertIn(fragment, html)
+        for gone in ("confirm_reference", "production_create_authorized"):  # owner decision 2026-10-23: one button
+            self.assertNotIn(gone, html)
         self.assertEqual(html.count("<form"), 1)
         self.assertIsNone(ui.gate(self.inputs())[0])
 
@@ -174,9 +176,9 @@ class GateTests(Base):
     def test_dry_run_gates(self):
         for item in (self.dir / pcr.RECORDS_SUBDIR).iterdir():
             item.unlink()
-        self.refuses("dry_run_required")
+        self.assertIsNone(ui.gate(self.inputs())[0])  # no dry-run gate any more (owner decision 2026-10-23)
         self.record(outcome="dry_run_passed", when=NOW - timedelta(hours=25))
-        self.refuses("dry_run_old")
+        self.assertIsNone(ui.gate(self.inputs())[0])
         self.setUp()
         self.unlocked()
         for item in (self.dir / pcr.RECORDS_SUBDIR).iterdir():
@@ -193,7 +195,7 @@ class GateTests(Base):
             item.unlink()
         pcr.record(self.dir, {"co_reference": CO, "approval_ref": "PROD-CE-0001-20261017", "outcome": "dry_run_passed",
                               "route": ROUTE}, NOW - timedelta(hours=1))
-        self.assertEqual(ui.gate(self.inputs())[0], "dry_run_required")
+        self.assertIsNone(ui.gate(self.inputs())[0])  # a dry run of any approval is irrelevant now
 
     def test_a_prior_attempt_blocks_and_shows_its_status(self):
         for outcome, code in (("attempt_started", ui.CREATE_OUTCOME_UNKNOWN), ("uncertain_submit", ui.CREATE_OUTCOME_UNKNOWN),
@@ -238,6 +240,74 @@ class GateTests(Base):
         self.assertFalse(self.has_control(ui.create_card_html(self.inputs())))
 
 
+class OneClickTests(Base):
+    """The single "Onboard in production" button of an Approved CO with no approval on record (owner decision 2026-10-23)."""
+
+    def setUp(self):
+        super().setUp()
+        self.unlocked()
+        self.approvals.unlink()
+        self.launched = []
+        self.issued = []
+
+    def approved_inputs(self, **over):
+        return self.inputs(row=row(Onboarding_Approval_Status__c="Approved"), **over)
+
+    def launch(self, ref, revision, env):
+        self.launched.append((ref, revision))
+        return SimpleNamespace(poll=lambda: None)
+
+    def issue_ok(self, ref, revision, route):
+        self.issued.append((ref, revision, route))
+        approval.issue(self.approvals, REF, ref, route, revision, OWNER, frozenset({OWNER}), NOW - timedelta(hours=1))
+        return True
+
+    def post(self, inputs, issue):
+        card = ui.create_card_html(inputs)
+        token = re.search(r"name='nonce' value='([^']+)'", card).group(1)
+        return ui.handle_create_post({"reference": CO, "nonce": token, "issue_approval": "1"}, inputs, self.launch, issue)
+
+    def test_the_card_is_one_button_with_no_typed_reference_or_checkbox(self):
+        card = ui.create_card_html(self.approved_inputs())
+        self.assertIn("Onboard in production", card)
+        self.assertIn("name='issue_approval'", card)
+        for gone in ("confirm_reference", "production_create_authorized", "type='checkbox'", "type='text'"):
+            self.assertNotIn(gone, card)
+        self.assertEqual(card.count("<form"), 1)
+
+    def test_a_co_not_approved_in_salesforce_gets_no_button(self):
+        self.assertFalse(self.has_control(ui.create_card_html(self.inputs())))
+        self.assertFalse(self.has_control(ui.create_card_html(self.inputs(row=row(Onboarding_Approval_Status__c="Pending")))))
+
+    def test_one_click_records_the_approval_and_launches_once(self):
+        inputs = self.approved_inputs()
+        self.assertEqual(self.post(inputs, self.issue_ok), "launched")
+        self.assertEqual(self.issued, [(CO, REV, ROUTE)])
+        self.assertEqual(self.launched, [(CO, REV)])
+
+    def test_a_refused_approval_launches_nothing(self):
+        self.assertEqual(self.post(self.approved_inputs(), lambda *a: False), "approval_not_issued")
+        self.assertEqual(self.launched, [])
+
+    def test_the_click_without_an_issuer_or_with_a_used_token_launches_nothing(self):
+        inputs = self.approved_inputs()
+        card = ui.create_card_html(inputs)
+        token = re.search(r"name='nonce' value='([^']+)'", card).group(1)
+        values = {"reference": CO, "nonce": token, "issue_approval": "1"}
+        self.assertEqual(ui.handle_create_post(values, inputs, self.launch), "approval_missing")  # spends the token
+        token = re.search(r"name='nonce' value='([^']+)'", ui.create_card_html(inputs)).group(1)
+        values = {**values, "nonce": token}
+        self.assertEqual(ui.handle_create_post(values, inputs, self.launch, self.issue_ok), "launched")
+        self.assertEqual(ui.handle_create_post(values, inputs, self.launch, self.issue_ok), "launch_in_progress")
+        self.assertEqual(len(self.launched), 1)
+
+    def test_a_wrong_token_issues_nothing(self):
+        inputs = self.approved_inputs()
+        values = {"reference": CO, "nonce": "wrong", "issue_approval": "1"}
+        self.assertEqual(ui.handle_create_post(values, inputs, self.launch, self.issue_ok), "confirmation_invalid")
+        self.assertEqual((self.issued, self.launched), ([], []))
+
+
 class PostTests(Base):
     def setUp(self):
         super().setUp()
@@ -279,10 +349,7 @@ class PostTests(Base):
         self.assertEqual(len(self.launched), 1)
 
     def test_bad_confirmations_refuse_without_launching(self):
-        for over, reason in (({"confirm_reference": "CO-0797"}, "typed_reference_mismatch"),
-                             ({"confirm_reference": ""}, "typed_reference_mismatch"),
-                             ({"production_create_authorized": "0"}, "authorization_missing"),
-                             ({"nonce": "wrong"}, "confirmation_invalid"), ({"nonce": ""}, "confirmation_invalid")):
+        for over, reason in (({"nonce": "wrong"}, "confirmation_invalid"), ({"nonce": ""}, "confirmation_invalid")):
             self.setUp()
             self.unlocked()
             self.launched.clear()
@@ -290,9 +357,6 @@ class PostTests(Base):
             self.assertEqual(self.launched, [], over)
 
     def test_missing_or_duplicated_fields_refuse(self):
-        values = self.values()
-        del values["production_create_authorized"]
-        self.assertEqual(ui.handle_create_post(values, self.inputs(), self.launch), "authorization_missing")
         self.assertEqual(ui.handle_create_post({**self.values(), "reference": "CO-0797"}, self.inputs(), self.launch), "invalid_request")
         self.assertEqual(self.launched, [])
 

@@ -170,9 +170,9 @@ class GateTests(Base):
     def test_the_dry_run_gates_apply_to_case_3(self):
         for item in (self.dir / pcr.RECORDS_SUBDIR).iterdir():
             item.unlink()
-        self.refuses("dry_run_required")
+        self.assertIsNone(ui.gate(self.inputs())[0])  # no dry-run gate any more (owner decision 2026-10-23)
         self.record(outcome="dry_run_passed", when=NOW - timedelta(hours=25))
-        self.refuses("dry_run_old")
+        self.assertIsNone(ui.gate(self.inputs())[0])
 
     def test_a_prior_attempt_blocks(self):
         self.record(outcome="uncertain_submit")
@@ -180,9 +180,10 @@ class GateTests(Base):
 
     def test_the_ready_card_names_the_route_and_has_one_form(self):
         html = ui.create_card_html(self.inputs())
-        for fragment in ("Create in production", "Surface &amp; Credential Exposure", "action='/attended/production-create'",
-                         "name='confirm_reference'", "name='production_create_authorized'", "name='nonce'"):
+        for fragment in ("Onboard in production", "Surface &amp; Credential Exposure", "action='/attended/production-create'",
+                         "name='nonce'"):
             self.assertIn(fragment, html)
+        self.assertNotIn("confirm_reference", html)
         self.assertEqual(html.count("<form"), 1)
         self.assertIn(NAME, html)  # the exact tenant name that will be typed
 
@@ -231,9 +232,7 @@ class PostTests(Base):
         self.assertEqual(len(self.launched), 1)
 
     def test_bad_confirmations_refuse_without_launching(self):
-        for over, reason in (({"confirm_reference": "CO-0797"}, "typed_reference_mismatch"),
-                             ({"production_create_authorized": "0"}, "authorization_missing"),
-                             ({"nonce": "wrong"}, "confirmation_invalid")):
+        for over, reason in (({"nonce": "wrong"}, "confirmation_invalid"),):
             self.setUp()
             self.unlocked()
             self.launched.clear()

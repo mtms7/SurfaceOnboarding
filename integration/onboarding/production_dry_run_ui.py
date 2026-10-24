@@ -28,6 +28,7 @@ from . import tenant_name_decision
 
 DRY_RUN_PATH = "/attended/production-dry-run"
 CASE3_ROUTE = production_create.CASE3_ROUTE
+DRY_RUN_ROUTES = production_create.DRY_RUN_ROUTES
 CASE3_PRODUCT = "Surface & Credential Exposure"
 CASE3_TYPE = "New Product Onboarding"
 RESULT_OUTCOMES = (production_create.OUTCOME_DRY_RUN, production_create.OUTCOME_REFUSED)
@@ -37,10 +38,12 @@ GATE_TEXT = {
     "vm_read_only": "The VM dashboard is read-only guidance; the dry run runs from the owner's Windows desktop.",
     "production_dry_run_not_supported": "The production dry run is locked in this build.",
     "salesforce_not_fresh": "The Salesforce data is not fresh: refresh the page.",
-    "route_not_case3": "This CO is not a Case 3 (Surface & Credential Exposure, New) onboarding.",
-    "approval_missing": "No Case 3 production approval is recorded for this CO (the owner issues one with "
-                        "tools/issue_production_approval.py).",
-    "approval_route_mismatch": "The approval on record is not a Case 3 approval for this CO.",
+    "route_not_case3": "This CO is not a Credential Exposure or Surface & Credential Exposure New onboarding.",
+    "approval_missing": "No production approval is recorded for this CO. Tick the box and use the button to approve and "
+                        "run the dry run in one step.",
+    "approval_not_issued": "The approval could not be recorded (not the owner, CO not eligible, or Salesforce org not "
+                           "pinned). Nothing was started.",
+    "approval_route_mismatch": "The approval on record is not an approval of this CO's route.",
     "approval_expired": "The Case 3 approval is expired.",
     "approval_consumed": "The Case 3 approval was already used.",
     "approval_superseded": "The Case 3 approval was superseded.",
@@ -93,8 +96,10 @@ def gate(inputs: create_ui.Inputs) -> tuple[str | None, dict[str, Any]]:
         return lock, ctx
     if not isinstance(inputs.row, Mapping) or not create_ui.CO_PATTERN.fullmatch(inputs.reference):
         return "salesforce_not_fresh", ctx
-    if route_for_row(inputs.row) != CASE3_ROUTE:
+    route = create_ui._row_route(inputs.row)  # CE-only New or Case 3 New
+    if route is None:
         return "route_not_case3", ctx
+    ctx["route"] = route
     listing = production_views.list_approvals(inputs.approvals_path, inputs.now)
     if listing["state"] != "ok":
         return "approval_unreadable", ctx
@@ -106,7 +111,7 @@ def gate(inputs: create_ui.Inputs) -> tuple[str | None, dict[str, Any]]:
     record = production_approval.record_for(inputs.approvals_path, valid[0]["approval_ref"])
     if record is None:
         return "approval_unreadable", ctx
-    if record.get("route") != CASE3_ROUTE:
+    if record.get("route") != route:
         return "approval_route_mismatch", ctx
     ctx["approval"] = record
     if not create_ui._owner_ok(inputs.operator, record):
@@ -118,7 +123,7 @@ def gate(inputs: create_ui.Inputs) -> tuple[str | None, dict[str, Any]]:
     revision = inputs.row.get("LastModifiedDate")
     if not isinstance(revision, str) or not revision or revision != record.get("source_revision"):
         return "approval_revision_drift", ctx
-    problem = production_approval.check(inputs.approvals_path, record["approval_ref"], inputs.reference, CASE3_ROUTE,
+    problem = production_approval.check(inputs.approvals_path, record["approval_ref"], inputs.reference, route,
                                         revision, inputs.now)
     if problem is not None:
         return problem, ctx
@@ -128,11 +133,11 @@ def gate(inputs: create_ui.Inputs) -> tuple[str | None, dict[str, Any]]:
         return "salesforce_not_fresh", ctx
     if inputs.sf_ready is not True:
         return "salesforce_session_not_ready", ctx
-    for field in ("Account_UUID__c", "Surface_Account_ID__c"):
+    for field in (("Account_UUID__c", "Surface_Account_ID__c") if route == CASE3_ROUTE else ("Account_UUID__c",)):
         if field not in inputs.row or str(inputs.row.get(field) or "").strip():
             return "salesforce_prior_uuid_present", ctx
     account = inputs.row.get("Account_Name__c")
-    if isinstance(account, str) and " ".join(account.split()):
+    if route == CASE3_ROUTE and isinstance(account, str) and " ".join(account.split()):
         full = " ".join(account.split()).rstrip(". ")
         if full and tenant_name_decision.needs_confirmation(full):
             try:
@@ -161,7 +166,7 @@ def _case3_results(parent: Path, co: str) -> list[dict[str, Any]]:
         history = create_ui.load_co_records(parent, co)
     except Exception:  # noqa: BLE001 - an unreadable record folder shows no result, never a pass
         return []
-    return sorted((r for r in history if r.get("route") == CASE3_ROUTE and r.get("outcome") in RESULT_OUTCOMES), key=_stamp)
+    return sorted((r for r in history if r.get("route") in production_create.DRY_RUN_ROUTES and r.get("outcome") in RESULT_OUTCOMES), key=_stamp)
 
 
 def result_since(parent: Path, co: str, since: str) -> dict[str, Any] | None:
@@ -189,7 +194,7 @@ def findings(observations: Any) -> list[str]:
 def _result_html(parent: Path, co: str) -> str:
     results = _case3_results(parent, co)
     if not results:
-        return "<p class='note'>No Case 3 dry run has been recorded for this CO.</p>"
+        return "<p class='note'>No dry run has been recorded for this CO.</p>"
     last = results[-1]
     passed = last.get("outcome") == production_create.OUTCOME_DRY_RUN
     when = _stamp(last)[:16].replace("T", " ") + " UTC" if _stamp(last) else ""
@@ -229,7 +234,7 @@ def progress_card_html(view: Mapping[str, Any]) -> str:
     else:
         chip, head = create_ui._chip("chip-warn", "Running"), "In progress"
     percent = str(int(view.get("percent") or 0))
-    return ("<div class='card-head'><h2 id='co-dry-run-title' class='pill'>Production dry run (Case 3)</h2>" + chip + "</div>"
+    return ("<div class='card-head'><h2 id='co-dry-run-title' class='pill'>Production dry run</h2>" + chip + "</div>"
             "<div class='runprog' aria-live='polite'><div class='runprog-head'><span>" + escape(head) + ": "
             + escape(str(view.get("current") or "")) + "</span><span>" + percent + "%</span></div>"
             "<div class='runprog-bar' role='progressbar' aria-label='Production dry run progress' aria-valuemin='0' "
@@ -244,13 +249,13 @@ def _card(body: str) -> str:
 
 
 def _head(chip: str) -> str:
-    return "<div class='card-head'><h2 id='co-dry-run-title' class='pill'>Production dry run (Case 3)</h2>" + chip + "</div>"
+    return "<div class='card-head'><h2 id='co-dry-run-title' class='pill'>Production dry run</h2>" + chip + "</div>"
 
 
 def card_html(inputs: create_ui.Inputs, run: Mapping[str, Any] | None = None) -> str:
     """The dry-run section of a Case 3 CO page; "" for any other CO and on the VM. ``run`` (a run this dashboard started):
     ``{"since", "running", "events"}``. A control exists only when the dry-run constant is True AND every gate passes."""
-    if inputs.vm is True or route_for_row(inputs.row) != CASE3_ROUTE:
+    if inputs.vm is True or create_ui._row_route(inputs.row) is None:
         return ""
     reference = inputs.reference
     lock = build_lock(inputs.vm)
@@ -268,6 +273,22 @@ def card_html(inputs: create_ui.Inputs, run: Mapping[str, Any] | None = None) ->
         reason, ctx = gate(inputs)
     except Exception:  # noqa: BLE001 - fail closed
         reason, ctx = "gate_unreadable", {}
+    if reason == "approval_missing" and inputs.row.get("Onboarding_Approval_Status__c") == "Approved":
+        revision = str(inputs.row.get("LastModifiedDate") or "")
+        token = create_ui.TOKENS.issue("dry_run", reference, create_ui._binding(reference, revision, "no-approval", "dry_run"))
+        return _card((shown or _head(create_ui._chip("chip-info", "Ready")) + _result_html(inputs.records_parent, reference))
+                     + "<p class='note'>The CO is Approved in Salesforce. One click records the one-CO production approval for "
+                       "this CO and runs the dry run: it opens the production BackOffice sign-in (SSO and MFA in the "
+                       "app.pentera.io window), fills the Add Account form, reads it back and cancels it. Nothing is created and "
+                       "Salesforce is not changed.</p>"
+                       "<form class='start-form' method='post' action='" + DRY_RUN_PATH + "'>"
+                       "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
+                       "<input type='hidden' name='nonce' value='" + escape(token) + "'>"
+                       "<input type='hidden' name='issue_approval' value='1'>"
+                       "<div class='confirm'><label><input type='checkbox' name='production_dry_run_authorized' value='1' required> "
+                       "I approve ONE production create for this CO, I will sign in with SSO and MFA, and I authorize ONE "
+                       "production dry run</label></div>"
+                       "<button type='submit'>Approve and run dry run</button></form>")
     if reason is not None:
         return _card((shown or _head(create_ui._chip("chip-warn", "Blocked")) + _result_html(inputs.records_parent, reference))
                      + "<p class='note'>" + escape(text(reason)) + "</p>")
@@ -289,7 +310,8 @@ def card_html(inputs: create_ui.Inputs, run: Mapping[str, Any] | None = None) ->
 # --- POST -------------------------------------------------------------------------------------------------------------------------
 
 def handle_post(values: Mapping[str, Any], inputs: create_ui.Inputs,
-                launch: Callable[[str, str, str, dict[str, str]], Any]) -> str:
+                launch: Callable[[str, str, str, dict[str, str]], Any],
+                issue: Callable[[str, str, str], bool] | None = None) -> str:
     """"launched" or the refusal code. Every gate is re-evaluated with the facts of THIS request; one attempt per token.
 
     ``launch(reference, revision, route, env)`` starts the runner and returns its process handle (None on failure); it is
@@ -299,6 +321,23 @@ def handle_post(values: Mapping[str, Any], inputs: create_ui.Inputs,
         return "invalid_request"
     token = create_ui._form(values, "nonce")
     reason, ctx = gate(inputs)
+    if (reason == "approval_missing" and create_ui._form(values, "issue_approval") == "1" and issue is not None
+            and isinstance(inputs.row, Mapping) and inputs.row.get("Onboarding_Approval_Status__c") == "Approved"):
+        # One click approves and starts the dry run: the same one-CO approval record the CLI issues, bound to this revision.
+        revision = str(inputs.row.get("LastModifiedDate") or "")
+        binding = create_ui._binding(reference, revision, "no-approval", "dry_run")
+        if not create_ui.TOKENS.consume("dry_run", reference, binding, token):
+            return "confirmation_invalid"
+        if create_ui._form(values, "production_dry_run_authorized") != "1":
+            return "authorization_missing"
+        route = create_ui._row_route(inputs.row)
+        if route is None or not issue(reference, revision, route):
+            return "approval_not_issued"
+        reason, ctx = gate(inputs)
+        if reason is not None:
+            return reason
+        started = create_ui.LAUNCHES.claim(lambda: launch(reference, revision, route, ctx["env"]))
+        return "launched" if started else "launch_failed"
     if reason is not None:
         create_ui.TOKENS.consume("dry_run", reference, "", token)  # a refused attempt also spends the token
         return reason
@@ -308,7 +347,7 @@ def handle_post(values: Mapping[str, Any], inputs: create_ui.Inputs,
         return "confirmation_invalid"
     if create_ui._form(values, "production_dry_run_authorized") != "1":
         return "authorization_missing"
-    started = create_ui.LAUNCHES.claim(lambda: launch(reference, revision, CASE3_ROUTE, ctx["env"]))
+    started = create_ui.LAUNCHES.claim(lambda: launch(reference, revision, ctx["route"], ctx["env"]))
     return "launched" if started else "launch_failed"
 
 

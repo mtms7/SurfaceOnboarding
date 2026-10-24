@@ -82,7 +82,9 @@ class LayoutTests(PageBase):
         for vm in (False, True):
             page = self.page(vm=vm)
             self.assertEqual(base.controls(page), [])
-            main = self.main(page).lower()
+            # the dry-run card (never creates anything) is the one owner-gated control of the unlocked build
+            main = re.sub(r"<form class='start-form' method='post' action='/attended/production-(dry-run|create)'>.*?</form>", "",
+                          self.main(page), flags=re.S).lower()
             for tag in ("<form", "<button", "<input", "<script", "<select", "<textarea", "onclick", "method='post'"):
                 self.assertNotIn(tag, main, tag)
             self.assertNotRegex(main, r"<(button|a)[^>]*>[^<]*(create|confirm|submit)")

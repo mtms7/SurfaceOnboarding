@@ -459,9 +459,8 @@ def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
         return "records_unreadable", ctx
     status = co_status(history)
     ctx["status"] = status
-    problem = dry_run_problem(history, record["approval_ref"], inputs.now)
-    if problem is not None:
-        return problem, ctx
+    # No dry-run gate (owner decision 2026-10-23: the dry run is not part of a CO's onboarding; the one-CO approval, the
+    # fresh Salesforce read and the readback after the create are the gates).
     if status["blocking"]:
         return "prior_attempt_needs_review", ctx
     if inputs.launching is True or LAUNCHES.busy():
@@ -513,6 +512,17 @@ def _status_html(code: str, route: object = None) -> str:
             + "</div><p class='note'>" + escape(note) + "</p>")
 
 
+def _onboard_form(reference: str, token: str, issue_approval: bool) -> str:
+    """The ONE button of a production CO page: no typed reference, no checkbox (owner decision 2026-10-23)."""
+    return ("<p class='note'>The CO is Approved in Salesforce. One click checks everything, creates ONE tenant in BackOffice "
+            "production (SSO and MFA in the app.pentera.io window), reads it back and records it in Salesforce. There is no retry.</p>"
+            "<form class='start-form' method='post' action='" + CREATE_PATH + "'>"
+            "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
+            "<input type='hidden' name='nonce' value='" + escape(token) + "'>"
+            + ("<input type='hidden' name='issue_approval' value='1'>" if issue_approval else "")
+            + "<button type='submit'>Onboard in production</button></form>")
+
+
 def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str:
     """The create section of the production CO page.
 
@@ -550,17 +560,13 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
                           "create nothing is written to Salesforce until you review and confirm it on this page.</p>")
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
                 "<h2 id='co-create-title' class='pill'>Create in production</h2>" + _chip("chip-warn", "Production")
-                + "</div>" + route_note + "<p class='note'>Every gate passed: fresh clone, fresh Salesforce data, a valid one-CO approval bound to "
-                  "this revision and a passing dry run. One click creates ONE tenant in BackOffice production, checks it by "
-                  "readback and consumes the approval. There is no retry.</p>"
-                  "<form class='start-form' method='post' action='" + CREATE_PATH + "'>"
-                  "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
-                  "<input type='hidden' name='nonce' value='" + escape(token) + "'>"
-                  "<div class='confirm'><label>Type the CO reference <code>" + escape(reference) + "</code> to confirm "
-                  "<input type='text' name='confirm_reference' autocomplete='off' required maxlength='16'></label></div>"
-                  "<div class='confirm'><label><input type='checkbox' name='production_create_authorized' value='1' required> "
-                  "I authorize ONE production create for this CO and approval</label></div>"
-                  "<button type='submit'>Create in production</button></form></section>")
+                + "</div>" + route_note + _onboard_form(reference, token, False) + "</section>")
+    if reason == "approval_missing" and isinstance(inputs.row, Mapping) and inputs.row.get("Onboarding_Approval_Status__c") == "Approved":
+        revision = str(inputs.row.get("LastModifiedDate") or "")
+        token = TOKENS.issue("create", reference, _binding(reference, revision, "no-approval", "create"))
+        return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
+                "<h2 id='co-create-title' class='pill'>Onboard in production</h2>" + _chip("chip-warn", "Production")
+                + "</div>" + _onboard_form(reference, token, True) + "</section>")
     if status is not None and status["code"] == CREATED_VERIFIED and _row_route(inputs.row) == production_approval.CASE3_ROUTE:
         from . import case3_followup  # lazy: case3_followup imports this module
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
@@ -653,28 +659,39 @@ def _form(values: Mapping[str, Any], name: str) -> str | None:
     return item if isinstance(item, str) else None
 
 
-def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callable[[str, str, dict[str, str]], Any]) -> str:
+def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callable[[str, str, dict[str, str]], Any],
+                       issue: Callable[[str, str, str], bool] | None = None) -> str:
     """"launched" or the refusal code. Re-evaluates every gate with the facts of THIS request; one attempt per token.
 
     ``launch(reference, revision, env)`` starts the runner and returns its process handle (None on failure); it is called
-    at most once, inside the single-run registry, and never after any refusal.
+    at most once, inside the single-run registry, and never after any refusal. ``issue(reference, revision, route)``
+    records the one-CO approval when none exists (the single "Onboard in production" button); it is called only for an
+    Approved CO whose only open gate is the missing approval.
     """
     reference = _form(values, "reference")
     if reference != inputs.reference or not isinstance(reference, str) or not CO_PATTERN.fullmatch(reference):
         return "invalid_request"
     reason, ctx = gate(inputs)
     token = _form(values, "nonce")
-    if reason is not None:
+    if (reason == "approval_missing" and _form(values, "issue_approval") == "1" and issue is not None
+            and isinstance(inputs.row, Mapping) and inputs.row.get("Onboarding_Approval_Status__c") == "Approved"):
+        revision = str(inputs.row.get("LastModifiedDate") or "")
+        if not TOKENS.consume("create", reference, _binding(reference, revision, "no-approval", "create"), token):
+            return "confirmation_invalid"
+        route = _row_route(inputs.row)
+        if route is None or not issue(reference, revision, route):
+            return "approval_not_issued"
+        reason, ctx = gate(inputs)
+        if reason is not None:
+            return reason
+        token = TOKENS.issue("create", reference, _create_binding(reference, revision, ctx["approval"]["approval_ref"], ctx))
+    elif reason is not None:
         TOKENS.consume("create", reference, "", token)  # a refused attempt also spends the token
         return reason
     approval = ctx["approval"]
     revision = str(inputs.row["LastModifiedDate"])
     if not TOKENS.consume("create", reference, _create_binding(reference, revision, approval["approval_ref"], ctx), token):
         return "confirmation_invalid"
-    if _form(values, "confirm_reference") != reference:
-        return "typed_reference_mismatch"
-    if _form(values, "production_create_authorized") != "1":
-        return "authorization_missing"
     def start() -> Any:
         try:  # the runner accepts ONLY this file-backed one-time ticket, never a flag or an environment value
             root = production_launch_ticket.ticket_root()  # the SAME helper the runner uses; never the repository
@@ -1116,6 +1133,8 @@ def production_progress(parent: Path, co: str, since: str, *, running: bool,
             stage = last_stage_write(parent, co)
             if stage == ("Account Scanning", "written_verified") or (follow or {}).get("stage") == "already_present":
                 reached = 5
+            elif stage is not None and stage[1] == "write_started" and running:
+                pass  # the stage write is in flight in the follow-up: not a failure yet (CO-0811, 2026-10-23)
             elif stage is not None and stage[1] != "written_verified":
                 failed = stage[1]
             elif follow is not None and follow.get("stage") not in _FOLLOW_OK:

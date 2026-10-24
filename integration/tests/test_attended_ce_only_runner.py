@@ -410,6 +410,26 @@ class SelectCeSubscriptionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ce_subscription_ambiguous"):
             select_ce_subscription(rows)
 
+    def test_a_cancelled_reopened_row_next_to_the_active_row_is_ignored(self):
+        # CO-0804 (2026-10-23): the old row (end 2028-08-14) is superseded by the Active row (end 2028-11-14).
+        old = {**self._row("Pentera Core Plus Commercial - 500 End Points", "2026-08-15", "2028-08-14"),
+               "DealHub_Status__c": "Cancelled Reopened"}
+        active = {**self._row("Pentera Core Plus Commercial - 500 End Points", "2026-08-15", "2028-11-14"),
+                  "DealHub_Status__c": "Active"}
+        self.assertEqual(select_ce_subscription([old, active]), (date(2026, 8, 15), date(2028, 11, 14)))
+        with self.assertRaisesRegex(RuntimeError, "ce_subscription_unavailable"):
+            select_ce_subscription([old])
+
+    def test_active_only_reads_just_the_active_row(self):
+        old = {**self._row("Pentera Core Plus Commercial - 500 End Points", "2026-08-15", "2028-08-14"), "DealHub_Status__c": "Pending"}
+        active = {**self._row("Pentera Core Plus Commercial - 500 End Points", "2026-08-15", "2028-11-14"),
+                  "DealHub_Status__c": "Active"}
+        self.assertEqual(select_ce_subscription([old, active], active_only=True), (date(2026, 8, 15), date(2028, 11, 14)))
+        with self.assertRaisesRegex(RuntimeError, "ce_subscription_unavailable"):
+            select_ce_subscription([old], active_only=True)  # no Active row: fail closed
+        with self.assertRaisesRegex(RuntimeError, "ce_subscription_ambiguous"):
+            select_ce_subscription([old, active])  # without the flag the two terms still disagree
+
     def test_prefix_match_is_case_insensitive(self):
         rows = [self._row("pentera core plus commercial - 500 End Points", "2026-10-01", "2027-09-30")]
         self.assertEqual(select_ce_subscription(rows), (date(2026, 10, 1), date(2027, 9, 30)))

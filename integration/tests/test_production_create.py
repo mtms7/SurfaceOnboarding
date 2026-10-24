@@ -540,21 +540,18 @@ class TestFreshClock(Base):
 
 
 class TestPriorRecords(Base):
-    def test_live_run_needs_a_prior_dry_run_for_same_co_and_ref(self):
-        wrong = [{**DRY_RECORD, "co_reference": "CO-0800"}, {**DRY_RECORD, "approval_ref": "PROD-CE-0001-20261016"},
-                 {**DRY_RECORD, "outcome": "refused"}, {**DRY_RECORD, "outcome": "attempt_started"}]
-        for prior in ([], *[[w] for w in wrong], wrong):
-            h = self.harness()
-            result = h.run(dry_run=False, owner_go=True, prior_records=prior)
-            self.assertEqual((result.outcome, result.reason), ("refused", "dry_run_required"), prior)
-            self.assertEqual((h.counts["fill"], h.counts["click"], h.counts["write"]), (0, 0, 1))
-            self.assertFalse(h.consumed())
+    def test_live_run_needs_no_prior_dry_run(self):
+        # Owner decision 2026-10-23: the dry run is not a gate of the live create any more.
+        h = self.harness()
+        result = h.run(dry_run=False, owner_go=True, prior_records=[])
+        self.assertEqual(result.outcome, "readback_verified")
 
-    def test_missing_prior_records_input_means_dry_run_required(self):
+    def test_missing_prior_records_input_still_refuses(self):
         h = self.harness()
         result = pc.run(h.inputs(), False, h.fill_form, h.click_confirm, h.read_back, h.write_record,
                         owner_go=True, _production_target_fn=target_ok, clock=lambda: NOW)
-        self.assertEqual(result.reason, "dry_run_required")
+        self.assertEqual(result.outcome, "refused")
+        self.assertNotEqual(result.reason, "dry_run_required")
 
     def test_bad_prior_records_fail_closed(self):
         for prior in (None, "x", {"outcome": "dry_run_passed"}, [DRY_RECORD, "x"], [DRY_RECORD, None]):
@@ -579,10 +576,6 @@ class TestPriorRecords(Base):
             result = self.harness().run(dry_run=False, owner_go=True, prior_records=prior,
                                         prior_review_cleared_by_owner=flag)
             self.assertEqual(result.reason, "prior_attempt_needs_review", flag)
-        # Clearance never waives the dry-run requirement.
-        result = self.harness().run(dry_run=False, owner_go=True, prior_review_cleared_by_owner=True,
-                                    prior_records=[{**DRY_RECORD, "outcome": "uncertain_submit"}])
-        self.assertEqual(result.reason, "dry_run_required")
         h = self.harness()
         result = h.run(dry_run=False, owner_go=True, prior_records=prior, prior_review_cleared_by_owner=True)
         self.assertEqual(result.outcome, "readback_verified")

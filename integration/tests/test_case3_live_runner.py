@@ -217,10 +217,10 @@ class RefusalTests(unittest.TestCase):
         self.refused(h, "salesforce_prior_uuid_present", source=present)
         self.assertEqual(h.opened, 0)
 
-    def test_a_missing_ticket_or_dry_run_or_owner_go_refuses(self):
+    def test_a_missing_ticket_or_owner_go_refuses_and_no_dry_run_is_needed(self):
         self.refused(C3Harness(self), "launch_ticket_invalid", with_ticket=False)
-        out = C3Harness(self).go(seed_dry=False)
-        self.assertEqual((out["outcome"], out["result"]), ("refused", "dry_run_required"))
+        out = C3Harness(self).go(seed_dry=False)  # owner decision 2026-10-23: no dry-run requirement
+        self.assertNotEqual(out["result"], "dry_run_required")
         out = C3Harness(self).go(owner_go=False)
         self.assertEqual((out["outcome"], out["result"]), ("refused", "owner_go_missing"))
 

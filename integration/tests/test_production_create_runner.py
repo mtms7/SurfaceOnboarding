@@ -319,11 +319,10 @@ class GateRefusalTests(Base):
         self.assertEqual((h.opened, h.page.confirm_clicks), (0, 0))
         self.assertIsNone(h.approval_unused())
 
-    def test_a_dry_run_is_required(self):
+    def test_no_dry_run_is_required(self):  # owner decision 2026-10-23
         h = self.harness()
-        self.assertEqual(h.go(dry_run_record=False)["result"], "dry_run_required")
-        self.assertEqual((h.page.confirm_clicks, h.page.form_open), (0, False))
-        self.assertIsNone(h.approval_unused())
+        self.assertEqual(h.go(dry_run_record=False)["result"], "created_verified")
+        self.assertEqual(h.page.confirm_clicks, 1)
 
     def test_stale_or_missing_clone_wrong_co_and_other_gates_refuse_before_the_browser(self):
         cases = {
@@ -845,11 +844,11 @@ class LaunchTicketTests(Base):
     def test_the_ticket_must_be_minted_for_the_approval_issuer(self):
         self.refused(self.harness(), "operator_not_owner", operator="someone.else")
 
-    def test_dry_run_age_is_enforced_by_the_runner(self):
+    def test_an_old_dry_run_record_is_irrelevant_to_the_runner(self):  # owner decision 2026-10-23
         h = self.harness()
         pcr.record(h.records, {"co_reference": CO, "approval_ref": REF, "outcome": "dry_run_passed", "route": ROUTE},
                    NOW - timedelta(hours=25))
-        self.refused(h, "dry_run_old", dry_run_record=False)
+        self.assertEqual(h.go(dry_run_record=False)["result"], "created_verified")
 
 
 class StrictReadbackTests(Base):
@@ -981,26 +980,6 @@ class ContextGuardAndCountryTests(Base):
             self.assertEqual(h.page.confirm_clicks, 0)
             self.assertIsNone(h.approval_unused())
             self.assertFalse(h.page.form_open)
-
-    def test_the_dry_run_age_is_rechecked_at_click_time(self):
-        h = self.harness()
-        calls = [0]
-
-        def clock():  # the pre-form read stamp, the fresh gate and the read age at NOW; the dry-run age check 25 h later
-            calls[0] += 1
-            return NOW if calls[0] < 4 else NOW + timedelta(hours=25)
-        # stamp() is fixed in the harness; use the runner's own clock hook to move time forward for the late check
-        h.seed_dry_run()
-        h.mint()
-        with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", True), \
-                mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", True), contextlib.redirect_stdout(io.StringIO()):
-            line = runner.run_production_create(
-                CO, REV, owner_go=True, environ=dict(dry.UNLOCK), now=NOW, records_parent=h.records, approval_path=h.approval_path,
-                load_source=h.load_source, clone_facts=good_clone, open_page=h.open_page, fill_date=lambda *_a: True,
-                date_kept=lambda *_a: True, run_day=DAY, clock=clock, ticket_parent=h.records, org_probe=dry.ORG_PROBE)
-        self.assertEqual(json.loads(line)["result"], "dry_run_old")
-        self.assertEqual(h.page.confirm_clicks, 0)
-        self.assertIsNone(h.approval_unused())
 
     def test_org_is_pinned_by_id_when_an_expected_org_is_configured(self):
         env = {**dry.UNLOCK, "SURFACE_SF_EXPECTED_ORG_ID": "00D5g0000012345EAA"}

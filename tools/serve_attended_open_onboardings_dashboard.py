@@ -6915,7 +6915,7 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
             detail = None
         production_views.apply_own_onboarding(guide, own + (" " + detail + "." if detail else ""))
     main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
-                 + _production_dry_run_html(reference, row) + _production_guide_html(guide, match))
+                 + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)
     refresh = ("<meta http-equiv='refresh' content='5'>"
                if progress is not None and not progress["done"] and not progress["failed"] else "") or _dry_run_refresh(reference)
@@ -7111,6 +7111,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         row, ref, check = item["row"], item["ref"], item["check"]
         product, kind = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
         start = (starts or {}).get(ref) if starts is not None else None
+        created_here = False  # a create this dashboard recorded and verified: done, whatever the nightly clone shows
         if item["supported"]:
             checks = (_chip(check["css"], check["label"])
                       + ("<span class='sub'>" + escape(check["reason"]) + "</span>"
@@ -7118,6 +7119,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             if item["create"]["code"] in production_views.CREATED_OUTCOMES:
                 onboarded = create_ui.onboarded_summary(production_records_parent(), ref, clone_payload)
                 if onboarded is not None:  # recorded evidence beats "Clear": the nightly clone cannot hold today's create
+                    created_here = True
                     checks = _chip(onboarded["css"], onboarded["label"]) + "<span class='sub'>" + escape(onboarded["text"]) + "</span>"
             approval_cell = _create_approval_chip(item["approval"])
             create_cell = _chip(item["create"]["css"], item["create"]["label"])
@@ -7130,7 +7132,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             approval_cell = create_cell = "<span class='muted'>—</span>"
             onboarding = "<span class='co'>" + escape(ref) + "</span>"
         body += ("<tr" + ("" if item["supported"] else " class='locked'") + "><td class='c-start'>"
-                 + ("<span class='muted'>done</span>" if check and check["code"] == "onboarded"
+                 + ("<span class='muted'>done</span>" if created_here or (check and check["code"] == "onboarded")
                     else _prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='stick'>"
                  + onboarding + "</td><td>" + escape(str(row.get("Account__r.Name") or "Account unavailable")) + "</td><td>"
                  + escape(_PRODUCT_SHORT.get(product or "", product or "—")) + "<span class='sub'>"
@@ -7370,14 +7372,19 @@ def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: 
         vm=vm, locked=locked, lock_reason=reason, clone=_clone_status(), match=match, domain_count=domain_count,
         uuid_state=uuid_state, ce_route=ce_route, start_iso=start_iso, today=now.date(), days_before=ONBOARD_DAYS_BEFORE_START,
         approval=production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, now, missing_is_unavailable=published),
-        create=production_views.create_state(records, reference, locked=locked), gate=state, session=session)
+        create=production_views.create_state(records, reference, locked=locked), gate=state, session=session,
+        approved_in_salesforce=isinstance(row, dict) and row.get("Onboarding_Approval_Status__c") == "Approved")
     where = ("<p class='lede'>Onboarding runs from the desktop dashboard</p><p class='note'>Desktop address: <code>"
              + escape(DESKTOP_DASHBOARD_ADDRESS) + "</code></p>") if vm else ""
     rows = "".join(_check_item(item["label"], escape(item["detail"]), _chip(*production_views.CHECK_CHIPS[item["status"]]))
                    for item in items)
+    phase, text = state["phase"], state["text"]
+    if (state.get("reason") == "approval_missing" and isinstance(row, dict) and row.get("Onboarding_Approval_Status__c") == "Approved"
+            and all(item["status"] == "ready" for item in items)):
+        phase, text = "ready", "Approved in Salesforce and every check passed: click Onboard in production."  # one-click flow
     return ("<section class='card onboard-card' aria-labelledby='co-ready-title'><div class='card-head'>"
-            "<h2 id='co-ready-title' class='pill'>Production readiness</h2>" + _chip(*CREATE_PHASE_CHIPS[state["phase"]])
-            + "</div>" + where + "<ol class='checks'>" + rows + "</ol><p class='note'>" + escape(state["text"]) + "</p></section>")
+            "<h2 id='co-ready-title' class='pill'>Production readiness</h2>" + _chip(*CREATE_PHASE_CHIPS[phase])
+            + "</div>" + where + "<ol class='checks'>" + rows + "</ol><p class='note'>" + escape(text) + "</p></section>")
 
 
 # The licence type text of the Dev CE-only fill (build_ce_only_fill selects "Type"); pinned against the runner in tests.
@@ -7685,9 +7692,11 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     sheet = _add_account_values_card(ref, row, summary["route"], match=check, start_iso=str(plan.get("license_start") or ""),
                                      country=country)
     main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
-            + _production_create_html(ref, row, state) + _production_dry_run_html(ref, row) + ready + blocked
+            + _production_create_html(ref, row, state) + ready + blocked
+            + "<details class='card more'><summary>All details (Salesforce facts, checks, values, approvals, record)</summary>"
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
-            + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + sheet + approval_card + record_card)
+            + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + sheet + approval_card + record_card
+            + "</details>")
     return _app_shell("Review " + ref, main, active="prod_onboarding", refresh=_dry_run_refresh(ref))
 
 
@@ -7855,8 +7864,11 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
                      else "")
         progress = _production_run_progress(reference)
         if progress is not None:
-            if (PRODUCTION_RUNS.get(reference) or {}).get("route") == "case_3_combined_baseline" and not progress["done"]:
+            if not progress["done"] and (progress["failed"]
+                                         or (PRODUCTION_RUNS.get(reference) or {}).get("route") == "case_3_combined_baseline"):
                 # Case 3: nothing is written automatically, so the owner's review button must stay reachable under the bar.
+                # A stopped run (a refusal before anything was created): the button stays under the reason so it can be retried;
+                # the gate itself still blocks it after a real attempt (prior_attempt_needs_review) or a consumed approval.
                 inputs = _create_ui_inputs(reference, row)
                 return create_ui.progress_card_html(progress) + create_ui.create_card_html(
                     inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
@@ -7946,6 +7958,7 @@ def _follow_production_create(reference: str, process: Any) -> None:
     with _PRODUCTION_RUNS_LOCK:
         if reference in PRODUCTION_RUNS:
             PRODUCTION_RUNS[reference]["follow"] = follow
+    clear_display_cache()  # the Salesforce row and checks shown on the page must be re-read after the writes (CO-0811 stale banner)
 
 
 def _production_run_progress(reference: str) -> dict[str, Any] | None:
@@ -7970,7 +7983,8 @@ PRODUCTION_DRY_RUNS: dict[str, dict[str, Any]] = {}
 
 def _launch_production_dry_run(reference: str, revision: str, route: str, env: dict[str, str]) -> Any:
     """Start the one visible production DRY RUN process (desktop only); None when it cannot be started."""
-    if (route != CASE3_ENGINE or not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
+    if (route not in dry_ui.DRY_RUN_ROUTES or not REFERENCE.fullmatch(reference) or not revision
+            or not local_browser_launch_allowed()
             or not ATTENDED_CE_ONLY_RUNNER.is_file()):
         return None
     child = {**os.environ, **{k: v for k, v in env.items() if k.startswith("SURFACE_ONBOARDING_PRODUCTION_")}}
@@ -7989,6 +8003,40 @@ def _launch_production_dry_run(reference: str, revision: str, route: str, env: d
     with _PRODUCTION_RUNS_LOCK:
         PRODUCTION_DRY_RUNS[reference] = {"since": since, "process": process}
     return process
+
+
+def _issue_one_co_approval(inputs: create_ui.Inputs, reference: str, revision: str, route: str) -> bool:
+    """Record the one-CO production approval from the page (same record ``tools/issue_production_approval.py`` writes).
+
+    Only the owner on the desktop: the signed-in operator must be on the issuer list, the pinned Salesforce org must be the
+    expected one, the CO must be Approved with one valid domain and no IDs, and the revision must be the one shown. It
+    unlocks nothing by itself and writes nothing to Salesforce or BackOffice. Any problem returns False (nothing recorded)."""
+    from tools import issue_production_approval as issuer_tool
+    try:
+        if vm_mode() or not isinstance(inputs.row, dict) or inputs.row.get("LastModifiedDate") != revision:
+            return False
+        if issuer_tool.eligibility_problem(inputs.row, reference) is not None or issuer_tool.route_for_row(inputs.row) != route:
+            return False
+        operator = (inputs.operator or "").strip().casefold()
+        allowed = issuer_tool.issuer_allow_list(os.environ)
+        if not operator or operator not in allowed:
+            return False
+
+        def org_probe() -> str | None:
+            response = sf_json(["data", "query", "--query", SALESFORCE_ORG_QUERY, "--json"])
+            records = response["result"]["records"]  # type: ignore[index]
+            return records[0].get("Id") if isinstance(records, list) and len(records) == 1 else None
+
+        if issuer_tool.org_problem(os.environ, org_probe, inputs.now) is not None:
+            return False
+        tenant = inputs.case3_tenant_name if route == CASE3_ENGINE else None
+        issuer_tool.build_approval(
+            path=PRODUCTION_APPROVAL_PATH, approval_ref=issuer_tool.default_approval_ref(reference, inputs.now, route),
+            co_reference=reference, route=route, source_revision=revision, issued_by=operator, allowed_issuers=allowed,
+            now=inputs.now, **({"tenant_name": tenant} if tenant is not None else {}))
+        return True
+    except Exception:  # noqa: BLE001 - fail closed: nothing recorded, no detail shown
+        return False
 
 
 def _production_dry_run_state(reference: str) -> dict[str, Any] | None:
@@ -8016,8 +8064,9 @@ def _dry_run_refresh(reference: str) -> str:
 
 
 def _production_dry_run_html(reference: str, row: dict[str, str | None] | None) -> str:
-    """The Case 3 dry-run section of a production CO page ('' for any other CO). Any failure shows no control."""
-    if dry_ui.route_for_row(row) is None:  # not a Case 3 CO: no card, and no Salesforce-readiness probe for it
+    """The CE-only / Case 3 dry-run section. No CO page includes it any more (owner decision 2026-10-23: the single
+    "Onboard in production" button is the only control); the code stays for a later, deliberate use."""
+    if create_ui._row_route(row) is None:  # not a CE-only or Case 3 CO: no card, and no Salesforce-readiness probe for it
         return ""
     try:
         return dry_ui.card_html(_create_ui_inputs(reference, row), _production_dry_run_state(reference))
@@ -9083,8 +9132,9 @@ class Handler(BaseHTTPRequestHandler):
             row = detail_row(reference)
         except ReadUnavailable:
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
-        code = dry_ui.handle_post(form or {}, _create_ui_inputs(reference, row, self.request_operator()),
-                                  _launch_production_dry_run)
+        inputs = _create_ui_inputs(reference, row, self.request_operator())
+        code = dry_ui.handle_post(form or {}, inputs, _launch_production_dry_run,
+                                  lambda ref, revision, route: _issue_one_co_approval(inputs, ref, revision, route))
         if code != "launched":
             body = ("<div class='banner banner-warn'><span class='chip chip-warn'>Not done</span> " + escape(dry_ui.text(code))
                     + " Nothing was sent.</div><p class='note'>Code: <code>" + escape(code) + "</code></p>" + back)
@@ -9115,7 +9165,8 @@ class Handler(BaseHTTPRequestHandler):
             self._post_case3_followup(path, reference, values, inputs, refuse, back)
             return
         if path == create_ui.CREATE_PATH:
-            code = create_ui.handle_create_post(values, inputs, _launch_production_create_followed)
+            code = create_ui.handle_create_post(values, inputs, _launch_production_create_followed,
+                                                lambda ref, revision, route: _issue_one_co_approval(inputs, ref, revision, route))
             if code != "launched":
                 refuse(code); return
             self.send_redirect("/co/" + reference + "?env=prod")  # the CO page shows the progress (same dashboard)

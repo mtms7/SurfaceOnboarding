@@ -95,7 +95,7 @@ class GateTests(Base):
         return [
             ("vm_read_only", dict(vm=True)),
             ("salesforce_not_fresh", dict(row=None)),
-            ("route_not_case3", dict(row=row(Onboarding_Product__c="Credential Exposure"))),
+            ("route_not_case3", dict(row=row(Onboarding_Product__c="Surface"))),
             ("approval_missing", dict(reference="CO-0899", row=row(Name="CO-0899"))),
             ("operator_not_owner", dict(operator="someone.else@example.com")),
             ("production_locked", dict(environ={})),
@@ -145,7 +145,7 @@ class GateTests(Base):
 class CardTests(Base):
     def test_only_a_case_3_co_gets_a_card(self):
         self.unlocked()
-        for other in (row(Onboarding_Product__c="Credential Exposure"), row(Onboarding_Product__c="Surface"),
+        for other in (row(Onboarding_Product__c="Surface"),
                       row(Onboarding_Type__c="Renewal"), None):
             self.assertEqual(ui.card_html(self.inputs(row=other)), "")
 
@@ -317,3 +317,63 @@ class ProgressTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApproveAndRunTests(Base):
+    """CE-only (and Case 3) with no approval yet: one click records the one-CO approval and starts the dry run."""
+
+    def setUp(self):
+        super().setUp()
+        self.unlocked()
+        self.empty = self.dir / "none.json"
+        finished = mock.Mock()
+        finished.poll.return_value = 0
+        self.launch = mock.Mock(return_value=finished)
+        self.issued = []
+
+    def inputs_ce(self, **over):
+        over.setdefault("row", row(Onboarding_Product__c="Credential Exposure"))
+        return self.inputs(approvals_path=self.empty, **over)
+
+    def issue(self, reference, revision, route):
+        self.issued.append((reference, revision, route))
+        approval.issue(self.empty, "PROD-CE-0800-20261020", reference, route, revision, OWNER, frozenset({OWNER}), NOW)
+        return True
+
+    def values(self, **over):
+        html = ui.card_html(self.inputs_ce())
+        data = {"reference": CO, "nonce": self.nonce(html), "production_dry_run_authorized": "1", "issue_approval": "1"}
+        data.update(over)
+        return data
+
+    def test_a_ce_only_co_without_an_approval_gets_the_one_button_card(self):
+        html = ui.card_html(self.inputs_ce())
+        self.assertIn("Approve and run dry run", html)
+        self.assertIn("name='issue_approval'", html)
+        self.assertEqual(html.count("<form"), 1)
+
+    def test_not_approved_in_salesforce_gets_no_button(self):
+        html = ui.card_html(self.inputs_ce(row=row(Onboarding_Product__c="Credential Exposure", Onboarding_Approval_Status__c="Pending")))
+        self.assertNotIn("<form", html)
+
+    def test_one_post_issues_the_ce_approval_and_launches_the_ce_dry_run(self):
+        code = ui.handle_post(self.values(), self.inputs_ce(), self.launch, self.issue)
+        self.assertEqual(code, "launched")
+        self.assertEqual(self.issued, [(CO, REV, "case_2_new_ce_only")])
+        self.assertEqual(self.launch.call_args.args[:3], (CO, REV, "case_2_new_ce_only"))
+
+    def test_without_the_authorization_nothing_is_issued_or_launched(self):
+        code = ui.handle_post(self.values(production_dry_run_authorized=""), self.inputs_ce(), self.launch, self.issue)
+        self.assertEqual(code, "authorization_missing")
+        self.assertEqual(self.issued, [])
+        self.launch.assert_not_called()
+
+    def test_a_refused_issue_launches_nothing_and_the_token_is_spent(self):
+        values = self.values()
+        self.assertEqual(ui.handle_post(values, self.inputs_ce(), self.launch, lambda *a: False), "approval_not_issued")
+        self.launch.assert_not_called()
+        self.assertEqual(ui.handle_post(values, self.inputs_ce(), self.launch, self.issue), "confirmation_invalid")
+
+    def test_the_flag_without_an_issuer_callback_does_nothing(self):
+        self.assertEqual(ui.handle_post(self.values(), self.inputs_ce(), self.launch), "approval_missing")
+        self.launch.assert_not_called()

@@ -468,7 +468,7 @@ CHECK_CHIPS = {"locked": ("chip-warn", "Locked"), "ready": ("chip-ok", "Ready"),
                "unavailable": ("chip-neutral", "Unavailable")}
 CHECK_ORDER = (("unlock", "Production runner unlocked"), ("session", "Production session"), ("clone", "Clone fresh under 6 h"),
                ("duplicate", "No duplicate in production"), ("data", "Salesforce data valid"), ("timing", "Timing window"),
-               ("approval", "One-CO create approval"), ("dry_run", "Dry run done"), ("owner_go", "Owner go"))
+               ("approval", "One-CO create approval"), ("owner_go", "Owner go"))  # no dry-run row (owner decision 2026-10-23)
 
 
 def _item(key: str, status: str, detail: str) -> dict[str, str]:
@@ -489,8 +489,8 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone:
                       match: dict[str, Any] | None, domain_count: int | None, uuid_state: str, ce_route: bool,
                       start_iso: str | None, today: date, days_before: int, approval: dict[str, Any] | None,
                       create: dict[str, Any] | None, gate: dict[str, Any] | None = None,
-                      session: dict[str, Any] | None = None) -> list[dict[str, str]]:
-    """The nine production onboarding checks as ``{"key", "label", "status", "detail"}``, in display order.
+                      session: dict[str, Any] | None = None, approved_in_salesforce: bool = False) -> list[dict[str, str]]:
+    """The eight production onboarding checks as ``{"key", "label", "status", "detail"}``, in display order.
 
     ``status`` is ``locked``, ``ready``, ``blocked`` or ``unavailable``. Pure: every input is already read by the caller
     (``clone`` from ``clone_status``, ``approval`` from ``approval_for_co``, ``create`` from ``create_state``, ``gate`` from
@@ -513,6 +513,8 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone:
         items.append(_item("session", "locked", "Locked with the production runner."))
     elif reason == _NOT_EVALUATED:
         items.append(_item("session", "unavailable", "The create gate was not evaluated."))
+    elif reason == "approval_missing" and approved_in_salesforce:  # the "Onboard in production" click records it (2026-10-23)
+        items.append(_item("session", "ready", "Unlocked when you click Onboard in production. The runner signs in to app.pentera.io then."))
     elif reason in _BEFORE_SESSION:
         items.append(_item("session", "blocked", "Unlocks with this CO's valid create approval. " + gate_words))
     elif reason == "production_locked":
@@ -566,7 +568,9 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone:
         items.append(_item("timing", "unavailable", "Start date not available."))
     # 7 one-CO create approval
     a_state = approval.get("state") if isinstance(approval, dict) else None
-    if not locked and reason in _APPROVAL_CODES:
+    if not locked and reason == "approval_missing" and approved_in_salesforce:
+        items.append(_item("approval", "ready", "Recorded by the Onboard in production click."))
+    elif not locked and reason in _APPROVAL_CODES:
         items.append(_item("approval", "blocked", gate_words))
     elif a_state == "valid":
         items.append(_item("approval", "ready", "Valid to " + _text(str((approval.get("item") or {}).get("expires_at") or ""))[:10] + "."))
@@ -578,30 +582,20 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone:
         items.append(_item("approval", "blocked", words[a_state]))
     else:
         items.append(_item("approval", "unavailable", "Create approval state not available."))
-    # 8 dry run, 9 owner go: from the create record steps
+    # 8 owner go: from the create record steps (there is no dry-run row any more)
     code = create.get("code") if isinstance(create, dict) else None
     if code == "unavailable":
-        for key, text in (("dry_run", "Create records"), ("owner_go", "Create records")):
-            items.append(_item(key, "unavailable", text + ": " + UNAVAILABLE_ON_SERVER + "."))
+        items.append(_item("owner_go", "unavailable", "Create records: " + UNAVAILABLE_ON_SERVER + "."))
     elif code == "unreadable" or not isinstance(create, dict):
-        for key in ("dry_run", "owner_go"):
-            items.append(_item(key, "unavailable", "Create records unreadable or not available."))
+        items.append(_item("owner_go", "unavailable", "Create records unreadable or not available."))
     else:
         done = int(create.get("steps_done") or 0)
-        pending = "locked" if locked else "blocked"
-        if not locked and reason in _DRY_RUN_CODES:
-            items.append(_item("dry_run", "blocked", gate_words))
-        elif not locked and (reason is None or reason in _AFTER_DRY_RUN):
-            items.append(_item("dry_run", "ready", "A passing dry run for this approval is recorded within 24 h."))
-        else:
-            items.append(_item("dry_run", "ready" if done >= 1 else pending,
-                               "Dry run recorded." if done >= 1 else "No dry run recorded."))
         if done >= 2:
             items.append(_item("owner_go", "ready", "Owner go recorded."))
         elif locked:
             items.append(_item("owner_go", "locked", "No owner go recorded."))
-        elif reason is None:
-            items.append(_item("owner_go", "ready", "Given by your typed, confirmed click in Create in production."))
+        elif reason is None or (reason == "approval_missing" and approved_in_salesforce):
+            items.append(_item("owner_go", "ready", "Given by your click on Onboard in production."))
         else:
             items.append(_item("owner_go", "blocked", "Waits for every other gate." + (" " + gate_words if gate_words else "")))
     return items

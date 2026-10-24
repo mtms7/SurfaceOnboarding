@@ -128,12 +128,16 @@ def get(path):
 
 def without_search(page):
     """The page without the shell's sidebar search form, so button/post assertions cover the page content only."""
-    return re.sub(r"<form class='sidesearch'.*?</form>", "", page, flags=re.S)
+    page = re.sub(r"<form class='sidesearch'.*?</form>", "", page, flags=re.S)
+    # and without the single "Onboard in production" form of an Approved CO (owner decision 2026-10-23)
+    return re.sub(r"<form class='start-form' method='post' action='/attended/production-create'>.*?</form>", "", page, flags=re.S)
 
 
 def forms(page):
     # The sidebar search form (GET /search, owner request 2026-10-07) is in every shell; any other form still fails.
-    return [f for f in re.findall(r"<form[^>]*>", page, flags=re.I) if "action='/search'" not in f]
+    # The single "Onboard in production" form of an Approved CO (owner decision 2026-10-23) is the one owner-gated form.
+    return [f for f in re.findall(r"<form[^>]*>", page, flags=re.I)
+            if "action='/search'" not in f and "action='/attended/production-create'" not in f]
 
 
 class NavigationTests(unittest.TestCase):
@@ -515,7 +519,7 @@ class ProductionCoViewTests(unittest.TestCase):
             self.assertEqual(forms(page), [])
             self.assertNotIn("<button", without_search(page))
             self.assertNotIn("<script", page.lower())
-            self.assertNotIn("method='post'", page.lower())
+            self.assertNotIn("method='post'", without_search(page).lower())
 
     def test_it_shows_the_status_the_comparison_and_the_matched_tenants(self):
         page = self.view()
@@ -614,7 +618,7 @@ class SafetyTests(unittest.TestCase):
         for page in pages:
             self.assertEqual(forms(page), [])
             self.assertNotIn("<script", page.lower())
-            self.assertNotIn("/attended/", page)
+            self.assertNotIn("/attended/", without_search(page))
             self.assertNotIn("inventory-refresh", page)
 
     def test_new_code_never_touches_a_production_session_or_writes(self):

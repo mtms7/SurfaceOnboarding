@@ -335,8 +335,7 @@ def _prior_problem(inputs: CreateInputs, prior_records: Any, cleared_by_owner: A
     if not isinstance(prior_records, (list, tuple)) or not all(isinstance(r, Mapping) for r in prior_records):
         return "prior_records_invalid"
     same_co = [r for r in prior_records if r.get("co_reference") == inputs.co_reference]
-    if not any(r.get("outcome") == OUTCOME_DRY_RUN and r.get("approval_ref") == inputs.approval_ref for r in same_co):
-        return "dry_run_required"
+    # No dry-run requirement (owner decision 2026-10-23): the approval and the post-create readback are the gates.
     if cleared_by_owner is not True and any(r.get("outcome") in _NEEDS_REVIEW
                                             for r in same_co):
         return "prior_attempt_needs_review"

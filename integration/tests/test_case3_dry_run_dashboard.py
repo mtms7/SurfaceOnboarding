@@ -57,8 +57,8 @@ class PageTests(Fixture):
             html = dashboard._production_dry_run_html(CO, base.row())
         self.assertIn("Locked", html)
         self.assertFalse(any(tag in html for tag in base.FORBIDDEN))
-        with self.patched_inputs(row=base.row(Onboarding_Product__c="Credential Exposure")):
-            self.assertEqual(dashboard._production_dry_run_html(CO, base.row(Onboarding_Product__c="Credential Exposure")), "")
+        with self.patched_inputs(row=base.row(Onboarding_Product__c="Surface")):
+            self.assertEqual(dashboard._production_dry_run_html(CO, base.row(Onboarding_Product__c="Surface")), "")
 
     def test_ready_shows_the_button_and_a_failing_read_shows_nothing(self):
         self.unlocked()
@@ -123,7 +123,7 @@ class LaunchTests(Fixture):
     def test_a_wrong_route_or_reference_or_a_machine_that_cannot_launch_starts_nothing(self):
         with mock.patch.object(dashboard, "local_browser_launch_allowed", return_value=True), \
                 mock.patch.object(dashboard.subprocess, "Popen") as popen:
-            for args in ((CO, REV, "case_2_new_ce_only", {}), ("not-a-co", REV, CASE3, {}), (CO, "", CASE3, {})):
+            for args in ((CO, REV, "case_2_renewal", {}), ("not-a-co", REV, CASE3, {}), (CO, "", CASE3, {})):
                 self.assertIsNone(dashboard._launch_production_dry_run(*args))
         with mock.patch.object(dashboard, "local_browser_launch_allowed", return_value=False), \
                 mock.patch.object(dashboard.subprocess, "Popen") as popen:

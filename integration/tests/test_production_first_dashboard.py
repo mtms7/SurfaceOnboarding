@@ -145,6 +145,10 @@ CREATE_WORDS = re.compile(r"create|start|confirm|submit|\bgo\b|run |dry run|laun
 def controls(page, allow=()):
     """Every interactive control in the page body that is not on the allow list, as (kind, label/action)."""
     found = []
+    # The dry-run card (CE-only and Case 3) is the one owner-gated control: it never creates anything.
+    page = re.sub(r"<form class='start-form' method='post' action='/attended/production-dry-run'>.*?</form>", "", page, flags=re.S)
+    # The single "Onboard in production" button (owner decision 2026-10-23) is the owner-gated control of an Approved CO.
+    page = re.sub(r"<form class='start-form' method='post' action='/attended/production-create'>.*?</form>", "", page, flags=re.S)
     for form in re.findall(r"<form[^>]*>", page, flags=re.I):
         action = re.search(r"action='([^']*)'", form)
         if action and action.group(1) in ALLOWED_FORM_ACTIONS + tuple(allow):
@@ -240,6 +244,8 @@ class LandingTests(unittest.TestCase):
         row = self.row_of(self.page(), "CO-0785")
         self.assertIn("<span class='chip chip-ok'>Onboarded</span>", row)
         self.assertIn("Salesforce stage Account Scanning", row)
+        self.assertIn("<span class='muted'>done</span>", row)  # not "overdue": our own verified create counts as done
+        self.assertNotIn("overdue", row)
         self.assertIn("CE scan (clone)", row)
         self.assertNotIn("chip-ok'>Clear", row)
         self.assertNotIn("b" * 32, row)
@@ -431,6 +437,11 @@ class CoPageTests(unittest.TestCase):
     def heads(self, page):
         return [text(h) for h in re.findall(r"<h2[^>]*>(.*?)</h2>", page, flags=re.S)]
 
+    def test_secondary_cards_are_collapsed_under_all_details(self):
+        page = self.page()
+        self.assertIn("<details class='card more'>", page)
+        self.assertLess(page.index("Production readiness"), page.index("<details class='card more'>"))
+
     def test_cards_in_the_production_first_order(self):
         page = self.page()
         self.assertEqual(self.heads(page), ["Production create", "Production readiness", "Salesforce facts", "Production checks",
@@ -567,13 +578,9 @@ class CoPageTests(unittest.TestCase):
 
     @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_readiness_steps_follow_the_record_and_never_become_controls(self):
-        def dry_run_item(page):
-            start = page.index("<span class='what'>Dry run done<")
-            return page[page.rindex("<li>", 0, start):page.index("</li>", start)]
-        self.assertIn("chip-warn'>Locked</span>", dry_run_item(self.page()))
+        self.assertNotIn("Dry run done", self.page())  # no dry-run row (owner decision 2026-10-23)
         self.env.write_record(record("CO-0780", "dry_run_passed"))
         one = self.page()
-        self.assertIn("chip-ok'>Ready</span>", dry_run_item(one))
         self.assertIn("Dry run passed", one)   # the D2 record
         self.assertNotIn("<h2 class='pill'>Create</h2>", one)   # the old second Create card is gone
         self.assertEqual(controls(one, allow=("/attended/review-approve", "Approve this summary")), [])

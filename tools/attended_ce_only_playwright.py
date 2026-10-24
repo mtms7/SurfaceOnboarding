@@ -439,7 +439,7 @@ def _parse_subscription_date(value: Any) -> date | None:
         return None
 
 
-def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False) -> tuple[date, date]:
+def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False, active_only: bool = False) -> tuple[date, date]:
     """Select the CE license subscription dates, failing closed.
 
     Uses "Pentera Core Plus ..." baseline rows of any tier (Commercial,
@@ -467,6 +467,8 @@ def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False) -> t
             continue
         if "DealHub_Status__c" in row and _row_status(row) in _INACTIVE_STATUSES:
             continue
+        if active_only and "DealHub_Status__c" in row and _row_status(row) != "active":
+            continue  # CE-only New (owner decision 2026-10-23): only the Active row, as the CO's DealHub Subscriptions list shows
         start = _parse_subscription_date(row.get("DealHub_Subscription_Start_Date__c"))
         end = _parse_subscription_date(row.get("DealHub_Subscription_End_Date__c"))
         if start is None or end is None or end <= start:
@@ -608,7 +610,7 @@ def ce_fill_source(reference: str) -> CeFillSource:
             "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
             "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
             "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
-        subscription_start, subscription_end = select_ce_subscription(subscription_rows)
+        subscription_start, subscription_end = select_ce_subscription(subscription_rows, active_only=True)
         return CeFillSource(
             reference, revision, account_id, " ".join(account_name.split()),
             email_domain, " ".join(country.split()),
@@ -1306,7 +1308,8 @@ RENEWAL_CASES = {
 }
 RENEWAL_NEW_MODEL_TIERS = frozenset({"go", "prime"})
 RENEWAL_APPLY_WINDOW_DAYS = 14  # Guide G8: a renewal may be applied up to two weeks before it starts
-_INACTIVE_STATUSES = ("expired", "cancelled", "canceled", "inactive")
+# "Cancelled Reopened" (CO-0804, 2026-10-23): the superseded old row; the Active row is the term the CO page shows.
+_INACTIVE_STATUSES = ("expired", "cancelled", "canceled", "inactive", "cancelled reopened")
 
 
 def renewal_case(product: Any, onboarding_type: Any) -> tuple[str, str, bool, bool] | None:
@@ -11030,10 +11033,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         expected_domains=(contract_intended["primary_domain"],) if case3 else (source.email_domain,),
         plan_summary=("Surface and Credential Exposure (Case 3) create" if case3 else "Credential Exposure CE-only create"))
     prior = _pcr_prior_records(parent, reference)
-    if prior is not None:
-        dry_problem = create_ui.dry_run_problem(prior, reference_value, now)  # the 24 h age and the approval binding
-        if dry_problem is not None:
-            return refused(dry_problem)
+    # No dry-run requirement (owner decision 2026-10-23): the approval and the readback after the create are the gates.
     cleared = bool(prior) and create_ui.review_cleared(prior)  # only an owner-reviewed NOT_CLICKED attempt
     pre_form: dict[str, Any] = {}  # the live duplicate check run with the form CLOSED right before it opens
 
@@ -11126,11 +11126,11 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                     return pre_form["problem"]
                 if not pre_form_fresh():
                     return "duplicate_check_stale"  # the fill took too long: the reads are no longer right before the click
-                # The 24 h dry-run age is judged again here, right before the consume and the click.
+                # No dry-run age to judge here any more (owner decision 2026-10-23); the records must still be readable.
                 again = _pcr_prior_records(parent, reference)
                 if again is None:
                     return "prior_records_invalid"
-                return create_ui.dry_run_problem(again, reference_value, (clock or stamp)())
+                return None
 
             def form_recheck(_inputs: Any) -> dict[str, str]:  # the last hook before the intent record and the consume
                 fields = _pdr_recheck_form(page, intended, date_kept or _license_date_kept, strict_state["overrides"],

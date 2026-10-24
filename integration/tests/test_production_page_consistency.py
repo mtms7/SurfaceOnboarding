@@ -123,35 +123,36 @@ class ReviewPageTests(unittest.TestCase):
 
     def test_gate_passed_every_panel_agrees_and_the_create_button_shows(self):
         main = self.main(self.review(PASSED))
-        self.assertIn("<button type='submit'>Create in production</button>", main)
+        self.assertIn("<button type='submit'>Onboard in production</button>", main)
         for text in CONTRADICTIONS:
             self.assertNotIn(text, main, text)
         readiness_card = card(main, "co-ready-title")
         self.assertNotIn("Locked", chips_of(readiness_card))
-        for label in ("Production runner unlocked", "Production session", "Dry run done", "Owner go"):
+        for label in ("Production runner unlocked", "Production session", "Owner go"):
             item = readiness_card[readiness_card.index(label):]
             self.assertEqual(chips_of(item)[0], "Ready", label)
         self.assertIn("Create ready", chips_of(main[:main.index("</div>", main.index("page-head"))]))
 
-    def test_a_closed_gate_is_named_once_and_the_runner_still_reads_unlocked(self):
+    def test_an_approved_co_with_no_approval_yet_reads_ready_for_the_one_click(self):
+        # Owner decision 2026-10-23: the missing approval is recorded by the Onboard in production click, not a blocker.
         main = self.main(self.review(("approval_missing", {"approval": None, "status": None, "env": None})))
-        self.assertNotIn("Create in production</button>", main)
+        self.assertIn("Onboard in production</button>", main)
         for text in CONTRADICTIONS:
             self.assertNotIn(text, main, text)
         readiness_card = card(main, "co-ready-title")
         unlock = readiness_card[readiness_card.index("Production runner unlocked"):]
         self.assertEqual(chips_of(unlock)[0], "Ready")
-        self.assertIn(create_ui.gate_text("approval_missing"), main)
         owner = readiness_card[readiness_card.index("Owner go"):]
-        self.assertEqual(chips_of(owner)[0], "Blocked")
-        self.assertIn("Create blocked", main)
+        self.assertEqual(chips_of(owner)[0], "Ready")
+        self.assertNotIn("Dry run", main)
+        self.assertIn("Create ready", main)
 
     def test_the_real_gate_without_an_approval_in_the_process_environment_is_not_called_locked(self):
         # No patched gate: the real one runs (no approval file, so it stops at approval_missing).
         main = self.main(self.review())
         for text in CONTRADICTIONS:
             self.assertNotIn(text, main, text)
-        self.assertIn(create_ui.gate_text("approval_missing"), main)
+        self.assertIn("Onboard in production</button>", main)
 
     def test_locked_build_says_locked_everywhere_with_the_gate_reason(self):
         with locked_create_build:   # a context manager: it must win over the class-level unlocked_build

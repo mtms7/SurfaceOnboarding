@@ -49,6 +49,19 @@ class ProgressTests(base.Base):
         self.assertEqual(p["percent"], 100)
         self.assertIsNone(p["failed"])
 
+    def test_a_stage_write_in_flight_is_not_a_failure_while_the_follow_up_runs(self):
+        # CO-0811 2026-10-23: the page rendered between the intent line and the result and showed "Stopped" for a write that
+        # then verified; it also stopped refreshing. While the follow-up is still running, write_started is just "active".
+        self.record("readback_verified", when=NOW + timedelta(seconds=30), account_uuid=UUID)
+        ui.record_uuid_write(self.dir, CO, UUID, "written_verified", NOW)
+        ui.record_stage_write(self.dir, CO, "Account Scanning", "write_started", NOW)
+        p = self.progress(running=True)
+        self.assertIsNone(p["failed"])
+        self.assertEqual(self.states(p), ["done", "done", "done", "done", "active"])
+        # once the follow-up has ended, an intent line without a result is still a real problem
+        self.assertEqual(self.progress(running=False, follow={"uuid": "written_verified", "stage": "write_uncertain"})["failed"],
+                         "write_started")
+
     def test_a_refusal_fails_the_running_step_with_its_reason(self):
         self.record("refused", refusal_reason="production_session_not_ready")
         p = self.progress(running=False)
@@ -115,6 +128,19 @@ class DashboardFollowTests(base.Base):
                 mock.patch.object(dashboard, "_create_ui_inputs", return_value=self.inputs()):
             dashboard._follow_production_create(CO, mock.Mock())
         self.assertEqual(dashboard.PRODUCTION_RUNS[CO]["follow"], {"uuid": "follow_up_failed", "stage": "follow_up_failed"})
+
+    def test_a_stopped_run_keeps_the_onboard_button_so_it_can_be_retried(self):
+        # CO-0804 2026-10-23: a refused run (nothing created) replaced the whole create card, leaving nothing to click.
+        self.unlocked()
+        stopped = {"steps": [("Signing in", "failed")], "done": False, "failed": "dry_run_required", "current": "Signing in",
+                   "percent": 5}
+        with mock.patch.object(dashboard, "_production_run_progress", return_value=stopped), \
+                mock.patch.object(dashboard, "_create_ui_inputs", return_value=self.inputs()), \
+                mock.patch.object(dashboard, "production_records_parent", return_value=self.dir):
+            html = dashboard._production_create_html(CO, base.row())
+        self.assertIn("Stopped", html)
+        self.assertIn("Onboard in production", html)
+        self.assertEqual(html.count("<form"), 1)
 
     def test_the_writeback_read_includes_the_stage(self):
         with mock.patch.object(dashboard, "sf_json", return_value={"status": 0, "result": {"records": []}}) as query:

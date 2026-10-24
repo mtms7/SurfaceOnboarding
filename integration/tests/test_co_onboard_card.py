@@ -23,7 +23,7 @@ from integration.tests.locked_build import locked_create_build  # noqa: E402
 unlocked_build = base.unlocked_build
 
 ITEM_LABELS = ["Production runner unlocked", "Production session", "Clone fresh under 6 h", "No duplicate in production",
-               "Salesforce data valid", "Timing window", "One-CO create approval", "Dry run done", "Owner go"]
+               "Salesforce data valid", "Timing window", "One-CO create approval", "Owner go"]
 TODAY = date(2026, 10, 16)
 FRESH = {"state": "fresh", "age_seconds": 7800, "reason": ""}
 CLEAR = {"status": "not_in_production", "candidates": [], "tenants_checked": 5}
@@ -118,27 +118,23 @@ class ChecklistTests(unittest.TestCase):
         self.assertIn("unavailable on this server", checklist(approval={"state": "unavailable", "item": None})["approval"]["detail"])
         self.assertEqual(checklist(approval=None)["approval"]["status"], "unavailable")
 
-    def test_dry_run_and_owner_go(self):
-        got = checklist()
-        self.assertEqual((got["dry_run"]["status"], got["owner_go"]["status"]), ("locked", "locked"))
+    def test_owner_go(self):  # there is no dry-run row any more (owner decision 2026-10-23)
+        self.assertEqual(checklist()["owner_go"]["status"], "locked")
         unlocked = checklist(locked=False, lock_reason=None, gate=gate("clone_stale", "Refresh the clone."))
-        self.assertEqual((unlocked["dry_run"]["status"], unlocked["owner_go"]["status"]), ("blocked", "blocked"))
+        self.assertEqual(unlocked["owner_go"]["status"], "blocked")
         self.assertIn("Refresh the clone.", unlocked["owner_go"]["detail"])
-        passed = checklist(locked=False, lock_reason=None, gate=PASSED_GATE)
-        self.assertEqual((passed["dry_run"]["status"], passed["owner_go"]["status"]), ("ready", "ready"))
-        old = checklist(locked=False, lock_reason=None, gate=gate("dry_run_old", "Run it again."),
-                        create={"code": "dry_run_passed", "steps_done": 1})
-        self.assertEqual((old["dry_run"]["status"], old["dry_run"]["detail"]), ("blocked", "Run it again."))
-        review = checklist(locked=False, lock_reason=None, gate=gate("prior_attempt_needs_review"))
-        self.assertEqual(review["dry_run"]["status"], "ready")
-        one = checklist(create={"code": "dry_run_passed", "steps_done": 1})
-        self.assertEqual((one["dry_run"]["status"], one["owner_go"]["status"]), ("ready", "locked"))
-        two = checklist(create={"code": "x", "steps_done": 2})
-        self.assertEqual((two["dry_run"]["status"], two["owner_go"]["status"]), ("ready", "ready"))
+        self.assertEqual(checklist(locked=False, lock_reason=None, gate=PASSED_GATE)["owner_go"]["status"], "ready")
+        self.assertEqual(checklist(create={"code": "x", "steps_done": 2})["owner_go"]["status"], "ready")
         for code in ("unavailable", "unreadable"):
-            bad = checklist(create={"code": code, "steps_done": 0})
-            self.assertEqual((bad["dry_run"]["status"], bad["owner_go"]["status"]), ("unavailable", "unavailable"))
-        self.assertEqual(checklist(create=None)["dry_run"]["status"], "unavailable")
+            self.assertEqual(checklist(create={"code": code, "steps_done": 0})["owner_go"]["status"], "unavailable")
+        self.assertEqual(checklist(create=None)["owner_go"]["status"], "unavailable")
+        self.assertNotIn("dry_run", checklist())
+
+    def test_a_missing_approval_of_an_approved_co_is_ready_for_the_one_click(self):
+        got = checklist(locked=False, lock_reason=None, gate=gate("approval_missing", "No approval."), approved_in_salesforce=True)
+        self.assertEqual([got[k]["status"] for k in ("session", "approval", "owner_go")], ["ready", "ready", "ready"])
+        got = checklist(locked=False, lock_reason=None, gate=gate("approval_missing", "No approval."))
+        self.assertEqual(got["approval"]["status"], "blocked")  # not Approved in Salesforce: still blocked
 
     def test_details_are_bounded_plain_text(self):
         bad = checklist(clone={"state": "unusable", "age_seconds": None, "reason": "<b>" + "x" * 500})
@@ -188,7 +184,7 @@ class CardPlacementTests(CardBase):
             self.assertEqual(page.count("onboard-card"), 1, name)
             sections = [m.start() for m in re.finditer(r"<section class='card", page)]
             ready = page.index("<section class='card onboard-card'")
-            self.assertEqual(sections.index(ready), 1, name)          # second card: the create card is first
+            self.assertLessEqual(sections.index(ready), 2, name)      # right after the create card (and the dry-run card, if any)
             self.assertLess(page.index("co-create-title"), ready, name)
 
     def test_production_only(self):
@@ -201,7 +197,8 @@ class CardPlacementTests(CardBase):
     @unlocked_build
     def test_the_closing_sentence_is_the_gate_text(self):
         page = self.review()
-        self.assertIn(escape(dashboard.create_ui.gate_text("approval_missing")), self.card(page))
+        # An Approved CO with no approval yet is ready for the one click (owner decision 2026-10-23).
+        self.assertIn("click Onboard in production", self.card(page))
 
 
 class DevContentTests(CardBase):
@@ -229,7 +226,7 @@ class VmModeTests(CardBase):
         for name, page in self.pages(vm=True).items():
             card = self.card(page)
             self.assertIn("unavailable on this server", self.item(card, "Production session"), name)
-            for label in ("Production session", "One-CO create approval", "Dry run done", "Owner go"):
+            for label in ("Production session", "One-CO create approval", "Owner go"):
                 self.assertNotIn("chip-ok", self.item(card, label), (name, label))
 
 
@@ -239,7 +236,7 @@ class ProductionRowTests(CardBase):
             card = self.card(page)
             labels = re.findall(r"<li><span class='what'>([^<]+)", card)
             self.assertEqual(labels, ITEM_LABELS, name)
-            self.assertEqual(len(re.findall(r"<li>.*?</li>", card, flags=re.S)), 9, name)
+            self.assertEqual(len(re.findall(r"<li>.*?</li>", card, flags=re.S)), 8, name)
             for item in re.findall(r"<li>.*?</li>", card, flags=re.S):
                 self.assertRegex(item, r"<span class='chip chip-(ok|warn|bad|neutral)'>(Locked|Ready|Blocked|Unavailable)</span></li>$")
             self.assertIn("<ol class='checks'>", card, name)
@@ -254,12 +251,12 @@ class ProductionRowTests(CardBase):
             self.assertIn("Create locked", card, name)
 
     @unlocked_build
-    def test_unlocked_build_without_an_approval_is_blocked_not_locked(self):
+    def test_unlocked_build_without_an_approval_is_ready_for_the_one_click_not_locked(self):
         card = self.card(self.review())
         self.assertNotIn("chip-warn'>Locked</span>", card)
         self.assertIn("chip-ok'>Ready</span>", self.item(card, "Production runner unlocked"))
-        self.assertIn("chip-bad'>Blocked</span>", self.item(card, "Production session"))
-        self.assertIn("Create blocked", card)
+        self.assertIn("chip-ok'>Ready</span>", self.item(card, "Production session"))
+        self.assertIn("Create ready", card)
 
     def test_card_has_no_button_form_input_or_link(self):
         for name, page in self.pages().items():
@@ -270,7 +267,9 @@ class ProductionRowTests(CardBase):
     def test_no_create_control_while_the_gate_is_closed(self):
         for name, page in self.pages().items():
             self.assertNotRegex(page, r"(?i)<(button|a)[^>]*>[^<]*(create in production|start onboarding|confirm|create)")
-            self.assertEqual(base.controls(page, allow=("/attended/review-approve", "Approve this summary")), [], name)
+            no_dry_run = re.sub(r"<form class='start-form' method='post' action='/attended/production-dry-run'>.*?</form>", "", page, flags=re.S)
+            no_dry_run = re.sub(r"<form class='start-form' method='post' action='/attended/production-create'>.*?</form>", "", no_dry_run, flags=re.S)
+            self.assertEqual(base.controls(no_dry_run, allow=("/attended/review-approve", "Approve this summary")), [], name)
             self.assertNotIn("/attended/", self.card(page), name)
 
     def test_blocked_items_show_blocked(self):
@@ -286,7 +285,6 @@ class ProductionRowTests(CardBase):
         self.env.write_record(base.record("CO-0780", "dry_run_passed"))
         card = self.card(self.review())
         self.assertIn("chip-ok'>Ready</span>", self.item(card, "One-CO create approval"))
-        self.assertIn("chip-ok'>Ready</span>", self.item(card, "Dry run done"))
         self.assertIn("chip-warn'>Locked</span>", self.item(card, "Owner go"))
 
     def test_stale_clone_blocks_and_a_missing_clone_is_unavailable(self):
