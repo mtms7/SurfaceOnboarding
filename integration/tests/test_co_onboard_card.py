@@ -210,17 +210,21 @@ class DevContentTests(CardBase):
 
 
 class VmModeTests(CardBase):
-    def test_vm_shows_the_desktop_text_and_no_button(self):
+    def test_vm_shows_the_desktop_text_and_an_open_on_my_pc_link(self):
         for name, page in self.pages(vm=True).items():
             card = self.card(page)
             self.assertIn("Onboarding runs from the desktop dashboard", card, name)
             self.assertIn("<code>http://127.0.0.1:8012</code>", card, name)
-            self.assertNotIn("href='http://127.0.0.1:8012", card, name)
-            self.assertNotIn("class='btn", card, name)
+            # One plain GET link to the owner's own PC; no form, no POST, nothing starts from the VM.
+            self.assertIn("href='http://127.0.0.1:8012/onboard/CO-0780'", card, name)
+            self.assertIn("Open this CO on my PC", card, name)
+            self.assertIn("rel='noopener noreferrer'", card, name)
+            self.assertNotIn("<form", card, name)
 
     def test_desktop_does_not_show_the_vm_text(self):
         for name, page in self.pages().items():
             self.assertNotIn("Onboarding runs from the desktop dashboard", self.card(page), name)
+            self.assertNotIn("Open this CO on my PC", self.card(page), name)
 
     def test_unevaluable_items_are_never_green_on_the_vm(self):
         for name, page in self.pages(vm=True).items():

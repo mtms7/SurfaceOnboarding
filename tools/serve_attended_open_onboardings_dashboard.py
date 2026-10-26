@@ -34,7 +34,7 @@ from threading import Lock, Thread
 from time import monotonic
 from types import SimpleNamespace
 import webbrowser
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -7374,8 +7374,12 @@ def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: 
         approval=production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, now, missing_is_unavailable=published),
         create=production_views.create_state(records, reference, locked=locked), gate=state, session=session,
         approved_in_salesforce=isinstance(row, dict) and row.get("Onboarding_Approval_Status__c") == "Approved")
+    # The link is a plain GET navigation: the owner's own browser resolves 127.0.0.1 to the owner's PC, so the create (browser,
+    # SSO, MFA, every gate) still runs only on the desktop dashboard. Nothing is posted or started from the VM.
+    desktop_url = DESKTOP_DASHBOARD_ADDRESS + "/onboard/" + quote(reference, safe="")
     where = ("<p class='lede'>Onboarding runs from the desktop dashboard</p><p class='note'>Desktop address: <code>"
-             + escape(DESKTOP_DASHBOARD_ADDRESS) + "</code></p>") if vm else ""
+             + escape(DESKTOP_DASHBOARD_ADDRESS) + "</code></p><p><a class='btn' href='" + escape(desktop_url, quote=True)
+             + "' target='_blank' rel='noopener noreferrer'>Open this CO on my PC</a></p>") if vm else ""
     rows = "".join(_check_item(item["label"], escape(item["detail"]), _chip(*production_views.CHECK_CHIPS[item["status"]]))
                    for item in items)
     phase, text = state["phase"], state["text"]
