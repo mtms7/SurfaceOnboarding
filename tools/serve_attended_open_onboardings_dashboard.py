@@ -7024,6 +7024,28 @@ def _prod_start_cell(start: str, today: date) -> str:
     return cell + "<span class='sub'>" + escape(text) + "</span>"
 
 
+def _prod_days_cell(start: str | None, today: date, sf_status: str | None, done: bool, next_up: bool) -> str:
+    """Days to the subscription start, the Salesforce approval and the "Next up" mark (owner request 2026-10-27).
+
+    Next up is only ever an Approved, not yet onboarded, unblocked CO with the soonest start: it never marks a Pending CO.
+    """
+    if done:
+        return "<span class='muted'>done</span>"
+    approved = sf_status == "Approved"
+    approval = _chip("chip-ok", "Approved") if approved else _chip("chip-neutral", "Not approved" + (" (" + sf_status + ")" if sf_status else ""))
+    if not start:
+        days = "<span class='muted'>—</span>"
+    else:
+        try:
+            count = (date.fromisoformat(start) - today).days
+        except ValueError:
+            count = None
+        days = ("<span class='muted'>—</span>" if count is None else "<b>today</b>" if count == 0
+                else "<b>" + str(count) + "</b> day" + ("" if count == 1 else "s") if count > 0
+                else "<span class='chip chip-bad'>overdue " + str(-count) + " day" + ("" if count == -1 else "s") + "</span>")
+    return days + "<span class='sub'>" + approval + "</span>" + (_chip("chip-ok", "Next up") if next_up and approved else "")
+
+
 def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> str:
     """The production landing (``/`` and ``/onboard``): every open CO with its production checks, approval and create state.
 
@@ -7102,10 +7124,17 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         return ("<th scope='col'" + (" class='" + css + "'" if css else "") + aria + "><a class='sort' href='" + escape(target)
                 + "'>" + escape(label) + "</a></th>")
 
-    head = ("<thead><tr>" + header("start", "Start") + header("co", "Onboarding", "stick") + "<th scope='col'>Account</th>"
+    head = ("<thead><tr>" + header("start", "Start") + "<th scope='col'>Days to start<span class='sub'>Salesforce approval</span></th>"
+            + header("co", "Onboarding", "stick") + "<th scope='col'>Account</th>"
             "<th scope='col'>Product</th><th scope='col'>Production checks</th>"
             "<th scope='col'>Approval<span class='sub'>create · 7 days</span></th><th scope='col'>Create</th>"
             + header("age", "Age", "num") + "</tr></thead>")
+    def _eligible(item: dict[str, Any]) -> bool:
+        return (item["supported"] and item["row"].get("Onboarding_Approval_Status__c") == "Approved"
+                and not item["flags"]["created"] and not item["flags"]["blocked"] and bool(start_of(item)))
+
+    candidates = sorted((item for item in items if _eligible(item)), key=lambda item: (start_of(item), item["ref"]))
+    next_ref = candidates[0]["ref"] if candidates and starts is not None else None
     body = ""
     for item in ordered:
         row, ref, check = item["row"], item["ref"], item["check"]
@@ -7133,7 +7162,10 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             onboarding = "<span class='co'>" + escape(ref) + "</span>"
         body += ("<tr" + ("" if item["supported"] else " class='locked'") + "><td class='c-start'>"
                  + ("<span class='muted'>done</span>" if created_here or (check and check["code"] == "onboarded")
-                    else _prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='stick'>"
+                    else _prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='c-days'>"
+                 + _prod_days_cell(start, today, row.get("Onboarding_Approval_Status__c"),
+                                   created_here or bool(check and check["code"] == "onboarded"), ref == next_ref)
+                 + "</td><td class='stick'>"
                  + onboarding + "</td><td>" + escape(str(row.get("Account__r.Name") or "Account unavailable")) + "</td><td>"
                  + escape(_PRODUCT_SHORT.get(product or "", product or "—")) + "<span class='sub'>"
                  + escape(_TYPE_SHORT.get(kind or "", kind or "—")) + "</span></td><td>" + checks + "</td><td>" + approval_cell

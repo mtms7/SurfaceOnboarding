@@ -255,7 +255,7 @@ class LandingTests(unittest.TestCase):
     def test_columns_in_the_owner_order(self):
         page = self.page()
         table = page[page.index("<table"):page.index("</table>")]
-        self.assertEqual(headers(table), ["Start", "Onboarding", "Account", "Product", "Production checks", "Approval create · 7 days",
+        self.assertEqual(headers(table), ["Start", "Days to start Salesforce approval", "Onboarding", "Account", "Product", "Production checks", "Approval create · 7 days",
                                           "Create", "Age"])
         self.assertIn("<h1>Onboarding</h1>", page)
         self.assertIn("envpill prod", page)
@@ -329,6 +329,42 @@ class LandingTests(unittest.TestCase):
         self.assertEqual(refs, ["CO-0785", "CO-0780", "CO-0784", "CO-0782", "CO-0781"])
         by_co = re.findall(r"<a class='co' href='/onboard/(CO-\d+)'>", self.page("/?sort=co&dir=desc"))
         self.assertEqual(by_co, ["CO-0785", "CO-0784", "CO-0782", "CO-0781", "CO-0780"])
+
+    def test_days_to_start_and_next_up_only_marks_an_approved_unblocked_co(self):
+        """Owner request 2026-10-27: days to the start, the Salesforce approval, and one "Next up" (Approved only)."""
+        approved = lambda row, status: {**row, "Onboarding_Approval_Status__c": status}  # noqa: E731
+        rows = [approved(ROWS[0], "Approved"),   # CO-0780: clear, start 10-18 (2 days)
+                approved(ROWS[1], "Approved"),   # CO-0781: Approved but blocked by a duplicate
+                approved(ROWS[2], "Pending"),    # CO-0782: soonest clear-ish start but not Approved
+                approved(ROWS[4], "Pending"),    # CO-0784
+                approved(ROWS[5], "Approved")]   # CO-0785: already created
+        html = self.page(rows=rows)
+        tr = {ref: next(chunk for chunk in html.split("<tr") if ">" + ref + "</a>" in chunk)
+              for ref in ("CO-0780", "CO-0781", "CO-0782", "CO-0784", "CO-0785")}
+        cells = {ref: re.search(r"<td class='c-days'>(.*?)</td>", chunk, re.S).group(1) for ref, chunk in tr.items()}
+        self.assertIn("<b>2</b> days", cells["CO-0780"])
+        self.assertIn("Approved", cells["CO-0780"])
+        self.assertEqual(html.count("Next up"), 1)
+        self.assertIn("Next up", cells["CO-0780"])
+        self.assertNotIn("Next up", cells["CO-0781"])  # blocked by a duplicate
+        self.assertNotIn("Next up", cells["CO-0782"])
+        self.assertIn("Not approved (Pending)", cells["CO-0782"])
+        self.assertIn("done", cells["CO-0785"])
+        self.assertNotIn("Next up", cells["CO-0785"])
+        self.assertIn("Days to start", html)
+
+    def test_next_up_is_the_soonest_approved_start_and_a_day_is_singular(self):
+        rows = [{**ROWS[0], "Onboarding_Approval_Status__c": "Approved"}]
+        html = self.page(rows=rows, starts={"CO-0780": "2026-10-17"})
+        self.assertIn("<b>1</b> day<", html)
+        self.assertIn("Next up", html)
+        html = self.page(rows=rows, starts={"CO-0780": "2026-10-16"})
+        self.assertIn("<b>today</b>", html)
+        html = self.page(rows=rows, starts={"CO-0780": "2026-10-14"})
+        self.assertIn("overdue 2 days", html)
+        self.assertIn("Next up", html)  # the most urgent Approved CO is still next
+        html = self.page(rows=rows, starts={})
+        self.assertNotIn("Next up", html)  # no start date: nothing is invented
 
     def test_clone_strip_trusted_stale_and_unusable(self):
         fresh = self.page()
