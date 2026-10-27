@@ -1,30 +1,30 @@
 #!/bin/sh
-# REVIEW ARTIFACT - Step 26A (operator-run on the VM as root: sudo sh /tmp/r37-upload/_step26a_vm_stage_r37.sh).
-# Stages release r37 only: verifies the SHA-256 sidecar, unpacks as surface-onboarding into a NEW staged folder,
+# REVIEW ARTIFACT - Step 27A (operator-run on the VM as root: sudo sh /tmp/r38-upload/_step27a_vm_stage_r38.sh).
+# Stages release r38 only: verifies the SHA-256 sidecar, unpacks as surface-onboarding into a NEW staged folder,
 # checks for CR bytes, runs the full suite and both guards with the managed Python. Does NOT touch the `app` symlink,
 # the running dashboard/nginx, /etc/surface-onboarding, snapshots, or any external system. Activation is a later step.
-# Expects /tmp/r37-upload/surface-onboarding-r37-44d25a2.tar.gz and its .sha256 (uploaded by the operator with scp).
+# Expects /tmp/r38-upload/surface-onboarding-r38-9b2a30e.tar.gz and its .sha256 (uploaded by the operator with scp).
 set -eu
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
 OPT=/opt/surface-onboarding
-UP=/tmp/r37-upload
-NAME=surface-onboarding-r37-44d25a2.tar.gz
-INC=$OPT/incoming-r37
-NEW=$OPT/app-r37-staged-20261026
+UP=/tmp/r38-upload
+NAME=surface-onboarding-r38-9b2a30e.tar.gz
+INC=$OPT/incoming-r38
+NEW=$OPT/app-r38-staged-20261027
 RUNAS=surface-onboarding
 [ -f "$UP/$NAME" ] && [ -f "$UP/$NAME.sha256" ] || { echo "missing upload in $UP"; exit 1; }
 [ ! -e "$INC" ] || { echo "$INC already exists: stop here"; exit 1; }
 [ ! -e "$NEW" ] || { echo "$NEW already exists: stop here"; exit 1; }
 
-echo "== 1. verify SHA-256 (expect OK, expected 169E8B45...55456) =="
-EXPECTED=169E8B45B8D05D668B48F18BE46F3D1387E39741947390163E70A03DBE5D5456
+echo "== 1. verify SHA-256 (expect OK, expected ABE40092...278D9) =="
+EXPECTED=ABE4009257DF5AB6B96D902CAD3AED23A9F171965698904CB9D5B1A769A278D9
 ACTUAL=$(sha256sum "$UP/$NAME" | cut -d' ' -f1 | tr a-f A-F)
 SIDECAR=$(cut -d' ' -f1 "$UP/$NAME.sha256")
 echo "actual  $ACTUAL"; echo "sidecar $SIDECAR"
 [ "$ACTUAL" = "$EXPECTED" ] && [ "$SIDECAR" = "$EXPECTED" ] || { echo "CHECKSUM MISMATCH: stop here"; exit 1; }
 echo OK
 
-echo "== 2. copy to incoming-r37 and list members for review =="
+echo "== 2. copy to incoming-r38 and list members for review =="
 install -d -o "$RUNAS" -g "$RUNAS" -m 0750 "$INC"
 install -o "$RUNAS" -g "$RUNAS" -m 0640 "$UP/$NAME" "$UP/$NAME.sha256" "$INC/"
 tar -tzf "$INC/$NAME" | grep -E '(^/|(^|/)\.\.(/|$))' && { echo "unsafe member path: stop here"; exit 1; } || echo "no absolute or .. paths"

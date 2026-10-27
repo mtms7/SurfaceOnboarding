@@ -28,34 +28,34 @@ TCP_FAIL or a timeout = the firewall path is still closed (reply on ticket 16160
 Paste only the output lines to Claude.
 
 
-# Deploy release r37 to the VM (adds "Open this CO on my PC" to the VM CO page), 2026-10-26
+# Deploy release r38 to the VM (adds "Open this CO on my PC", the Days to start column and the stale-banner fix), 2026-10-27
 
 Pentera VPN on. The `workato` VM password prompts are typed in your own window; never paste them to Claude.
-Archive: surface-onboarding-r37-44d25a2.tar.gz, SHA-256 169E8B45B8D05D668B48F18BE46F3D1387E39741947390163E70A03DBE5D5456 (458 files, LF, checker passed).
-The VM runs r36 now. Stage first (changes nothing live), activate only with the owner's separate go.
+Archive: surface-onboarding-r38-9b2a30e.tar.gz, SHA-256 ABE4009257DF5AB6B96D902CAD3AED23A9F171965698904CB9D5B1A769A278D9 (460 files, LF, checker passed).
+The VM runs r36 now (r37 was built but never sent; it is superseded by r38). Stage first (changes nothing live), activate only with the owner's separate go.
 
-## PC tab, step B: upload four files to the VM /tmp/r37-upload (asks the password per command)
+## PC tab, step B: upload four files to the VM /tmp/r38-upload (asks the password per command)
 
-    ssh workato@172.26.37.20 "mkdir -p /tmp/r37-upload"
-    scp "$env:USERPROFILE/.surface-onboarding/releases/surface-onboarding-r37-44d25a2.tar.gz" "$env:USERPROFILE/.surface-onboarding/releases/surface-onboarding-r37-44d25a2.tar.gz.sha256" workato@172.26.37.20:/tmp/r37-upload/
-    scp "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step26a_vm_stage_r37.sh" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step26b_vm_activate_r37.sh" workato@172.26.37.20:/tmp/r37-upload/
+    ssh workato@172.26.37.20 "mkdir -p /tmp/r38-upload"
+    scp "$env:USERPROFILE/.surface-onboarding/releases/surface-onboarding-r38-9b2a30e.tar.gz" "$env:USERPROFILE/.surface-onboarding/releases/surface-onboarding-r38-9b2a30e.tar.gz.sha256" workato@172.26.37.20:/tmp/r38-upload/
+    scp "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step27a_vm_stage_r38.sh" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step27b_vm_activate_r38.sh" workato@172.26.37.20:/tmp/r38-upload/
 
 Expect "100%" lines.
 
-## PC tab (runs on the VM), step C: stage r37 (checksum, unpack, CR check, full suite and guards; activates nothing)
+## PC tab (runs on the VM), step C: stage r38 (checksum, unpack, CR check, full suite and guards; activates nothing)
 
-    ssh -t workato@172.26.37.20 "sudo sh /tmp/r37-upload/_step26a_vm_stage_r37.sh"
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r38-upload/_step27a_vm_stage_r38.sh"
 
 Expect: checksum OK, "no absolute or .. paths", "none" for CR bytes, suite OK, both guards pass, "staged only; nothing activated".
 Any "stop here" or suite failure: stop and paste the output to Claude.
 
-## PC tab (runs on the VM), step D: activate r37 (ONLY after the owner's go)
+## PC tab (runs on the VM), step D: activate r38 (ONLY after the owner's go)
 
-    ssh -t workato@172.26.37.20 "sudo sh /tmp/r37-upload/_step26b_vm_activate_r37.sh"
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r38-upload/_step27b_vm_activate_r38.sh"
 
 Expect: GET / 200, POST / 403 or 405, direct dashboard without secret 4xx. Rollback to r36:
 
-    ssh -t workato@172.26.37.20 "sudo sh /tmp/r37-upload/_step26b_vm_activate_r37.sh rollback"
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r38-upload/_step27b_vm_activate_r38.sh rollback"
 
 ## PC, step E: check the button
 

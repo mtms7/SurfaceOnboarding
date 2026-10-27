@@ -1,18 +1,18 @@
 #!/bin/sh
-# REVIEW ARTIFACT - Step 26B (operator-run on the VM as root): sudo sh /tmp/r37-upload/_step26b_vm_activate_r37.sh [rollback]
-# Points `app` at the staged, tested r37 and restarts ONLY the dashboard if the pilot is currently running; if the pilot
+# REVIEW ARTIFACT - Step 27B (operator-run on the VM as root): sudo sh /tmp/r38-upload/_step27b_vm_activate_r38.sh [rollback]
+# Points `app` at the staged, tested r38 and restarts ONLY the dashboard if the pilot is currently running; if the pilot
 # is stopped it stays stopped. Does not touch nginx, the approved-web-identity marker, /etc/surface-onboarding,
 # snapshots, boot enablement, the firewall or any external system. `rollback` points `app` back at r36.
 set -eu
 [ "$(id -u)" -eq 0 ] || { echo "run as root"; exit 1; }
 OPT=/opt/surface-onboarding
 R36=$OPT/app-r36-staged-20261017
-R37=$OPT/app-r37-staged-20261026
+R38=$OPT/app-r38-staged-20261027
 UNIT=surface-onboarding-dashboard
 case "${1:-}" in
-"") FROM=$R36; TO=$R37;;
-rollback) FROM=$R37; TO=$R36;;
-*) echo "usage: sh _step26b_vm_activate_r37.sh [rollback]"; exit 1;;
+"") FROM=$R36; TO=$R38;;
+rollback) FROM=$R38; TO=$R36;;
+*) echo "usage: sh _step27b_vm_activate_r38.sh [rollback]"; exit 1;;
 esac
 [ -d "$TO/integration" ] || { echo "missing $TO"; exit 1; }
 [ -L "$OPT/app" ] && [ "$(readlink "$OPT/app")" = "$FROM" ] || { echo "app is not -> $FROM (is: $(readlink "$OPT/app" || echo not-a-symlink)): stop here"; exit 1; }
@@ -40,4 +40,4 @@ else
   echo "== 3. pilot was stopped: left stopped (start it with: sudo sh /tmp/step2c.sh start) =="
 fi
 echo "enabled at boot: $(systemctl is-enabled $UNIT nginx | tr '\n' ' ')"
-echo "rollback: sudo sh /tmp/r37-upload/_step26b_vm_activate_r37.sh rollback"
+echo "rollback: sudo sh /tmp/r38-upload/_step27b_vm_activate_r38.sh rollback"
