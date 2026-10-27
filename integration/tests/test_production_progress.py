@@ -122,6 +122,22 @@ class DashboardFollowTests(base.Base):
         follow.assert_called_once()
         self.assertEqual(dashboard.PRODUCTION_RUNS[CO]["follow"], {"uuid": "written_verified", "stage": "written_verified"})
 
+    def test_each_follow_up_salesforce_write_clears_the_display_cache_at_once(self):
+        # CO-0812 2026-10-27: the page polled during the run kept a cached Salesforce read with an empty UUID after the UUID
+        # write, so it showed "UUID sources disagree" until the run ended. Every follow-up write now drops the cached reads.
+        dashboard.PRODUCTION_RUNS[CO] = {"since": SINCE, "follow": None}
+        order = []
+
+        def follow(inputs, read_row, run_argv, alias):
+            order.append("before-write")
+            self.assertTrue(run_argv(["data", "update", "record"]))
+            order.append("after-write")
+            return {"uuid": "written_verified", "stage": "written_verified"}
+
+        with mock.patch.object(dashboard.create_ui, "after_verified_create", side_effect=follow),                 mock.patch.object(dashboard, "_run_sf_argv", side_effect=lambda argv: order.append("write") or True),                 mock.patch.object(dashboard, "clear_display_cache", side_effect=lambda: order.append("clear")),                 mock.patch.object(dashboard, "_create_ui_inputs", return_value=self.inputs()):
+            dashboard._follow_production_create(CO, mock.Mock())
+        self.assertEqual(order[:4], ["before-write", "write", "clear", "after-write"])
+
     def test_a_crashing_follow_up_is_recorded_not_raised(self):
         dashboard.PRODUCTION_RUNS[CO] = {"since": SINCE, "follow": None}
         with mock.patch.object(dashboard.create_ui, "after_verified_create", side_effect=RuntimeError("boom")), \

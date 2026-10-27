@@ -7955,8 +7955,13 @@ def _follow_production_create(reference: str, process: Any) -> None:
         pass
     try:
         inputs = _create_ui_inputs(reference, None)
-        follow = create_ui.after_verified_create(inputs, lambda: _read_production_writeback_row(reference), _run_sf_argv,
-                                                 create_ui.PINNED_SF_ALIAS)
+        def run_and_forget_cached_reads(argv: list[str]) -> bool:
+            ok = _run_sf_argv(argv)
+            clear_display_cache()  # a page polled mid-run must not keep the pre-write Salesforce row (CO-0812 stale banner)
+            return ok
+
+        follow = create_ui.after_verified_create(inputs, lambda: _read_production_writeback_row(reference),
+                                                 run_and_forget_cached_reads, create_ui.PINNED_SF_ALIAS)
     except Exception:  # noqa: BLE001 - recorded, never raised in the worker
         follow = {"uuid": "follow_up_failed", "stage": "follow_up_failed"}
     with _PRODUCTION_RUNS_LOCK:
