@@ -660,6 +660,14 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
                              "outcome": "readback_verified", "tenant_name": self.NAME, "domains": [self.DOMAIN],
                              "account_id": "a" * 24, "account_uuid": self.UUID, "plan_summary": "CE, 1 year",
                              "salesforce_revision": "REV-1"}, datetime.now(timezone.utc) - timedelta(hours=1))
+        folder = desktop / "production-create-records"
+        (folder / "production-uuid-writes.jsonl").write_text(json.dumps(
+            {"co_reference": "CO-0001", "field": "Account_UUID__c", "result": "written_verified", "value_sha256": "c" * 64,
+             "operator": "", "reason": "", "recorded_at": "2026-10-27T19:54:30Z"}) + "\n", encoding="utf-8")
+        (desktop / "production_create_approvals.json").write_text(json.dumps({"PROD-CE-0001-1": {
+            "approval_ref": "PROD-CE-0001-1", "co_reference": "CO-0001", "route": "case_2_new_ce_only", "scope": "ce_only_single_co",
+            "issued_by": "owner@example.test", "issued_at": "2026-10-23T09:00:00Z", "expires_at": "2026-10-30T09:00:00Z",
+            "consumed_at": "2026-10-27T19:54:18Z", "source_revision": "SECRET-REVISION-9"}}), encoding="utf-8")
         import tools.build_records_push_bundle as builder
         out = self.state.parent / "records.zip"
         key_file = self.state.parent / "records.key"
@@ -670,7 +678,11 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         _, _, after = self.get("/", email=OWNER)
         row = after[after.index(">CO-0001<"):after.index("</tr>", after.index(">CO-0001<"))]
         self.assertIn("Verified", row)
+        self.assertIn("Used", row)  # the approval column: the approval was consumed by the create
+        self.assertNotIn("Unavailable on this server", row)
+        self.assertIn("Account UUID written and read back", row)
         self.assertNotIn(self.UUID, after)  # the page never prints the UUID
+        self.assertNotIn("SECRET-REVISION-9", after)
 
     def test_only_inactive_tenants_show_other_tenants_only(self):
         self.publish({"CO-0001": self.item()})

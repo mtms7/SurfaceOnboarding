@@ -63,13 +63,56 @@ class Base(unittest.TestCase):
         return code, buffer.getvalue().strip()
 
 
+APPROVAL = {"approval_ref": "PROD-CE-0812-1", "co_reference": "CO-0812", "route": "case_2_new_ce_only", "scope": "ce_only_single_co",
+            "issued_by": "owner@example.test", "issued_at": "2026-10-23T09:00:00Z", "expires_at": "2026-10-30T09:00:00Z",
+            "consumed_at": "2026-10-27T19:54:18Z", "source_revision": "SECRET-REVISION-9"}
+
+
 class BuilderTests(Base):
+    def write_logs(self):
+        folder = self.desktop / "production-create-records"
+        folder.mkdir(exist_ok=True)
+        (folder / "production-uuid-writes.jsonl").write_text(
+            json.dumps({"co_reference": "CO-0812", "field": "Account_UUID__c", "result": "written_verified",
+                        "value_sha256": "c" * 64, "operator": "", "reason": "", "recorded_at": "2026-10-27T19:54:30Z"}) + "\n",
+            encoding="utf-8")
+        (folder / "production-stage-writes.jsonl").write_text(
+            json.dumps({"co_reference": "CO-0812", "field": "Onboarding_Stage__c", "to_stage": "Account Scanning",
+                        "result": "written_verified", "reason": "", "recorded_at": "2026-10-27T19:55:02Z"}) + "\n",
+            encoding="utf-8")
+
+    def write_approvals(self, *records):
+        (self.desktop / "production_create_approvals.json").write_text(json.dumps({r["approval_ref"]: r for r in records}), encoding="utf-8")
+
+    def test_approvals_are_published_without_the_salesforce_source_revision(self):
+        self.write_approvals(APPROVAL)
+        bundle = vs.verify_bundle(self.build(), KEY)
+        published = json.loads(bundle.files[vs.PRODUCTION_APPROVALS_FILE])
+        self.assertEqual(sorted(published), ["PROD-CE-0812-1"])
+        self.assertNotIn("SECRET-REVISION-9", json.dumps(published))
+        self.assertEqual(published["PROD-CE-0812-1"]["consumed_at"], "2026-10-27T19:54:18Z")
+
+    def test_no_approvals_file_publishes_an_empty_one_so_the_vm_says_none_not_unavailable(self):
+        bundle = vs.verify_bundle(self.build(), KEY)
+        self.assertEqual(json.loads(bundle.files[vs.PRODUCTION_APPROVALS_FILE]), {})
+
+    def test_a_corrupt_approvals_file_refuses_the_build(self):
+        (self.desktop / "production_create_approvals.json").write_text("{not json", encoding="utf-8")
+        with self.assertRaises(builder.BuildRefused):
+            self.build()
+
+    def test_the_uuid_and_stage_write_logs_travel_inside_the_records_file(self):
+        self.write_logs()
+        payload = json.loads(vs.verify_bundle(self.build(), KEY).files[vs.PRODUCTION_RECORDS_FILE])
+        self.assertEqual(sorted(payload["logs"]), ["production-stage-writes.jsonl", "production-uuid-writes.jsonl"])
+        self.assertNotIn("b" * 32, json.dumps(payload["logs"]))  # only the SHA-256 of the UUID, as in the local log
+
     def test_it_bundles_only_the_masked_records_under_the_records_producer(self):
         self.write_record()
         raw = self.build()
         bundle = vs.verify_bundle(raw, KEY)
         self.assertEqual(bundle.manifest["producer"], vs.RECORDS_PUSH_PRODUCER)
-        self.assertEqual(sorted(bundle.files), [vs.PRODUCTION_RECORDS_FILE])
+        self.assertEqual(sorted(bundle.files), [vs.PRODUCTION_APPROVALS_FILE, vs.PRODUCTION_RECORDS_FILE])
         records = json.loads(bundle.files[vs.PRODUCTION_RECORDS_FILE])["records"]
         self.assertEqual(len(records), 1)
         self.assertTrue(next(iter(records)).startswith("CO-0812-"))
@@ -86,6 +129,35 @@ class BuilderTests(Base):
 
 
 class IngestTests(Base):
+    def test_approvals_and_write_logs_reach_the_vm_folder_the_dashboard_reads(self):
+        self.current_snapshot()
+        self.write_record()
+        BuilderTests.write_logs(self)
+        BuilderTests.write_approvals(self, APPROVAL)
+        self.assertEqual(self.push(self.build())[0], 0)
+        current = vs.current_dir(vs.snapshots_root(self.state))
+        listing = production_views.list_approvals(current / "production_create_approvals.json", NOW, missing_is_unavailable=True)
+        self.assertEqual(listing["state"], "ok")
+        self.assertEqual(production_views.pick_approval(listing, "CO-0812")["state"], "consumed")
+        from integration.onboarding import production_create_ui as create_ui
+        self.assertEqual(create_ui.last_uuid_write(current, "CO-0812"), "written_verified")
+        self.assertEqual(create_ui.last_stage_write(current, "CO-0812"), ("Account Scanning", "written_verified"))
+        summary = create_ui.onboarded_summary(current, "CO-0812", None)
+        self.assertEqual(summary["label"], "Onboarded")
+        self.assertIn("Account UUID written and read back", summary["text"])
+
+    def test_a_log_line_that_is_not_a_json_object_or_an_unknown_log_name_is_refused(self):
+        self.current_snapshot()
+        before = vs.current_name(vs.snapshots_root(self.state))
+        for logs in ({"production-uuid-writes.jsonl": "not json\n"}, {"evil.jsonl": "{}\n"},
+                     {"production-uuid-writes.jsonl": "[1]\n"}):
+            payload = json.dumps({"records": {}, "logs": logs}).encode()
+            raw = vs.build_bundle({vs.PRODUCTION_RECORDS_FILE: payload}, KEY, vs.RECORDS_PUSH_PRODUCER, NOW)
+            code, line = self.push(raw)
+            self.assertEqual(code, 2, logs)
+            self.assertTrue(line.startswith("refused:"), logs)
+        self.assertEqual(vs.current_name(vs.snapshots_root(self.state)), before)
+
     def test_records_are_merged_into_the_current_snapshot_without_dropping_anything(self):
         self.current_snapshot()
         self.write_record()

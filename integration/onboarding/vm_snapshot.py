@@ -54,7 +54,10 @@ INVENTORY_SUBDIR = "leonardo-inventory"
 CLONE_PUSH_PRODUCER = "desktop-clone-push"  # clone-only bundles (docs/51): never a full snapshot
 SNAPSHOT_PUSH_PRODUCER = "desktop-snapshot-push"  # a full signed snapshot pushed by the PC task over the same restricted key
 RECORDS_PUSH_PRODUCER = "desktop-records-push"  # the masked production create records only, merged into the CURRENT snapshot
-PRODUCTION_RECORDS_FILE = "production_create_records.json"  # {"records": {"CO-0812-<stamp>.json": record}}
+PRODUCTION_RECORDS_FILE = "production_create_records.json"  # {"records": {"CO-0812-<stamp>.json": record}, "logs": {name: text}}
+PRODUCTION_APPROVALS_FILE = "production_create_approvals.json"  # the desktop file name: the dashboard reads it from the snapshot on the VM
+RECORD_LOG_NAMES = frozenset({"production-uuid-writes.jsonl", "production-stage-writes.jsonl", "case3-followup-writes.jsonl"})
+MAX_LOG_BYTES = 512 * 1024
 _RECORD_FILE_NAME = re.compile(r"CO-[0-9]{3,6}-[0-9]{8}T[0-9]{6}Z(?:-[0-9]{1,3})?\.json")
 PRODUCER_VM_READER = "vm-salesforce-reader"  # the VM refreshed queue.json / co_details.json itself (docs/43 part A)
 QUEUE_FILE = "queue.json"
@@ -91,7 +94,8 @@ STATE_FILE_NAMES = frozenset({
     "attended_user_created_confirmations.json", "attended_spycloud.json", "attended_salesforce_id_writebacks.json",
     "attended_surface_validation.json", "attended_renewal_mirrors.json", "attended_renewal_outcomes.json",
 })
-EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, PRODUCTION_INPUTS_FILE, PRODUCTION_RECORDS_FILE, INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
+EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, PRODUCTION_INPUTS_FILE, PRODUCTION_RECORDS_FILE, PRODUCTION_APPROVALS_FILE,
+                               INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
                                INVENTORY_CLONE_LATEST, INVENTORY_CLONE_SNAPSHOT})
 ALLOWED_NAMES = STATE_FILE_NAMES | EXPORT_FILE_NAMES
 
@@ -484,6 +488,18 @@ def write_records_folder(stage: Path, data: bytes) -> None:
                 raise ValueError("record_name")
             cleaned = records._validate(raw)  # noqa: SLF001 - the same validator the desktop reader applies
             (folder / name).write_text(json.dumps(cleaned, sort_keys=True), encoding="utf-8")
+        # The append-only write logs the dashboard reads beside the records (UUID write, stage move, Case 3 follow-up): only
+        # the three known names, each line a JSON object, each log bounded. They hold hashes and codes, never a UUID.
+        logs = json.loads(data.decode("utf-8")).get("logs", {})
+        if not isinstance(logs, dict):
+            raise ValueError("logs")
+        for name, text in logs.items():
+            if name not in RECORD_LOG_NAMES or not isinstance(text, str) or len(text.encode("utf-8")) > MAX_LOG_BYTES:
+                raise ValueError("log_name")
+            for line in text.splitlines():
+                if not isinstance(json.loads(line), dict):
+                    raise ValueError("log_line")
+            (folder / name).write_text(text, encoding="utf-8")
     except (KeyError, TypeError, ValueError, UnicodeDecodeError, OSError, records.ProductionCreateRecordError) as error:
         raise SnapshotError("records_invalid") from error
 

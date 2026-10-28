@@ -21,6 +21,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from integration.onboarding import production_approval  # noqa: E402
 from integration.onboarding import production_create_record as records  # noqa: E402
 from integration.onboarding import state_paths  # noqa: E402
 from integration.onboarding import vm_snapshot as vs  # noqa: E402
@@ -38,6 +39,29 @@ def records_parent() -> Path:
     return Path(folder) if folder is not None else ROOT
 
 
+PLACEHOLDER_REVISION = "1970-01-01T00:00:00.000+0000"  # the Salesforce revision an approval is bound to never leaves the desktop
+
+
+def published_approvals(parent: Path) -> dict[str, dict]:
+    """The create approvals for display on the VM: the desktop file with every ``source_revision`` replaced by a placeholder.
+
+    A missing file is an empty set (the VM then says "None", not "Unavailable"); a corrupt one refuses the build. Nothing the VM
+    receives can authorise a create: the PC checks its own file at launch."""
+    from integration.onboarding import production_views
+
+    candidates = [parent / "integration" / production_approval.STATE_FILE_NAME, parent / production_approval.STATE_FILE_NAME]
+    source = next((item for item in candidates if item.is_file()), None)
+    if source is None:
+        return {}
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise BuildRefused("approvals_unreadable") from None
+    if not isinstance(raw, dict) or not all(production_views._valid_approval(key, record) for key, record in raw.items()):  # noqa: SLF001
+        raise BuildRefused("approvals_unreadable")
+    return {key: {**record, "source_revision": PLACEHOLDER_REVISION} for key, record in raw.items()}
+
+
 def build(key_file: str, out: Path, parent: Path | None = None, now: datetime | None = None) -> dict[str, int]:
     now = (now or datetime.now(timezone.utc)).replace(microsecond=0)
     try:
@@ -51,9 +75,19 @@ def build(key_file: str, out: Path, parent: Path | None = None, now: datetime | 
             entries[path.name] = records.load(path)
     except (records.ProductionCreateRecordError, OSError, ValueError, TypeError, KeyError):
         raise BuildRefused("record_unreadable") from None
-    payload = json.dumps({"records": entries}, sort_keys=True).encode("utf-8")
+    logs: dict[str, str] = {}
     try:
-        data = vs.build_bundle({vs.PRODUCTION_RECORDS_FILE: payload}, key, vs.RECORDS_PUSH_PRODUCER, now)
+        for name in sorted(vs.RECORD_LOG_NAMES):
+            log = parent / records.RECORDS_SUBDIR / name
+            if log.is_file():
+                logs[name] = log.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise BuildRefused("log_unreadable") from None
+    payload = json.dumps({"records": entries, "logs": logs}, sort_keys=True).encode("utf-8")
+    approvals = json.dumps(published_approvals(parent), sort_keys=True).encode("utf-8")
+    try:
+        data = vs.build_bundle({vs.PRODUCTION_RECORDS_FILE: payload, vs.PRODUCTION_APPROVALS_FILE: approvals}, key,
+                               vs.RECORDS_PUSH_PRODUCER, now)
         out.write_bytes(data)
     except (vs.SnapshotError, OSError) as error:
         raise BuildRefused(getattr(error, "code", "write_failed")) from None

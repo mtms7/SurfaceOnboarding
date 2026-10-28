@@ -6947,6 +6947,16 @@ def production_records_parent() -> Path:
     return folder if folder is not None else Path(__file__).resolve().parents[1]
 
 
+def approvals_read_path() -> Path:
+    """Where the create approvals are READ from: on the VM the display copy inside the published snapshot (resolved per call, so
+    it follows ``current``); on the desktop the module constant. The VM copy never carries a revision and authorises nothing."""
+    if vm_mode():
+        current = state_paths.snapshot_current_dir(resolve=True)
+        if current is not None:
+            return current / PRODUCTION_APPROVAL_FILE
+    return PRODUCTION_APPROVAL_PATH
+
+
 def production_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -7065,7 +7075,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         starts: dict[str, str] | None = queue_start_dates(tuple(str(row["Name"]) for row in rows)) if rows else {}
     except ReadUnavailable:
         starts = None
-    approvals = production_views.list_approvals(PRODUCTION_APPROVAL_PATH, now, missing_is_unavailable=published)
+    approvals = production_views.list_approvals(approvals_read_path(), now, missing_is_unavailable=published)
     records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=published)
     locked = _production_lock()[0]
     try:  # the verified clone, once per page, for the CE scan state of COs this dashboard onboarded
@@ -7337,7 +7347,7 @@ _APPROVAL_SCOPE_LABELS = {production_approval.SCOPE: "One CO, CE-only",
 
 
 def _create_approval_html(reference: str) -> str:
-    view = production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, production_now(),
+    view = production_views.approval_for_co(approvals_read_path(), reference, production_now(),
                                             missing_is_unavailable=_state_not_published())
     state, item = view["state"], view["item"]
     if state == "none":
@@ -7409,7 +7419,7 @@ def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: 
     items = production_views.onboard_checklist(
         vm=vm, locked=locked, lock_reason=reason, clone=_clone_status(), match=match, domain_count=domain_count,
         uuid_state=uuid_state, ce_route=ce_route, start_iso=start_iso, today=now.date(), days_before=ONBOARD_DAYS_BEFORE_START,
-        approval=production_views.approval_for_co(PRODUCTION_APPROVAL_PATH, reference, now, missing_is_unavailable=published),
+        approval=production_views.approval_for_co(approvals_read_path(), reference, now, missing_is_unavailable=published),
         create=production_views.create_state(records, reference, locked=locked), gate=state, session=session,
         approved_in_salesforce=isinstance(row, dict) and row.get("Onboarding_Approval_Status__c") == "Approved")
     # The link is a plain GET navigation: the owner's own browser resolves 127.0.0.1 to the owner's PC, so the create (browser,
@@ -7768,7 +7778,7 @@ def _onboard_link(reference: str) -> str:
 def render_prod_approvals() -> str:
     """``/prod/approvals``: the 7-day create approvals and the 4-hour summary approvals, read-only and labelled apart."""
     now, published = production_now(), _state_not_published()
-    create = production_views.list_approvals(PRODUCTION_APPROVAL_PATH, now, missing_is_unavailable=published)
+    create = production_views.list_approvals(approvals_read_path(), now, missing_is_unavailable=published)
     summary = production_views.list_summary_approvals(REVIEW_APPROVAL_PATH, now, missing_is_unavailable=published)
     create_rows = "".join(
         "<tr><td><code>" + escape(item["approval_ref"]) + "</code></td><td>" + _onboard_link(item["co_reference"]) + "</td><td>"
@@ -7881,7 +7891,7 @@ def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operato
     return create_ui.Inputs(
         reference=reference, row=row, now=production_now(), environ=os.environ,
         operator=operator if operator is not None else (_current_operator.get() or None), vm=vm_mode(),
-        approvals_path=PRODUCTION_APPROVAL_PATH, records_parent=production_records_parent(), clone=_clone_status(),
+        approvals_path=approvals_read_path(), records_parent=production_records_parent(), clone=_clone_status(),
         sf_ready=sf_ready, row_fresh=bool(row), tenant_names_path=attended_runner.TENANT_NAMES_PATH,
         case3_tenant_name=_case3_tenant_name(reference, row))
 

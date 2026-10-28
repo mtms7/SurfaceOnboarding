@@ -248,8 +248,20 @@ def ingest_records(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) ->
     banner still says where the Salesforce data came from. No current snapshot means refusal; the same records twice are a
     no-op (no new snapshot)."""
     bundle = vs.verify_bundle(raw, key)
-    if set(bundle.files) != {vs.PRODUCTION_RECORDS_FILE}:
+    if vs.PRODUCTION_RECORDS_FILE not in bundle.files or not set(bundle.files) <= {vs.PRODUCTION_RECORDS_FILE,
+                                                                                    vs.PRODUCTION_APPROVALS_FILE}:
         raise PushRefused("records_bundle_has_other_files")
+    if vs.PRODUCTION_APPROVALS_FILE in bundle.files:  # display copy of the create approvals: strictly the desktop's own format
+        from integration.onboarding import production_views
+
+        try:
+            approvals = json.loads(bundle.files[vs.PRODUCTION_APPROVALS_FILE].decode("utf-8"))
+            valid = isinstance(approvals, dict) and all(
+                production_views._valid_approval(key_, record) for key_, record in approvals.items())  # noqa: SLF001
+        except (ValueError, UnicodeDecodeError):
+            valid = False
+        if not valid:
+            raise PushRefused("approvals_invalid")
     root = vs.snapshots_root(state_dir)
     manifest = vs.read_current_manifest(root)
     current = vs.current_dir(root)
@@ -258,17 +270,16 @@ def ingest_records(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) ->
     merged: dict[str, bytes] = {}
     for entry in manifest["files"]:
         name = entry["name"]
-        if name == vs.PRODUCTION_RECORDS_FILE:
+        if name in bundle.files:  # replaced by the pushed copy below
             continue
         data = (current / name).read_bytes()
         if hashlib.sha256(data).hexdigest() != entry["sha256"]:
             raise PushRefused("current_snapshot_damaged")
         merged[name] = data
-    new_records = bundle.files[vs.PRODUCTION_RECORDS_FILE]
-    for entry in manifest["files"]:
-        if entry["name"] == vs.PRODUCTION_RECORDS_FILE and entry["sha256"] == hashlib.sha256(new_records).hexdigest():
-            return "unchanged-records"
-    merged[vs.PRODUCTION_RECORDS_FILE] = new_records
+    current_hashes = {entry["name"]: entry["sha256"] for entry in manifest["files"]}
+    if all(current_hashes.get(name) == hashlib.sha256(data).hexdigest() for name, data in bundle.files.items()):
+        return "unchanged-records"
+    merged.update(bundle.files)
     created = max(datetime.now(timezone.utc).replace(microsecond=0), vs.parse_created_at(manifest["created_at"]))
     name = vs.ingest_bundle(vs.build_bundle(merged, key, str(manifest["producer"]), created), key, state_dir)
     return "ingested-records " + name
