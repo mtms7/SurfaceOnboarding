@@ -31,7 +31,7 @@ import socket
 import subprocess
 import sys
 from threading import Lock, Thread
-from time import monotonic
+from time import monotonic, sleep
 from types import SimpleNamespace
 import webbrowser
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
@@ -167,6 +167,8 @@ _view_id_lock = Lock()
 _open_onboardings_view_id: str | None = None
 _salesforce_login_lock = Lock()
 _salesforce_login_process: subprocess.Popen[str] | None = None
+_salesforce_login_problem: str | None = None  # code only: why the last sign-in did not start
+SALESFORCE_LOGIN_SETTLE_SECONDS = 2.0  # how long a started sign-in must stay alive before it counts as started
 _comment_update_acks: dict[str, tuple[str, str, float]] = {}
 _comment_update_lock = Lock()
 # One attended start at a time: the gate, the start record, and the launch run
@@ -344,13 +346,16 @@ def start_attended_salesforce_login() -> bool:
     discards CLI output and retains only a running-process reference so the
     dashboard cannot duplicate browser-login prompts.
     """
-    global _salesforce_login_process
+    global _salesforce_login_process, _salesforce_login_problem
+    _salesforce_login_problem = None
     if not local_browser_launch_allowed():
+        _salesforce_login_problem = "salesforce_login_not_allowed"
         return False
     with _salesforce_login_lock:
         if _salesforce_login_process is not None and _salesforce_login_process.poll() is None:
             return True
         if salesforce_login_port_busy():
+            _salesforce_login_problem = "salesforce_login_port_busy"
             return False
         try:
             _salesforce_login_process = subprocess.Popen(
@@ -362,10 +367,19 @@ def start_attended_salesforce_login() -> bool:
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            return True
         except OSError:
             _salesforce_login_process = None
+            _salesforce_login_problem = "salesforce_login_launch_failed"
             return False
+        # CO-0812 2026-10-27: a sign-in that dies at once (for example the browser could not be opened) was reported as
+        # started and the page showed nothing. Only the exit state is read (never the CLI output).
+        sleep(SALESFORCE_LOGIN_SETTLE_SECONDS)
+        code = _salesforce_login_process.poll()
+        if code is not None and code != 0:
+            _salesforce_login_process = None
+            _salesforce_login_problem = "salesforce_login_exited"
+            return False
+        return True
 
 
 # --- Sign in / Prepare sessions (2026-10-03) ---------------------------------
@@ -493,8 +507,12 @@ def prepare_sessions_problem(environment: str | None) -> str | None:
 def prepare_sessions() -> None:
     """Check the Salesforce session and open its sign-in when it needs the operator (no Leonardo work any more)."""
     salesforce = probe_salesforce_readiness()
-    if salesforce.state is SessionState.EXPIRED and start_attended_salesforce_login():
-        set_session_status("salesforce", SessionStatus(SessionState.SIGNING_IN, "waiting_for_operator", readiness_now()))
+    if salesforce.state is SessionState.EXPIRED:
+        if start_attended_salesforce_login():
+            set_session_status("salesforce", SessionStatus(SessionState.SIGNING_IN, "waiting_for_operator", readiness_now()))
+        else:  # say why nothing opened (the page also shows the sign-in command to run by hand)
+            set_session_status("salesforce", SessionStatus(SessionState.EXPIRED, _salesforce_login_problem or "salesforce_login_launch_failed",
+                                                           readiness_now()))
 
 
 def action_readiness_problem(action: str) -> str | None:
@@ -530,6 +548,10 @@ SESSION_REASON_TEXT = {
     "check_is_old": "The last check is too old; it is re-checked before the next action.",
     "salesforce_ready": "Signed in to the pinned Salesforce org.",
     "salesforce_sign_in_required": "Sign-in required (no valid CLI session for the pinned org alias).",
+    "salesforce_login_port_busy": "The sign-in did not open: another Salesforce sign-in (or the VM sign-in tunnel) holds port 1717. Close it, then try again.",
+    "salesforce_login_exited": "The sign-in program stopped before the browser opened (a pending Chrome update can cause this: relaunch Chrome).",
+    "salesforce_login_launch_failed": "The Salesforce CLI could not be started.",
+    "salesforce_login_not_allowed": "A browser sign-in can only be started from the desktop dashboard.",
     "salesforce_org_not_pinned": "The expected Salesforce org Id is not configured (SURFACE_SF_EXPECTED_ORG_ID). Nothing runs until it is.",
     "salesforce_wrong_org": "The CLI session belongs to a different Salesforce org than the pinned one.",
     "salesforce_timeout": "Salesforce did not answer in time. Check the network or VPN, then re-check.",
@@ -4524,6 +4546,12 @@ def _sessions_card(statuses: dict[str, SessionStatus], waiting: bool, busy: bool
         css, text = SESSION_CHIPS[status.state]
         detail = "" if status.state is SessionState.READY else escape(
             SESSION_REASON_TEXT.get(status.reason, status.reason.replace("_", " ")))
+        if status.state is not SessionState.READY and status.reason.startswith("salesforce_login_"):
+            try:  # the same sign-in the button starts, to run by hand in your own window
+                detail += " Or run in PowerShell: <code>sf org login web --alias " + escape(salesforce_target_org()) \
+                          + " --browser " + escape(salesforce_login_browser()) + "</code>, then Re-check."
+            except Exception:  # noqa: BLE001 - the explanation alone is enough
+                pass
         rows += ("<tr><th>" + label + "</th><td><span class='chip " + css + "'>" + text + "</span></td><td>" + detail
                  + " <span class='note'>" + _age_text(status.checked_at, now) + "</span></td></tr>")
     # Owner decision 2026-10-19: no Leonardo or preflight row, no Leonardo buttons or wording; production only.

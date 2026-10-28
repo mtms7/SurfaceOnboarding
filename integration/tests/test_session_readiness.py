@@ -313,6 +313,53 @@ class PrepareSessionsRouteTests(unittest.TestCase):
         self.assertFalse(run(expired=False))
 
 
+class SalesforceSignInFailureTests(unittest.TestCase):
+    """CO-0812 2026-10-27: Prepare sessions opened nothing and said nothing. A sign-in that does not start now says why."""
+
+    def setUp(self):
+        dashboard._salesforce_login_process = None
+        self.addCleanup(setattr, dashboard, "_salesforce_login_process", None)
+        self.addCleanup(dashboard.set_session_status, "salesforce", r.NOT_SIGNED_IN)
+        for item in (patch.object(dashboard, "local_browser_launch_allowed", return_value=True),
+                     patch.object(dashboard, "SALESFORCE_LOGIN_SETTLE_SECONDS", 0)):
+            item.start()
+            self.addCleanup(item.stop)
+
+    def start(self, **kw):
+        with patch.object(dashboard, "salesforce_login_port_busy", return_value=kw.get("busy", False)), \
+                patch.object(dashboard.subprocess, "Popen", **({"side_effect": kw["error"]} if "error" in kw
+                                                              else {"return_value": kw["process"]})):
+            return dashboard.start_attended_salesforce_login()
+
+    def test_a_sign_in_that_exits_at_once_is_not_reported_as_started(self):
+        dead = Mock(); dead.poll.return_value = 1
+        self.assertFalse(self.start(process=dead))
+        self.assertEqual(dashboard._salesforce_login_problem, "salesforce_login_exited")
+
+    def test_a_running_sign_in_is_started_and_clears_the_problem(self):
+        alive = Mock(); alive.poll.return_value = None
+        self.assertTrue(self.start(process=alive))
+        self.assertIsNone(dashboard._salesforce_login_problem)
+
+    def test_a_busy_port_and_a_missing_cli_have_their_own_reasons(self):
+        self.assertFalse(self.start(busy=True, process=Mock()))
+        self.assertEqual(dashboard._salesforce_login_problem, "salesforce_login_port_busy")
+        self.assertFalse(self.start(error=OSError("no cli")))
+        self.assertEqual(dashboard._salesforce_login_problem, "salesforce_login_launch_failed")
+
+    def test_prepare_sessions_records_the_reason_and_the_page_shows_the_command(self):
+        expired = SessionStatus(SessionState.EXPIRED, "salesforce_sign_in_required", NOW)
+        with patch.object(dashboard, "probe_salesforce_readiness", return_value=expired), \
+                patch.object(dashboard, "start_attended_salesforce_login", return_value=False), \
+                patch.object(dashboard, "_salesforce_login_problem", "salesforce_login_exited"):
+            dashboard.prepare_sessions()
+        status = dashboard.session_statuses(include_runs=False)["salesforce"]
+        self.assertEqual((status.state, status.reason), (SessionState.EXPIRED, "salesforce_login_exited"))
+        card = dashboard._sessions_card(dashboard.session_statuses(include_runs=False), False)
+        self.assertIn("stopped before the browser opened", card)
+        self.assertIn("sf org login web --alias", card)
+
+
 class LeonardoWorkerTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(dashboard.set_session_status, "leonardo", r.NOT_SIGNED_IN)
