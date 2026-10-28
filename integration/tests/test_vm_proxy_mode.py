@@ -403,6 +403,37 @@ class ProxySecretTests(ServerCase):
             self.assertEqual(dashboard.cookie_attributes(), "; HttpOnly; SameSite=Strict")
 
 
+class VmChromeTests(ServerCase):
+    """VM page chrome (owner request 2026-10-27): no dead Sign out link on the tunnel VM, and no desktop Sessions page."""
+
+    def operator_block(self, **env):
+        with vm_env(**env):
+            token = dashboard._current_operator.set(OWNER)
+            try:
+                return dashboard._operator_block()
+            finally:
+                dashboard._current_operator.reset(token)
+
+    def test_the_tunnel_vm_shows_who_is_connected_but_no_sign_out_link(self):
+        html = self.operator_block()
+        self.assertIn(OWNER, html)
+        self.assertIn("SSH tunnel", html)
+        self.assertNotIn("Sign out", html)
+        self.assertNotIn("oauth2", html)
+
+    def test_the_sign_out_link_returns_only_when_oauth2_proxy_is_declared(self):
+        html = self.operator_block(SURFACE_ONBOARDING_VM_SIGN_OUT="1")
+        self.assertIn("/oauth2/sign_out", html)
+        self.assertIn("Sign out", html)
+
+    def test_the_desktop_sessions_page_is_not_served_on_the_vm(self):
+        with vm_env():
+            status, headers, body = self.request("GET", "/connection", {dashboard.PROXY_IDENTITY_HEADER: OWNER})
+        self.assertEqual(status, 303)
+        self.assertEqual(headers.get("Location"), "/")
+        self.assertNotIn("runner", body.lower())
+
+
 class UsersFileParserTests(unittest.TestCase):
     def test_roles_comments_case_and_blank_lines(self):
         text = f"# pilot\n\n{OWNER} operator  # owner\n{VIEWER.upper()}\n  {STRANGER.upper()}   OPERATOR \n"

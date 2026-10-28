@@ -144,8 +144,19 @@ def collect_dashboard_reads(extra_references: Iterable[str] = (), failed_countri
                     inputs[reference]["country"] = country
                 elif not read_ok and failed_countries is not None:
                     failed_countries.add(reference)
-        except Exception:  # noqa: BLE001 - a CO the check cannot read simply has no entry (the VM shows it unavailable)
+        except Exception:  # noqa: BLE001 - a CO the check cannot read simply has no plan entry
             inputs_missing += 1
+            # The desktop still checks such a CO by identity (names and domains against the clone); publish exactly that so the
+            # VM shows the same Clear / Other tenants only instead of "Not checked" (owner request 2026-10-27).
+            read_identity = getattr(dash, "co_identity_for", None)
+            try:
+                identity = read_identity(reference) if read_identity is not None else None
+            except Exception:  # noqa: BLE001 - no identity: the CO stays "not checked" on the VM
+                identity = None
+            if isinstance(identity, dict) and (identity.get("names") or identity.get("domains")):
+                inputs[reference] = dash._plain({"product": row.get("Onboarding_Product__c"), "type": row.get("Onboarding_Type__c"),
+                                                 "identity": {"names": list(identity.get("names") or ()),
+                                                              "domains": list(identity.get("domains") or ())}})
     files = {
         vm_snapshot.QUEUE_FILE: json.dumps({"rows": queue}, sort_keys=True).encode("utf-8"),
         vm_snapshot.CO_DETAILS_FILE: json.dumps({"details": details}, sort_keys=True).encode("utf-8"),

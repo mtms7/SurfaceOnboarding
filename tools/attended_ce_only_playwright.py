@@ -8132,6 +8132,29 @@ def _snapshot_production_expectation(reference: str, product: Any,
     return engine, {"tenant_names": tuple(names), "domains": tuple(domains)}, plan
 
 
+def _snapshot_identity(reference: str, product: Any, onboarding_type: Any, account_uuid: str | None) -> dict[str, Any] | None:
+    """VM mode: the CO's names and domains published beside its inputs when the full plan could not be built (no DealHub
+    Active row yet, a renewal, Surface + CE). The desktop then checks the clone by identity; so does the VM (owner 2026-10-27:
+    the VM page showed "Not checked" where the desktop showed Clear or Other tenants only). ``None`` = nothing published, or it
+    belongs to another product/type or has the wrong shape (fail closed: the CO stays "not checked")."""
+    from integration.onboarding import state_paths, vm_snapshot
+
+    folder = state_paths.state_dir()
+    if folder is None:
+        return None
+    try:
+        data = vm_snapshot.load_current_json(vm_snapshot.snapshots_root(folder), vm_snapshot.PRODUCTION_INPUTS_FILE)
+        item = data["inputs"][reference]
+        if (product and item.get("product") != product) or (onboarding_type and item.get("type") != onboarding_type):
+            return None
+        raw = item["identity"]
+        names = tuple(" ".join(value.split()) for value in raw["names"] if isinstance(value, str) and value.strip())
+        domains = tuple(value for value in raw["domains"] if isinstance(value, str) and value.strip())
+    except (vm_snapshot.SnapshotError, KeyError, TypeError, AttributeError):
+        return None
+    return {"names": names, "domains": domains, "uuid": account_uuid.strip() if isinstance(account_uuid, str) and account_uuid.strip() else None}
+
+
 def _production_expectation(reference: str, product: Any = None,
                             onboarding_type: Any = None) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """(engine, co_source, plan) for the production match, from read-only Salesforce reads (raises on any problem).
@@ -8267,9 +8290,11 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     if not isinstance(snapshot, str) and REFERENCE.fullmatch(reference) and (co_source is None or plan is None):
         if not state_paths.vm_mode():  # desktop: one fixed read of the CO itself (the VM has only the published snapshot)
             identity = _identity_for(reference)
+        else:  # the VM: the identity the refresher published beside the inputs (same names, domains and clone rules)
+            identity = _snapshot_identity(reference, product, onboarding_type, uuid_value)
     elif not state_paths.vm_mode() and not isinstance(snapshot, str):
         identity = _identity_for(reference)  # the full match gets the CO's own UUID on the desktop too
-    if identity is not None and uuid_value is None:
+    if identity is not None and uuid_value is None and not state_paths.vm_mode():
         uuid_value = identity["uuid"] or ""
     if identity is not None and (co_source is None or plan is None):
         renewal = "renewal" in str(onboarding_type or "").casefold()

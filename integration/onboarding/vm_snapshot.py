@@ -52,6 +52,10 @@ CURRENT_MARKER = "CURRENT"
 INVENTORY_SUBDIR = "leonardo-inventory"
 
 CLONE_PUSH_PRODUCER = "desktop-clone-push"  # clone-only bundles (docs/51): never a full snapshot
+SNAPSHOT_PUSH_PRODUCER = "desktop-snapshot-push"  # a full signed snapshot pushed by the PC task over the same restricted key
+RECORDS_PUSH_PRODUCER = "desktop-records-push"  # the masked production create records only, merged into the CURRENT snapshot
+PRODUCTION_RECORDS_FILE = "production_create_records.json"  # {"records": {"CO-0812-<stamp>.json": record}}
+_RECORD_FILE_NAME = re.compile(r"CO-[0-9]{3,6}-[0-9]{8}T[0-9]{6}Z(?:-[0-9]{1,3})?\.json")
 PRODUCER_VM_READER = "vm-salesforce-reader"  # the VM refreshed queue.json / co_details.json itself (docs/43 part A)
 QUEUE_FILE = "queue.json"
 CO_DETAILS_FILE = "co_details.json"
@@ -87,7 +91,7 @@ STATE_FILE_NAMES = frozenset({
     "attended_user_created_confirmations.json", "attended_spycloud.json", "attended_salesforce_id_writebacks.json",
     "attended_surface_validation.json", "attended_renewal_mirrors.json", "attended_renewal_outcomes.json",
 })
-EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, PRODUCTION_INPUTS_FILE, INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
+EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, PRODUCTION_INPUTS_FILE, PRODUCTION_RECORDS_FILE, INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
                                INVENTORY_CLONE_LATEST, INVENTORY_CLONE_SNAPSHOT})
 ALLOWED_NAMES = STATE_FILE_NAMES | EXPORT_FILE_NAMES
 
@@ -462,10 +466,34 @@ def _prune(root: Path, keep: int, protect: str) -> list[str]:
     return removed
 
 
+def write_records_folder(stage: Path, data: bytes) -> None:
+    """Unpack ``production_create_records.json`` into ``<stage>/production-create-records`` (the folder the dashboard reads).
+
+    Every record is validated by the desktop's own record validator and every file name must be a plain record name, so a
+    signed bundle still cannot place anything else or corrupt the folder (one bad record refuses the whole snapshot)."""
+    from integration.onboarding import production_create_record as records
+
+    try:
+        entries = json.loads(data.decode("utf-8"))["records"]
+        if not isinstance(entries, dict):
+            raise ValueError("records")
+        folder = stage / records.RECORDS_SUBDIR
+        folder.mkdir(parents=True)
+        for name, raw in entries.items():
+            if not isinstance(name, str) or _RECORD_FILE_NAME.fullmatch(name) is None:
+                raise ValueError("record_name")
+            cleaned = records._validate(raw)  # noqa: SLF001 - the same validator the desktop reader applies
+            (folder / name).write_text(json.dumps(cleaned, sort_keys=True), encoding="utf-8")
+    except (KeyError, TypeError, ValueError, UnicodeDecodeError, OSError, records.ProductionCreateRecordError) as error:
+        raise SnapshotError("records_invalid") from error
+
+
 def _write_snapshot_dir(stage: Path, bundle: VerifiedBundle) -> None:
     stage.mkdir(parents=True)
     for name, data in bundle.files.items():
         (stage / name).write_bytes(data)
+    if PRODUCTION_RECORDS_FILE in bundle.files:
+        write_records_folder(stage, bundle.files[PRODUCTION_RECORDS_FILE])
     # The dashboard's inventory reader expects <root>/<env>/latest.json plus the named snapshot file.
     for latest_name, snapshot_name, env_name, _prefix in INVENTORY_PAIRS:
         if latest_name in bundle.files:
@@ -487,7 +515,7 @@ def ingest_bundle(source: str | os.PathLike[str] | bytes, key: bytes, state_dir:
     if type(keep) is not int or keep < 1:
         raise SnapshotError("bad_keep")
     bundle = verify_bundle(source, key)
-    if bundle.manifest.get("producer") == CLONE_PUSH_PRODUCER:
+    if bundle.manifest.get("producer") in (CLONE_PUSH_PRODUCER, RECORDS_PUSH_PRODUCER):
         raise SnapshotError("clone_push_bundle_not_a_snapshot")
     root = snapshots_root(state_dir)
     incoming = root / INCOMING_DIR

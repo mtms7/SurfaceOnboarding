@@ -25,6 +25,7 @@ Prints one short line (counts and codes only, never content). Exit 0 = ingested 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -229,6 +230,50 @@ def _min_rows_override() -> int | None:
     return int(text)
 
 
+def ingest_snapshot(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) -> str:
+    """A full signed snapshot (Salesforce queue and CO details, local state, inventories) pushed by the PC task (owner request
+    2026-10-27: the VM page showed data from 2026-10-17). Same HMAC, caps, names and no-rollback rules as the manual
+    ``ingest_vm_snapshot.py``; only the producer label ``desktop-snapshot-push`` is accepted on this channel. The clone the
+    dashboard trusts still comes from ``<state>/clone-inventory`` (the clone push), never from this snapshot's copy."""
+    name = vs.ingest_bundle(raw, key, state_dir)
+    return "ingested-snapshot " + name
+
+
+def ingest_records(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) -> str:
+    """The masked production create records from the PC, MERGED into the current snapshot (owner request 2026-10-27).
+
+    Exactly one file (``production_create_records.json``), the same HMAC and size rules as every bundle, and every record is
+    validated again by the desktop's own validator when the snapshot folder is written. Everything else in the current snapshot
+    (queue, CO details, inputs, clone copy, state files) is carried over unchanged, with the current producer label, so the
+    banner still says where the Salesforce data came from. No current snapshot means refusal; the same records twice are a
+    no-op (no new snapshot)."""
+    bundle = vs.verify_bundle(raw, key)
+    if set(bundle.files) != {vs.PRODUCTION_RECORDS_FILE}:
+        raise PushRefused("records_bundle_has_other_files")
+    root = vs.snapshots_root(state_dir)
+    manifest = vs.read_current_manifest(root)
+    current = vs.current_dir(root)
+    if manifest is None or current is None:
+        raise PushRefused("no_current_snapshot")
+    merged: dict[str, bytes] = {}
+    for entry in manifest["files"]:
+        name = entry["name"]
+        if name == vs.PRODUCTION_RECORDS_FILE:
+            continue
+        data = (current / name).read_bytes()
+        if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+            raise PushRefused("current_snapshot_damaged")
+        merged[name] = data
+    new_records = bundle.files[vs.PRODUCTION_RECORDS_FILE]
+    for entry in manifest["files"]:
+        if entry["name"] == vs.PRODUCTION_RECORDS_FILE and entry["sha256"] == hashlib.sha256(new_records).hexdigest():
+            return "unchanged-records"
+    merged[vs.PRODUCTION_RECORDS_FILE] = new_records
+    created = max(datetime.now(timezone.utc).replace(microsecond=0), vs.parse_created_at(manifest["created_at"]))
+    name = vs.ingest_bundle(vs.build_bundle(merged, key, str(manifest["producer"]), created), key, state_dir)
+    return "ingested-records " + name
+
+
 def _terminate(signum, frame):  # noqa: ARG001 - lets the ``finally`` cleanup run on SIGTERM / SSH hangup
     raise SystemExit(128 + signum)
 
@@ -247,7 +292,13 @@ def main(argv: list[str] | None = None, stdin: BinaryIO | None = None) -> int:
             if hasattr(signal, name):
                 signal.signal(getattr(signal, name), _terminate)
         raw = read_stdin_limited(stdin if stdin is not None else sys.stdin.buffer)
-        print(ingest(raw, key, args.state_dir, min_rows=_min_rows_override()))
+        producer = vs.verify_bundle(raw, key).manifest.get("producer")
+        if producer == vs.SNAPSHOT_PUSH_PRODUCER:
+            print(ingest_snapshot(raw, key, args.state_dir))
+        elif producer == vs.RECORDS_PUSH_PRODUCER:
+            print(ingest_records(raw, key, args.state_dir))
+        else:
+            print(ingest(raw, key, args.state_dir, min_rows=_min_rows_override()))
     except vs.SnapshotError as error:
         print("refused:" + error.code)
         return 2

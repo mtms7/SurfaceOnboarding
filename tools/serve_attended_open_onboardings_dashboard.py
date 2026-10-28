@@ -113,6 +113,7 @@ from tools.attended_ce_only_playwright import (
     close_automation_browser,
     production_match_for,
     production_review_inputs,
+    _identity_for as co_identity_for,
     load_check_state,
     load_runner_state,
     start_blocker,
@@ -5214,6 +5215,11 @@ def _operator_block() -> str:
     if not operator:
         return ""
     if vm_mode():
+        if os.environ.get(VM_SIGN_OUT_ENV) != "1":
+            # The interim tunnel VM has one fixed identity set by nginx and no oauth2-proxy, so /oauth2/sign_out does not exist
+            # there (owner 2026-10-27: the link did nothing). Access ends when the owner closes the SSH tunnel.
+            return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
+                    "<br><span class='muted'>read-only, through your SSH tunnel</span></div>")
         return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
                 "<br><a href='" + VM_SIGN_OUT_PATH + "'>Sign out</a></div>")
     return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
@@ -6934,7 +6940,7 @@ WRONG_CREATE_NOTE = "Wrong create: the owner edits the parameters in BackOffice;
 
 def production_records_parent() -> Path:
     """The folder that holds ``production-create-records``: the published snapshot on the VM, the state folder, else the repo."""
-    current = state_paths.snapshot_current_dir()
+    current = state_paths.snapshot_current_dir(resolve=True)
     if current is not None:
         return current
     folder = state_paths.state_dir()
@@ -8282,6 +8288,7 @@ PUBLIC_ORIGIN_ENV = "SURFACE_ONBOARDING_PUBLIC_ORIGIN"
 ROLE_VIEWER = "viewer"
 ROLE_OPERATOR = "operator"
 VM_SIGN_OUT_PATH = "/oauth2/sign_out"  # served by oauth2-proxy, not by this dashboard
+VM_SIGN_OUT_ENV = "SURFACE_ONBOARDING_VM_SIGN_OUT"  # "1" only on a VM that really sits behind oauth2-proxy (OneLogin)
 PROXY_EMAIL = re.compile(r"[a-z0-9._%+'-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,24}")
 # Phase 1 (read-only VM): the only POSTs an operator may use. They are local acknowledgements (no browser, no
 # Leonardo, no Salesforce write) and read-only checks. Everything else (runner starts, Leonardo sessions and
@@ -8972,6 +8979,8 @@ class Handler(BaseHTTPRequestHandler):
                 record_timing("page_build", "queue", started, True)
                 self.send_page(HTTPStatus.OK, html); return
             if path == "/connection":
+                if vm_mode():  # the desktop Sessions page is not part of the VM (its Salesforce sign-in is the VM login program)
+                    self.send_redirect("/"); return
                 self.send_page(HTTPStatus.OK, page_salesforce_unavailable(failed=False)); return
             if path in ("/history", "/dev/history"):
                 self.send_page(HTTPStatus.OK, render_history()); return

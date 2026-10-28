@@ -267,12 +267,14 @@ class EmptyStateTests(SnapshotDashboardCase):
     publish = False
 
     def test_no_snapshot_means_a_clear_empty_state_on_every_page(self):
-        for path in ("/", "/history", "/dev/onboarded", "/prod", "/co/CO-0001", "/connection"):
+        for path in ("/", "/history", "/dev/onboarded", "/prod", "/co/CO-0001"):
             status, _, body = self.get(path)
             self.assertIn("No data published yet", body, path)
             self.assertNotIn("Data as of ", body, path)
             self.assertIn(status, (200, 503), path)
             self.assertNotIn("Traceback", body, path)
+        status, _, _ = self.get("/connection")  # the desktop Sessions page is not part of the VM (owner 2026-10-27)
+        self.assertEqual(status, 303)
         self.assertEqual(self.calls, [])
 
     def test_empty_state_is_not_a_login_or_salesforce_error(self):
@@ -619,6 +621,56 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         self.assertIn("Not checked", row)
         self.assertNotIn("Clone unavailable", row)
         self.assertNotIn("Clone stale", row)
+
+    def test_a_co_with_a_published_identity_is_checked_by_identity_like_the_desktop(self):
+        # CO-0812 2026-10-27: the desktop showed Clear / Other tenants only, the VM "Not checked" (no DealHub plan to build).
+        ident = {"product": self.PRODUCT, "type": self.KIND, "identity": {"names": ["Brand New Co"], "domains": ["brandnew.example"]}}
+        self.publish({"CO-0001": self.item(), "CO-0002": ident})
+        self.push_clone()
+        found = self.match("CO-0002")
+        self.assertEqual(found["status"], "not_in_production")
+        self.assertTrue(found.get("identity_only"))
+        # the exact name of a live paid tenant is a duplicate; identity never clears a miss
+        ident2 = {**ident, "identity": {"names": [self.NAME], "domains": ["brandnew.example"]}}
+        self.publish({"CO-0001": self.item(), "CO-0002": ident2})
+        self.assertEqual(self.match("CO-0002")["status"], "exists_differs")
+
+    def test_an_identity_for_another_product_or_a_malformed_one_stays_not_checked(self):
+        bad_type = {"product": self.PRODUCT, "type": "Renewal of Existing Product",
+                    "identity": {"names": ["X Co"], "domains": ["x.example"]}}
+        self.publish({"CO-0001": self.item(), "CO-0002": bad_type})
+        self.push_clone()
+        self.assertEqual(self.match("CO-0002")["status"], "not_checked")
+        malformed = {"product": self.PRODUCT, "type": self.KIND, "identity": {"names": "not-a-list"}}
+        self.publish({"CO-0001": self.item(), "CO-0002": malformed})
+        self.assertEqual(self.match("CO-0002")["status"], "not_checked")
+
+    def test_pushed_create_records_make_the_vm_queue_show_verified_like_the_desktop(self):
+        # CO-0812 2026-10-27: the desktop showed "Verified" and the onboarded line; the VM showed "Unavailable on this server".
+        import tools.ingest_clone_push as push
+        from integration.onboarding import production_create_record as pcr
+        self.publish({"CO-0001": self.item()})
+        self.push_clone()
+        _, _, before = self.get("/", email=OWNER)
+        row = before[before.index(">CO-0001<"):before.index("</tr>", before.index(">CO-0001<"))]
+        self.assertIn("Unavailable on this server", row)
+        desktop = self.state.parent / "desktop-records"
+        desktop.mkdir(exist_ok=True)
+        pcr.record(desktop, {"co_reference": "CO-0001", "route": "case_2_new_ce_only", "approval_ref": "PROD-CE-0001-1",
+                             "outcome": "readback_verified", "tenant_name": self.NAME, "domains": [self.DOMAIN],
+                             "account_id": "a" * 24, "account_uuid": self.UUID, "plan_summary": "CE, 1 year",
+                             "salesforce_revision": "REV-1"}, datetime.now(timezone.utc) - timedelta(hours=1))
+        import tools.build_records_push_bundle as builder
+        out = self.state.parent / "records.zip"
+        key_file = self.state.parent / "records.key"
+        key_file.write_bytes(KEY)
+        builder.build(str(key_file), out, desktop)
+        self.assertTrue(push.ingest_records(out.read_bytes(), KEY, self.state).startswith("ingested-records "))
+        dashboard.clear_display_cache()
+        _, _, after = self.get("/", email=OWNER)
+        row = after[after.index(">CO-0001<"):after.index("</tr>", after.index(">CO-0001<"))]
+        self.assertIn("Verified", row)
+        self.assertNotIn(self.UUID, after)  # the page never prints the UUID
 
     def test_only_inactive_tenants_show_other_tenants_only(self):
         self.publish({"CO-0001": self.item()})

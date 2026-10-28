@@ -182,7 +182,7 @@ class RealDashboardReadsThroughTheAdapterTests(unittest.TestCase):
         dashboard.sf_json = vr.make_sf_json(client, dashboard.ReadUnavailable)
         try:
             env = {k: v for k, v in os.environ.items() if k != "SURFACE_ONBOARDING_RUNTIME"}
-            with patch.dict(os.environ, env, clear=True),                     patch.object(dashboard, "production_review_inputs", side_effect=RuntimeError("no live read in tests")):
+            with patch.dict(os.environ, env, clear=True),                     patch.object(dashboard, "co_identity_for", return_value=None), patch.object(dashboard, "production_review_inputs", side_effect=RuntimeError("no live read in tests")):
                 files, counts = publisher.collect_dashboard_reads()
         finally:
             dashboard.sf_json = original
@@ -247,7 +247,7 @@ class ProductionInputsTests(RefreshCase):
                     "plan": {"license_end": date(2027, 1, 2), "alternate_domains": ()}}
 
         second = {**row, "Name": "CO-0002"}
-        with patch.object(dashboard, "queue_source_rows", return_value=[row, second]),                 patch.object(dashboard, "detail_row", return_value={"Name": "x"}),                 patch.object(dashboard, "dev_onboarded_refs", return_value=[]),                 patch.object(dashboard, "production_review_inputs", side_effect=inputs):
+        with patch.object(dashboard, "queue_source_rows", return_value=[row, second]),                 patch.object(dashboard, "detail_row", return_value={"Name": "x"}),                 patch.object(dashboard, "dev_onboarded_refs", return_value=[]),                 patch.object(dashboard, "co_identity_for", return_value=None), patch.object(dashboard, "production_review_inputs", side_effect=inputs):
             files, counts = publisher.collect_dashboard_reads()
         stored = json.loads(files[vs.PRODUCTION_INPUTS_FILE])["inputs"]
         self.assertEqual(sorted(stored), ["CO-0001"])                          # the unreadable CO has no entry
@@ -256,6 +256,26 @@ class ProductionInputsTests(RefreshCase):
         self.assertEqual((stored["CO-0001"]["product"], stored["CO-0001"]["type"]),
                          ("Credential Exposure", "New Product Onboarding"))
         self.assertEqual((counts["production_inputs"], counts["production_inputs_unavailable"]), (1, 1))
+
+    def test_a_co_without_a_plan_still_publishes_its_identity_like_the_desktop_check(self):
+        row = {field: None for field in dashboard.QUEUE_FIELDS}
+        row.update(Name="CO-0002", Onboarding_Product__c="Credential Exposure", Onboarding_Type__c="New Product Onboarding")
+        identity = {"names": ("Shannon Engine Support (SES)",), "domains": ("ses.aero",), "uuid": "a" * 32}
+        with patch.object(dashboard, "queue_source_rows", return_value=[row]),                 patch.object(dashboard, "detail_row", return_value={"Name": "x"}),                 patch.object(dashboard, "dev_onboarded_refs", return_value=[]),                 patch.object(dashboard, "co_identity_for", return_value=identity),                 patch.object(dashboard, "production_review_inputs", side_effect=RuntimeError("ce_subscription_unavailable")):
+            files, counts = publisher.collect_dashboard_reads()
+        stored = json.loads(files[vs.PRODUCTION_INPUTS_FILE])["inputs"]["CO-0002"]
+        self.assertEqual(stored["identity"], {"names": ["Shannon Engine Support (SES)"], "domains": ["ses.aero"]})
+        self.assertEqual((stored["product"], stored["type"]), ("Credential Exposure", "New Product Onboarding"))
+        self.assertNotIn("engine", stored)
+        self.assertNotIn("uuid", json.dumps(stored))  # the UUID travels only in co_details.json, as before
+        self.assertEqual(counts["production_inputs_unavailable"], 1)
+
+    def test_an_unreadable_identity_leaves_no_entry(self):
+        row = {field: None for field in dashboard.QUEUE_FIELDS}
+        row.update(Name="CO-0002", Onboarding_Product__c="Credential Exposure", Onboarding_Type__c="New Product Onboarding")
+        with patch.object(dashboard, "queue_source_rows", return_value=[row]),                 patch.object(dashboard, "detail_row", return_value={"Name": "x"}),                 patch.object(dashboard, "dev_onboarded_refs", return_value=[]),                 patch.object(dashboard, "co_identity_for", side_effect=RuntimeError("boom")),                 patch.object(dashboard, "production_review_inputs", side_effect=RuntimeError("x")):
+            files, _counts = publisher.collect_dashboard_reads()
+        self.assertEqual(json.loads(files[vs.PRODUCTION_INPUTS_FILE]), {"inputs": {}})
 
     def test_the_publisher_adds_a_valid_country_for_ce_only_cos_only(self):
         row = {field: None for field in dashboard.QUEUE_FIELDS}
