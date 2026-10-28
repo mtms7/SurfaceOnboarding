@@ -26,6 +26,11 @@ approved one-CO attempt: it sets SURFACE_ONBOARDING_PRODUCTION_SESSIONS=1 in the
 dashboard process. The approval reference and times still come only from the
 approval record, and every create gate still applies. Without the switch any
 inherited value is cleared, so a Dev-only start never opens production.
+
+-RemoteStart (off by default, owner decision 2026-10-27, docs/62) lets the VM page ask THIS PC to start the same guarded one-CO
+create the "Onboard in production" button starts. It also needs -ProductionSessions. A background poller asks the VM over the
+restricted clone-push key; every create gate still runs here and you still sign in with SSO and MFA in the BackOffice window.
+Without the switch any inherited value is cleared and no poller starts.
 #>
 [CmdletBinding()]
 param(
@@ -33,6 +38,8 @@ param(
     [switch]$NoLogin,
     [switch]$NoBrowser,
     [switch]$ProductionSessions,
+    [switch]$RemoteStart,
+    [string]$VmHost = '172.26.37.20',
     [int]$Port = 8012,
     [string]$TargetOrg = 'surface-onboarding',
     [string]$ExpectedOrgId = '',
@@ -147,6 +154,18 @@ if ($ProductionSessions) {
     $env:SURFACE_ONBOARDING_PRODUCTION_SESSIONS = '1'
 } else {
     Remove-Item Env:SURFACE_ONBOARDING_PRODUCTION_SESSIONS -ErrorAction SilentlyContinue
+}
+if ($RemoteStart) {
+    $env:SURFACE_ONBOARDING_REMOTE_START = '1'
+    $env:SURFACE_ONBOARDING_REMOTE_START_OPERATOR = $AllowedUser
+    $env:SURFACE_REMOTE_START_VM_HOST = $VmHost
+    $env:SURFACE_REMOTE_START_PUSH_KEY = (Join-Path $env:USERPROFILE '.surface-onboarding\clone_push_ed25519')
+    $env:SURFACE_REMOTE_START_HMAC_KEY = (Join-Path $env:USERPROFILE '.surface-onboarding\snapshot.key')
+} else {
+    foreach ($name in 'SURFACE_ONBOARDING_REMOTE_START', 'SURFACE_ONBOARDING_REMOTE_START_OPERATOR', 'SURFACE_REMOTE_START_VM_HOST',
+                      'SURFACE_REMOTE_START_PUSH_KEY', 'SURFACE_REMOTE_START_HMAC_KEY') {
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
 }
 $process = Start-Process -FilePath $PythonPath -ArgumentList $quotedDashboard -WorkingDirectory $projectRoot -WindowStyle Hidden -RedirectStandardError $startupLog -PassThru
 $deadline = (Get-Date).AddSeconds(20)

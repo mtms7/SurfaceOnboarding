@@ -330,6 +330,18 @@ def ingest_records(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) ->
     return "ingested-records " + name
 
 
+def poll_remote_start(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) -> str:
+    """The PC's signed poll (docs/62): ``remote-start CO-x <nonce> <expires>`` once per owner request, else ``none``. Only the poll
+    file is accepted; it carries no data and creates no snapshot."""
+    from integration.onboarding import remote_start
+
+    bundle = vs.verify_bundle(raw, key)
+    _refuse_future(bundle)
+    if set(bundle.files) != {vs.REMOTE_POLL_FILE}:
+        raise PushRefused("poll_bundle_has_other_files")
+    return remote_start.deliver(state_dir, datetime.now(timezone.utc))
+
+
 def _terminate(signum, frame):  # noqa: ARG001 - lets the ``finally`` cleanup run on SIGTERM / SSH hangup
     raise SystemExit(128 + signum)
 
@@ -353,6 +365,8 @@ def main(argv: list[str] | None = None, stdin: BinaryIO | None = None) -> int:
             print(ingest_snapshot(raw, key, args.state_dir))
         elif producer == vs.RECORDS_PUSH_PRODUCER:
             print(ingest_records(raw, key, args.state_dir))
+        elif producer == vs.REMOTE_POLL_PRODUCER:
+            print(poll_remote_start(raw, key, args.state_dir))
         else:
             print(ingest(raw, key, args.state_dir, min_rows=_min_rows_override()))
     except vs.SnapshotError as error:

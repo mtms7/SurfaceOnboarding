@@ -43,6 +43,7 @@ from integration.onboarding import state_paths
 from integration.onboarding import production_approval
 from integration.onboarding import production_views
 from integration.onboarding import production_create_ui as create_ui
+from integration.onboarding import remote_start
 from integration.onboarding import case3_followup
 from integration.onboarding import production_case3_sheet as case3_sheet
 from integration.onboarding import production_case3_summary as case3_summary
@@ -6920,7 +6921,11 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
         except Exception:  # noqa: BLE001 - the stage line is optional
             detail = None
         production_views.apply_own_onboarding(guide, own + (" " + detail + "." if detail else ""))
-    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _production_create_html(reference, row)
+    remote = _remote_start_html(reference, row) if vm_mode() else ""
+    remote_card = ("<section class='card' aria-labelledby='co-remote-title'><div class='card-head'><h2 id='co-remote-title' "
+                   "class='pill'>Onboard in production</h2><span class='chip chip-warn'>Runs on your PC</span></div>"
+                   + remote + "</section>") if remote else ""
+    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + remote_card + _production_create_html(reference, row)
                  + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)
     refresh = ("<meta http-equiv='refresh' content='5'>"
@@ -7396,6 +7401,31 @@ def _record_html(found: dict[str, Any]) -> tuple[str, str]:
 DESKTOP_DASHBOARD_ADDRESS = "http://127.0.0.1:8012"
 
 
+def _remote_start_html(reference: str, row: Any) -> str:
+    """The VM button that asks the owner's PC to start the guarded create (docs/62). Only when switched on and the CO is eligible.
+
+    It posts one owner-only request and nothing else; the PC does the work, and SSO and MFA stay a human step there."""
+    if (not vm_remote_start_enabled() or not _is_remote_start_owner(_current_operator.get())
+            or remote_start_problem(reference, row) is not None):
+        return ""
+    note = ""
+    folder = state_paths.state_dir()
+    request = remote_start._read_request(Path(folder)) if folder is not None else None  # noqa: SLF001 - same module family
+    if request is not None and request["co_reference"] == reference:
+        now = production_now()
+        expires = remote_start._parse(request["expires_at"])  # noqa: SLF001
+        if expires is not None and expires > now:
+            note = ("<p class='note'>Requested at " + escape(str(request["requested_at"])[11:16]) + " UTC; "
+                    + ("your PC picked it up at " + escape(str(request["delivered_at"])[11:16]) + " UTC: sign in with SSO and MFA in the "
+                       "BackOffice window it opened." if request.get("delivered_at") else "waiting for your PC (it checks every 20 seconds).")
+                    + "</p>")
+    return ("<form class='start-form' method='post' action='" + REMOTE_START_PATH + "'>"
+            "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
+            "<button type='submit'>Start onboarding on my PC</button></form>"
+            "<p class='note'>Asks your PC to start this onboarding. Every check still runs there, and you sign in with SSO and MFA in "
+            "the BackOffice window. It creates nothing by itself.</p>" + note)
+
+
 CREATE_PHASE_CHIPS = {"ready": ("chip-ok", "Create ready"), "blocked": ("chip-warn", "Create blocked"),
                       "locked": ("chip-warn", "Create locked")}
 
@@ -7427,9 +7457,10 @@ def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: 
     # The link is a plain GET navigation: the owner's own browser resolves 127.0.0.1 to the owner's PC, so the create (browser,
     # SSO, MFA, every gate) still runs only on the desktop dashboard. Nothing is posted or started from the VM.
     desktop_url = DESKTOP_DASHBOARD_ADDRESS + "/onboard/" + quote(reference, safe="")
+    remote_html = _remote_start_html(reference, row) if vm else ""
     where = ("<p class='lede'>Onboarding runs from the desktop dashboard</p><p class='note'>Desktop address: <code>"
              + escape(DESKTOP_DASHBOARD_ADDRESS) + "</code></p><p><a class='btn' href='" + escape(desktop_url, quote=True)
-             + "' target='_blank' rel='noopener noreferrer'>Open this CO on my PC</a></p>") if vm else ""
+             + "' target='_blank' rel='noopener noreferrer'>Open this CO on my PC</a></p>" + remote_html) if vm else ""
     rows = "".join(_check_item(item["label"], escape(item["detail"]), _chip(*production_views.CHECK_CHIPS[item["status"]]))
                    for item in items)
     phase, text = state["phase"], state["text"]
@@ -8064,6 +8095,91 @@ def _launch_production_dry_run(reference: str, revision: str, route: str, env: d
     return process
 
 
+REMOTE_START_PATH = "/attended/remote-start-request"
+
+
+def vm_remote_start_enabled() -> bool:
+    """The VM button and its one POST exist only when the VM is switched on for them (owner decision 2026-10-27, docs/62)."""
+    return (vm_mode() and os.environ.get(remote_start.ENABLE_ENV) == "1"
+            and remote_start._OPERATOR.fullmatch(os.environ.get(remote_start.OWNER_ENV, "")) is not None)  # noqa: SLF001
+
+
+def _is_remote_start_owner(email: object) -> bool:
+    return (isinstance(email, str) and email.strip().casefold() == os.environ.get(remote_start.OWNER_ENV, "").strip().casefold()
+            and bool(email.strip()))
+
+
+def remote_start_problem(reference: str, row: Any) -> str | None:
+    """Why the VM must not even ask the PC to start a run for this CO, or None. Checks only the published snapshot; the PC re-checks
+    every create gate with a live Salesforce read."""
+    if not isinstance(row, dict) or row.get("Name") != reference:
+        return "co_unavailable"
+    if row.get("Onboarding_Approval_Status__c") != "Approved":
+        return "not_approved"
+    if create_ui._row_route(row) is None:  # noqa: SLF001 - the route the create itself approves (CE-only New or Case 3 New)
+        return "route_not_supported"
+    try:
+        records = production_views.create_records_by_co(production_records_parent(), missing_is_unavailable=True)
+    except Exception:  # noqa: BLE001 - fail closed
+        return "records_unavailable"
+    if records["state"] == "ok" and (records["by_co"].get(reference) or {}).get("outcome") in production_views.CREATED_OUTCOMES:
+        return "already_created"
+    return None
+
+
+def _owner_session_live(operator: str) -> bool:
+    """True while the owner is signed in to THIS PC dashboard (an unexpired SSO session): the same sign-in the button needs."""
+    now = monotonic()
+    with _login_lock:
+        return any(now < session[0] and str(session[1]).casefold() == operator.casefold() for session in _dashboard_sessions.values())
+
+
+def _start_remote_create(reference: str, operator: str, revision: str = "") -> str:
+    """PC side of a VM request: start the SAME guarded create the "Onboard in production" button starts, as the owner.
+
+    Every gate runs in ``create_ui.handle_create_post`` (Approved CO, one-CO approval, unlocked build, sessions, duplicate and
+    plan checks, launch ticket, one run at a time). SSO and MFA stay a human step in the BackOffice window. Returns a result code."""
+    if vm_mode():
+        return "vm_read_only"
+    if not isinstance(reference, str) or not create_ui.CO_PATTERN.fullmatch(reference):
+        return "invalid_request"
+    if login_required() and not _owner_session_live(operator):
+        return "dashboard_not_signed_in"  # the button needs a signed-in owner; a remote start needs one too
+    try:
+        row = detail_row(reference)
+    except ReadUnavailable:
+        return "salesforce_unavailable"
+    if not revision or str(row.get("LastModifiedDate") or "") != revision:
+        return "revision_changed"  # the CO changed since the owner looked at it on the VM page
+    inputs = _create_ui_inputs(reference, row, operator)
+    values, code = create_ui.remote_start_values(inputs)
+    if values is None:
+        return code
+    def launch_with_fresh_signin(ref: str, rev: str, env: dict[str, str], route: str | None = None) -> Any:
+        # Owner decision 2026-10-27 (docs/62 G9): a remote start never rides on an already-signed-in BackOffice session. The runner
+        # child gets a brand-new temporary profile, so SSO and MFA are asked for every time. The button is unchanged.
+        fresh = {**env, remote_start.FRESH_SIGNIN_ENV: "1"}
+        return (_launch_production_create_followed(ref, rev, fresh, route=route) if route is not None
+                else _launch_production_create_followed(ref, rev, fresh))
+
+    return create_ui.handle_create_post(values, inputs, launch_with_fresh_signin,
+                                        lambda ref, revision, route: _issue_one_co_approval(inputs, ref, revision, route))
+
+
+def _production_sessions_enabled() -> bool:
+    return os.environ.get(create_ui.SESSIONS_ENV) == "1"
+
+
+def start_remote_start_worker() -> Any:
+    """The PC poller thread, or None. Needs the remote-start switch, a complete configuration AND the production-sessions switch."""
+    config = remote_start.PcConfig.from_env(os.environ)
+    if config is None or vm_mode() or not _production_sessions_enabled():
+        return None
+    folder = state_paths.state_dir()
+    return remote_start.start_worker(config, folder if folder is not None else Path(__file__).resolve().parents[1] / "integration",
+                                     _start_remote_create)
+
+
 def _issue_one_co_approval(inputs: create_ui.Inputs, reference: str, revision: str, route: str) -> bool:
     """Record the one-CO production approval from the page (same record ``tools/issue_production_approval.py`` writes).
 
@@ -8445,7 +8561,13 @@ def vm_strip_actions(html: str) -> str:
     The GET Refresh buttons and the then-empty More menu go too (a refresh cannot read anything on the VM), and wording
     that implies a live Salesforce read is replaced, because the page is rendered from the published snapshot.
     """
+    # The ONE form the VM keeps (owner decision 2026-10-27, docs/62): the owner-only "Start onboarding on my PC" request.
+    kept = re.findall(r"<form class='start-form' method='post' action='" + re.escape(REMOTE_START_PATH) + r"'>.*?</form>", html, re.DOTALL)
+    for index, form in enumerate(kept):
+        html = html.replace(form, "\x00REMOTE" + str(index) + "\x00", 1)
     html = _EMPTY_MENU.sub("", _REFRESH_FORM.sub("", _POST_FORM.sub("", html)))
+    for index, form in enumerate(kept):
+        html = html.replace("\x00REMOTE" + str(index) + "\x00", form, 1)
     return (html.replace("Read from Salesforce at", "Page rendered at")
                 .replace("Unavailable · open to retry", "Not included in the published snapshot"))
 
@@ -8793,7 +8915,7 @@ POST_ROUTES = frozenset({
     "/attended/leonardo-session-check", "/attended/start-manual-onboarding", "/attended/scan-status-refresh", "/attended/scan-status-refresh-all",
     "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
-    "/attended/review-approve", "/attended/tenant-name-confirm", dry_ui.DRY_RUN_PATH,
+    "/attended/review-approve", "/attended/tenant-name-confirm", dry_ui.DRY_RUN_PATH, REMOTE_START_PATH,
     *sorted(create_ui.POST_PATHS),
 })
 
@@ -9187,6 +9309,40 @@ class Handler(BaseHTTPRequestHandler):
                            "Nothing was sent anywhere.</p><p><code>" + escape(code) + "</code></p>" + back); return
         self.send_redirect("/onboard/" + reference + "?notice=name_confirmed")
 
+    def _post_remote_start(self, form: Any) -> None:
+        """VM only, owner only: ask the owner's PC to start the guarded create for one Approved CO (docs/62). Writes one short-lived
+        request file and nothing else; it carries no create authority (the PC re-checks every gate and the human does SSO and MFA)."""
+        reference = exact_form_value(form, "reference") or ""
+        back = "<p><a href='/co/" + escape(reference if create_ui.CO_PATTERN.fullmatch(reference) else "") + "?env=prod'>Return</a></p>"
+
+        def refuse(code: str, status: HTTPStatus = HTTPStatus.CONFLICT) -> None:
+            body = ("<div class='banner banner-warn'><span class='chip chip-warn'>Not requested</span> The VM did not ask your PC to start "
+                    "anything.</div><p class='note'>Code: <code>" + escape(code) + "</code></p>" + back)
+            self.send_page(status, _app_shell("Not requested", "<section class='card'>" + body + "</section>",
+                                              active="prod_onboarding", env="prod"))
+
+        if not vm_remote_start_enabled():
+            refuse("remote_start_not_enabled", HTTPStatus.FORBIDDEN); return
+        if not _is_remote_start_owner(self.request_operator()):
+            refuse("not_the_owner", HTTPStatus.FORBIDDEN); return
+        if not create_ui.CO_PATTERN.fullmatch(reference):
+            refuse("invalid_request", HTTPStatus.BAD_REQUEST); return
+        try:
+            row = detail_row(reference)
+        except ReadUnavailable:
+            refuse("co_unavailable"); return
+        problem = remote_start_problem(reference, row)
+        if problem is not None:
+            refuse(problem); return
+        folder = state_paths.state_dir()
+        if folder is None:
+            refuse("store_unavailable"); return
+        code, _request = remote_start.request_remote_start(folder, reference, self.request_operator(), production_now(),
+                                                           str(row.get("LastModifiedDate") or ""))
+        if code != "requested":
+            refuse(code); return
+        self.send_redirect("/co/" + reference + "?env=prod")
+
     def _post_production_dry_run(self, reference: str, form: Any) -> None:
         """The Case 3 production DRY RUN post (owner decision 2026-10-20). Re-checks every gate with a fresh CO read."""
         back = "<p><a href='/co/" + escape(reference) + "?env=prod'>Return to " + escape(reference) + "</a></p>"
@@ -9325,7 +9481,7 @@ class Handler(BaseHTTPRequestHandler):
             if path in ("/login/start", "/login/cancel"):
                 self._vm_refuse(HTTPStatus.SERVICE_UNAVAILABLE, "Sign-in unavailable",
                                 "Sign-in is handled by the single sign-on proxy on this VM, not by the dashboard."); return
-            if path not in VM_OPERATOR_POSTS:
+            if path not in VM_OPERATOR_POSTS and not (path == REMOTE_START_PATH and vm_remote_start_enabled()):
                 self._vm_refuse(HTTPStatus.FORBIDDEN, "Not available on the VM",
                                 "The VM dashboard is read-only in phase 1: runs start from the owner's Windows desktop. "
                                 "Nothing was started or changed."); return
@@ -9348,6 +9504,8 @@ class Handler(BaseHTTPRequestHandler):
             # Unknown routes stop here: no form parse, Salesforce read, or launch.
             self.send_page(HTTPStatus.NOT_FOUND, "<!doctype html><title>Not found</title>")
             return
+        if path == REMOTE_START_PATH:
+            self._post_remote_start(post_form(self)); return
         if path == "/attended/prepare-sessions":
             environment = exact_form_value(post_form(self), "environment") or readiness.LEONARDO_DEVELOPMENT
             problem = prepare_sessions_problem(environment)
@@ -9799,4 +9957,7 @@ if __name__ == "__main__":
         Thread(target=_auto_scan_loop, name="auto-scan", daemon=True).start()
         if clone_autorefresh.enabled(vm=vm_mode()):
             Thread(target=clone_autorefresh.run_loop, name="clone-autorefresh", daemon=True).start()
-    ThreadingHTTPServer((listener_host, listener_port), Handler).serve_forever()
+    _server = ThreadingHTTPServer((listener_host, listener_port), Handler)  # a second process dies here, before it can poll
+    if not vm_mode():
+        start_remote_start_worker()  # None unless the owner switched remote start ON (docs/62) and production sessions are on
+    _server.serve_forever()

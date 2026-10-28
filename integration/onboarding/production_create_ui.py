@@ -659,6 +659,28 @@ def _form(values: Mapping[str, Any], name: str) -> str | None:
     return item if isinstance(item, str) else None
 
 
+def remote_start_values(inputs: Inputs) -> tuple[dict[str, str] | None, str]:
+    """The form values the page's ONE button would post, built server-side for a PC-side remote start (owner decision 2026-10-27,
+    docs/62): ``(values, "")`` or ``(None, refusal code)``. It issues the same single-use token the page would, for the same facts;
+    ``handle_create_post`` then re-evaluates EVERY gate. Never on the VM, never while the build is locked."""
+    if inputs.vm is True:
+        return None, "vm_read_only"
+    lock = build_lock(False)
+    if lock is not None:
+        return None, lock
+    reference = inputs.reference
+    reason, ctx = gate(inputs)
+    row = inputs.row if isinstance(inputs.row, Mapping) else {}
+    revision = str(row.get("LastModifiedDate") or "")
+    if reason is None:
+        token = TOKENS.issue("create", reference, _create_binding(reference, revision, ctx["approval"]["approval_ref"], ctx))
+        return {"reference": reference, "nonce": token}, ""
+    if reason == "approval_missing" and row.get("Onboarding_Approval_Status__c") == "Approved":
+        token = TOKENS.issue("create", reference, _binding(reference, revision, "no-approval", "create"))
+        return {"reference": reference, "nonce": token, "issue_approval": "1"}, ""
+    return None, reason
+
+
 def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callable[[str, str, dict[str, str]], Any],
                        issue: Callable[[str, str, str], bool] | None = None) -> str:
     """"launched" or the refusal code. Re-evaluates every gate with the facts of THIS request; one attempt per token.

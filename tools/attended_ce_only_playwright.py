@@ -3139,6 +3139,10 @@ def leonardo_profile(target: RunTarget | None = None) -> tuple[Path, bool]:
     """
     target = target or DEV_TARGET
     if target.environment_key != DEV_TARGET.environment_key:
+        if os.environ.get("SURFACE_ONBOARDING_PRODUCTION_FRESH_SIGNIN") == "1":
+            # A VM-started run (docs/62 G9): a brand-new temporary profile, never the persisted one and never a running Chrome,
+            # deleted with every cookie at the end, so BackOffice and its SSO must ask for a fresh sign-in and MFA.
+            return Path(tempfile.mkdtemp(prefix="attended_fresh_signin_")), False
         # A non-Development target (the read-only production probe) never uses the Dev override and never shares
         # cookies with the Dev profile: its own directory name, persisted only on the Windows desktop.
         if os.name != "nt":

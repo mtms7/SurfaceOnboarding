@@ -53,6 +53,8 @@ INVENTORY_SUBDIR = "leonardo-inventory"
 
 CLONE_PUSH_PRODUCER = "desktop-clone-push"  # clone-only bundles (docs/51): never a full snapshot
 SNAPSHOT_PUSH_PRODUCER = "desktop-snapshot-push"  # a full signed snapshot pushed by the PC task over the same restricted key
+REMOTE_POLL_PRODUCER = "desktop-remote-poll"  # the PC asks the VM whether the owner requested a run (docs/62); never a snapshot
+REMOTE_POLL_FILE = "remote_start_poll.json"
 RECORDS_PUSH_PRODUCER = "desktop-records-push"  # the masked production create records only, merged into the CURRENT snapshot
 PRODUCTION_RECORDS_FILE = "production_create_records.json"  # {"records": {"CO-0812-<stamp>.json": record}, "logs": {name: text}}
 PRODUCTION_APPROVALS_FILE = "production_create_approvals.json"  # the desktop file name: the dashboard reads it from the snapshot on the VM
@@ -94,7 +96,7 @@ STATE_FILE_NAMES = frozenset({
     "attended_user_created_confirmations.json", "attended_spycloud.json", "attended_salesforce_id_writebacks.json",
     "attended_surface_validation.json", "attended_renewal_mirrors.json", "attended_renewal_outcomes.json",
 })
-EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, PRODUCTION_INPUTS_FILE, PRODUCTION_RECORDS_FILE, PRODUCTION_APPROVALS_FILE,
+EXPORT_FILE_NAMES = frozenset({QUEUE_FILE, CO_DETAILS_FILE, PRODUCTION_INPUTS_FILE, PRODUCTION_RECORDS_FILE, PRODUCTION_APPROVALS_FILE, REMOTE_POLL_FILE,
                                INVENTORY_DEV_LATEST, INVENTORY_DEV_SNAPSHOT,
                                INVENTORY_CLONE_LATEST, INVENTORY_CLONE_SNAPSHOT})
 ALLOWED_NAMES = STATE_FILE_NAMES | EXPORT_FILE_NAMES
@@ -531,7 +533,7 @@ def ingest_bundle(source: str | os.PathLike[str] | bytes, key: bytes, state_dir:
     if type(keep) is not int or keep < 1:
         raise SnapshotError("bad_keep")
     bundle = verify_bundle(source, key)
-    if bundle.manifest.get("producer") in (CLONE_PUSH_PRODUCER, RECORDS_PUSH_PRODUCER):
+    if bundle.manifest.get("producer") in (CLONE_PUSH_PRODUCER, RECORDS_PUSH_PRODUCER, REMOTE_POLL_PRODUCER):
         raise SnapshotError("clone_push_bundle_not_a_snapshot")
     root = snapshots_root(state_dir)
     incoming = root / INCOMING_DIR

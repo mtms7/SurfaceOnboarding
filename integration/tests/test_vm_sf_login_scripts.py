@@ -108,5 +108,30 @@ class HideSessionScriptTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
+class RemoteStartSwitchScriptTests(unittest.TestCase):
+    def setUp(self):
+        data = (VM_PILOT / "_step28d_vm_remote_start_switch.sh").read_bytes()
+        self.assertNotIn(bytes([13]), data)
+        self.text = data.decode("utf-8")
+
+    def test_it_only_adds_or_removes_one_dashboard_drop_in_with_the_switch_variable(self):
+        self.assertTrue(self.text.startswith("#!/bin/sh" + chr(10) + "# REVIEW ARTIFACT"))
+        self.assertIn('[ "$(id -u)" -eq 0 ]', self.text)
+        self.assertIn("Environment=SURFACE_ONBOARDING_REMOTE_START=1", self.text)
+        self.assertIn("surface-onboarding-dashboard.service", self.text)
+        for mode in ("on)", "off)", "status)"):
+            self.assertIn(mode, self.text)
+        for forbidden in ("approved-sf-reader", "authorized_keys", "ufw ", "iptables", "snapshots/", "data update", "eval ",
+                          "sf-refresh", "nginx", "snapshot.key", "push_key"):
+            self.assertNotIn(forbidden, self.text, forbidden)
+
+    def test_the_embedded_syntax_is_valid_shell(self):
+        sh = shutil.which("sh")
+        if sh is None:
+            self.skipTest("no POSIX sh on this machine")
+        completed = subprocess.run([sh, "-n", str(VM_PILOT / "_step28d_vm_remote_start_switch.sh")], capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
