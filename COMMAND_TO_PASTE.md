@@ -136,3 +136,32 @@ Expect GET / 200, POST / 403 or 405, direct dashboard 4xx. Rollback:
 Check %LOCALAPPDATA%/SurfaceOnboarding/clone-push/clone-push.log: expect `records_push ssh_exit=0 result=ingested-records snapshot-...`.
 The next VM Salesforce refresh (every 10 minutes until the 30-minute cadence is applied) publishes the identity inputs.
 Then compare https://localhost:8443/ with http://127.0.0.1:8012/: CO-0813, CO-0806, CO-0757 get the same Clear / blocked chips, Created counts match, the Create column shows Verified. The Approval column stays "Unavailable on this server" on the VM by design.
+
+
+# Deploy release r40 to the VM (VM queue parity part 2: Approval column, UUID and stage logs), 2026-10-27
+
+Pentera VPN on. The `workato` and `sudo` passwords are typed in your own window, never pasted to Claude.
+Archive: surface-onboarding-r40-b73f302.tar.gz, SHA-256 43825C27BF6EF9D3C522C4116923D8906AEB6C32ECF63BDE8DC05104D196A812 (468 files, LF, checker passed).
+The VM runs r39 now. Stage first (activates nothing), activate only with the owner's separate go. Rollback goes back to r39.
+
+## Step B (PC tab): upload four files
+
+    ssh workato@172.26.37.20 "mkdir -p /tmp/r40-upload"
+    scp "C:/Users/Milton Stevenson/.surface-onboarding/releases/surface-onboarding-r40-b73f302.tar.gz" "C:/Users/Milton Stevenson/.surface-onboarding/releases/surface-onboarding-r40-b73f302.tar.gz.sha256" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step30a_vm_stage_r40.sh" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step30b_vm_activate_r40.sh" workato@172.26.37.20:/tmp/r40-upload/
+
+## Step C (runs on the VM): stage
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r40-upload/_step30a_vm_stage_r40.sh"
+
+## Step D (ONLY after the owner's go): activate
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r40-upload/_step30b_vm_activate_r40.sh"
+
+Rollback: same script with `rollback`.
+
+## Step E (PC tab): push records, approvals copy and logs now, then reload both pages (Ctrl+F5 on each)
+
+    powershell -Command "Start-ScheduledTask -TaskName SurfaceOnboarding-CloneToVm"
+
+Log: %LOCALAPPDATA%/SurfaceOnboarding/clone-push/clone-push.log, expect `records_push ssh_exit=0 result=ingested-records snapshot-...`.
+The VM Approval column should now say Used / None / Valid to MM-DD instead of "Unavailable on this server", and the onboarded line should read "Account UUID written and read back". CO-0813 and the other "Not checked" COs need one VM Salesforce refresh after r39 (every 10 minutes).
