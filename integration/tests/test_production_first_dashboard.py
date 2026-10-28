@@ -252,10 +252,49 @@ class LandingTests(unittest.TestCase):
         other = self.row_of(self.page(), "CO-0780")
         self.assertNotIn("Onboarded", other)  # a CO with no verified create is untouched
 
+    def test_status_shows_the_salesforce_stage_and_completed_reads_onboarded(self):
+        """Owner request 2026-10-28: the queue shows the Salesforce Onboarding Stage as the CO's status."""
+        stages = {"CO-0780": "New", "CO-0781": "Request Approved", "CO-0782": "Account Scanning",
+                  "CO-0784": "Scan Completed Successfully", "CO-0785": "User Created", "CO-0783": "Onboarding Completed"}
+        rows = [dict(item, Onboarding_Stage__c=stages[item["Name"]]) for item in ROWS]
+        page = self.page(rows=rows)
+        for ref, stage in stages.items():
+            label = "Onboarded" if stage == "Onboarding Completed" else stage
+            self.assertIn("'>" + label + "</span><span class='sub'>" + str(dashboard.ONBOARDING_STAGES.index(stage) + 1)
+                          + " of 6</span>", self.row_of(page, ref), ref)
+        self.assertIn("chip chip-ok'>Onboarded</span><span class='sub'>6 of 6", self.row_of(page, "CO-0783"))
+        odd = self.page(rows=[dict(ROWS[0], Onboarding_Stage__c="Something Else")])
+        self.assertIn("chip chip-warn'>Something Else</span>", self.row_of(odd, "CO-0780"))
+
+    def test_a_case3_co_onboarded_by_hand_shows_onboarded_not_a_duplicate(self):
+        """A UUID in Salesforce (the clone check is UUID-based) plus a stage past approval: onboarded, also by hand (CO-0824)."""
+        case3 = {"Name": "CO-0824", "Account__r.Name": "Canal Example", "Onboarding_Product__c": "Surface & Credential Exposure",
+                 "Onboarding_Type__c": "New Product Onboarding", "Submission_Date__c": "2026-10-20",
+                 "Onboarding_Approval_Status__c": "Approved", "Onboarding_Stage__c": "User Created"}
+        matches = {**MATCHES, "CO-0824": match("uuid_not_in_clone", reason="uuid_not_in_clone")}
+        starts = {**STARTS, "CO-0824": "2026-10-10"}
+        row = self.row_of(self.page(rows=ROWS + [case3], matches=matches, starts=starts), "CO-0824")
+        self.assertIn("Onboarded (UUID in Salesforce)", row)
+        self.assertIn("Created by hand", row)
+        self.assertIn("<span class='muted'>done</span>", row)
+        self.assertNotIn("overdue", row)
+        self.assertNotIn("UUID set, not in clone", row)
+        before = self.row_of(self.page(rows=ROWS + [dict(case3, Onboarding_Stage__c="Request Approved")], matches=matches,
+                                       starts=starts), "CO-0824")
+        self.assertIn("UUID set, not in clone", before)  # approved only: not counted as onboarded
+        self.assertNotIn("Created by hand", before)
+
+    def test_hand_entered_onboarded_rule(self):
+        for code, stage, expected in (("onboarded", "Onboarding Completed", True), ("uuid_not_in_clone", "Account Scanning", True),
+                                      ("uuid_not_in_clone", "Request Approved", False), ("clear", "User Created", False),
+                                      ("other_tenants", "User Created", False)):
+            self.assertEqual(dashboard.hand_entered_onboarded({"code": code}, stage), expected, (code, stage))
+        self.assertFalse(dashboard.hand_entered_onboarded(None, "User Created"))
+
     def test_columns_in_the_owner_order(self):
         page = self.page()
         table = page[page.index("<table"):page.index("</table>")]
-        self.assertEqual(headers(table), ["Start", "Days to start Salesforce approval", "Onboarding", "Account", "Product", "Production checks", "Approval create · 7 days",
+        self.assertEqual(headers(table), ["Start", "Days to start Salesforce approval", "Onboarding", "Account", "Product", "Status Salesforce stage", "Production checks", "Approval create · 7 days",
                                           "Create", "Age"])
         self.assertIn("<h1>Onboarding</h1>", page)
         self.assertIn("envpill prod", page)

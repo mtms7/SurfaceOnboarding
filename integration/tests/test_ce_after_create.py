@@ -1,7 +1,7 @@
 """Owner decision 2026-10-19 (after the CO-0798 production create): for a CE-only New onboarding the Account UUID write
 runs AUTOMATICALLY right after a verified create, and the Salesforce stage then moves Request Approved -> Account
-Scanning. CE-only never uses "User Created": later, after the CE scan is confirmed finished, Account Scanning -> Scan
-Completed Successfully -> Onboarding Completed.
+Scanning. Later, after the CE scan is confirmed finished, Account Scanning -> Scan Completed Successfully -> User Created
+-> Onboarding Completed (CE-only creates no user but passes through User Created: owner decision 2026-10-28).
 
 Every stage write is one fixed field on one CO, only from the exact expected stage, only on the CE-only route, only after
 the UUID was written and verified, read back after the write, recorded before and after, and never retried after an
@@ -24,11 +24,19 @@ def sf_row(**over):
 
 
 class StagePlanTests(unittest.TestCase):
-    def test_the_ce_only_flow_never_uses_user_created(self):
+    def test_the_ce_only_flow_passes_through_user_created(self):
         self.assertEqual(sw.CE_ONLY_FLOW, (("Request Approved", "Account Scanning"),
                                            ("Account Scanning", "Scan Completed Successfully"),
-                                           ("Scan Completed Successfully", "Onboarding Completed")))
-        self.assertNotIn("User Created", [stage for pair in sw.CE_ONLY_FLOW for stage in pair])
+                                           ("Scan Completed Successfully", "User Created"),
+                                           ("User Created", "Onboarding Completed")))
+
+    def test_user_created_and_completed_only_from_the_stage_before(self):
+        self.assertEqual(sw.plan(sf_row(Onboarding_Stage__c="Scan Completed Successfully"), "User Created").status,
+                         "ready_to_write")
+        self.assertEqual(sw.plan(sf_row(Onboarding_Stage__c="User Created"), "Onboarding Completed").status, "ready_to_write")
+        self.assertEqual(sw.plan(sf_row(Onboarding_Stage__c="Scan Completed Successfully"), "Onboarding Completed").reason,
+                         "stage_not_expected")
+        self.assertEqual(sw.plan(sf_row(Onboarding_Stage__c="Account Scanning"), "User Created").reason, "stage_not_expected")
 
     def test_a_ready_plan_needs_the_exact_from_stage_and_the_ce_route(self):
         plan = sw.plan(sf_row(), "Account Scanning")
@@ -41,7 +49,8 @@ class StagePlanTests(unittest.TestCase):
                             ({"Id": "x"}, "row_unreadable"), (None, "row_unreadable")):
             plan = sw.plan(row, "Account Scanning")
             self.assertEqual((plan.status, plan.reason), ("blocked", reason), row)
-        self.assertEqual(sw.plan(sf_row(), "User Created").reason, "transition_not_allowed")
+        self.assertEqual(sw.plan(sf_row(), "Request Approved").reason, "transition_not_allowed")
+        self.assertEqual(sw.plan(sf_row(), "User Created").reason, "stage_not_expected")
         self.assertEqual(sw.plan(sf_row(), "Onboarding Completed").reason, "stage_not_expected")
 
     def test_the_update_is_one_fixed_field_argv(self):
@@ -152,7 +161,8 @@ class NoVerifiedCreateTests(base.Base):
 
 
 class LaterStagesTests(base.Base):
-    """Account Scanning -> Scan Completed Successfully -> Onboarding Completed, only after a confirmed finished scan."""
+    """Account Scanning -> Scan Completed Successfully -> User Created -> Onboarding Completed, only after a confirmed
+    finished scan."""
 
     def setUp(self):
         super().setUp()
@@ -170,11 +180,40 @@ class LaterStagesTests(base.Base):
         self.salesforce["Onboarding_Stage__c"] = argv[argv.index("--values") + 1].partition("=")[2].strip("'")
         return True
 
-    def test_a_confirmed_finished_scan_completes_the_onboarding_in_two_steps(self):
+    def test_a_confirmed_finished_scan_completes_the_onboarding_through_user_created(self):
         result = ui.after_scan_finished(self.inputs(), self.read, self.run_argv, "surface-onboarding", scan_state="scan_completed")
-        self.assertEqual(result, ["written_verified", "written_verified"])
+        self.assertEqual(result, ["written_verified", "written_verified", "written_verified"])
+        self.assertEqual([a[a.index("--values") + 1] for a in self.writes],
+                         ["Onboarding_Stage__c='Scan Completed Successfully'", "Onboarding_Stage__c='User Created'",
+                          "Onboarding_Stage__c='Onboarding Completed'"])
         self.assertEqual(self.salesforce["Onboarding_Stage__c"], "Onboarding Completed")
         self.assertEqual(ui.last_stage_write(self.dir, CO), ("Onboarding Completed", "written_verified"))
+
+    def test_it_stops_at_the_first_failed_move(self):
+        def reject_user_created(argv):
+            if argv[argv.index("--values") + 1] == "Onboarding_Stage__c='User Created'":
+                self.writes.append(argv)
+                return False
+            return self.run_argv(argv)
+        result = ui.after_scan_finished(self.inputs(), self.read, reject_user_created, "surface-onboarding",
+                                        scan_state="scan_completed")
+        self.assertEqual(result[0], "written_verified")
+        self.assertEqual(len(result), 2)
+        self.assertNotEqual(result[1], "written_verified")
+        self.assertEqual(self.salesforce["Onboarding_Stage__c"], "Scan Completed Successfully")
+
+    def test_a_co_left_at_user_created_finishes_on_the_next_check(self):
+        self.salesforce["Onboarding_Stage__c"] = "User Created"
+        ui.record_stage_write(self.dir, CO, "User Created", "written_verified", base.NOW)
+        result = ui.after_scan_finished(self.inputs(), self.read, self.run_argv, "surface-onboarding", scan_state="scan_completed")
+        self.assertEqual(result, ["already_present", "already_present", "written_verified"])
+        self.assertEqual(self.salesforce["Onboarding_Stage__c"], "Onboarding Completed")
+
+    def test_user_created_set_by_hand_is_left_alone(self):
+        self.salesforce["Onboarding_Stage__c"] = "User Created"
+        result = ui.after_scan_finished(self.inputs(), self.read, self.run_argv, "surface-onboarding", scan_state="scan_completed")
+        self.assertEqual(result, ["stage_not_expected"])
+        self.assertEqual(self.writes, [])
 
     def test_any_other_scan_state_writes_nothing(self):
         for state in ("scan_started", "no_scan", "unrecognized", "scan_failed", None):

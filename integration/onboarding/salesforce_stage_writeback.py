@@ -1,10 +1,12 @@
 """Guarded Onboarding Stage moves for CE-only New onboardings (pure; owner decision 2026-10-19, after the CO-0798 create).
 
-CE-only never creates a customer user, so it never uses "User Created". The only moves allowed are:
+CE-only never creates a customer user, but it still passes THROUGH "User Created" (owner decision 2026-10-28, supersedes
+"CE-only skips User Created"). The only moves allowed are:
 
     Request Approved            -> Account Scanning              (right after a verified create and a verified UUID write)
     Account Scanning            -> Scan Completed Successfully   (after the CE scan is confirmed finished)
-    Scan Completed Successfully -> Onboarding Completed          (immediately after the previous move)
+    Scan Completed Successfully -> User Created                  (immediately after; no user is created for CE-only)
+    User Created                -> Onboarding Completed          (immediately after the previous move)
 
 Each move writes ONE field (``Onboarding_Stage__c``) on ONE CO, only from the exact expected stage and only on the
 CE-only New route. Nothing here performs I/O or runs a process: the caller runs the returned argument list, then checks
@@ -23,7 +25,8 @@ STAGE_FIELD = "Onboarding_Stage__c"
 SOBJECT = uuid_wb.SOBJECT
 CE_ONLY_FLOW = (("Request Approved", "Account Scanning"),
                 ("Account Scanning", "Scan Completed Successfully"),
-                ("Scan Completed Successfully", "Onboarding Completed"))
+                ("Scan Completed Successfully", "User Created"),
+                ("User Created", "Onboarding Completed"))
 _FROM = {to: frm for frm, to in CE_ONLY_FLOW}
 _SF_ID = re.compile(r"(?:[A-Za-z0-9]{15}|[A-Za-z0-9]{18})")
 _ORG = re.compile(r"[A-Za-z0-9_.@][A-Za-z0-9_.@-]*")

@@ -134,7 +134,7 @@ class DashboardFollowTests(base.Base):
             order.append("after-write")
             return {"uuid": "written_verified", "stage": "written_verified"}
 
-        with mock.patch.object(dashboard.create_ui, "after_verified_create", side_effect=follow),                 mock.patch.object(dashboard, "_run_sf_argv", side_effect=lambda argv: order.append("write") or True),                 mock.patch.object(dashboard, "clear_display_cache", side_effect=lambda: order.append("clear")),                 mock.patch.object(dashboard, "_create_ui_inputs", return_value=self.inputs()):
+        with mock.patch.object(dashboard.create_ui, "after_verified_create", side_effect=follow),                 mock.patch.object(dashboard, "_run_sf_argv", side_effect=lambda argv: order.append("write") or True),                 mock.patch.object(dashboard, "clear_display_cache_for", side_effect=lambda ref: order.append("clear")),                 mock.patch.object(dashboard, "_create_ui_inputs", return_value=self.inputs()):
             dashboard._follow_production_create(CO, mock.Mock())
         self.assertEqual(order[:4], ["before-write", "write", "clear", "after-write"])
 

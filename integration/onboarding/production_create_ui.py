@@ -973,8 +973,9 @@ def after_verified_create(inputs: Inputs, read_row: Callable[[], Mapping[str, An
 
 def after_scan_finished(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None],
                         run_argv: Callable[[list[str]], bool], target_org: str, *, scan_state: str | None) -> list[str]:
-    """Account Scanning -> Scan Completed Successfully -> Onboarding Completed (CE-only skips User Created), only for a
-    ``scan_completed`` state from the runner's own read-only scan check and only with the verified UUID on the CO."""
+    """Account Scanning -> Scan Completed Successfully -> User Created -> Onboarding Completed (CE-only creates no user but
+    passes through User Created: owner decision 2026-10-28), only for a ``scan_completed`` state from the runner's own
+    read-only scan check or the clone, and only with the verified UUID on the CO. Stops at the first move that fails."""
     if scan_state != "scan_completed":
         return ["scan_not_finished"]
     try:
@@ -983,8 +984,16 @@ def after_scan_finished(inputs: Inputs, read_row: Callable[[], Mapping[str, Any]
         row = None
     if not _uuid_on_co(inputs, row):
         return ["uuid_not_on_co"]
+    order = ("Account Scanning", "Scan Completed Successfully", "User Created", "Onboarding Completed")
+    current = (row or {}).get(stage_wb.STAGE_FIELD)
+    # Resume only from a stage THIS dashboard wrote and read back (e.g. left at User Created by a failed last move); a
+    # stage changed by hand is left alone (the first move then refuses with stage_not_expected).
+    resume = current if last_stage_write(inputs.records_parent, inputs.reference) == (current, "written_verified") else None
     results = []
-    for to_stage in ("Scan Completed Successfully", "Onboarding Completed"):
+    for to_stage in order[1:]:
+        if resume in order and order.index(resume) >= order.index(to_stage):
+            results.append("already_present")
+            continue
         result = _stage_move(inputs, read_row, run_argv, target_org, to_stage)
         results.append(result)
         if result not in ("written_verified", "already_present"):
@@ -994,7 +1003,8 @@ def after_scan_finished(inputs: Inputs, read_row: Callable[[], Mapping[str, Any]
 
 # --- Automatic CE scan finish from the production clone (docs/56 step 3, owner decision 2026-10-19) --------------------------
 
-AUTO_SCAN_WAITING = (("Account Scanning", "written_verified"), ("Scan Completed Successfully", "written_verified"))
+AUTO_SCAN_WAITING = (("Account Scanning", "written_verified"), ("Scan Completed Successfully", "written_verified"),
+                     ("User Created", "written_verified"))
 AUTO_SCAN_TEXT = {
     "finished": "The clone shows the CE scan finished; the stage moves ran.",
     "finished_with_errors": "The clone shows the CE scan finished with errors; the stage moves ran.",
@@ -1011,7 +1021,8 @@ AUTO_SCAN_TEXT = {
 
 
 def auto_scan_candidates(parent: Path) -> list[str]:
-    """COs whose newest stage line is a verified Account Scanning or Scan Completed Successfully (sorted); [] if unreadable."""
+    """COs whose newest stage line is a verified Account Scanning, Scan Completed Successfully or User Created (sorted);
+    [] if unreadable."""
     try:
         lines = (Path(parent) / records.RECORDS_SUBDIR / STAGE_WRITES_FILE).read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -1269,8 +1280,8 @@ def scan_card_html(parent: Path, co: str, *, running: bool, auto: Mapping[str, A
                 "<input type='hidden' name='reference' value='" + escape(co) + "'>"
                 "<button type='submit'>Check CE scan in BackOffice</button></form>"
                 "<p class='note'>Read only: opens the BackOffice window (SSO and MFA), reads this tenant's scan fields and, "
-                "only when the scan is finished, moves the stage to Scan Completed Successfully and then Onboarding Completed "
-                "(CE-only skips User Created).</p>")
+                "only when the scan is finished, moves the stage to Scan Completed Successfully, User Created and then "
+                "Onboarding Completed (CE-only creates no user; the stage still passes through User Created).</p>")
     else:
         body = "<p class='note'>" + escape(gate_text(problem)) + "</p>"
     return ("<section class='card' aria-labelledby='co-scan-title'><div class='card-head'><h2 id='co-scan-title' "

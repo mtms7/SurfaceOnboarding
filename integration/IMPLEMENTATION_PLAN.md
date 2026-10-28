@@ -2343,3 +2343,53 @@ Rules: explain each step and wait for my "go" before any external action; tests 
 
 First: ask whether I restarted the dashboard and whether Prepare sessions now opens the Salesforce sign-in or shows its reason, and whether I want the fix committed. Then the open items, one owner go each: send/stage r41 to the VM and enable the VM-started run; 30-minute VM refresh cadence (_step28b); 28C; reboot sign-in reminder; Maximum scan Duration readback or guarded edit (Case 3); Technical Advisor to operator mapping; automated Case 3 scan check and primary-user creation; first Case 3 run through the one-button flow.
 ```
+
+### 2026-10-28 handoff: CE-only passes through User Created; queue Status column; hand-entered Case 3 shows onboarded (UNCOMMITTED)
+
+- **Observed (read-only, Salesforce 2026-10-28):** CO-0800, 0802, 0804, 0809, 0811, 0812 are Onboarding Completed (the owner moved the CE-only ones by hand 17:12-17:20 UTC; history shows Scan Completed Successfully -> Onboarding Completed is accepted by Salesforce). CO-0824 (Case 3, Canal de Panama) is User Created with an Account UUID (Request Approved -> User Created 18:13 UTC, by hand). The running dashboard was still the 2026-10-26 process (PID 53084, started directly, not through the start script), so the page had 20 h old data, no Days to start column and showed CO-0824 as "Other tenants only". Not restarted yet.
+- **Owner decision 2026-10-28 (supersedes "CE-only skips User Created", 2026-10-19):** CE-only creates no user but its stage passes THROUGH User Created: Account Scanning -> Scan Completed Successfully -> User Created -> Onboarding Completed, all automatic with read-back once the CE scan is finished. CE scans usually finish in about 10 h; the Redash clone is slow, so check once a day or whenever the owner signs in. The queue shows the Salesforce stage as status; Onboarding Completed reads "Onboarded".
+- **A** `salesforce_stage_writeback.CE_ONLY_FLOW` has four moves (each only from the exact stage before it). `after_scan_finished` runs Scan Completed Successfully, User Created, Onboarding Completed, stops at the first failure, and resumes only from a stage THIS dashboard wrote and read back (a stage changed by hand is still left alone). `AUTO_SCAN_WAITING` includes a verified User Created. CO page text updated.
+- **B** A Ready Salesforce session (Prepare sessions, Re-check, finished CLI sign-in) wakes the clone scan job at once (`request_auto_scan`, `AUTO_SCAN_WAKE`); the quiet 10-minute look at the local clone file stays (no browser, no login, every guard unchanged). Never on the VM.
+- **C** Queue column "Status / Salesforce stage" after Product: stage chip and "n of 6"; Onboarding Completed = "Onboarded"; an unknown stage shows as a warning chip. `classify_queue_row`: CE-only at Scan Completed Successfully or User Created reads "Moves automatically" (Case 3 keeps "Create customer user" / "Complete onboarding").
+- **D** `hand_entered_onboarded`: the UUID-based clone check says onboarded or "UUID set, not in clone" AND the stage is Account Scanning or later -> done (Start/Days "done", not Ready, not Blocked), Production checks "Onboarded (UUID in Salesforce)" when the clone has not caught up, Create "Created by hand". Approved-only with a UUID still shows "UUID set, not in clone".
+- **Tests:** new/updated in `test_ce_after_create`, `test_ce_auto_scan` (WakeOnSignInTests), `test_production_first_dashboard`, `test_attended_open_onboardings_dashboard`. Full `integration/tests` with the dashboard Python (codex runtime): 3601 OK (18 skipped). (`.venv-renewal-playwright` lacks `tzdata`, so 8 scaffold/config tests error there: environment only.)
+- **Not done:** dashboard restart (loads 6551efe and this change; ends the dashboard sign-in); nothing committed or pushed; VM key setup (owner steps 1-4) not done on the PC (agent Disabled, no key); r41, `-RemoteStart`, 28C, 30-minute cadence, reboot reminder, Case 3 gaps (Maximum scan Duration, Technical Advisor to operator, automated scan check, primary user) still open.
+
+```text
+Continue the Surface Customer Onboarding work in C:/Users/Milton Stevenson/Documents/Surface/Workato (branch main, 24+ commits ahead of origin; the 2026-10-28 CE-only User Created / queue Status / hand-entered Case 3 change is UNCOMMITTED in production_create_ui.py, salesforce_stage_writeback.py, serve_attended_open_onboardings_dashboard.py and four test files). Follow AGENTS.md and the surface-workato-opa skill. Read integration/IMPLEMENTATION_PLAN.md section 18, the 2026-10-28 handoff, first.
+
+State: CE-only now moves Account Scanning -> Scan Completed Successfully -> User Created -> Onboarding Completed automatically once the CE scan is finished (no user created); the check also runs when Salesforce turns Ready after a sign-in. The queue shows the Salesforce stage as Status (Onboarding Completed = Onboarded) and hand-entered Case 3 COs with a UUID and a stage past approval show as onboarded (CO-0824). Full suite 3601 OK.
+
+Rules: explain each step and wait for my "go"; I push; commit only when I ask. Never handle or store passwords, MFA codes or tokens; sudo on the VM stays mine. Production BackOffice writes need the per-CO approval and my click. Restart the dashboard after page code changes. PowerShell 5.1: no &&; forward slashes; label PC or VM.
+
+First: ask whether I restarted the dashboard with tools/start_attended_dashboard.ps1 -Restart -ProductionSessions and whether CO-0824 and the Status column look right; ask whether to commit. Then, one go each: VM key setup (agent-held key, today only), CE scan check status, first Case 3 one-button run, Case 3 gaps, r41 to the VM.
+```
+
+### 2026-10-28 (later): dashboard speed fixes and the UUID-not-in-clone match rule (UNCOMMITTED)
+
+- **Symptom (owner):** after the restart, each menu and CO page took several seconds. **Cause (timing log, an expert-agent read of the code, and measurements):**
+  - each `sf` CLI call costs about 4.7–7 s on the PC (3 s just to start);
+  - the first queue load took 77 s (about 3 hidden CLI reads per CO in `production_match_for`, which are not in the timing log);
+  - CO pages read one after another and re-read the review values on every visit;
+  - the 17–23 MB clone was parsed and SHA-256 checked 4–6 times per page;
+  - every POST, including Re-check, cleared the whole cache;
+  - two clone collectors write each hour (16.4 MB at :15, 22.7 MB at :19), so every match entry was stale twice an hour.
+- **Fixes (owner go "1 to 5"):**
+  1. `leonardo_inventory.load_latest` reuses a verified payload ONLY while `MEMO_WHEN()` is true (the dashboard sets it to "display GET rendering"), keyed on the size and modification time of latest.json and the snapshot file. The age is still checked on every call; creates, writes, collectors and ingest always verify.
+  2. Display cache: an expired value under 30 min is served at once while one background read replaces it (`DISPLAY_STALE_MAX_SECONDS`). A clear bumps a generation, so an in-flight read never stores. A new match stamp is still a miss: a match is never replayed over a newer clone. Warm-up thread `_display_warm_loop`: at start, every 10 min, within 30 s of a new match stamp and 5 s after a clear, it re-reads queue rows, start dates, each CO's match and row (3 workers).
+  3. `/onboard/CO-x` prefetches row, preflight, review values (`production_review_inputs_display`, cached), match and country in parallel. A display page no longer runs the 4.7 s Salesforce probe (`_salesforce_ready_for_create`); the create POST still does. The dashboard sets `SF_SKIP_NEW_VERSION_CHECK`, `SF_AUTOUPDATE_DISABLE`, `SFDX_AUTOUPDATE_DISABLE`, `SF_DISABLE_TELEMETRY` and `SF_DISABLE_LOG_FILE` (setdefault).
+  4. Sign-in, Prepare sessions, Re-check and logout POSTs keep the cache. Follow-up and auto-scan writes clear only that CO plus the queue lists (`clear_display_cache_for`). The auto-scan pass loads the clone once. A CO whose stage was moved by hand (`stage_not_expected`) is held for 24 h.
+  5. `production_match` and `identity_match`: a CO UUID with no clone owner and only non-live name or domain matches gives `uuid_not_in_clone` (candidates listed), not `exists_other` (CO-0824, CO-0813); a live paid match still blocks. Nothing becomes creatable (a UUID always blocks the create).
+- **Tests:** new `test_dashboard_speed_2026_10_28.py` (memo, stale-while-revalidate, generation, stamp rule, per-CO clear, warm-up, probe, auto-scan pass, match rule); `test_production_progress` updated. Full suite with the dashboard Python: 3623 OK (18 skipped).
+- **Live (PC):** restarted in the Terminal tab (PID 892). Queue page builds are now 47–78 ms (was 77 s cold); the owner confirmed "much better".
+- **Open (owner decisions):** which hourly clone collector to keep (the dashboard auto-refresh or the scheduled clone-push task); batch the per-CO match reads into one `IN` query (runner refactor); the leftover "Dry run ready" / "Ready for dry run" queue labels. Earlier items unchanged: VM key setup, r41, `-RemoteStart`, 28C, 30-minute cadence, Case 3 gaps, first Case 3 one-button run. Nothing committed or pushed.
+
+```text
+Continue the Surface Customer Onboarding work in C:/Users/Milton Stevenson/Documents/Surface/Workato (branch main, ahead of origin; two batches from 2026-10-28 are UNCOMMITTED: (1) CE-only passes through User Created, queue Status column, hand-entered Case 3 onboarded; (2) dashboard speed fixes and the UUID-not-in-clone match rule). Follow AGENTS.md and the surface-workato-opa skill. Read integration/IMPLEMENTATION_PLAN.md section 18, the two 2026-10-28 entries, first.
+
+State: the dashboard runs on the new code (restarted 2026-10-28, PID 892) and pages are fast (queue 47-78 ms). Full suite 3623 OK.
+
+Rules: explain each step and wait for my "go"; I push; commit only when I ask. Never handle or store passwords, MFA codes or tokens; sudo on the VM stays mine. Production BackOffice writes need the per-CO approval and my click. Restart the dashboard after page code changes. PowerShell 5.1: no &&; forward slashes; label PC or VM.
+
+First: ask whether to commit the two batches. Then, one go each: which hourly clone collector to keep; remove the leftover "Dry run ready" labels; VM key setup (agent-held key, today only); CE scan status; first Case 3 one-button run; Case 3 gaps; r41 to the VM.
+```

@@ -19,7 +19,8 @@ import math
 import os
 from pathlib import Path
 import re
-from typing import Any, Mapping
+import threading
+from typing import Any, Callable, Mapping
 
 from . import state_paths
 
@@ -705,6 +706,20 @@ def _read_json(path: Path) -> dict[str, Any]:
     return value
 
 
+# Display-only memo (owner request 2026-10-28, page speed): the 17-23 MB clone was parsed and SHA-256 re-checked 4-6 times
+# per page. When ``MEMO_WHEN()`` is true (the dashboard sets it to "a display GET is rendering"), a payload that passed
+# every check below is reused while latest.json and the snapshot file keep the same size and modification time; the age
+# is still checked on every call. Every other caller (create gate, writes, collectors, ingest) always re-verifies.
+MEMO_WHEN: Callable[[], bool] | None = None
+_memo: dict[tuple[str, str], tuple[tuple[Any, ...], dict[str, Any], datetime]] = {}
+_memo_lock = threading.Lock()
+
+
+def _file_key(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_mtime_ns, stat.st_size
+
+
 def load_latest(root: Path, env_name: str, *, max_age: timedelta, now: datetime) -> dict[str, Any]:
     """Load and re-verify the newest snapshot; any mismatch fails closed with a reason code."""
     environment = require_environment(env_name)
@@ -719,6 +734,17 @@ def load_latest(root: Path, env_name: str, *, max_age: timedelta, now: datetime)
         raise InventoryError("inventory_snapshot_schema_version")
     if latest.get("environment") != environment.name:
         raise InventoryError("inventory_snapshot_wrong_environment")
+    memo = MEMO_WHEN is not None and MEMO_WHEN()
+    slot = (str(directory), environment.name)
+    if memo:
+        try:
+            files = (name, latest.get("rows_sha256"), *_file_key(directory / LATEST_FILE), *_file_key(directory / name))
+        except OSError:
+            files = None
+        with _memo_lock:
+            hit = _memo.get(slot)
+        if files is not None and hit is not None and hit[0] == files:
+            return _aged(hit[1], hit[2], now, max_age)
     payload = _read_json(directory / name)
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise InventoryError("inventory_snapshot_schema_version")
@@ -732,6 +758,13 @@ def load_latest(root: Path, env_name: str, *, max_age: timedelta, now: datetime)
             or latest.get("captured_at") != payload.get("captured_at") or payload.get("row_count") != len(tenants)
             or not _name_matches(name, environment, captured_at)):
         raise InventoryError("inventory_snapshot_tampered")
+    if memo and files is not None:
+        with _memo_lock:
+            _memo[slot] = (files, payload, captured_at)
+    return _aged(payload, captured_at, now, max_age)
+
+
+def _aged(payload: dict[str, Any], captured_at: datetime, now: datetime, max_age: timedelta) -> dict[str, Any]:
     age = now - captured_at
     if age < -_FUTURE_SKEW:
         raise InventoryError("inventory_snapshot_tampered")

@@ -3,7 +3,7 @@ from the production clone (query 253) with no browser and no login, and the clon
 
 For a CO this dashboard created and moved to Account Scanning, a finished CE scan in the clone row (matched by the verified
 Account UUID, ended after the create time) runs ``after_scan_finished``: Account Scanning -> Scan Completed Successfully ->
-Onboarding Completed. Same guards as the BackOffice check: both constants True, not the VM, exact from-stage, CE-only route,
+User Created -> Onboarding Completed (owner decision 2026-10-28). Same guards as the BackOffice check: both constants True, not the VM, exact from-stage, CE-only route,
 read-back, logged, never retried after an uncertain result. Hermetic: fake clone, fake Salesforce, temporary folders.
 """
 
@@ -55,20 +55,20 @@ class AutoScanTests(base.Base):
         data = self.payload if payload == "default" else payload
         return ui.auto_scan_finish(self.inputs(**over), lambda: data, self.read, self.run_argv, "surface-onboarding")
 
-    def test_a_finished_ce_scan_completes_the_onboarding_in_two_guarded_steps(self):
-        self.assertEqual(self.job(), {"scan": "finished", "stages": ["written_verified", "written_verified"]})
+    def test_a_finished_ce_scan_completes_the_onboarding_in_three_guarded_steps(self):
+        self.assertEqual(self.job(), {"scan": "finished", "stages": ["written_verified"] * 3})
         self.assertEqual(self.salesforce["Onboarding_Stage__c"], "Onboarding Completed")
         self.assertEqual([a[a.index("--values") + 1] for a in self.writes],
-                         ["Onboarding_Stage__c='Scan Completed Successfully'", "Onboarding_Stage__c='Onboarding Completed'"])
+                         ["Onboarding_Stage__c='Scan Completed Successfully'", "Onboarding_Stage__c='User Created'",
+                          "Onboarding_Stage__c='Onboarding Completed'"])
         self.assertEqual(ui.last_stage_write(self.dir, CO), ("Onboarding Completed", "written_verified"))
         lines = (self.dir / "production-create-records" / ui.STAGE_WRITES_FILE).read_text(encoding="utf-8").splitlines()
-        self.assertEqual([json.loads(l)["result"] for l in lines][-4:],
-                         ["write_started", "written_verified", "write_started", "written_verified"])
+        self.assertEqual([json.loads(l)["result"] for l in lines][-6:], ["write_started", "written_verified"] * 3)
         self.assertNotIn(UUID, "".join(lines))
 
     def test_done_with_errors_counts_as_finished(self):
         result = self.job(clone(**{**FINISHED, "ce_status": "DONE_WITH_ERRORS"}))
-        self.assertEqual((result["scan"], result["stages"]), ("finished_with_errors", ["written_verified", "written_verified"]))
+        self.assertEqual((result["scan"], result["stages"]), ("finished_with_errors", ["written_verified"] * 3))
 
     def test_it_runs_once_a_second_tick_writes_nothing(self):
         self.job()
@@ -160,8 +160,15 @@ class AutoScanTests(base.Base):
         ui.record_stage_write(self.dir, CO, "Scan Completed Successfully", "written_verified", NOW)
         self.salesforce["Onboarding_Stage__c"] = "Scan Completed Successfully"
         result = self.job()
-        self.assertEqual(result, {"scan": "finished", "stages": ["already_present", "written_verified"]})
-        self.assertEqual([a[a.index("--values") + 1] for a in self.writes], ["Onboarding_Stage__c='Onboarding Completed'"])
+        self.assertEqual(result, {"scan": "finished", "stages": ["already_present", "written_verified", "written_verified"]})
+        self.assertEqual([a[a.index("--values") + 1] for a in self.writes],
+                         ["Onboarding_Stage__c='User Created'", "Onboarding_Stage__c='Onboarding Completed'"])
+
+    def test_a_co_left_at_user_created_by_this_dashboard_finishes(self):
+        ui.record_stage_write(self.dir, CO, "User Created", "written_verified", NOW)
+        self.salesforce["Onboarding_Stage__c"] = "User Created"
+        self.assertEqual(self.job(), {"scan": "finished", "stages": ["already_present", "already_present", "written_verified"]})
+        self.assertEqual(self.salesforce["Onboarding_Stage__c"], "Onboarding Completed")
 
 
 class CandidateTests(base.Base):
@@ -170,10 +177,11 @@ class CandidateTests(base.Base):
                            ("CO-0002", [("Account Scanning", "written_verified"), ("Scan Completed Successfully", "written_verified")]),
                            ("CO-0003", [("Account Scanning", "written_verified"), ("Onboarding Completed", "written_verified")]),
                            ("CO-0004", [("Account Scanning", "write_uncertain")]),
-                           ("CO-0005", [("Account Scanning", "written_verified"), ("Scan Completed Successfully", "write_uncertain")])):
+                           ("CO-0005", [("Account Scanning", "written_verified"), ("Scan Completed Successfully", "write_uncertain")]),
+                           ("CO-0006", [("Scan Completed Successfully", "written_verified"), ("User Created", "written_verified")])):
             for stage, result in stages:
                 ui.record_stage_write(self.dir, co, stage, result, NOW)
-        self.assertEqual(ui.auto_scan_candidates(self.dir), ["CO-0001", "CO-0002"])
+        self.assertEqual(ui.auto_scan_candidates(self.dir), ["CO-0001", "CO-0002", "CO-0006"])
 
     def test_no_or_unreadable_log_has_no_candidates(self):
         self.assertEqual(ui.auto_scan_candidates(self.dir), [])
@@ -263,6 +271,50 @@ class TickTests(AutoScanTests):
             raise RuntimeError("x")
         self.assertEqual(self.tick(_create_ui_inputs=boom)[CO]["scan"], "follow_up_failed")
         self.assertEqual(self.writes, [])
+
+
+class WakeOnSignInTests(unittest.TestCase):
+    """Owner request 2026-10-28: a Ready Salesforce session (sign-in, Prepare sessions, Re-check) wakes the job at once."""
+
+    def setUp(self):
+        dashboard.AUTO_SCAN_WAKE.clear()
+        self.addCleanup(dashboard.AUTO_SCAN_WAKE.clear)
+
+    def probe(self, returncode, org_id):
+        done = mock.Mock(returncode=returncode, stdout=json.dumps({"result": {"records": [{"Id": org_id}]}}))
+        with mock.patch.object(dashboard.subprocess, "run", return_value=done), \
+                mock.patch.dict(dashboard.os.environ, {"SURFACE_SF_EXPECTED_ORG_ID": "00D000000000001AAA"}), \
+                mock.patch.object(dashboard, "set_session_status"), mock.patch.object(dashboard, "vm_mode", return_value=False):
+            return dashboard.probe_salesforce_readiness()
+
+    def test_a_ready_session_wakes_the_job(self):
+        self.probe(0, "00D000000000001AAA")
+        self.assertTrue(dashboard.AUTO_SCAN_WAKE.is_set())
+
+    def test_a_failed_or_wrong_org_session_does_not(self):
+        self.probe(1, None)
+        self.probe(0, "00D000000000002AAA")
+        self.assertFalse(dashboard.AUTO_SCAN_WAKE.is_set())
+
+    def test_never_on_the_vm(self):
+        with mock.patch.object(dashboard, "vm_mode", return_value=True):
+            dashboard.request_auto_scan()
+        self.assertFalse(dashboard.AUTO_SCAN_WAKE.is_set())
+
+    def test_the_loop_ticks_again_when_woken_and_stops_on_request(self):
+        from threading import Event
+        stop, ticks = Event(), []
+
+        def tick():
+            ticks.append(1)
+            if len(ticks) == 1:
+                dashboard.AUTO_SCAN_WAKE.set()  # a sign-in during the first tick: no 10-minute wait
+            else:
+                stop.set()
+                dashboard.AUTO_SCAN_WAKE.set()
+        with mock.patch.object(dashboard, "_auto_scan_tick", tick):
+            dashboard._auto_scan_loop(stop)
+        self.assertEqual(len(ticks), 2)
 
 
 class OnboardedSummaryTests(base.Base):

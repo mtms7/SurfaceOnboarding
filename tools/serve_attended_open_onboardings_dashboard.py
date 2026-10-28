@@ -30,7 +30,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from time import monotonic, sleep
 from types import SimpleNamespace
 import webbrowser
@@ -445,6 +445,8 @@ def probe_salesforce_readiness() -> SessionStatus:
         status = readiness.classify_salesforce_probe(done.returncode, org_id,
                                                      os.environ.get("SURFACE_SF_EXPECTED_ORG_ID"), now)
     set_session_status("salesforce", status)
+    if status.state is SessionState.READY:
+        request_auto_scan()
     return status
 
 
@@ -1187,11 +1189,15 @@ _display_cache_lock = Lock()
 DISPLAY_CACHE_MAX_ENTRIES = 512
 # Reads whose LAST argument is a data stamp: a new stamp supersedes (drops) the older entries of the same other arguments.
 _STAMPED_READS = frozenset({"production_match_display"})
+# The verified clone is reused only while a display GET renders (owner request 2026-10-28); creates and writes re-verify.
+inventory.MEMO_WHEN = _display_reads.get
 
 
 def _evict_display_cache(now: float, key: tuple[object, ...]) -> None:
-    """Bound the cache (caller holds the lock): drop expired entries, superseded stamps, then the oldest over the cap."""
-    for old in [k for k, entry in _display_cache.items() if entry[0] <= now and entry[2].done()]:
+    """Bound the cache (caller holds the lock): drop entries too old to serve stale, superseded stamps, then the oldest over
+    the cap."""
+    keep = DISPLAY_STALE_MAX_SECONDS - DISPLAY_READ_TTL_SECONDS
+    for old in [k for k, entry in _display_cache.items() if entry[0] + keep <= now and entry[2].done()]:
         del _display_cache[old]
     if key and key[0] in _STAMPED_READS:
         for old in [k for k in _display_cache if k[0] == key[0] and k[:-1] == key[:-1] and k != key]:
@@ -1204,16 +1210,98 @@ def _evict_display_cache(now: float, key: tuple[object, ...]) -> None:
 _display_prefetch_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="display-read")
 
 
+# Stale-while-revalidate (owner request 2026-10-28, page speed): an expired entry younger than this is still served at
+# once while ONE background read replaces it. A clear (POST, Refresh, a write) removes entries, so it never serves them.
+DISPLAY_STALE_MAX_SECONDS = 1800.0
+_display_generation = 0  # bumped by every clear: a background read started before a clear never stores its result
+_display_refreshing: set[tuple[object, ...]] = set()
+
+
 def clear_display_cache() -> None:
+    global _display_generation
     with _display_cache_lock:
         _display_cache.clear()
+        _display_generation += 1
+    DISPLAY_WARM_WAKE.set()  # re-warm the queue soon, so the next page does not wait on the CLI
+
+
+_QUEUE_WIDE_READS = frozenset({"queue_source_rows", "queue_start_dates", "closed_history"})
+_POSTS_KEEPING_DISPLAY_CACHE = frozenset({"/login/start", "/login/cancel", "/logout", "/attended/prepare-sessions",
+                                          "/attended/session-recheck", "/attended/salesforce-login"})
+
+
+def clear_display_cache_for(reference: str) -> None:
+    """Drop only what a write to ONE CO can change: its own cached reads and the queue-wide lists (owner request
+    2026-10-28: a whole-cache clear made every other CO page cold). A background read in flight never stores."""
+    global _display_generation
+    with _display_cache_lock:
+        for key in [k for k in _display_cache if reference in k[1:] or k[0] in _QUEUE_WIDE_READS]:
+            del _display_cache[key]
+        _display_generation += 1
+    DISPLAY_WARM_WAKE.set()
+
+
+DISPLAY_WARM_WAKE = Event()
+
+
+def _store_display_value(key: tuple[object, ...], value: Any, generation: int) -> None:
+    """Store a finished background read, unless a clear happened since it started."""
+    future: Future = Future()
+    future.set_result(value)
+    with _display_cache_lock:
+        if generation == _display_generation:
+            now = monotonic()
+            _display_cache[key] = (now + DISPLAY_READ_TTL_SECONDS, datetime.now().timestamp(), future)
+            _evict_display_cache(now, key)
+
+
+def _refresh_display_in_background(fn: Any, args: tuple[Any, ...], key: tuple[object, ...]) -> None:
+    """One background re-read of ``key`` at a time (caller holds the lock and has added it to _display_refreshing)."""
+    generation = _display_generation
+
+    def task() -> None:
+        token = _display_reads.set(True)
+        try:
+            _store_display_value(key, fn(*args), generation)
+        except Exception:  # noqa: BLE001 - the stale value stays until it is too old; then a page reads itself
+            pass
+        finally:
+            _display_reads.reset(token)
+            with _display_cache_lock:
+                _display_refreshing.discard(key)
+    _display_prefetch_pool.submit(task)
+
+
+def warm_display_read(fn: Any, *args: Any, margin: float = 90.0) -> None:
+    """Background warm-up: re-read a cached display value that is missing or expires within ``margin`` seconds."""
+    key = (fn.__name__, *args)
+    with _display_cache_lock:
+        entry = _display_cache.get(key)
+        if key in _display_refreshing:
+            return
+        fresh = (entry is not None and entry[2].done() and entry[2].exception() is None
+                 and entry[0] - monotonic() > margin)
+        if fresh:
+            return
+        _display_refreshing.add(key)
+        generation = _display_generation
+    token = _display_reads.set(True)
+    try:
+        _store_display_value(key, fn.__wrapped__(*args), generation)
+    except Exception:  # noqa: BLE001 - a page that needs it reads it itself
+        pass
+    finally:
+        _display_reads.reset(token)
+        with _display_cache_lock:
+            _display_refreshing.discard(key)
 
 
 def _display_cached(fn: Any) -> Any:
     """Cache fn(*args) for display GETs; outside a display GET, call fn directly.
 
     Concurrent callers share one in-flight read. A failed read is not cached.
-    Callers get a deep copy, so a page cannot change a cached value.
+    Callers get a deep copy, so a page cannot change a cached value. An expired
+    value under DISPLAY_STALE_MAX_SECONDS is served while it is re-read in the background.
     """
     @functools.wraps(fn)
     def wrapper(*args: Any) -> Any:
@@ -1221,10 +1309,22 @@ def _display_cached(fn: Any) -> Any:
             return fn(*args)
         key = (fn.__name__, *args)
         now = monotonic()
+        keep = DISPLAY_STALE_MAX_SECONDS - DISPLAY_READ_TTL_SECONDS
+
+        def servable(item: Any) -> bool:
+            return item is not None and item[2].done() and item[2].exception() is None and now - item[0] < keep
+
         with _display_cache_lock:
-            entry = _display_cache.get(key)
-            stale = (entry is None or entry[0] <= now
-                     or (entry[2].done() and entry[2].exception() is not None))
+            entry = _display_cache.get(key)  # a new data stamp is a new key: a match is never replayed over a newer clone
+            usable_stale = entry is not None and entry[0] <= now and servable(entry)
+            if usable_stale:
+                if key not in _display_refreshing:
+                    _display_refreshing.add(key)
+                    _refresh_display_in_background(fn, args, key)
+                stale = False
+            else:
+                stale = (entry is None or entry[0] <= now
+                         or (entry[2].done() and entry[2].exception() is not None))
             if stale:
                 entry = (now + DISPLAY_READ_TTL_SECONDS, datetime.now().timestamp(), Future())
                 _display_cache[key] = entry
@@ -3022,6 +3122,9 @@ def classify_queue_row(row: dict[str, str | None], record: dict[str, str] | None
                                 "<span class='sub'>Leonardo scan completed</span>"), "you"
         if stage in ("New", "Request Approved"):
             return "scanning", "<b>Update Salesforce</b><span class='sub'>IDs and stage → Account Scanning</span>", "you"
+        if stage in ("Scan Completed Successfully", "User Created") and route_for(row) == CE_ENGINE:
+            # CE-only creates no user; the stage passes through User Created automatically (owner decision 2026-10-28)
+            return "scanning", "<span class='wait'>Moves automatically</span><span class='sub'>CE-only: no user</span>", "runner"
         if stage == "Scan Completed Successfully":
             return "scanning", "<b>Create customer user</b>", "you"
         if stage == "User Created":
@@ -6507,6 +6610,30 @@ def _plain(value: Any) -> Any:
     return str(value)
 
 
+@_display_cached
+def production_review_inputs_display(reference: str, product: str | None, kind: str | None) -> dict[str, Any]:
+    """The summary's source values as a cached display read (owner request 2026-10-28: they were re-read on every CO page
+    visit). The approval POST runs outside a display GET, so it always reads fresh and a changed CO fails as changed."""
+    return production_review_inputs(reference, product, kind)
+
+
+def prefetch_onboard_page(reference: str) -> None:
+    """Start the CO page's display reads together (they ran one after another): row, preflight, values, match, country."""
+    queued = next((r for r in peek_display_cache("queue_source_rows") or [] if r.get("Name") == reference), None)
+    prefetch_display_read(detail_row, reference)
+    if queued is None:
+        return
+    route, product, kind = route_for(queued), queued.get("Onboarding_Product__c"), queued.get("Onboarding_Type__c")
+    if route == CE_ENGINE:
+        prefetch_display_read(evaluate_ce_only_fill_preflight, reference)
+        prefetch_display_read(_read_sheet_country, reference)
+    elif route in SURFACE_ROUTES:
+        prefetch_display_read(evaluate_surface_fill_preflight, reference, route)
+    if route == CE_ENGINE or route in SURFACE_ROUTES:
+        prefetch_display_read(production_review_inputs_display, reference, product, kind)
+    prefetch_display_read(production_match_display, reference, product or "", kind or "", _match_stamp())
+
+
 def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """(summary, extras) for one CO. The summary is exactly what the operator approves (it is hashed).
 
@@ -6539,7 +6666,7 @@ def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]
     if isinstance(scope, dict):
         summary["values"]["scope"] = _plain(scope)
     try:
-        inputs = production_review_inputs(reference, product, kind)
+        inputs = production_review_inputs_display(reference, product, kind)
     except Exception:  # noqa: BLE001 - any failure to read the values blocks approval
         blockers.append("summary_source_unreadable")
     else:
@@ -7096,6 +7223,27 @@ def _prod_days_cell(start: str | None, today: date, sf_status: str | None, done:
     return days + "<span class='sub'>" + approval + "</span>" + (_chip("chip-ok", "Next up") if next_up and approved else "")
 
 
+_STAGE_CHIP_CSS = {"New": "chip-neutral", "Request Approved": "chip-neutral", "Account Scanning": "chip-warn",
+                   "Scan Completed Successfully": "chip-warn", "User Created": "chip-warn", "Onboarding Completed": "chip-ok"}
+# A UUID in Salesforce plus a stage past approval: onboarded, also when the tenant was created by hand (Case 3 today).
+_ONBOARDED_STAGES = _TENANT_STAGES | {"Onboarding Completed"}
+
+
+def _prod_status_cell(stage: str | None) -> str:
+    """The Salesforce Onboarding Stage as the CO's status (owner request 2026-10-28); Onboarding Completed reads Onboarded."""
+    if stage not in ONBOARDING_STAGES:
+        return _chip("chip-warn", stage) if stage else "<span class='muted'>—</span>"
+    label = "Onboarded" if stage == "Onboarding Completed" else stage
+    step = str(ONBOARDING_STAGES.index(stage) + 1) + " of " + str(len(ONBOARDING_STAGES))
+    return _chip(_STAGE_CHIP_CSS[stage], label) + "<span class='sub'>" + escape(step) + "</span>"
+
+
+def hand_entered_onboarded(check: dict[str, Any] | None, stage: str | None) -> bool:
+    """Pure: the CO holds an Account UUID (the clone check is UUID-based) and Salesforce is past approval, so it is
+    onboarded even with no create recorded here (a Case 3 tenant created by hand, e.g. CO-0824). Never a duplicate."""
+    return bool(check and check["code"] in ("onboarded", "uuid_not_in_clone")) and stage in _ONBOARDED_STAGES
+
+
 def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> str:
     """The production landing (``/`` and ``/onboard``): every open CO with its production checks, approval and create state.
 
@@ -7127,9 +7275,12 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         check = production_views.production_check(_match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
         approval = production_views.pick_approval(approvals, ref)
         create = production_views.create_state(records, ref, locked=locked and not vm_mode())  # the header chip already says the VM cannot create
-        created = create["code"] in production_views.CREATED_OUTCOMES or bool(check and check["code"] == "onboarded")
+        hand_entered = hand_entered_onboarded(check, row.get("Onboarding_Stage__c"))
+        created = (create["code"] in production_views.CREATED_OUTCOMES or bool(check and check["code"] == "onboarded")
+                   or hand_entered)
         items.append({"row": row, "ref": ref, "supported": supported, "check": check, "approval": approval, "create": create,
-                      "flags": {"blocked": supported and bool(check and check["blocked"]),
+                      "hand_entered": hand_entered,
+                      "flags": {"blocked": supported and bool(check and check["blocked"]) and not hand_entered,
                                 "ready": supported and bool(check) and not check["blocked"] and not created,
                                 "approved": supported and approval["state"] == "valid", "created": created}})
     flt = flt if flt in {key for key, _label in PROD_FILTERS} else ""
@@ -7176,7 +7327,8 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
 
     head = ("<thead><tr>" + header("start", "Start") + "<th scope='col'>Days to start<span class='sub'>Salesforce approval</span></th>"
             + header("co", "Onboarding", "stick") + "<th scope='col'>Account</th>"
-            "<th scope='col'>Product</th><th scope='col'>Production checks</th>"
+            "<th scope='col'>Product</th><th scope='col'>Status<span class='sub'>Salesforce stage</span></th>"
+            "<th scope='col'>Production checks</th>"
             "<th scope='col'>Approval<span class='sub'>create · 7 days</span></th><th scope='col'>Create</th>"
             + header("age", "Age", "num") + "</tr></thead>")
     def _eligible(item: dict[str, Any]) -> bool:
@@ -7200,8 +7352,14 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                 if onboarded is not None:  # recorded evidence beats "Clear": the nightly clone cannot hold today's create
                     created_here = True
                     checks = _chip(onboarded["css"], onboarded["label"]) + "<span class='sub'>" + escape(onboarded["text"]) + "</span>"
+            if not created_here and item["hand_entered"] and check["code"] == "uuid_not_in_clone":
+                checks = (_chip("chip-ok", "Onboarded (UUID in Salesforce)") + "<span class='sub'>Account UUID set in Salesforce, "
+                          "stage " + escape(str(row.get("Onboarding_Stage__c"))) + "; the tenant is not in the clone yet (the "
+                          "clone may be older than the create). Do not create another.</span>")
             approval_cell = _create_approval_chip(item["approval"])
-            create_cell = _chip(item["create"]["css"], item["create"]["label"])
+            create_cell = (_chip("chip-neutral", "Created by hand") if item["hand_entered"] and not created_here
+                           and item["create"]["code"] not in production_views.CREATED_OUTCOMES
+                           else _chip(item["create"]["css"], item["create"]["label"]))
             onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
         else:  # no automated create route: the clone validation still shows, so the list says what is next for every CO
             checks = (_chip(check["css"], check["label"]) + "<span class='sub'>No automated route · Exact Product and Type pair not "
@@ -7210,15 +7368,16 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                                                                                  ("onboarded", "tenant_found")) else "") + "</span>")
             approval_cell = create_cell = "<span class='muted'>—</span>"
             onboarding = "<span class='co'>" + escape(ref) + "</span>"
+        done = created_here or bool(check and check["code"] == "onboarded") or item["hand_entered"]
         body += ("<tr" + ("" if item["supported"] else " class='locked'") + "><td class='c-start'>"
-                 + ("<span class='muted'>done</span>" if created_here or (check and check["code"] == "onboarded")
+                 + ("<span class='muted'>done</span>" if done
                     else _prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='c-days'>"
-                 + _prod_days_cell(start, today, row.get("Onboarding_Approval_Status__c"),
-                                   created_here or bool(check and check["code"] == "onboarded"), ref == next_ref)
+                 + _prod_days_cell(start, today, row.get("Onboarding_Approval_Status__c"), done, ref == next_ref)
                  + "</td><td class='stick'>"
                  + onboarding + "</td><td>" + escape(str(row.get("Account__r.Name") or "Account unavailable")) + "</td><td>"
                  + escape(_PRODUCT_SHORT.get(product or "", product or "—")) + "<span class='sub'>"
-                 + escape(_TYPE_SHORT.get(kind or "", kind or "—")) + "</span></td><td>" + checks + "</td><td>" + approval_cell
+                 + escape(_TYPE_SHORT.get(kind or "", kind or "—")) + "</span></td><td>"
+                 + _prod_status_cell(row.get("Onboarding_Stage__c")) + "</td><td>" + checks + "</td><td>" + approval_cell
                  + "</td><td>" + create_cell + "</td><td class='num'>" + _age_days(row.get("Submission_Date__c"), today) + "</td></tr>")
     if ordered:
         table = "<div class='tbl-wrap'><table class='dense'>" + head + "<tbody>" + body + "</tbody></table></div>"
@@ -7927,6 +8086,8 @@ def _salesforce_ready_for_create() -> bool:
             return True
         if status.state is not SessionState.READY:
             return False
+        if _display_reads.get():
+            return True  # a page shows the last READY; the create POST (never a display read) re-probes (2026-10-28, speed)
         return probe_salesforce_readiness().state is SessionState.READY
     except Exception:  # noqa: BLE001 - fail closed
         return False
@@ -8066,7 +8227,7 @@ def _follow_production_create(reference: str, process: Any) -> None:
         inputs = _create_ui_inputs(reference, None)
         def run_and_forget_cached_reads(argv: list[str]) -> bool:
             ok = _run_sf_argv(argv)
-            clear_display_cache()  # a page polled mid-run must not keep the pre-write Salesforce row (CO-0812 stale banner)
+            clear_display_cache_for(reference)  # a page polled mid-run must not keep the pre-write row (CO-0812 stale banner)
             return ok
 
         follow = create_ui.after_verified_create(inputs, lambda: _read_production_writeback_row(reference),
@@ -8076,7 +8237,7 @@ def _follow_production_create(reference: str, process: Any) -> None:
     with _PRODUCTION_RUNS_LOCK:
         if reference in PRODUCTION_RUNS:
             PRODUCTION_RUNS[reference]["follow"] = follow
-    clear_display_cache()  # the Salesforce row and checks shown on the page must be re-read after the writes (CO-0811 stale banner)
+    clear_display_cache_for(reference)  # the row and checks shown must be re-read after the writes (CO-0811 stale banner)
 
 
 def _production_run_progress(reference: str) -> dict[str, Any] | None:
@@ -8279,7 +8440,17 @@ def _production_dry_run_html(reference: str, row: dict[str, str | None] | None) 
 
 _STAGE_MOVE_LOCK = Lock()  # one CE stage move at a time: the BackOffice check's follow-up and the background job
 AUTO_SCAN_INTERVAL_SECONDS = 600  # the clone is a nightly snapshot read hourly: a 10 minute look is plenty
-AUTO_SCAN_STATE: dict[str, dict[str, str]] = {}  # per CO, the last automatic clone check: {"scan", "at"}
+AUTO_SCAN_STATE: dict[str, dict[str, Any]] = {}  # per CO, the last automatic clone check: {"scan", "at", "hold_until"?}
+AUTO_SCAN_HOLD_SECONDS = 24 * 3600  # a CO whose stage was moved by hand is not re-read every interval
+# Owner request 2026-10-28: also check at once when the owner signs in (the Salesforce session turns Ready after Prepare
+# sessions, Re-check or a finished CLI sign-in); the clone is slow, so this saves waiting for the next interval.
+AUTO_SCAN_WAKE = Event()
+
+
+def request_auto_scan() -> None:
+    """Wake the background job now (desktop only; it still checks every guard)."""
+    if not vm_mode():
+        AUTO_SCAN_WAKE.set()
 
 
 def _clone_payload_for_job() -> dict[str, Any]:
@@ -8292,33 +8463,121 @@ def _auto_scan_tick() -> None:
     if vm_mode():
         return
     parent = production_records_parent()
-    for reference in create_ui.auto_scan_candidates(parent):
+    candidates = [ref for ref in create_ui.auto_scan_candidates(parent)
+                  if float((AUTO_SCAN_STATE.get(ref) or {}).get("hold_until") or 0) <= datetime.now(timezone.utc).timestamp()]
+    if not candidates:
+        return
+    payload: Any = None
+    loaded = False
+
+    def clone_once() -> Any:  # one verified clone load per pass (it was two per CO, holding the CPU from page threads)
+        nonlocal payload, loaded
+        if not loaded:
+            loaded = True
+            payload = _clone_payload_for_job()
+        return payload
+
+    for reference in candidates:
         with _PRODUCTION_RUNS_LOCK:
             if (PRODUCTION_SCAN_RUNS.get(reference) or {}).get("running"):
                 continue  # the owner's BackOffice check is running for this CO
+        stages: list[Any] = []
         try:
             with _STAGE_MOVE_LOCK:
                 result = create_ui.auto_scan_finish(
-                    _create_ui_inputs(reference, None), _clone_payload_for_job,
+                    _create_ui_inputs(reference, None), clone_once,
                     lambda ref=reference: _read_production_writeback_row(ref), _run_sf_argv, create_ui.PINNED_SF_ALIAS)
             scan = str(result["scan"])
+            stages = list(result.get("stages") or [])
         except Exception:  # noqa: BLE001 - recorded, never raised in the worker
             scan = "follow_up_failed"
-        AUTO_SCAN_STATE[reference] = {"scan": scan, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if "written_verified" in stages:
+            clear_display_cache_for(reference)  # the page must show the moved stage
+        state: dict[str, Any] = {"scan": scan, "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        if "stage_not_expected" in stages:  # moved by hand (e.g. already Onboarding Completed): look again in a day
+            state["hold_until"] = datetime.now(timezone.utc).timestamp() + AUTO_SCAN_HOLD_SECONDS
+        AUTO_SCAN_STATE[reference] = state
 
 
 def _auto_scan_loop(stop: Any = None) -> None:
-    """Daemon loop: a tick every ``AUTO_SCAN_INTERVAL_SECONDS`` until the process ends."""
-    from threading import Event
-
-    wait = (stop or Event()).wait
+    """Daemon loop: a tick every ``AUTO_SCAN_INTERVAL_SECONDS``, or at once after ``request_auto_scan``, until ``stop``."""
     while True:
         try:
             _auto_scan_tick()
         except Exception:  # noqa: BLE001 - the loop never dies
             pass
-        if wait(AUTO_SCAN_INTERVAL_SECONDS):
+        AUTO_SCAN_WAKE.wait(AUTO_SCAN_INTERVAL_SECONDS)
+        AUTO_SCAN_WAKE.clear()
+        if stop is not None and stop.is_set():
             return
+
+
+# --- Display warm-up (owner request 2026-10-28, page speed) ---------------------------------------------------------------
+# A cold queue cost ~77 s (about 3 CLI reads per CO at ~5 s each). This thread re-reads the queue, the start dates, each
+# CO's row and each CO's production match in the background, so pages are served from the display cache. Display reads
+# only: nothing here writes, opens a browser, or feeds a create (creates and writes always read fresh themselves).
+DISPLAY_WARM_INTERVAL_SECONDS = 600
+DISPLAY_WARM_SETTLE_SECONDS = 5  # after a clear, wait a moment so a burst of POSTs warms once
+DISPLAY_WARM_STAMP_POLL_SECONDS = 30.0
+_display_warm_pool = ThreadPoolExecutor(max_workers=3, thread_name_prefix="display-warm")
+
+
+def _display_warm_tick() -> int:
+    """One warm-up pass; returns the number of COs warmed. Never raises."""
+    if vm_mode():
+        return 0
+    warm_display_read(queue_source_rows)
+    rows = peek_display_cache("queue_source_rows")
+    if not isinstance(rows, list):
+        return 0
+    rows = [row for row in rows if isinstance(row, dict) and REFERENCE.fullmatch(str(row.get("Name") or ""))]
+    warm_display_read(queue_start_dates, tuple(str(row["Name"]) for row in rows))
+    stamp = _match_stamp()
+    jobs = []
+    for row in rows:
+        ref = str(row["Name"])
+        jobs.append(_display_warm_pool.submit(warm_display_read, production_match_display, ref,
+                                              row.get("Onboarding_Product__c") or "", row.get("Onboarding_Type__c") or "", stamp))
+        jobs.append(_display_warm_pool.submit(warm_display_read, detail_row, ref))
+    for job in jobs:
+        try:
+            job.result(timeout=600)
+        except Exception:  # noqa: BLE001
+            pass
+    return len(rows)
+
+
+def _display_warm_loop(stop: Any = None) -> None:
+    """Daemon loop: warm at start, every DISPLAY_WARM_INTERVAL_SECONDS, and soon after a cache clear."""
+    halt = stop or Event()
+    while True:
+        try:
+            _display_warm_tick()
+        except Exception:  # noqa: BLE001 - the loop never dies
+            pass
+        _wait_for_warm_reason(halt)
+        DISPLAY_WARM_WAKE.clear()
+        if halt.wait(DISPLAY_WARM_SETTLE_SECONDS):
+            return
+
+
+def _wait_for_warm_reason(halt: Any) -> None:
+    """Until the interval ends, a cache clear wakes the loop, or a new clone / record changes the match stamp (checked every
+    DISPLAY_WARM_STAMP_POLL_SECONDS; a new stamp is a cache miss for every match, so it is re-read before a page needs it)."""
+    try:
+        stamp = _match_stamp()
+    except Exception:  # noqa: BLE001
+        stamp = ""
+    waited = 0.0
+    while waited < DISPLAY_WARM_INTERVAL_SECONDS and not halt.is_set():
+        if DISPLAY_WARM_WAKE.wait(DISPLAY_WARM_STAMP_POLL_SECONDS):
+            return
+        waited += DISPLAY_WARM_STAMP_POLL_SECONDS
+        try:
+            if _match_stamp() != stamp:
+                return
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # Build 3: the owner's read-only CE scan checks started by THIS dashboard process: {"running": bool, "stages": list | None}.
@@ -9187,6 +9446,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.OK, page_ce_only_runner_status(state, ref)); return
             review = re.fullmatch(r"/onboard/(CO-[0-9]{4,10})", path)
             if review:
+                prefetch_onboard_page(review.group(1))
                 review_summary, review_extras = build_review_summary(review.group(1))
                 try:
                     review_row: dict[str, str | None] | None = detail_row(review.group(1))
@@ -9495,9 +9755,11 @@ class Handler(BaseHTTPRequestHandler):
         self.send_redirect("/co/" + reference + "?env=prod")  # the create card shows the recorded result
 
     def do_POST(self) -> None:
-        # Any action may change Salesforce or local state; later pages read fresh.
-        clear_display_cache()
+        # Any action may change Salesforce or local state; later pages read fresh. Sign-in and session checks change no CO
+        # data, so they keep the cache (owner request 2026-10-28: every Re-check made all pages cold).
         path = urlsplit(self.path).path
+        if path not in _POSTS_KEEPING_DISPLAY_CACHE:
+            clear_display_cache()
         if vm_mode():
             email, role = self._vm_identity()
             if email is None or role is None:
@@ -9977,12 +10239,18 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     listener_host, listener_port = listener_address()
     print(f"attended_open_onboardings_dashboard_listening_on_{listener_host}:{listener_port}")
+    # Every `sf` call (this process and the runner children) skips the CLI's update check, telemetry and log file
+    # (owner request 2026-10-28, page speed; the VM refresh already does this). An explicit value is kept.
+    for _name in ("SF_SKIP_NEW_VERSION_CHECK", "SF_AUTOUPDATE_DISABLE", "SFDX_AUTOUPDATE_DISABLE", "SF_DISABLE_TELEMETRY",
+                  "SF_DISABLE_LOG_FILE"):
+        os.environ.setdefault(_name, "true")
     _timing_handler = logging.StreamHandler(sys.stderr)
     _timing_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     _timing_logger.addHandler(_timing_handler)
     _timing_logger.setLevel(logging.INFO)
     if not vm_mode():
         Thread(target=_auto_scan_loop, name="auto-scan", daemon=True).start()
+        Thread(target=_display_warm_loop, name="display-warm", daemon=True).start()
         if clone_autorefresh.enabled(vm=vm_mode()):
             Thread(target=clone_autorefresh.run_loop, name="clone-autorefresh", daemon=True).start()
     _server = ThreadingHTTPServer((listener_host, listener_port), Handler)  # a second process dies here, before it can poll

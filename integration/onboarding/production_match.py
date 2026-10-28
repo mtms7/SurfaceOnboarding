@@ -253,6 +253,16 @@ def _result(status: str, reason: str = "", **extra: Any) -> dict[str, Any]:
             "captured_at": None, "age_seconds": None, "tenants_checked": 0, **extra}
 
 
+def _uuid_not_in_clone(candidates: list[dict[str, Any]], base: Mapping[str, Any]) -> dict[str, Any]:
+    """The CO holds an Account UUID no clone tenant carries yet (the clone lags the create). Name or domain matches that are
+    only trial, evaluation, POV, disabled or deleted tenants are listed but do not turn it into "Other tenants only" (owner
+    request 2026-10-28, CO-0824 / CO-0813); a live paid match is never handled here (it stays a duplicate). Still blocks."""
+    reason = "UUID set but tenant not found in clone (the clone may be older than the create)."
+    if candidates:
+        reason += " Other non-live tenants match by name or domain."
+    return _result("uuid_not_in_clone", reason, candidates=[_summary(tenant) for tenant in candidates][:MAX_LISTED], **base)
+
+
 def identity_match(identity: Mapping[str, Any] | None, snapshot: Mapping[str, Any] | str | None, *,
                    renewal: bool) -> dict[str, Any]:
     """The clone check for a CO whose plan cannot be built (renewals, Surface + CE New, anything but CE-only New).
@@ -298,9 +308,8 @@ def identity_match(identity: Mapping[str, Any] | None, snapshot: Mapping[str, An
                       "warnings": []}
             return _result("onboarded", review["line"], candidates=[_summary(owner[0])], target=_summary(owner[0]), review=review,
                            **base)
-        if not candidates:
-            return _result("uuid_not_in_clone", "UUID set but tenant not found in clone (the clone may be older than the create).",
-                           **base)
+        if not any(is_live_paid_tenant(tenant) for tenant in candidates):
+            return _uuid_not_in_clone(candidates, base)
     if not candidates:
         if renewal:
             return _result("tenant_missing", "No tenant with this name or domain in the clone: a renewal expects its tenant "
@@ -361,9 +370,8 @@ def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any
                                      names=names)
             return _result("onboarded", review["line"], fields=compare_fields(owned[0], plan, names), candidates=[_summary(owned[0])],
                            target=_summary(owned[0]), review=review, **base)
-        if not candidates:
-            return _result("uuid_not_in_clone", "UUID set but tenant not found in clone (the clone may be older than the create).",
-                           **base)
+        if not any(is_live_paid_tenant(tenant) for tenant in candidates):
+            return _uuid_not_in_clone(candidates, base)
     if not candidates:
         return _result("not_in_production", NOT_A_CLEARANCE, **base)
     listed = [_summary(tenant) for tenant in candidates]
