@@ -165,3 +165,44 @@ Rollback: same script with `rollback`.
 
 Log: %LOCALAPPDATA%/SurfaceOnboarding/clone-push/clone-push.log, expect `records_push ssh_exit=0 result=ingested-records snapshot-...`.
 The VM Approval column should now say Used / None / Valid to MM-DD instead of "Unavailable on this server", and the onboarded line should read "Account UUID written and read back". CO-0813 and the other "Not checked" COs need one VM Salesforce refresh after r39 (every 10 minutes).
+
+
+# Deploy release r41 to the VM (supersedes r40: parity part 2, review fixes, VM-started run) and switch things on, 2026-10-28
+
+Pentera VPN on. The `workato` and `sudo` passwords are typed in your own window (or in the Terminal-panel tabs Claude starts), never pasted to Claude.
+Archive: surface-onboarding-r41-5e6984c.tar.gz, SHA-256 0CE99BC9888355B89A415E4201FD12D9DDAAFFB8DF0CEB959C96D9A8519B5018 (477 files, LF, checker passed).
+The VM runs r39 now (r40 was never sent). Stage first (activates nothing); activate only with the owner's separate go. Rollback goes back to r39.
+
+## Step B (PC tab): upload four files
+
+    ssh workato@172.26.37.20 "mkdir -p /tmp/r41-upload"
+    scp "C:/Users/Milton Stevenson/.surface-onboarding/releases/surface-onboarding-r41-5e6984c.tar.gz" "C:/Users/Milton Stevenson/.surface-onboarding/releases/surface-onboarding-r41-5e6984c.tar.gz.sha256" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step31a_vm_stage_r41.sh" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step31b_vm_activate_r41.sh" workato@172.26.37.20:/tmp/r41-upload/
+
+## Step C (runs on the VM): stage
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r41-upload/_step31a_vm_stage_r41.sh"
+
+## Step D (ONLY after the owner's go): activate
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r41-upload/_step31b_vm_activate_r41.sh"
+
+Rollback: same script with `rollback`.
+
+## Step E (PC tab): push records, approvals copy and write logs now, then reload both pages (Ctrl+F5)
+
+    powershell -Command "Start-ScheduledTask -TaskName SurfaceOnboarding-CloneToVm"
+
+Expect in %LOCALAPPDATA%/SurfaceOnboarding/clone-push/clone-push.log: `records_push ssh_exit=0 result=ingested-records snapshot-...`.
+The VM page then shows Approval Used/None and "Account UUID written and read back" like the PC page.
+
+## Optional, each with its own go (upload each script to /tmp first with scp, as in step B)
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/_step28b_vm_sf_refresh_cadence.sh 30"          # refresh every 30 minutes instead of 10
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/_step28c_vm_hide_sf_session_from_dashboard.sh install"   # hide the Salesforce session from the dashboard unit
+
+## VM-started onboarding run (docs/62), only after step D and with your go for each line
+
+1. VM switch ON (the ONE owner e-mail): `ssh -t workato@172.26.37.20 "sudo sh /tmp/_step28d_vm_remote_start_switch.sh on milton.stevenson@pentera.io"`
+2. PC dashboard restart with the switch (SSO sign-in again afterwards): `powershell -File tools/start_attended_dashboard.ps1 -Restart -ProductionSessions -RemoteStart -PythonPath .venv-renewal-playwright/Scripts/python.exe`
+3. On the VM page, open an Approved CE-only or Case 3 CO and click "Start onboarding on my PC". Within about 20 seconds your PC opens a NEW Chrome window: sign in with SSO and MFA there (a fresh profile every time). The PC dashboard CO page shows the progress.
+4. Switch OFF any time: `... _step28d_vm_remote_start_switch.sh off` and restart the PC dashboard without `-RemoteStart`.
