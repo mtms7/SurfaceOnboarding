@@ -63,3 +63,76 @@ Expect: GET / 200, POST / 403 or 405, direct dashboard without secret 4xx. Rollb
 2. Open https://localhost:8443/ (the VM), open a production CO page, find the card "Production readiness".
 3. Click "Open this CO on my PC": the PC dashboard CO page opens (http://127.0.0.1:8012/onboard/CO-xxxx).
 4. A real create is a separate owner go per CO.
+
+
+# VM refreshes its own Salesforce data from YOUR attended sign-in (owner decision 2026-10-27), PC tab
+
+Pentera VPN on. Passwords (workato, then sudo) are typed in your own window, never pasted to Claude. No new release is needed: the
+refresher, the unit templates and the Salesforce CLI are already on the VM (r38 active). Port 1717 on the PC must be free while you sign in.
+
+## Step 1 (PC): upload the installer (asks the password per command)
+
+    scp "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step28a_vm_install_sf_login_and_refresh.sh" workato@172.26.37.20:/tmp/
+
+## Step 2 (runs on the VM): install the login program, the logout program, the refresh timer and the approval marker
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/_step28a_vm_install_sf_login_and_refresh.sh install https://pentera.my.salesforce.com"
+
+Expect: "ok", the five listed files, "enabled" and "active" for the timer. Undo everything: same script with `revert`.
+
+## Step 3: sign in (do this after every VM reboot; the session lives only in the VM's memory)
+
+    ssh -t -L 1717:127.0.0.1:1717 workato@172.26.37.20 "sudo /usr/local/sbin/surface-sf-login"
+
+1. Keep this window open. It prints a long https://... URL.
+2. Open that URL in the Chrome where you are signed in to SSO; complete SSO and MFA there.
+3. The window then prints a status 0 line and starts one refresh. Browser message "localhost refused to connect" afterwards is normal.
+
+## Step 4: check
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/_step28a_vm_install_sf_login_and_refresh.sh status"
+
+Then open https://localhost:8443/ : the banner "Data as of ..." should show today's time and the queue the current COs.
+End the session on purpose: `ssh -t workato@172.26.37.20 "sudo /usr/local/sbin/surface-sf-logout"`.
+
+
+# VM Salesforce refresh cadence: every 30 minutes instead of 10 (owner decision 2026-10-27), PC tab
+
+Each refresh costs about 3 minutes of CPU, so 10 minutes keeps the VM busy a third of the time. Only the timer interval changes (a systemd drop-in).
+
+    scp "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step28b_vm_sf_refresh_cadence.sh" workato@172.26.37.20:/tmp/
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/_step28b_vm_sf_refresh_cadence.sh 30"
+
+Expect: "drop-in: OnUnitActiveSec=30min", timer enabled and active, next run listed. Undo: same script with `reset`. Look: `show`.
+
+
+# Deploy release r39 to the VM (VM page parity: identity check, create records, no dead Sign out), 2026-10-27
+
+Pentera VPN on. The `workato` and `sudo` passwords are typed in your own window, never pasted to Claude.
+Archive: surface-onboarding-r39-a910fb4.tar.gz, SHA-256 1DF9D05CA727F61DAA664876E0EA6BBF09B63D01A1D0D2E3F7D783F37F6495DF (466 files, LF, checker passed).
+The VM runs r38 now. Stage first (activates nothing), activate only with the owner's separate go. Rollback goes back to r38.
+
+## Step B (PC tab): upload four files
+
+    ssh workato@172.26.37.20 "mkdir -p /tmp/r39-upload"
+    scp "C:/Users/Milton Stevenson/.surface-onboarding/releases/surface-onboarding-r39-a910fb4.tar.gz" "C:/Users/Milton Stevenson/.surface-onboarding/releases/surface-onboarding-r39-a910fb4.tar.gz.sha256" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step29a_vm_stage_r39.sh" "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step29b_vm_activate_r39.sh" workato@172.26.37.20:/tmp/r39-upload/
+
+## Step C (runs on the VM): stage (checksum, unpack, CR check, full suite, guards; activates nothing)
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r39-upload/_step29a_vm_stage_r39.sh"
+
+## Step D (ONLY after the owner's go): activate
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r39-upload/_step29b_vm_activate_r39.sh"
+
+Expect GET / 200, POST / 403 or 405, direct dashboard 4xx. Rollback:
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/r39-upload/_step29b_vm_activate_r39.sh rollback"
+
+## Step E (PC tab): push the create records now instead of waiting for the hourly task, then compare
+
+    powershell -Command "Start-ScheduledTask -TaskName SurfaceOnboarding-CloneToVm"
+
+Check %LOCALAPPDATA%/SurfaceOnboarding/clone-push/clone-push.log: expect `records_push ssh_exit=0 result=ingested-records snapshot-...`.
+The next VM Salesforce refresh (every 10 minutes until the 30-minute cadence is applied) publishes the identity inputs.
+Then compare https://localhost:8443/ with http://127.0.0.1:8012/: CO-0813, CO-0806, CO-0757 get the same Clear / blocked chips, Created counts match, the Create column shows Verified. The Approval column stays "Unavailable on this server" on the VM by design.
