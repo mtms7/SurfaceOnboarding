@@ -427,6 +427,24 @@ class CliTransportTests(RefreshCase):
             seen["home_after"] = os.environ.get("HOME")
         return counts, seen, os.path.realpath(session)
 
+    def test_records_pushed_while_the_salesforce_reads_run_are_not_overwritten_by_the_refresh(self):
+        # Security review 2026-10-27: the refresher carried the files it read at the START, so a records push that landed during
+        # its minutes of Salesforce reads was overwritten at ingest (a consumed approval showed "valid" again).
+        def collect(extra_references=(), failed_countries=None):
+            payload = json.dumps({"records": {}, "logs": {}}).encode()
+            midrun = vs.build_bundle({vs.QUEUE_FILE: b'{"rows": []}', vs.PRODUCTION_RECORDS_FILE: payload}, KEY, "desktop",
+                                     SECOND - timedelta(minutes=1))
+            vs.ingest_bundle(midrun, KEY, self.state)
+            return ({vs.QUEUE_FILE: b'{"rows": [{"Name": "CO-0001"}]}',
+                     vs.CO_DETAILS_FILE: json.dumps({"details": {"CO-0001": detail("CO-0001", "new")}}).encode()},
+                    {"queue_rows": 1, "co_details": 1, "co_details_unavailable": 0})
+
+        before = vs.build_bundle({vs.QUEUE_FILE: b'{"rows": []}'}, KEY, "desktop", SECOND - timedelta(minutes=5))
+        vs.ingest_bundle(before, KEY, self.state)
+        self.run_cli(collect=collect)
+        names = {entry["name"] for entry in vs.read_current_manifest(vs.snapshots_root(self.state))["files"]}
+        self.assertIn(vs.PRODUCTION_RECORDS_FILE, names)
+
     def test_the_dashboards_own_cli_reads_run_with_the_whole_cli_home_in_memory_and_the_environment_is_restored(self):
         original = dashboard.sf_json
         counts, seen, session = self.run_cli()

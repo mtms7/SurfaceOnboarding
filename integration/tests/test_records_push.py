@@ -234,6 +234,59 @@ class IngestTests(Base):
             self.assertNotIn(secret, line)
 
 
+class ReviewFixTests(Base):
+    """Opus review 2026-10-27: a snapshot push must not wipe the records, no rollback or future stamps, no shrink, no real revision."""
+
+    def pushed_with_records(self):
+        self.current_snapshot()
+        self.write_record()
+        BuilderTests.write_approvals(self, APPROVAL)
+        self.assertEqual(self.push(self.build())[0], 0)
+
+    def test_a_full_snapshot_push_keeps_the_records_and_approvals_the_vm_already_holds(self):
+        self.pushed_with_records()
+        raw = vs.build_bundle(BASE_FILES, KEY, vs.SNAPSHOT_PUSH_PRODUCER, datetime.now(timezone.utc).replace(microsecond=0))
+        code, line = self.push(raw)
+        self.assertEqual(code, 0)
+        self.assertTrue(line.startswith("ingested-snapshot "))
+        current = vs.current_dir(vs.snapshots_root(self.state))
+        self.assertEqual(production_views.create_records_by_co(current, missing_is_unavailable=True)["state"], "ok")
+        self.assertIn("CO-0812", production_views.create_records_by_co(current, missing_is_unavailable=True)["by_co"])
+        self.assertEqual(production_views.list_approvals(current / "production_create_approvals.json", NOW,
+                                                         missing_is_unavailable=True)["state"], "ok")
+
+    def test_an_older_records_bundle_is_refused_as_a_replay(self):
+        self.pushed_with_records()
+        before = vs.current_name(vs.snapshots_root(self.state))
+        self.write_record(moment=NOW - timedelta(minutes=30), outcome="dry_run_passed")  # a different content, an older stamp
+        stale = self.build(now=NOW - timedelta(days=1))
+        self.assertEqual(self.push(stale), (2, "refused:records_older_than_last"))
+        self.assertEqual(vs.current_name(vs.snapshots_root(self.state)), before)
+
+    def test_a_bundle_stamped_in_the_future_is_refused_for_records_and_snapshots(self):
+        self.current_snapshot()
+        future = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(hours=2)
+        self.write_record()
+        self.assertEqual(self.push(self.build(now=future)), (2, "refused:bundle_from_the_future"))
+        raw = vs.build_bundle(BASE_FILES, KEY, vs.SNAPSHOT_PUSH_PRODUCER, future)
+        self.assertEqual(self.push(raw), (2, "refused:bundle_from_the_future"))
+
+    def test_fewer_records_than_the_vm_already_holds_are_refused(self):
+        self.pushed_with_records()
+        empty = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(empty, ignore_errors=True))
+        out = self.tmp / "empty.zip"
+        builder.build(str(self.key_file), out, Path(empty), NOW + timedelta(hours=1))
+        self.assertEqual(self.push(out.read_bytes()), (2, "refused:records_shrunk"))
+
+    def test_the_pushed_records_never_carry_the_real_salesforce_revision(self):
+        self.write_record()
+        payload = json.loads(vs.verify_bundle(self.build(), KEY).files[vs.PRODUCTION_RECORDS_FILE])
+        text = json.dumps(payload)
+        self.assertNotIn("REV-1", text)
+        self.assertIn(builder.PLACEHOLDER_REVISION, text)
+
+
 class ScriptTextTests(unittest.TestCase):
     def test_the_hourly_script_pushes_records_after_the_clone_and_keeps_the_snapshot_push_optional(self):
         run = (Path(__file__).resolve().parents[2] / "tools" / "run_clone_push.ps1").read_text(encoding="utf-8")

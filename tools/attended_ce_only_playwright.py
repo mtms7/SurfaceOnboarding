@@ -9125,6 +9125,10 @@ def _pdr_reason(value: object, default: str = "unexpected_error") -> str:
 def _pdr_records_parent() -> Path:
     from integration.onboarding import state_paths
 
+    if state_paths.vm_mode():  # the VM holds the pushed records inside the current snapshot, not in the bare state folder
+        current = state_paths.snapshot_current_dir(resolve=True)
+        if current is not None:
+            return current
     folder = state_paths.state_dir()
     return folder if folder is not None else Path(__file__).resolve().parents[1]
 

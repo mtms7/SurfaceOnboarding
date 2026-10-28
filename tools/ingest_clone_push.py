@@ -54,6 +54,7 @@ KEEP = 4
 FIRST_PUSH_MIN_ROWS = 1000            # about 5,400 tenants in production; lowered only by the owner-run file below
 MIN_ROWS_OVERRIDE_FILE = "/etc/surface-onboarding/clone-push-min-rows"  # root-owned, owner-created, one integer
 HIGH_WATER_NAME = "clone-push-high-water.json"
+RECORDS_HIGH_WATER_NAME = "records-push-high-water.json"
 STALE_STAGE_SECONDS = 3600
 DEFAULT_STATE_DIR = "/var/lib/surface-onboarding"
 _FOREVER = timedelta(days=3650)
@@ -230,11 +231,32 @@ def _min_rows_override() -> int | None:
     return int(text)
 
 
+def _refuse_future(bundle: "vs.VerifiedBundle") -> None:
+    """A signed bundle stamped in the future would make every later VM refresh ``older_than_current``: same skew as the clone."""
+    if bundle.created_at > datetime.now(timezone.utc) + FUTURE_SKEW:
+        raise PushRefused("bundle_from_the_future")
+
+
 def ingest_snapshot(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) -> str:
     """A full signed snapshot (Salesforce queue and CO details, local state, inventories) pushed by the PC task (owner request
     2026-10-27: the VM page showed data from 2026-10-17). Same HMAC, caps, names and no-rollback rules as the manual
     ``ingest_vm_snapshot.py``; only the producer label ``desktop-snapshot-push`` is accepted on this channel. The clone the
     dashboard trusts still comes from ``<state>/clone-inventory`` (the clone push), never from this snapshot's copy."""
+    bundle = vs.verify_bundle(raw, key)
+    _refuse_future(bundle)
+    root = vs.snapshots_root(state_dir)
+    manifest, current = vs.read_current_manifest(root), vs.current_dir(root)
+    if manifest is not None and current is not None:
+        carried = {}
+        for entry in manifest["files"]:  # the PC snapshot has no records or approvals: the VM keeps the ones it already holds
+            name = entry["name"]
+            if name in (vs.PRODUCTION_RECORDS_FILE, vs.PRODUCTION_APPROVALS_FILE) and name not in bundle.files:
+                data = (current / name).read_bytes()
+                if hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                    raise PushRefused("current_snapshot_damaged")
+                carried[name] = data
+        if carried:
+            raw = vs.build_bundle({**bundle.files, **carried}, key, str(bundle.manifest["producer"]), bundle.created_at)
     name = vs.ingest_bundle(raw, key, state_dir)
     return "ingested-snapshot " + name
 
@@ -248,6 +270,7 @@ def ingest_records(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) ->
     banner still says where the Salesforce data came from. No current snapshot means refusal; the same records twice are a
     no-op (no new snapshot)."""
     bundle = vs.verify_bundle(raw, key)
+    _refuse_future(bundle)
     if vs.PRODUCTION_RECORDS_FILE not in bundle.files or not set(bundle.files) <= {vs.PRODUCTION_RECORDS_FILE,
                                                                                     vs.PRODUCTION_APPROVALS_FILE}:
         raise PushRefused("records_bundle_has_other_files")
@@ -276,12 +299,34 @@ def ingest_records(raw: bytes, key: bytes, state_dir: str | os.PathLike[str]) ->
         if hashlib.sha256(data).hexdigest() != entry["sha256"]:
             raise PushRefused("current_snapshot_damaged")
         merged[name] = data
+    # No rollback and no shrink: records are append-only on the PC, so an older bundle (replay) or one with fewer records than the
+    # VM already shows (a PC pointed at the wrong state folder) is refused. The marker is written only after a verified ingest.
+    marker = Path(state_dir) / RECORDS_HIGH_WATER_NAME
+    held = 0
+    try:
+        mark = json.loads(marker.read_text(encoding="utf-8"))
+        held = int(mark["records"])
+        if bundle.created_at < vs.parse_created_at(mark["created_at"]):
+            raise PushRefused("records_older_than_last")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError):
+        raise PushRefused("records_marker_unreadable") from None
+    count = len(json.loads(bundle.files[vs.PRODUCTION_RECORDS_FILE].decode("utf-8")).get("records", {}))
+    if count < held:
+        raise PushRefused("records_shrunk")
     current_hashes = {entry["name"]: entry["sha256"] for entry in manifest["files"]}
     if all(current_hashes.get(name) == hashlib.sha256(data).hexdigest() for name, data in bundle.files.items()):
         return "unchanged-records"
     merged.update(bundle.files)
     created = max(datetime.now(timezone.utc).replace(microsecond=0), vs.parse_created_at(manifest["created_at"]))
     name = vs.ingest_bundle(vs.build_bundle(merged, key, str(manifest["producer"]), created), key, state_dir)
+    try:
+        temporary = marker.with_name(marker.name + f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps({"records": count, "created_at": bundle.manifest["created_at"]}), encoding="utf-8")
+        os.replace(temporary, marker)
+    except OSError:
+        raise PushRefused("store_unavailable") from None
     return "ingested-records " + name
 
 

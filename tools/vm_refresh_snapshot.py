@@ -229,6 +229,9 @@ def refresh(config_path: str, key_file: str, state_dir: str, *, opener: Any | No
             merged_inputs[reference] = {**fresh, "country": country}
     reads[vm_snapshot.PRODUCTION_INPUTS_FILE] = json.dumps({"inputs": merged_inputs}, sort_keys=True).encode("utf-8")
     counts["production_inputs"] = len(merged_inputs)
+    # The Salesforce reads above take minutes. Re-read what the current snapshot carries NOW, so records, approvals or a clone copy
+    # pushed meanwhile are kept instead of overwritten by the copies read at the start (security review 2026-10-27).
+    carried, _latest_details = carried_files(state_dir)
     files = {**carried, **reads}
     created = (now or datetime.now(timezone.utc)).replace(microsecond=0)
     try:

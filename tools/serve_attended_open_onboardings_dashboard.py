@@ -7020,7 +7020,8 @@ def _create_approval_chip(view: dict[str, Any]) -> str:
     if state == "valid":
         return _chip("chip-ok", "Valid to " + str(view["item"]["expires_at"])[5:10])
     return {"expired": _chip("chip-warn", "Expired"), "consumed": _chip("chip-neutral", "Used"),
-            "none": _chip("chip-neutral", "None"), "unreadable": _chip("chip-warn", "Unreadable"),
+            "none": _chip("chip-neutral", "None"), "superseded": _chip("chip-neutral", "Superseded"),
+            "unreadable": _chip("chip-warn", "Unreadable"),
             "unavailable": _chip("chip-neutral", "Unavailable on this server")}.get(state, _chip("chip-warn", "Unreadable"))
 
 
@@ -7092,7 +7093,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         supported = route == CE_ENGINE or route in SURFACE_ROUTES
         check = production_views.production_check(_match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
         approval = production_views.pick_approval(approvals, ref)
-        create = production_views.create_state(records, ref, locked=locked)
+        create = production_views.create_state(records, ref, locked=locked and not vm_mode())  # the header chip already says the VM cannot create
         created = create["code"] in production_views.CREATED_OUTCOMES or bool(check and check["code"] == "onboarded")
         items.append({"row": row, "ref": ref, "supported": supported, "check": check, "approval": approval, "create": create,
                       "flags": {"blocked": supported and bool(check and check["blocked"]),
@@ -7356,10 +7357,11 @@ def _create_approval_html(reference: str) -> str:
         return "<p><strong>The create approval record cannot be read.</strong> Nothing is treated as approved.</p>"
     if state == "unavailable":
         return "<p>Create approvals are unavailable on this server.</p>"
-    word = {"valid": "Valid", "expired": "Expired", "consumed": "Used"}[state]
-    css = {"valid": "chip-ok", "expired": "chip-warn", "consumed": "chip-neutral"}[state]
+    word = {"valid": "Valid", "expired": "Expired", "consumed": "Used", "superseded": "Superseded"}.get(state, "Unreadable")
+    css = {"valid": "chip-ok", "expired": "chip-warn", "consumed": "chip-neutral", "superseded": "chip-neutral"}.get(state, "chip-warn")
     note = {"valid": "Bound to one CO, one route and the revision seen at approval. Used once by the create.",
-            "expired": "Expired: a new create approval is needed.", "consumed": "Used once: a new create approval is needed."}[state]
+            "expired": "Expired: a new create approval is needed.", "consumed": "Used once: a new create approval is needed.",
+            "superseded": "Replaced by a newer approval: a new create approval is needed."}.get(state, "")
     return ("<p>" + _chip(css, word) + "</p>" + _kv_grid([
         ("Reference", item["approval_ref"]), ("Scope", _APPROVAL_SCOPE_LABELS.get(item["scope"], "One CO")), ("Issued by", item["issued_by"]),
         ("Expires", item["expires_at"][:10] + " (7 days)"), ("Consumed", "Yes" if item["consumed_at"] else "No")],

@@ -72,7 +72,10 @@ def build(key_file: str, out: Path, parent: Path | None = None, now: datetime | 
     entries: dict[str, dict] = {}
     try:
         for path in records.list_records(parent):  # a corrupt record raises: nothing partial is ever sent
-            entries[path.name] = records.load(path)
+            entry = records.load(path)
+            if "salesforce_revision" in entry:  # the real revision never leaves the desktop (security review 2026-10-27)
+                entry = {**entry, "salesforce_revision": PLACEHOLDER_REVISION}
+            entries[path.name] = entry
     except (records.ProductionCreateRecordError, OSError, ValueError, TypeError, KeyError):
         raise BuildRefused("record_unreadable") from None
     logs: dict[str, str] = {}

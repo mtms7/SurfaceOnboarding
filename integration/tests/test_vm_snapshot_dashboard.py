@@ -684,6 +684,12 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         self.assertNotIn(self.UUID, after)  # the page never prints the UUID
         self.assertNotIn("SECRET-REVISION-9", after)
 
+    def test_the_runner_reads_create_records_from_the_current_snapshot_on_the_vm(self):
+        # Parity review 2026-10-27: _apply_verified_tenant read the bare state folder on the VM, so a CO the desktop turns from
+        # "UUID set, not in clone" into "Onboarded" (verified readback) stayed blocked there.
+        self.publish({"CO-0001": self.item()})
+        self.assertEqual(runner._pdr_records_parent(), vs.current_dir(vs.snapshots_root(self.state)))
+
     def test_only_inactive_tenants_show_other_tenants_only(self):
         self.publish({"CO-0001": self.item()})
         self.push_clone(**{"enabled": False})

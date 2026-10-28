@@ -366,6 +366,13 @@ class LandingTests(unittest.TestCase):
         html = self.page(rows=rows, starts={})
         self.assertNotIn("Next up", html)  # no start date: nothing is invented
 
+    def test_a_superseded_approval_shows_as_superseded_not_unreadable(self):
+        # Parity review 2026-10-27: state "superseded" fell through to "Unreadable" and raised a KeyError on the CO page.
+        self.env.write_approvals(approval(superseded_at="2026-10-16T10:00:00Z"))
+        row = self.row_of(self.page(), "CO-0780")
+        self.assertIn("Superseded", row)
+        self.assertNotIn("Unreadable", row)
+
     def test_clone_strip_trusted_stale_and_unusable(self):
         fresh = self.page()
         self.assertIn("<span class='chip chip-ok'>Clone 2 h 10 min old, limit 6 h; data 2 h 20 min old, limit 36 h &middot; trusted</span>", fresh)
