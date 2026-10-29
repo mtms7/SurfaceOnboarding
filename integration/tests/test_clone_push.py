@@ -374,6 +374,8 @@ class ScriptTextTests(unittest.TestCase):
         self.assertIn("[switch]$Remove", register)
         run = (REPO / "tools" / "run_clone_push.ps1").read_text(encoding="utf-8")
         self.assertIn("--cached-ok", run)
+        # owner decision 2026-10-28: the VM gets the v2 clone (query 253, with the CE scan fields), never the v1 default
+        self.assertIn("'--cached-ok', '--query-id', '253'", run)
         self.assertIn("IdentitiesOnly=yes", run)
         self.assertIn("StrictHostKeyChecking=yes", run)
         self.assertIn("BatchMode=yes", run)

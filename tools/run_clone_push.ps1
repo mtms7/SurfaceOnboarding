@@ -7,7 +7,7 @@ clone-only signed bundle, send it to the VM over the restricted push key.
 Run by the scheduled task SurfaceOnboarding-CloneToVm (tools\register_clone_push_task.ps1) every hour while you are signed in and on
 the VPN. Needs no browser, no MFA, no Claude. Stores and prints no secret: the Redash key stays in its DPAPI blob (read by the
 collector), the HMAC key and the push key are files only your Windows user can read, and the only text logged is a result code.
-Steps: 1 collector --collect --cached-ok  2 build bundle (re-verifies the local clone: at most 6 h old)  4 (after the push) the Salesforce snapshot
+Steps: 1 collector --collect --cached-ok --query-id 253 (v2, with the CE scan fields; owner decision 2026-10-28)  2 build bundle (re-verifies the local clone: at most 6 h old)  4 (after the push) the Salesforce snapshot
 is built by publish_vm_snapshot.py and pushed the same way (best effort, never changes the exit code; owner request 2026-10-27)  3 ssh to the VM with the
 forced-command key (the bundle goes in on stdin; the VM verifies and answers one line: ingested | unchanged | refused:<code>).
 Exit: 0 ingested or unchanged, 1 collector failed (the push still tried the last good local clone), 2 build refused,
@@ -61,7 +61,7 @@ function Invoke-Native([string]$exe, [string[]]$arguments) {
 
 try {
     # 1. collect (the collector writes only reason codes and counts; the Redash key is read from its DPAPI blob)
-    $collected = Invoke-Native $PythonPath @((Join-Path $projectRoot 'tools\redash_inventory_collector.py'), '--collect', '--cached-ok')
+    $collected = Invoke-Native $PythonPath @((Join-Path $projectRoot 'tools\redash_inventory_collector.py'), '--collect', '--cached-ok', '--query-id', '253')
     $collectOut = $collected.Out
     $collectExit = $collected.Exit
     $collectCode = 'collector_no_output'
