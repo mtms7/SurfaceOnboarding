@@ -208,7 +208,7 @@ class CreateStateTests(unittest.TestCase):
     def test_locked_none_and_outcomes(self):
         ok = {"state": "ok", "by_co": {}}
         self.assertEqual(self.state(ok)["label"], "Locked")
-        self.assertEqual(self.state(ok, locked=False)["label"], "Dry run ready")
+        self.assertEqual(self.state(ok, locked=False)["label"], "Not created")
         for outcome, label in (("dry_run_passed", "Dry run passed"), ("readback_verified", "Verified"),
                                ("created_unverified", "Created, not verified"), ("uncertain_submit", "Uncertain: do not retry"),
                                ("refused", "Refused")):
@@ -220,7 +220,7 @@ class CreateStateTests(unittest.TestCase):
         self.assertEqual(self.state({"state": "unreadable"})["label"], "Records unreadable")
         self.assertEqual(self.state({"state": "unavailable"})["label"], "Unavailable on this server")
         for state in ("unreadable", "unavailable"):
-            self.assertNotIn(self.state({"state": state})["label"], ("Locked", "Verified", "Dry run ready"))
+            self.assertNotIn(self.state({"state": state})["label"], ("Locked", "Verified", "Not created"))
 
 
 class ProductionCheckTests(unittest.TestCase):

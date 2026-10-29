@@ -7093,7 +7093,7 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
 # page carries a create, Start or Confirm control, and no route here reaches a production write, a Salesforce write or
 # an approval issue. The one form is the existing 4-hour summary approval on the CO page (a local record, nothing else).
 PRODUCTION_APPROVAL_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / PRODUCTION_APPROVAL_FILE)
-PROD_FILTERS = (("ready", "Ready for dry run"), ("blocked", "Blocked"), ("approved", "Approved"), ("created", "Created"))
+PROD_FILTERS = (("ready", "Ready to onboard"), ("blocked", "Blocked"), ("approved", "Approved"), ("created", "Created"))
 PROD_SORTS = frozenset({"start", "co", "age"})
 WRONG_CREATE_NOTE = "Wrong create: the owner edits the parameters in BackOffice; the delete path is unknown."
 
@@ -8366,7 +8366,18 @@ def start_remote_start_worker() -> Any:
         return None
     folder = state_paths.state_dir()
     return remote_start.start_worker(config, folder if folder is not None else Path(__file__).resolve().parents[1] / "integration",
-                                     _start_remote_create)
+                                     _start_remote_create, _remote_poll_ssh)
+
+
+def _remote_poll_ssh(argv: list, data: bytes) -> tuple:
+    """The remote-start poll's one ssh call (lives here: integration/onboarding stays free of process execution, CI boundary
+    check). A process failure becomes OSError, which the poll treats as "no request"."""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        done = subprocess.run(argv, input=data, capture_output=True, timeout=45, check=False, creationflags=flags)
+    except subprocess.SubprocessError as error:
+        raise OSError("remote_poll_ssh_failed") from error
+    return done.returncode, done.stdout.decode("utf-8", "replace")
 
 
 def _issue_one_co_approval(inputs: create_ui.Inputs, reference: str, revision: str, route: str) -> bool:

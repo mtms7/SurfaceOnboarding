@@ -355,7 +355,7 @@ class LandingTests(unittest.TestCase):
     def test_filters_with_counts(self):
         page = self.page()
         counts = {label: int(number) for label, number in re.findall(r"class='fchip(?: on)?' href='[^']+'>([A-Za-z ]+) <b>(\d+)</b>", page)}
-        self.assertEqual(counts, {"All": 6, "Ready for dry run": 1, "Blocked": 3, "Approved": 1, "Created": 1})
+        self.assertEqual(counts, {"All": 6, "Ready to onboard": 1, "Blocked": 3, "Approved": 1, "Created": 1})
         refs = lambda html: re.findall(r"<a class='co' href='/onboard/(CO-\d+)'>", html)  # noqa: E731
         self.assertEqual(sorted(refs(self.page("/?filter=blocked"))), ["CO-0781", "CO-0782", "CO-0784"])
         self.assertEqual(refs(self.page("/?filter=ready")), ["CO-0780"])

@@ -19,7 +19,6 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -300,12 +299,6 @@ class PcConfig:
 SshRunner = Callable[[list, bytes], tuple]
 
 
-def run_ssh(argv: list, data: bytes) -> tuple:
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    done = subprocess.run(argv, input=data, capture_output=True, timeout=45, check=False, creationflags=flags)
-    return done.returncode, done.stdout.decode("utf-8", "replace")
-
-
 def poll_once(config: PcConfig, ssh: SshRunner, now: datetime) -> RemoteRequest | None:
     """One poll of the VM over the restricted forced-command key. ``None`` for no request, any error or any unexpected reply."""
     try:
@@ -313,7 +306,7 @@ def poll_once(config: PcConfig, ssh: SshRunner, now: datetime) -> RemoteRequest 
         argv = ["ssh", "-T", "-i", config.push_key, "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
                 "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=15", f"{config.user}@{config.host}", "clone-push"]
         code, out = ssh(argv, build_poll_bundle(key, now))
-    except (OSError, subprocess.SubprocessError, vs.SnapshotError, ValueError):
+    except (OSError, vs.SnapshotError, ValueError):  # the runner (tools/, the dashboard) turns process errors into OSError
         return None
     if code != 0:
         return None
@@ -362,9 +355,9 @@ def process(config: PcConfig, inbox: Inbox, ssh: SshRunner, now: datetime, start
 
 
 def start_worker(config: PcConfig | None, state_dir: str | os.PathLike[str], start: Callable[[str, str, str], str],
-                 ssh: SshRunner = run_ssh, interval: float = POLL_SECONDS) -> threading.Thread | None:
+                 ssh: SshRunner | None = None, interval: float = POLL_SECONDS) -> threading.Thread | None:
     """The PC dashboard's background poller. ``None`` (nothing starts) unless the configuration is complete and enabled."""
-    if config is None:
+    if config is None or ssh is None:  # the ssh runner comes from the dashboard (tools/): no process execution here
         return None
     inbox = Inbox(state_dir)
 

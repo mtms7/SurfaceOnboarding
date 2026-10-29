@@ -2393,3 +2393,25 @@ Rules: explain each step and wait for my "go"; I push; commit only when I ask. N
 
 First: ask whether to commit the two batches. Then, one go each: which hourly clone collector to keep; remove the leftover "Dry run ready" labels; VM key setup (agent-held key, today only); CE scan status; first Case 3 one-button run; Case 3 gaps; r41 to the VM.
 ```
+
+### 2026-10-28 (evening): CI boundary fix, queue labels, clone collectors found, Case 3 gap map (committed; owner pushes)
+
+- **CI:** the owner pushed main (41f7b16 and the earlier commits). "Integration scaffold checks" failed on `tools/check_integration_offline_boundary.py`: `integration/onboarding/remote_start.py` imported `subprocess` (from 5e6984c, first pushed now). Fix: the ssh call moved to the dashboard (`_remote_poll_ssh` in `tools/serve_attended_open_onboardings_dashboard.py`, process errors become OSError); `remote_start.start_worker(..., ssh=None)` starts nothing without a runner. Boundary check passes, artifact check passes, full suite 3623 OK.
+- **Labels:** Create chip "Dry run ready" -> "Not created" (code `dry_run_ready` kept); filter "Ready for dry run" -> "Ready to onboard". Needs a dashboard restart.
+- **CE scan status (read-only, Salesforce):** no CE-only CO is waiting on a scan. CO-0813, CO-0816 and CO-0825 were set to User Created by hand (no local records, so the automatic check does not touch them); their last step is Onboarding Completed. CO-0828 (Case 3) is at Account Scanning, created by hand.
+- **Clone collectors (found):** three write the same `prod-clone/latest.json`:
+  1. Windows task `SurfaceOnboarding-RedashInventory`, at :46, query 253 (v2, 23.8 MB);
+  2. Windows task `SurfaceOnboarding-CloneToVm` (`run_clone_push.ps1`), at :51, collector with NO query id, so query 251 (v1, 17.2 MB, no CE scan fields), then pushes it to the VM;
+  3. the dashboard's own `clone_autorefresh` (query 253, at start and when older than 45 min).
+  When 251 is the latest, the CE scan auto-check sees no v2 row (`clone_row_unavailable`) and every match is re-read. Recommendation (owner decision pending): one source, query 253. Add `--query-id 253` to the collector step of `run_clone_push.ps1`, and disable the `SurfaceOnboarding-RedashInventory` task; keep `clone_autorefresh` (it only collects when the clone is over 45 min old).
+- **Case 3 gap map (agent, read-only):** today only Request Approved -> Account Scanning after the owner's review. Build order: (1) CASE3_FLOW stage plan plus tests, needing the owner's scan-finished rule; (2) TA -> operator mapping table, needing the owner's table; (3) live read-only Edit Account probe plus one HAR of a manual save (Max scan Duration, Operator); (4) guarded one-field edits; (5) live check of the Case 3 executions menu (failed 3/3 on CO-0800) and the scan rule; (6) live HAR of one manual add-user; (7) guarded add-user plus read-back, then User Created -> Onboarding Completed. Open owner decisions: scan finished = Surface COMPLETED and/or LC DONE; operator at create or after the first scan; the primary user email field (Primary_User_Email__c or the Contact), name split, role and MFA, invite email.
+- **VM key:** owner steps 1-4 still not done on the PC (ssh-agent Disabled, no key).
+
+Paste-able prompt for the next session:
+
+```
+Continue Surface Workato OPA work in C:/Users/Milton Stevenson/Documents/Surface/Workato. Use .codex/skills/surface-workato-opa/SKILL.md; read AGENTS.md, README.md and integration/IMPLEMENTATION_PLAN.md section 18 (latest 2026-10-28 entries).
+Rules: explain each step and wait for my "go"; I push; commit only when I ask. MFA stays manual, never persist secrets. Production BackOffice writes need the per-CO approval and my click. Fail closed on ambiguity; verify external changes directly. Forward slashes, label PC or VM, single-line PowerShell 5.1 (no &&), COMMAND_TO_PASTE.md for long ones; detailed steps with each next action; dated handoff in section 18 plus this prompt in chat.
+State: CI boundary fix and labels committed; check that "Integration scaffold checks" is green after my push. Restart the dashboard to load the labels.
+Next, one go each: clone collectors to query 253 only (run_clone_push.ps1 --query-id 253, disable SurfaceOnboarding-RedashInventory); VM Redash test after IT ticket 16160; VM key steps 1-4 (mine); Onboarding Completed for CO-0813/0816/0825 (go per CO); Case 3 build step 1 after my scan-finished rule, step 2 after my TA->operator table; r41 to the VM. CO-0801 stays parked.
+```

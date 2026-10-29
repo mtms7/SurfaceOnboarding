@@ -298,7 +298,8 @@ def create_state(records: dict[str, Any], co_reference: str, *, locked: bool) ->
         return {"code": record["outcome"], "css": css, "label": label, "steps_done": done}
     if locked:
         return {"code": "locked", "css": "chip-warn", "label": "Locked", "steps_done": 0}
-    return {"code": "dry_run_ready", "css": "chip-neutral", "label": "Dry run ready", "steps_done": 0}
+    # No dry run since the one-button flow (owner decision 2026-10-23); the code is kept for the VM snapshot and records.
+    return {"code": "dry_run_ready", "css": "chip-neutral", "label": "Not created", "steps_done": 0}
 
 
 # --- Production checks chip -----------------------------------------------------------------------------------------
