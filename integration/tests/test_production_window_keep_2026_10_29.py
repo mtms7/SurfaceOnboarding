@@ -104,18 +104,19 @@ class DashboardWindowTests(unittest.TestCase):
         self.active(False)
         dashboard.close_kept_production_window("start")
         dashboard.close_kept_production_window("sign_out")
-        self.assertEqual(self.calls, [{"only_if_expired": False}, {"only_if_expired": False}])
+        self.assertEqual(self.calls, [{"only_if_expired": False, "reason": "dashboard_start"},
+                                      {"only_if_expired": False, "reason": "dashboard_sign_out"}])
 
     def test_expiry_only_closes_an_expired_window(self):
         self.active(False)
         dashboard.close_kept_production_window("expiry")
-        self.assertEqual(self.calls, [{"only_if_expired": True}])
+        self.assertEqual(self.calls, [{"only_if_expired": True, "reason": "dashboard_expiry"}])
 
     def test_a_running_run_is_never_interrupted(self):
         self.active(True)
         self.assertEqual(dashboard.close_kept_production_window("expiry"), "production_window_in_use")
         dashboard.close_kept_production_window("sign_out")
-        self.assertEqual(self.calls, [{"expire": True}])
+        self.assertEqual(self.calls, [{"expire": True, "reason": "dashboard_sign_out"}])
 
     def test_the_vm_does_nothing_and_errors_are_reported(self):
         with mock.patch.object(dashboard, "vm_mode", return_value=True):
@@ -134,7 +135,7 @@ class DashboardWindowTests(unittest.TestCase):
         stop.wait.side_effect = [False, True]
         self.active(False)
         dashboard._production_window_loop(stop)
-        self.assertEqual(self.calls, [{"only_if_expired": True}])
+        self.assertEqual(self.calls, [{"only_if_expired": True, "reason": "dashboard_expiry"}])
 
 
 class PerCoClearTests(unittest.TestCase):

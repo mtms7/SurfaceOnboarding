@@ -378,7 +378,7 @@ class WiringTests(unittest.TestCase):
         fake_module = mock.MagicMock()
         with mock.patch.dict("sys.modules", {"playwright": mock.MagicMock(), "playwright.sync_api": fake_module}), \
                 mock.patch.object(runner, "_open_automation_tab", return_value=tab) as opened, \
-                mock.patch.object(runner, "_probe_wait_for_login", return_value=wait_result) as waited, \
+                mock.patch.object(runner, "_backoffice_signed_in", return_value=wait_result) as waited, \
                 mock.patch.object(runner, "_probe_attach", return_value=(mock.Mock(), page)), \
                 mock.patch.object(runner, "_probe_snapshot", return_value=("/backoffice/tenantManagement",
                                                                            {"texts": ["Add Account"], "tables": 1, "navs": 1})), \
@@ -396,7 +396,7 @@ class WiringTests(unittest.TestCase):
         self.assertEqual((line["result"], line["reason"]), ("production_readback_refused", "sign_in_timeout"))
         self.assertEqual(opened.call_args.args[1], ORIGIN + "/backoffice/tenantManagement")
         self.assertEqual(opened.call_args.args[2].profile_dir_name, "backoffice-production-automation")
-        self.assertEqual(waited.call_args.args, (page, 7))
+        self.assertEqual((waited.call_args.args[0], waited.call_args.args[2]), (page, 7))  # 2026-10-30: plus the auth watch
         released.assert_called_once()
         self.assertEqual((page.routes, page.evaluated, page.clicks), ([], [], []))
 

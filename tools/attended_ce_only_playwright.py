@@ -9026,6 +9026,86 @@ def _probe_wait_for_login(page: Any, timeout_seconds: float) -> bool:
     return production_probe.wait_for_login(lambda: _probe_snapshot(page), timeout_seconds)
 
 
+# Owner report 2026-10-30 (CO-0831): a window holding an old, expired BackOffice session showed the app shell under
+# /backoffice, so the sign-in wait passed and the first read got 401/403 (production_session_expired) instead of waiting for
+# the owner. The production windows now also need the page's OWN getAuthorities / accountInfo calls to have answered 200.
+AUTH_RELOAD_SECONDS = 30.0  # the shell looks signed in but no 200 auth call was seen yet: reload at most this often
+AUTH_SILENT_RELOADS = 2  # no auth call at all after this many reloads: today's page-only rule applies (never blocks onboarding)
+
+
+class _BackOfficeAuthWatch:
+    """The LATEST status of the page's own getAuthorities / accountInfo GETs on the production origin (status only: never a
+    header or a body). ``verdict``: "ok" (at least one 200, none other), "refused" (a latest 401/403), "other", "none"."""
+
+    def __init__(self, page: Any, clock: Any = monotonic) -> None:
+        self.page, self.clock = page, clock
+        self.latest: dict[str, int] = {}
+        self._reloaded_at: float | None = None
+        self.reloads = 0
+        try:
+            page.on("response", self._on_response)
+        except Exception:
+            pass  # nothing observed: the wait never passes and times out (fail closed)
+
+    def _on_response(self, response: Any) -> None:
+        try:
+            if str(response.request.method).upper() != "GET":
+                return
+            url, status = str(response.url), response.status
+            if production_probe.url_origin(url) != production_probe.PRODUCTION_ORIGIN or type(status) is not int:
+                return
+            path = production_probe.url_path(url)
+            if path in production_dry_run.PASSIVE_SESSION_PATHS:
+                self.latest[path] = status
+        except Exception:
+            pass
+
+    def verdict(self) -> str:
+        statuses = list(self.latest.values())
+        if not statuses:
+            return "none"
+        if any(s in (401, 403) for s in statuses):
+            return "refused"
+        return "ok" if all(s == 200 for s in statuses) else "other"
+
+    def accepts(self) -> bool:
+        """A 200 auth call, or none at all after AUTH_SILENT_RELOADS reloads (the page did not make them); a 401/403 never."""
+        verdict = self.verdict()
+        return verdict == "ok" or (verdict == "none" and self.reloads >= AUTH_SILENT_RELOADS)
+
+    def nudge(self) -> None:
+        """Reload once in a while so the page makes its start-up auth calls again (a GET of the same page; nothing typed)."""
+        now = self.clock()
+        if self._reloaded_at is not None and now - self._reloaded_at < AUTH_RELOAD_SECONDS:
+            return
+        self._reloaded_at = now
+        self.reloads += 1
+        try:
+            self.page.reload(wait_until="domcontentloaded", timeout=30_000)
+        except Exception:
+            pass
+
+
+def _backoffice_signed_in_poll(page: Any, watch: _BackOfficeAuthWatch) -> Any:
+    """``wait_for_login``'s poll: the page's sign-in snapshot, counted only while its own auth calls answered 200."""
+    def poll() -> tuple[str, Any]:
+        path, snapshot = _probe_snapshot(page)
+        if not production_probe.is_authenticated(path, snapshot):
+            return path, snapshot
+        if watch.accepts():
+            return path, snapshot
+        if watch.verdict() != "other":
+            watch.nudge()  # "none": no auth call seen yet; "refused": an expired session, the reload shows the sign-in page
+        return path, None
+    return poll
+
+
+def _backoffice_signed_in(page: Any, watch: _BackOfficeAuthWatch, timeout_seconds: float, say: Any = print) -> bool:
+    """Signed in on 3 consecutive polls AND the page's own auth calls answered 200 (or it made none; bounded wait)."""
+    return (production_probe.wait_for_login(_backoffice_signed_in_poll(page, watch), timeout_seconds, say=say)
+            and production_probe.is_authenticated(*_probe_snapshot(page)) and watch.accepts())
+
+
 def _probe_attach(playwright: Any, tab: _AutomationTab) -> tuple[Any, Any]:
     """Attach over CDP and return this run's own tab (matched by target id) as the one page used for everything."""
     browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{tab.port}")
@@ -9955,8 +10035,45 @@ def production_window_deadline(profile_dir: Path) -> datetime | None:
     return moment if moment.tzinfo is not None and moment.utcoffset() == timedelta(0) else None
 
 
-def _close_production_window_at(profile_dir: Path) -> str:
+PRODUCTION_WINDOW_LOG_SUFFIX = ".window-log"  # beside the profile: one line per launch, reuse, keep or close; no secret
+PRODUCTION_WINDOW_LOG_MAX_BYTES = 256 * 1024
+
+
+def _log_production_window(profile_dir: Path, event: str, reason: str = "") -> None:
+    """Append ``<UTC time> <event> <reason>`` (fixed words only) for the production window; never raises (owner request
+    2026-10-30: the kept window from one CO-0831 click was gone at the next and nothing said why)."""
+    try:
+        path = profile_dir.with_name(profile_dir.name + PRODUCTION_WINDOW_LOG_SUFFIX)
+        if path.exists() and path.stat().st_size > PRODUCTION_WINDOW_LOG_MAX_BYTES:
+            path.replace(path.with_name(path.name + ".old"))
+        line = " ".join(part for part in (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), event, reason) if part)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _production_reuse_outlook(target: RunTarget) -> str:
+    """Why a production run would NOT reuse a window: no_deadline, deadline_passed, browser_not_running (a valid deadline
+    but no answering browser: it was closed outside the dashboard), temporary_profile; "" when it would reuse one."""
+    try:
+        profile_dir, persist = leonardo_profile(target)
+        if not persist:
+            return "temporary_profile"
+        deadline = production_window_deadline(profile_dir)
+        if deadline is None:
+            return "no_deadline"
+        if datetime.now(timezone.utc) >= deadline:
+            return "deadline_passed"
+        return "" if _verified_automation_port(profile_dir) is not None else "browser_not_running"
+    except Exception:
+        return "unknown"
+
+
+def _close_production_window_at(profile_dir: Path, reason: str = "") -> str:
     result = _close_automation_browser_at(profile_dir)
+    if not (reason == "dashboard_expiry" and result == "automation_browser_not_running"):  # the idle 5-minute check
+        _log_production_window(profile_dir, "close", (reason + ":" if reason else "") + result)
     if result != "automation_browser_close_unavailable":
         try:
             _production_keep_path(profile_dir).unlink()
@@ -9975,17 +10092,21 @@ def _finish_production_window(tab: _AutomationTab, now: datetime | None = None) 
         try:
             _production_keep_path(tab.profile_dir).write_text(
                 (moment + PRODUCTION_WINDOW_KEEP).astimezone(timezone.utc).isoformat(), encoding="utf-8")
+            _log_production_window(tab.profile_dir, "kept", "run_end")
             return
         except OSError:
             pass
+        reason = "run_end_deadline_unwritable"
     else:
         deadline = production_window_deadline(tab.profile_dir)
         if deadline is not None and moment < deadline:
             return
-    _close_production_window_at(tab.profile_dir)
+        reason = "run_end_deadline_passed" if deadline is not None else "run_end_no_deadline"
+    _close_production_window_at(tab.profile_dir, reason)
 
 
-def close_production_window(*, only_if_expired: bool = False, expire: bool = False, now: datetime | None = None) -> str:
+def close_production_window(*, only_if_expired: bool = False, expire: bool = False, now: datetime | None = None,
+                            reason: str = "") -> str:
     """Close the kept desktop production window. ``only_if_expired``: only once its deadline has passed (or it has none).
     ``expire``: first move the deadline to now, so a run still using the window closes it when it ends. Returns the close
     result, "production_window_kept" or "production_window_expired"."""
@@ -9998,12 +10119,13 @@ def close_production_window(*, only_if_expired: bool = False, expire: bool = Fal
             _production_keep_path(profile_dir).write_text(moment.astimezone(timezone.utc).isoformat(), encoding="utf-8")
         except OSError:
             pass
+        _log_production_window(profile_dir, "expire", reason or "dashboard")
         return "production_window_expired"
     if only_if_expired:
         deadline = production_window_deadline(profile_dir)
         if deadline is not None and moment < deadline:
             return "production_window_kept"
-    return _close_production_window_at(profile_dir)
+    return _close_production_window_at(profile_dir, reason or "dashboard")
 
 
 @contextmanager
@@ -10016,14 +10138,17 @@ def _pdr_browser_page(target: RunTarget, wait_seconds: float):
         raise RuntimeError("playwright_runtime_unavailable") from None
     url = production_probe.start_url(target)
     with sync_playwright() as playwright:
+        why = _production_reuse_outlook(target)
         tab = _open_automation_tab(playwright, url, target)
+        _log_production_window(tab.profile_dir, "reused" if tab.reused else "launched", "" if tab.reused else why)
         browser = None
         try:
             browser, page = _probe_attach(playwright, tab)
+            watch = _BackOfficeAuthWatch(page)
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             page.bring_to_front()
             print("Sign in with SSO and MFA in the window titled app.pentera.io; waiting up to 15 minutes", flush=True)
-            if not _probe_wait_for_login(page, wait_seconds) or not production_probe.is_authenticated(*_probe_snapshot(page)):
+            if not _backoffice_signed_in(page, watch, wait_seconds):
                 raise RuntimeError("production_dry_run_login_timeout")
             yield page
         finally:
@@ -10077,10 +10202,11 @@ def _kept_browser_page(target: RunTarget, wait_seconds: float):
                              persist=True, chrome_proc=None, reused=True)
         browser = None
         try:
+            _log_production_window(profile_dir, "reused", "scan_check")
             browser, page = _probe_attach(playwright, tab)
+            watch = _BackOfficeAuthWatch(page)
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            if (not production_probe.wait_for_login(lambda: _probe_snapshot(page), wait_seconds, say=lambda *_: None)
-                    or not production_probe.is_authenticated(*_probe_snapshot(page))):
+            if not _backoffice_signed_in(page, watch, wait_seconds, say=lambda *_: None):
                 raise RuntimeError("production_window_signed_out")
             yield page
         finally:

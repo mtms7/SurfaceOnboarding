@@ -29,6 +29,18 @@ class LauncherSwitchTests(unittest.TestCase):
     def test_the_flag_is_settled_before_the_dashboard_process_starts(self):
         self.assertLess(self.text.index("if ($ProductionSessions)"), self.text.index("Start-Process -FilePath $PythonPath"))
 
+    def test_the_default_interpreter_is_the_playwright_venv(self):
+        # 2026-10-30: a restart on the bare runtime stopped the CO-0831 click with playwright_runtime_unavailable.
+        self.assertIn("[string]$PythonPath = ''", self.text)
+        self.assertIn(".venv-renewal-playwright\\Scripts\\python.exe", self.text)
+        self.assertLess(self.text.index(".venv-renewal-playwright\\Scripts\\python.exe"), self.text.index("Test-Path -LiteralPath $PythonPath"))
+
+    def test_production_sessions_refuse_an_interpreter_without_playwright_before_any_restart(self):
+        check = self.text.index("import playwright.sync_api")
+        self.assertLess(check, self.text.index("if (-not $Restart)"))
+        self.assertLess(check, self.text.index("Start-Process -FilePath $PythonPath"))
+        self.assertIn("playwright_runtime_unavailable", self.text)
+
     def test_the_launcher_sets_no_approval_values(self):
         # Approval reference / times come from the approval record inside the gate, never from the launcher.
         for name in ("SURFACE_ONBOARDING_PRODUCTION_APPROVAL", "SURFACE_ONBOARDING_PRODUCTION_SESSION_REF"):

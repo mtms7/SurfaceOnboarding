@@ -38,6 +38,16 @@ except ModuleNotFoundError:
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="surface_test_state_"))
 atexit.register(shutil.rmtree, _STATE_DIR, True)
 
+# 2026-10-30: the sign-out test posts /logout, whose handler closes the kept production window. Under the real
+# %LOCALAPPDATA% that found and closed the owner's LIVE app.pentera.io window (CO-0831: two kept windows vanished during
+# full-suite runs). Every browser profile, keep deadline, window log and other per-user folder now resolves inside this
+# temporary folder for the whole test run, so no test can reach a real automation browser.
+import os  # noqa: E402
+
+os.environ["LOCALAPPDATA"] = str(_STATE_DIR / "localappdata")
+for _name in ("SURFACE_LEONARDO_PROFILE_DIR", "SURFACE_ONBOARDING_PRODUCTION_FRESH_SIGNIN"):
+    os.environ.pop(_name, None)  # an inherited override could point back at a real profile
+
 import tools.attended_ce_only_playwright as _runner  # noqa: E402
 
 for _name in ("RUNNER_STATE_PATH", "CHECK_STATE_PATH", "READBACK_PATH", "SCAN_STATUS_PATH", "VALIDATION_PATH",

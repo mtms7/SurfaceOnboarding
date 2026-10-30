@@ -124,6 +124,7 @@ class KeptPageTests(unittest.TestCase):
         released, finished = [], []
         with mock.patch.object(runner, "production_window_kept", return_value=True), \
                 mock.patch.object(runner, "leonardo_profile", return_value=(Path("p"), True)), \
+                mock.patch.object(runner, "_log_production_window") as logged, \
                 mock.patch.object(runner, "_verified_automation_port", return_value=9222), \
                 mock.patch.object(runner, "_cdp_page_targets", return_value=[{"id": "A"}]), \
                 mock.patch.object(runner, "_cdp_open_tab", return_value="B"), \
@@ -135,6 +136,7 @@ class KeptPageTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "production_window_signed_out"):
                 self.open()
         self.assertEqual(wait.call_args.args[1], 5)
+        logged.assert_called_once()  # patched: the relative profile "p" must never log into the working folder
         page.bring_to_front.assert_not_called()
         self.assertEqual(len(released), 1)
         self.assertTrue(released[0].reused and released[0].persist and released[0].chrome_proc is None)

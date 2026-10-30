@@ -45,7 +45,7 @@ param(
     [string]$ExpectedOrgId = '',
     [string]$AllowedUser = 'milton.stevenson@pentera.io',
     [string]$PasswordResetUrl = '',
-    [string]$PythonPath = 'C:\Users\Milton Stevenson\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+    [string]$PythonPath = ''
 )
 
 Set-StrictMode -Version Latest
@@ -56,12 +56,32 @@ if ($env:OS -ne 'Windows_NT') {
 }
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+# 2026-10-30: a restart without -PythonPath ran the bare runtime (no Playwright), so the CO-0831 click stopped at once with
+# playwright_runtime_unavailable. The default is now the project's Playwright venv; the bare runtime only when it is missing.
+if ([string]::IsNullOrWhiteSpace($PythonPath)) {
+    $venvPython = Join-Path $projectRoot '.venv-renewal-playwright\Scripts\python.exe'
+    $PythonPath = if (Test-Path -LiteralPath $venvPython) { $venvPython } else { 'C:\Users\Milton Stevenson\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' }
+}
 $dashboard = Join-Path $PSScriptRoot 'serve_attended_open_onboardings_dashboard.py'
 if (-not (Test-Path -LiteralPath $dashboard)) {
     throw "Dashboard script not found: $dashboard"
 }
 if (-not (Test-Path -LiteralPath $PythonPath)) {
     throw "Python runtime not found: $PythonPath. Supply -PythonPath with an approved desktop Python 3.12+ runtime."
+}
+if ($ProductionSessions.IsPresent) {
+    # Every production create and scan check runs the runner with this interpreter: refuse here, before -Restart stops the
+    # running dashboard, instead of failing at the owner's click.
+    $playwrightOk = $false
+    try {
+        & $PythonPath -c 'import playwright.sync_api' 2>$null | Out-Null
+        $playwrightOk = ($LASTEXITCODE -eq 0)
+    } catch {
+        $playwrightOk = $false
+    }
+    if (-not $playwrightOk) {
+        throw "Playwright is not installed for $PythonPath, so production runs would stop with playwright_runtime_unavailable. Use -PythonPath .venv-renewal-playwright/Scripts/python.exe."
+    }
 }
 if (-not (Get-Command sf.cmd -ErrorAction SilentlyContinue)) {
     throw 'Salesforce CLI (sf.cmd) is not available on PATH. Install or repair the approved Salesforce CLI before continuing.'

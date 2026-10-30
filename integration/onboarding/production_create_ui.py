@@ -341,6 +341,9 @@ class Inputs:
     launching: bool = False
     tenant_names_path: Path | None = None  # the confirmed short tenant names (docs/60); None = none confirmed
     case3_tenant_name: str | None = None   # Case 3 only: the exact tenant name the create would type (confirmed), else None
+    # Owner request 2026-10-30: the early-activation box is only for a CO whose Start-minus-2-days window is NOT open yet.
+    # False only when the page knows the window is already open; a closed or undetermined window still offers it.
+    early_offer: bool = True
 
 
 def _owner_ok(operator: str | None, record: Mapping[str, Any]) -> bool:
@@ -545,11 +548,14 @@ def _onboard_form(reference: str, token: str, issue_approval: bool, early: str =
             + early_html + "<button type='submit'>Onboard in production</button></form>")
 
 
-def _early_state(route: Any, approval: Mapping[str, Any] | None) -> str:
-    """``_onboard_form``'s ``early`` value: CE-only offers the box, or shows it as recorded on the approval."""
+def _early_state(route: Any, approval: Mapping[str, Any] | None, offer: bool = True) -> str:
+    """``_onboard_form``'s ``early`` value: CE-only offers the box (only while its timing window is not open, ``offer``), or
+    shows it as recorded on the approval."""
     if route != production_approval.ALLOWED_ROUTE:
         return ""
-    return "recorded" if isinstance(approval, Mapping) and approval.get("early_activation") is True else "offer"
+    if isinstance(approval, Mapping) and approval.get("early_activation") is True:
+        return "recorded"
+    return "offer" if offer is not False else ""
 
 
 def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str:
@@ -589,14 +595,15 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
                           "create nothing is written to Salesforce until you review and confirm it on this page.</p>")
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
                 "<h2 id='co-create-title' class='pill'>Create in production</h2>" + _chip("chip-warn", "Production")
-                + "</div>" + route_note + _onboard_form(reference, token, False, _early_state(ctx.get("route"), approval))
+                + "</div>" + route_note + _onboard_form(reference, token, False,
+                                                               _early_state(ctx.get("route"), approval, inputs.early_offer))
                 + "</section>")
     if reason == "approval_missing" and isinstance(inputs.row, Mapping) and inputs.row.get("Onboarding_Approval_Status__c") == "Approved":
         revision = str(inputs.row.get("LastModifiedDate") or "")
         token = TOKENS.issue("create", reference, _binding(reference, revision, "no-approval", "create"))
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
                 "<h2 id='co-create-title' class='pill'>Onboard in production</h2>" + _chip("chip-warn", "Production")
-                + "</div>" + _onboard_form(reference, token, True, _early_state(_row_route(inputs.row), None)) + "</section>")
+                + "</div>" + _onboard_form(reference, token, True, _early_state(_row_route(inputs.row), None, inputs.early_offer)) + "</section>")
     if status is not None and status["code"] == CREATED_VERIFIED and _row_route(inputs.row) == production_approval.CASE3_ROUTE:
         from . import case3_followup  # lazy: case3_followup imports this module
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"

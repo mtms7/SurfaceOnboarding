@@ -11,6 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 import contextvars
 import copy
 from html import escape
+import dataclasses
 from dataclasses import dataclass
 import functools
 import hmac
@@ -7991,7 +7992,9 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     return _app_shell("Review " + ref, main, active="prod_onboarding", refresh=_dry_run_refresh(ref))
 
 
-_APPROVAL_STATE_CHIPS = {"valid": ("chip-ok", "Valid"), "expired": ("chip-warn", "Expired"), "consumed": ("chip-neutral", "Used")}
+# "superseded" (2026-10-30): an early-activation approval replaces a live one (CO-0801); without it /prod/approvals failed.
+_APPROVAL_STATE_CHIPS = {"valid": ("chip-ok", "Valid"), "expired": ("chip-warn", "Expired"), "consumed": ("chip-neutral", "Used"),
+                         "superseded": ("chip-neutral", "Superseded")}
 
 
 def _approval_table(listing: dict[str, Any], columns: tuple[str, ...], rows_html: str, noun: str, singular: str) -> str:
@@ -8145,6 +8148,18 @@ def _production_page_state(reference: str, row: dict[str, str | None] | None) ->
         return {"phase": "blocked", "reason": "gate_unreadable", "text": create_ui.gate_text("gate_unreadable")}
 
 
+def _card_inputs(reference: str, row: dict[str, str | None] | None) -> create_ui.Inputs:
+    """The create card's inputs: also whether the early-activation box is offered (owner request 2026-10-30): not once the
+    Start-minus-2-days window is open (the cached start date of the queue); a closed or unknown window still offers it."""
+    inputs = _create_ui_inputs(reference, row)
+    try:
+        window = production_views.timing_window(_prod_view_start(reference) or "", production_now().date(),
+                                                ONBOARD_DAYS_BEFORE_START)
+    except Exception:  # noqa: BLE001 - unknown: the box stays offered, the gate decides as before
+        return inputs
+    return dataclasses.replace(inputs, early_offer=window["state"] != "open")
+
+
 def _production_create_html(reference: str, row: dict[str, str | None] | None, state: dict[str, Any] | None = None) -> str:
     """The create section of a production CO page. With ``state`` (the review page) a closed gate without a record shows a
     read-only card naming that gate instead of nothing; without it, "" as before. Any failure shows no control."""
@@ -8162,11 +8177,11 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
                 # Case 3: nothing is written automatically, so the owner's review button must stay reachable under the bar.
                 # A stopped run (a refusal before anything was created): the button stays under the reason so it can be retried;
                 # the gate itself still blocks it after a real attempt (prior_attempt_needs_review) or a consumed approval.
-                inputs = _create_ui_inputs(reference, row)
+                inputs = _card_inputs(reference, row)
                 return create_ui.progress_card_html(progress) + create_ui.create_card_html(
                     inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
             return create_ui.progress_card_html(progress) + (scan_html if progress["done"] else "")
-        inputs = _create_ui_inputs(reference, row)
+        inputs = _card_inputs(reference, row)
         html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference)) + scan_html
     except Exception:  # noqa: BLE001 - fail closed: no control
         html = ""
@@ -8623,8 +8638,8 @@ def close_kept_production_window(reason: str) -> str:
             return "vm_read_only"
         if _production_run_active():
             return ("production_window_in_use" if reason == "expiry"
-                    else attended_runner.close_production_window(expire=True))
-        return attended_runner.close_production_window(only_if_expired=reason == "expiry")
+                    else attended_runner.close_production_window(expire=True, reason="dashboard_" + reason))
+        return attended_runner.close_production_window(only_if_expired=reason == "expiry", reason="dashboard_" + reason)
     except Exception:  # noqa: BLE001 - the next check tries again
         return "production_window_close_failed"
 
