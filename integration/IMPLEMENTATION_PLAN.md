@@ -2415,3 +2415,24 @@ Rules: explain each step and wait for my "go"; I push; commit only when I ask. M
 State: CI boundary fix and labels committed; check that "Integration scaffold checks" is green after my push. Restart the dashboard to load the labels.
 Next, one go each: clone collectors to query 253 only (run_clone_push.ps1 --query-id 253, disable SurfaceOnboarding-RedashInventory); VM Redash test after IT ticket 16160; VM key steps 1-4 (mine); Onboarding Completed for CO-0813/0816/0825 (go per CO); Case 3 build step 1 after my scan-finished rule, step 2 after my TA->operator table; r41 to the VM. CO-0801 stays parked.
 ```
+
+### 2026-10-28 (night): CI green, one clone source (query 253), duplicate collector disabled
+
+- **CI:** the owner pushed fa24f66 (boundary fix, labels); "Integration scaffold checks" #47 passed (3m49s).
+- **Dashboard:** restarted on fa24f66 (listener PID 4736); the owner signed in. The queue shows "Ready to onboard" and "Not created"; CO-0825 shows "Onboarded (UUID in Salesforce)" / "Created by hand".
+- **Clone source (owner decision 2026-10-28):** 9651791, `tools/run_clone_push.ps1` collects with `--cached-ok --query-id 253` (v2, with the CE scan fields); `test_clone_push` guards the argument. The PC already has `redash/query-253.key`; the bundle builder accepts v2; 23.8 MB is under the VM's 32 MB per-file limit. 62 push tests OK, boundary and artifact checks pass. The owner pushes 9651791.
+- **Scheduled tasks (verified read-only, 18:28):** `SurfaceOnboarding-RedashInventory` Disabled (owner, admin PowerShell); `SurfaceOnboarding-CloneToVm` Ready, last run 17:51 result 0, next 18:51 (the first query 253 push); `SurfaceOnboarding-VmTunnel` Running. The dashboard's `clone_autorefresh` stays (query 253, only when the clone is over 45 min old).
+- **Not yet verified:** the 18:51 push (push log result, VM answer ingested/unchanged, latest clone from query 253).
+- **Seen on the queue:** CO-0821 (renewal) "Onboarded: review", identity mismatch on the tenant that owns its UUID; owner check, not an automation item.
+- **Still open:** VM key steps 1-4 (owner); VM Redash test after IT ticket 16160; Onboarding Completed for CO-0813/0816/0825 (go per CO); Case 3 build step 1 (needs the owner's scan-finished rule) and step 2 (needs the TA -> operator table); primary-user field decisions; r41 to the VM, `-RemoteStart`, 28C, 30-minute cadence; CO-0801 parked.
+
+Paste-able prompt for the next session:
+
+```
+Continue Surface Workato OPA work in C:/Users/Milton Stevenson/Documents/Surface/Workato. Use .codex/skills/surface-workato-opa/SKILL.md; read AGENTS.md, README.md and integration/IMPLEMENTATION_PLAN.md section 18 (latest: 2026-10-28 night).
+Rules: explain each step and wait for my "go"; I push; commit only when I ask. MFA stays manual, never persist secrets. Production BackOffice writes need the per-CO approval and my click. Fail closed on ambiguity; verify external changes directly. Forward slashes, label PC or VM, single-line PowerShell 5.1 (no &&), COMMAND_TO_PASTE.md for long ones; detailed steps with each next action; dated handoff in section 18 plus the prompt in chat.
+State: CI green on fa24f66; 9651791 (clone push uses query 253) committed, I push it; SurfaceOnboarding-RedashInventory disabled.
+First (read-only): verify the latest SurfaceOnboarding-CloneToVm run collected query 253 and the VM answered ingested or unchanged; the dashboard clone stays trusted.
+Then, one go each: Onboarding Completed for CO-0813/0816/0825 (go per CO); VM key steps 1-4 (mine) then a BatchMode check; VM Redash test after IT ticket 16160; Case 3 build step 1 after my scan-finished rule, step 2 after my TA->operator table; r41 to the VM. CO-0801 stays parked.
+```
+
