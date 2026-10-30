@@ -10036,6 +10036,63 @@ def _pdr_browser_page(target: RunTarget, wait_seconds: float):
             _finish_production_window(tab)  # kept up to 8 h (owner decision 2026-10-29), else closed
 
 
+# Owner request 2026-10-30: the automatic BackOffice CE scan check runs ONLY inside the kept, still signed-in production
+# window. It never launches a browser, never waits for a human sign-in and never brings the window to the front.
+KEPT_SIGN_IN_SECONDS = 45.0  # the reused tab must read as signed in within this; otherwise the check stops (no prompt)
+
+
+def production_window_kept(now: datetime | None = None) -> bool:
+    """True only while the desktop production window is kept (deadline in the future) and its browser answers. Reads only."""
+    try:
+        profile_dir, persist = leonardo_profile(production_probe.probe_target())
+        deadline = production_window_deadline(profile_dir)
+        moment = now or datetime.now(timezone.utc)
+        return bool(persist and deadline is not None and moment < deadline
+                    and _verified_automation_port(profile_dir) is not None)
+    except Exception:
+        return False
+
+
+@contextmanager
+def _kept_browser_page(target: RunTarget, wait_seconds: float):
+    """A new tab in the KEPT production window, never a launch: raises production_window_not_kept when there is no kept,
+    running window and production_window_signed_out when the tab does not read as signed in (nobody is asked to sign in)."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ModuleNotFoundError:
+        raise RuntimeError("playwright_runtime_unavailable") from None
+    if not production_window_kept():
+        raise RuntimeError("production_window_not_kept")
+    profile_dir, _ = leonardo_profile(target)
+    url = production_probe.start_url(target)
+    with sync_playwright() as playwright:
+        port = _verified_automation_port(profile_dir)
+        if port is None:
+            raise RuntimeError("production_window_not_kept")
+        preexisting = frozenset(item["id"] for item in _cdp_page_targets(port) if item["id"])
+        target_id = _cdp_open_tab(port, url, target.origin)
+        if target_id is None:
+            raise RuntimeError("browser_tab_unavailable")
+        tab = _AutomationTab(port=port, target_id=target_id, preexisting=preexisting, profile_dir=profile_dir,
+                             persist=True, chrome_proc=None, reused=True)
+        browser = None
+        try:
+            browser, page = _probe_attach(playwright, tab)
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            if (not production_probe.wait_for_login(lambda: _probe_snapshot(page), wait_seconds, say=lambda *_: None)
+                    or not production_probe.is_authenticated(*_probe_snapshot(page))):
+                raise RuntimeError("production_window_signed_out")
+            yield page
+        finally:
+            try:
+                if browser is not None:
+                    browser.close()
+            except Exception:
+                pass
+            _release_automation_tab(tab)
+            _finish_production_window(tab)  # a reuse never extends the deadline; a passed one closes the window
+
+
 def run_production_dry_run(reference: str, acknowledged_revision: str, *, route: str = CE_ENGINE,
                            environ: Any | None = None,
                            now: datetime | None = None, records_parent: Path | None = None,
@@ -10557,6 +10614,9 @@ def main() -> int:
     parser.add_argument("--production-scan-check", action="store_true",
                         help="With --co: READ-ONLY CE scan check of a tenant created by a verified production create (you sign "
                              "in with SSO and MFA; nothing is typed, clicked or written).")
+    parser.add_argument("--kept-window-only", action="store_true",
+                        help="Only with --production-scan-check: use the kept, signed-in production window or stop (no launch, "
+                             "no sign-in wait). The dashboard's automatic check.")
     parser.add_argument("--owner-go", action="store_true",
                         help="Only with --production-create: the owner's explicit go for this one create (never implied).")
     args = parser.parse_args()
@@ -10564,8 +10624,10 @@ def main() -> int:
         if (not args.co or args.revision or args.production_create or args.production_dry_run or args.production_probe
                 or args.production_readback or args.dry_run or args.confirm_write or args.owner_go):
             parser.error("--production-scan-check needs --co and is a separate read-only run")
-        print(run_production_scan_check(args.co))
+        print(run_production_scan_check(args.co, kept_only=args.kept_window_only))
         return 0
+    if args.kept_window_only:
+        parser.error("--kept-window-only is only for --production-scan-check")
     if args.production_search_probe:
         if args.co or args.revision or args.production_create or args.dry_run or args.confirm_write:
             parser.error("--production-search-probe is a separate read-only run")
@@ -10931,13 +10993,16 @@ def _scan_check_line(result: str) -> str:
 
 def run_production_scan_check(reference: str, *, environ: Any | None = None, now: datetime | None = None,
                               records_parent: Path | None = None, open_page: Any = None,
-                              wait_seconds: float = MAX_WAIT_SECONDS) -> str:
+                              wait_seconds: float = MAX_WAIT_SECONDS, kept_only: bool = False) -> str:
     """Build 3 (owner decision 2026-10-19): READ-ONLY CE scan check of one tenant created by a verified production create.
 
     Bound to the CO's own verified create record (its Account UUID and tenant name); no approval and no lock constant,
     because nothing is written. Opens tenantManagement in the dedicated profile (SSO + MFA by the owner), installs the
     read-only request guard, reads the tenant's OWN row through the page's own table request and records only scan field
     names with safe values (production_scan_check). The VM and unknown runtimes never open a browser.
+
+    ``kept_only`` (the dashboard's automatic check, owner request 2026-10-30): only a new tab in the kept, signed-in
+    production window; no launch, no sign-in wait, nothing brought to the front; otherwise nothing is read or recorded.
     """
     from integration.onboarding import production_create_ui as create_ui
     from integration.onboarding import production_scan_check as scan
@@ -10963,8 +11028,9 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
         return _scan_check_line("no_verified_create")
     reply = {"state": "read_unavailable", "found": False, "fields": {}}
     result = None
+    opener = open_page or (_kept_browser_page if kept_only else _pdr_browser_page)
     try:
-        with (open_page or _pdr_browser_page)(production_probe.probe_target(), wait_seconds) as page:
+        with opener(production_probe.probe_target(), KEPT_SIGN_IN_SECONDS if kept_only else wait_seconds) as page:
             guard = production_probe.RequestGuard(require_read_body=True)
             guard.install(page)
             try:
@@ -10992,7 +11058,9 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
                                  "executions_counts": getattr(error, "counts", None),
                                  "executions_menu_items": getattr(error, "menu_items", None)}
     except RuntimeError as error:
-        result = "production_sign_in_timeout" if str(error) == "production_dry_run_login_timeout" else "scan_check_failed"
+        result = {"production_dry_run_login_timeout": "production_sign_in_timeout",
+                  "production_window_not_kept": "production_window_not_kept",
+                  "production_window_signed_out": "production_window_signed_out"}.get(str(error), "scan_check_failed")
     except Exception:
         result = "scan_check_failed"
     if result is not None:

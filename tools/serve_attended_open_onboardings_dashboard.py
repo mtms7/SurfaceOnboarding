@@ -8484,9 +8484,13 @@ AUTO_SCAN_WAKE = Event()
 
 
 def request_auto_scan() -> None:
-    """Wake the background job now (desktop only; it still checks every guard)."""
+    """Wake the background jobs now (desktop only; they still check every guard). Also marks a sign-in for the kept-window
+    check, so each waiting CO gets one more BackOffice look even after its 90-minute schedule."""
+    global KEPT_SCAN_SIGN_IN_AT
     if not vm_mode():
+        KEPT_SCAN_SIGN_IN_AT = datetime.now(timezone.utc)
         AUTO_SCAN_WAKE.set()
+        KEPT_SCAN_WAKE.set()
 
 
 def _clone_payload_for_job() -> dict[str, Any]:
@@ -8544,6 +8548,56 @@ def _auto_scan_loop(stop: Any = None) -> None:
             pass
         AUTO_SCAN_WAKE.wait(AUTO_SCAN_INTERVAL_SECONDS)
         AUTO_SCAN_WAKE.clear()
+        if stop is not None and stop.is_set():
+            return
+
+
+# --- Automatic BackOffice CE scan check in the kept production window (owner request 2026-10-30) --------------------------
+# The clone is refreshed about every 12 h, but a CE scan ends ~26 min after the create (CO-0801: start +16 min, 10 min run).
+# While the production window is kept and signed in, this job runs the SAME read-only scan check as the button, with
+# --kept-window-only: a new tab in that window, no launch, no sign-in wait, nothing brought to the front. Timing is
+# create_ui.kept_scan_due (20 min, then every 5 min until 90 min, then once per sign-in). One check at a time, through the
+# same launch lock as every production run, never under a create. Page builds never call this. The stage moves are the
+# button's own follow-up (after_scan_finished); a stage moved by hand is left alone and not looked at again for a day.
+KEPT_SCAN_POLL_SECONDS = 60
+KEPT_SCAN_HOLD = timedelta(hours=24)
+KEPT_SCAN_STATE: dict[str, dict[str, Any]] = {}  # per CO: {"at": datetime of the last automatic start, "hold_until"?}
+KEPT_SCAN_SIGN_IN_AT: datetime | None = None
+KEPT_SCAN_WAKE = Event()
+
+
+def _kept_scan_tick(now: datetime | None = None) -> str | None:
+    """Start at most one automatic kept-window check; returns the CO started, else None. Never raises."""
+    try:
+        if vm_mode() or _production_run_active() or not attended_runner.production_window_kept():
+            return None
+        moment = now or datetime.now(timezone.utc)
+        parent = production_records_parent()
+        for reference in create_ui.auto_scan_candidates(parent):
+            state = KEPT_SCAN_STATE.setdefault(reference, {})
+            with _PRODUCTION_RUNS_LOCK:
+                stages = (PRODUCTION_SCAN_RUNS.get(reference) or {}).get("stages") or []
+            if "stage_not_expected" in stages and state.get("at") and "hold_until" not in state:
+                state["hold_until"] = state["at"] + KEPT_SCAN_HOLD
+            if state.get("hold_until") and moment < state["hold_until"]:
+                continue
+            if not create_ui.kept_scan_due(parent, reference, moment, state.get("at"), KEPT_SCAN_SIGN_IN_AT):
+                continue
+            if create_ui.LAUNCHES.claim(lambda ref=reference: _launch_scan_check(ref, kept_only=True)):
+                KEPT_SCAN_STATE[reference] = {"at": moment}
+                return reference
+            return None  # another production run holds the lock: try again next poll
+    except Exception:  # noqa: BLE001 - the loop never dies
+        return None
+    return None
+
+
+def _kept_scan_loop(stop: Any = None) -> None:
+    """Daemon loop: a tick every KEPT_SCAN_POLL_SECONDS (local files and one loopback check only), or at once on sign-in."""
+    while True:
+        _kept_scan_tick()
+        KEPT_SCAN_WAKE.wait(KEPT_SCAN_POLL_SECONDS)
+        KEPT_SCAN_WAKE.clear()
         if stop is not None and stop.is_set():
             return
 
@@ -8657,8 +8711,9 @@ def _wait_for_warm_reason(halt: Any) -> None:
 PRODUCTION_SCAN_RUNS: dict[str, dict[str, Any]] = {}
 
 
-def _launch_scan_check(reference: str) -> Any:
-    """Start the runner's read-only CE scan check (desktop only) and a worker that moves the stage when it is finished."""
+def _launch_scan_check(reference: str, kept_only: bool = False) -> Any:
+    """Start the runner's read-only CE scan check (desktop only) and a worker that moves the stage when it is finished.
+    ``kept_only``: the automatic check, which uses the kept signed-in production window or stops (never a sign-in)."""
     if not REFERENCE.fullmatch(reference) or not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
         return None
     child = dict(os.environ)
@@ -8668,7 +8723,8 @@ def _launch_scan_check(reference: str) -> Any:
         child[runner_child_log.LOG_ENV] = str(folder / (reference + "-scan-" + datetime.now(timezone.utc)
                                                         .strftime("%Y%m%dT%H%M%SZ") + ".log"))
     try:
-        process = subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-scan-check", "--co", reference],
+        process = subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-scan-check", "--co", reference,
+                                    *(["--kept-window-only"] if kept_only else [])],
                                    env=child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         return None
@@ -10328,6 +10384,7 @@ if __name__ == "__main__":
         Thread(target=_display_warm_loop, name="display-warm", daemon=True).start()
         Thread(target=close_kept_production_window, args=("start",), name="production-window-start", daemon=True).start()
         Thread(target=_production_window_loop, name="production-window", daemon=True).start()
+        Thread(target=_kept_scan_loop, name="kept-scan", daemon=True).start()
         if clone_autorefresh.enabled(vm=vm_mode()):
             Thread(target=clone_autorefresh.run_loop, name="clone-autorefresh", daemon=True).start()
     _server = ThreadingHTTPServer((listener_host, listener_port), Handler)  # a second process dies here, before it can poll

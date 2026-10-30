@@ -81,7 +81,8 @@ class WindowTests(unittest.TestCase):
 
     def test_the_production_runs_finish_through_the_keep_rule(self):
         source = Path(runner.__file__).read_text(encoding="utf-8")
-        self.assertEqual(source.count("_finish_production_window(tab)"), 2)
+        # 2026-10-30: the third is the kept-window opener of the automatic scan check (_kept_browser_page).
+        self.assertEqual(source.count("_finish_production_window(tab)"), 3)
         self.assertNotIn("if tab.persist:  # end the loopback CDP exposure", source)
 
 

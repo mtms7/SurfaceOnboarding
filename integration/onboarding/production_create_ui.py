@@ -1088,6 +1088,36 @@ def auto_scan_candidates(parent: Path) -> list[str]:
     return sorted(co for co, last in newest.items() if last in AUTO_SCAN_WAITING and CO_PATTERN.fullmatch(co))
 
 
+# Automatic BackOffice CE scan check in the kept production window (owner request 2026-10-30). Live CO-0801: the CE scan
+# started 16 min after the create and ran 10 min, so the first look is at 20 min, then every 5 min until 90 min. After that
+# only a sign-in (the Salesforce session turning Ready) looks once more; the nightly clone check and the button remain.
+KEPT_SCAN_FIRST = timedelta(minutes=20)
+KEPT_SCAN_EVERY = timedelta(minutes=5)
+KEPT_SCAN_UNTIL = timedelta(minutes=90)
+
+
+def kept_scan_due(parent: Path, co: str, now: datetime, last_attempt: datetime | None,
+                  sign_in_at: datetime | None = None) -> bool:
+    """Whether the automatic kept-window check should look at ``co`` now (pure apart from reading its create records).
+
+    Never before KEPT_SCAN_FIRST after the verified create, never twice within KEPT_SCAN_EVERY. Inside KEPT_SCAN_UNTIL it
+    is due every KEPT_SCAN_EVERY; later only once per sign-in (``sign_in_at`` newer than the last attempt)."""
+    try:
+        created_ms = _created_ms(load_co_records(parent, co))
+    except Exception:
+        return False
+    if created_ms is None:
+        return False
+    age = now - datetime.fromtimestamp(created_ms / 1000, tz=timezone.utc)
+    if age < KEPT_SCAN_FIRST:
+        return False
+    if last_attempt is not None and now - last_attempt < KEPT_SCAN_EVERY:
+        return False
+    if age <= KEPT_SCAN_UNTIL:
+        return True
+    return sign_in_at is not None and sign_in_at <= now and (last_attempt is None or last_attempt < sign_in_at)
+
+
 def _created_ms(history: list[dict[str, Any]]) -> int | None:
     """The create time recorded for this CO (its newest ``readback_verified``), epoch ms; None when absent or unreadable."""
     stamps = [r.get("recorded_at") for r in active_history(history) if r.get("outcome") == production_create.OUTCOME_VERIFIED]
