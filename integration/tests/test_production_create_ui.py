@@ -271,8 +271,11 @@ class OneClickTests(Base):
         card = ui.create_card_html(self.approved_inputs())
         self.assertIn("Onboard in production", card)
         self.assertIn("name='issue_approval'", card)
-        for gone in ("confirm_reference", "production_create_authorized", "type='checkbox'", "type='text'"):
+        for gone in ("confirm_reference", "production_create_authorized", "type='text'"):
             self.assertNotIn(gone, card)
+        # owner decision 2026-10-29: the only box is the optional, unticked CE-only early activation (CSM exception)
+        self.assertEqual(re.findall(r"type='checkbox' name='([a-z_]+)'", card), ["early_activation"])
+        self.assertNotIn("checked", card)
         self.assertEqual(card.count("<form"), 1)
 
     def test_a_co_not_approved_in_salesforce_gets_no_button(self):

@@ -1230,6 +1230,13 @@ _POSTS_KEEPING_DISPLAY_CACHE = frozenset({"/login/start", "/login/cancel", "/log
                                           "/attended/session-recheck", "/attended/salesforce-login"})
 
 
+# Production buttons of ONE CO (owner request 2026-10-29: each "Onboard in production" click made every page cold, and the
+# warm-up then re-read all COs one by one, ~4.5 s each). They clear only that CO and the queue lists, once the form names
+# a valid CO; a form without one clears everything as before.
+_PER_CO_POSTS = frozenset({create_ui.CREATE_PATH, create_ui.UUID_REVIEW_PATH, create_ui.UUID_CONFIRM_PATH,
+                           create_ui.SCAN_CHECK_PATH, create_ui.FOLLOWUP_REVIEW_PATH, create_ui.FOLLOWUP_CONFIRM_PATH})
+
+
 def clear_display_cache_for(reference: str) -> None:
     """Drop only what a write to ONE CO can change: its own cached reads and the queue-wide lists (owner request
     2026-10-28: a whole-cache clear made every other CO page cold). A background read in flight never stores."""
@@ -2857,9 +2864,16 @@ def post_form(handler: BaseHTTPRequestHandler) -> dict[str, list[str]] | None:
         if length < 1 or length > 4096:
             return None
         parsed = parse_qs(handler.rfile.read(length).decode("utf-8"), keep_blank_values=True, strict_parsing=True)
-        return parsed
     except (UnicodeDecodeError, ValueError):
-        return None
+        parsed = None
+    if getattr(handler, "display_clear_pending", False):  # a per-CO production POST: its clear waits for the form
+        handler.display_clear_pending = False
+        reference = exact_form_value(parsed, "reference")
+        if isinstance(reference, str) and REFERENCE.fullmatch(reference):
+            clear_display_cache_for(reference)
+        else:
+            clear_display_cache()
+    return parsed
 
 
 def exact_form_value(form: dict[str, list[str]] | None, name: str) -> str | None:
@@ -6584,6 +6598,9 @@ REVIEW_CLONE_MAX_AGE_SECONDS = 6 * 3600
 REVIEW_BLOCKER_TEXT = {
     "no_automated_route": "This CO has no automated route (exact Product and Type pair not supported).",
     "summary_source_unreadable": "The values to be sent could not be read from Salesforce.",
+    "early_activation_needed": ("Only a Pending (renewal) Pentera Core Plus term exists: the create needs the Early activation "
+                                "(CSM exception) box. The licence then starts on the day of the create and ends on that "
+                                "term's end."),
     "salesforce_not_approved": "Salesforce does not show this CO as Approved yet (Onboarding Approval Status): it cannot be approved here.",
     "source_revision_missing": "The Salesforce source revision could not be determined.",
     "production_clone_stale": "The production clone (Redash) is older than 6 hours: collect it again.",
@@ -6672,6 +6689,8 @@ def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]
     else:
         summary["values"].update(tenant_names=_plain(inputs["co_source"]["tenant_names"]),
                                  domains=_plain(inputs["co_source"]["domains"]), plan=_plain(inputs["plan"]))
+        if inputs["plan"].get("pending_term") is True:
+            blockers.append("early_activation_needed")
     match = _match_of(reference, product, kind)
     status = str(match.get("status") or "clone_unavailable")
     summary["production_check"] = {
@@ -8352,7 +8371,7 @@ def _start_remote_create(reference: str, operator: str, revision: str = "") -> s
                 else _launch_production_create_followed(ref, rev, fresh))
 
     return create_ui.handle_create_post(values, inputs, launch_with_fresh_signin,
-                                        lambda ref, revision, route: _issue_one_co_approval(inputs, ref, revision, route))
+                                        lambda ref, revision, route, **kw: _issue_one_co_approval(inputs, ref, revision, route, **kw))
 
 
 def _production_sessions_enabled() -> bool:
@@ -8380,12 +8399,15 @@ def _remote_poll_ssh(argv: list, data: bytes) -> tuple:
     return done.returncode, done.stdout.decode("utf-8", "replace")
 
 
-def _issue_one_co_approval(inputs: create_ui.Inputs, reference: str, revision: str, route: str) -> bool:
+def _issue_one_co_approval(inputs: create_ui.Inputs, reference: str, revision: str, route: str,
+                           early_activation: bool = False) -> bool:
     """Record the one-CO production approval from the page (same record ``tools/issue_production_approval.py`` writes).
 
     Only the owner on the desktop: the signed-in operator must be on the issuer list, the pinned Salesforce org must be the
     expected one, the CO must be Approved with one valid domain and no IDs, and the revision must be the one shown. It
-    unlocks nothing by itself and writes nothing to Salesforce or BackOffice. Any problem returns False (nothing recorded)."""
+    unlocks nothing by itself and writes nothing to Salesforce or BackOffice. Any problem returns False (nothing recorded).
+    ``early_activation`` (CE-only, the owner's ticked CSM exception box, 2026-10-29) is recorded on the approval under its
+    own reference (suffix ``-EA``), replacing a live approval of the same revision that does not carry it."""
     from tools import issue_production_approval as issuer_tool
     try:
         if vm_mode() or not isinstance(inputs.row, dict) or inputs.row.get("LastModifiedDate") != revision:
@@ -8405,10 +8427,13 @@ def _issue_one_co_approval(inputs: create_ui.Inputs, reference: str, revision: s
         if issuer_tool.org_problem(os.environ, org_probe, inputs.now) is not None:
             return False
         tenant = inputs.case3_tenant_name if route == CASE3_ENGINE else None
+        early = early_activation is True
         issuer_tool.build_approval(
-            path=PRODUCTION_APPROVAL_PATH, approval_ref=issuer_tool.default_approval_ref(reference, inputs.now, route),
+            path=PRODUCTION_APPROVAL_PATH,
+            approval_ref=issuer_tool.default_approval_ref(reference, inputs.now, route) + ("-EA" if early else ""),
             co_reference=reference, route=route, source_revision=revision, issued_by=operator, allowed_issuers=allowed,
-            now=inputs.now, **({"tenant_name": tenant} if tenant is not None else {}))
+            now=inputs.now, **({"tenant_name": tenant} if tenant is not None else {}),
+            **({"early_activation": True} if early else {}))
         return True
     except Exception:  # noqa: BLE001 - fail closed: nothing recorded, no detail shown
         return False
@@ -8521,6 +8546,43 @@ def _auto_scan_loop(stop: Any = None) -> None:
         AUTO_SCAN_WAKE.clear()
         if stop is not None and stop.is_set():
             return
+
+
+# --- Kept production window (owner decision 2026-10-29) ------------------------------------------------------------------
+# The runner keeps the desktop production window signed in for up to 8 hours (attended_runner.PRODUCTION_WINDOW_KEEP). This
+# dashboard closes it at its own start, at sign-out and once the deadline has passed, never under a run that is using it:
+# then sign-out only moves the deadline to now, and the run closes the window when it ends.
+PRODUCTION_WINDOW_CHECK_SECONDS = 300
+
+
+def _production_run_active() -> bool:
+    if create_ui.LAUNCHES.busy():
+        return True
+    with _PRODUCTION_RUNS_LOCK:
+        return any(run.get("running") for run in PRODUCTION_SCAN_RUNS.values())
+
+
+def close_kept_production_window(reason: str) -> str:
+    """``reason``: "start", "sign_out" or "expiry". Desktop only; any failure is reported, never raised."""
+    try:
+        if vm_mode():
+            return "vm_read_only"
+        if _production_run_active():
+            return ("production_window_in_use" if reason == "expiry"
+                    else attended_runner.close_production_window(expire=True))
+        return attended_runner.close_production_window(only_if_expired=reason == "expiry")
+    except Exception:  # noqa: BLE001 - the next check tries again
+        return "production_window_close_failed"
+
+
+def _production_window_loop(stop: Any = None) -> None:
+    """Daemon loop: close the kept production window once its 8 hours have passed (checked every 5 minutes)."""
+    while True:
+        if stop is None:
+            sleep(PRODUCTION_WINDOW_CHECK_SECONDS)
+        elif stop.wait(PRODUCTION_WINDOW_CHECK_SECONDS):
+            return
+        close_kept_production_window("expiry")
 
 
 # --- Display warm-up (owner request 2026-10-28, page speed) ---------------------------------------------------------------
@@ -9651,7 +9713,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable()); return
         inputs = _create_ui_inputs(reference, row, self.request_operator())
         code = dry_ui.handle_post(form or {}, inputs, _launch_production_dry_run,
-                                  lambda ref, revision, route: _issue_one_co_approval(inputs, ref, revision, route))
+                                  lambda ref, revision, route, **kw: _issue_one_co_approval(inputs, ref, revision, route, **kw))
         if code != "launched":
             body = ("<div class='banner banner-warn'><span class='chip chip-warn'>Not done</span> " + escape(dry_ui.text(code))
                     + " Nothing was sent.</div><p class='note'>Code: <code>" + escape(code) + "</code></p>" + back)
@@ -9683,7 +9745,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == create_ui.CREATE_PATH:
             code = create_ui.handle_create_post(values, inputs, _launch_production_create_followed,
-                                                lambda ref, revision, route: _issue_one_co_approval(inputs, ref, revision, route))
+                                                lambda ref, revision, route, **kw: _issue_one_co_approval(inputs, ref, revision, route, **kw))
             if code != "launched":
                 refuse(code); return
             self.send_redirect("/co/" + reference + "?env=prod")  # the CO page shows the progress (same dashboard)
@@ -9769,7 +9831,8 @@ class Handler(BaseHTTPRequestHandler):
         # Any action may change Salesforce or local state; later pages read fresh. Sign-in and session checks change no CO
         # data, so they keep the cache (owner request 2026-10-28: every Re-check made all pages cold).
         path = urlsplit(self.path).path
-        if path not in _POSTS_KEEPING_DISPLAY_CACHE:
+        self.display_clear_pending = path in _PER_CO_POSTS
+        if path not in _POSTS_KEEPING_DISPLAY_CACHE and not self.display_clear_pending:
             clear_display_cache()
         if vm_mode():
             email, role = self._vm_identity()
@@ -9799,6 +9862,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.CONFLICT, "<!doctype html><title>Sign-out refused</title><p>"
                                + escape(LOGIN_REASON_TEXT[problem]) + "</p><p><a href='/'>Return</a></p>")
                 return
+            Thread(target=close_kept_production_window, args=("sign_out",), daemon=True).start()
             self.send_redirect_with_cookies("/login", [SESSION_COOKIE + "=; Path=/" + cookie_attributes() + "; Max-Age=0"])
             return
         if path not in POST_ROUTES:
@@ -10262,6 +10326,8 @@ if __name__ == "__main__":
     if not vm_mode():
         Thread(target=_auto_scan_loop, name="auto-scan", daemon=True).start()
         Thread(target=_display_warm_loop, name="display-warm", daemon=True).start()
+        Thread(target=close_kept_production_window, args=("start",), name="production-window-start", daemon=True).start()
+        Thread(target=_production_window_loop, name="production-window", daemon=True).start()
         if clone_autorefresh.enabled(vm=vm_mode()):
             Thread(target=clone_autorefresh.run_loop, name="clone-autorefresh", daemon=True).start()
     _server = ThreadingHTTPServer((listener_host, listener_port), Handler)  # a second process dies here, before it can poll

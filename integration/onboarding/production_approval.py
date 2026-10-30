@@ -41,7 +41,9 @@ DEFAULT_LIFETIME = timedelta(days=7)
 REQUIRED_FIELDS = frozenset({"approval_ref", "co_reference", "route", "scope", "source_revision", "issued_by",
                              "issued_at", "expires_at"})
 # Path B step (b), owner go 2026-10-22: a Case 3 record also carries the owner-confirmed tenant name it was approved for.
-RECORD_FIELDS = REQUIRED_FIELDS | {"consumed_at", "superseded_at", "tenant_name"}
+# Owner decision 2026-10-29 (CO-0801, CSM exception): a CE-only record may carry ``early_activation: true``, the owner's
+# recorded CSM request to activate before the licence start (the create gate's ``csm_request_recorded``). Only ever True.
+RECORD_FIELDS = REQUIRED_FIELDS | {"consumed_at", "superseded_at", "tenant_name", "early_activation"}
 TENANT_NAME_MAX = 80
 CO_REFERENCE = re.compile(r"CO-[0-9]{4,10}")
 ISSUER = re.compile(r"[^\s<>'\"]{1,254}")
@@ -107,6 +109,8 @@ def _valid_record(key: Any, record: Any) -> bool:
             and _valid_revision(record["source_revision"])
             and ("tenant_name" not in record
                  or (record["route"] == CASE3_ROUTE and valid_tenant_name(record["tenant_name"])))
+            and ("early_activation" not in record
+                 or (record["route"] == ALLOWED_ROUTE and record["early_activation"] is True))
             and isinstance(record["issued_by"], str) and ISSUER.fullmatch(record["issued_by"]) is not None
             and _parse(record["issued_at"]) is not None and _parse(record["expires_at"]) is not None
             and ("consumed_at" not in record or _parse(record["consumed_at"]) is not None)
@@ -143,10 +147,11 @@ def _write(path: Path, records: Mapping[str, Any]) -> None:
 
 def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_revision: str, issued_by: str,
           allowed_issuers: frozenset[str], now: datetime, lifetime: timedelta = DEFAULT_LIFETIME,
-          tenant_name: str | None = None) -> dict[str, Any]:
+          tenant_name: str | None = None, early_activation: bool = False) -> dict[str, Any]:
     """Record a one-CO production approval (CE-only or Case 3). Raises ApprovalRefused(reason) on anything invalid.
 
-    A Case 3 approval needs the confirmed ``tenant_name`` it is bound to; a CE-only approval takes none."""
+    A Case 3 approval needs the confirmed ``tenant_name`` it is bound to; a CE-only approval takes none. ``early_activation``
+    (CE-only only) records the owner's CSM exception; it supersedes a live same-revision approval that does not carry it."""
     if scope_for(route) is None:
         raise ApprovalRefused("route_not_ce_only")
     if route == CASE3_ROUTE:
@@ -154,6 +159,8 @@ def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_r
             raise ApprovalRefused("invalid_tenant_name")
     elif tenant_name is not None:
         raise ApprovalRefused("tenant_name_not_allowed")
+    if early_activation is not False and (early_activation is not True or route != ALLOWED_ROUTE):
+        raise ApprovalRefused("early_activation_not_allowed")
     if (not isinstance(allowed_issuers, frozenset) or not isinstance(issued_by, str)
             or issued_by not in allowed_issuers or not ISSUER.fullmatch(issued_by)):
         raise ApprovalRefused("issuer_not_allowed")
@@ -173,6 +180,8 @@ def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_r
               "expires_at": _stamp(moment + lifetime)}
     if route == CASE3_ROUTE:
         record["tenant_name"] = tenant_name
+    if early_activation is True:
+        record["early_activation"] = True
     with _lock:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,9 +205,10 @@ def issue(path: Path, approval_ref: str, co_reference: str, route: str, source_r
                     continue  # consumed, superseded or expired: not live
                 if other["co_reference"] != co_reference:
                     raise ApprovalRefused("other_approval_active")
-                if other["source_revision"] == source_revision:
+                if other["source_revision"] == source_revision and (other.get("early_activation") is True
+                                                                     or early_activation is not True):
                     raise ApprovalRefused("approval_already_active_for_co")
-                superseded.append(key)  # bound to an older revision: it can no longer pass the gate
+                superseded.append(key)  # an older revision, or the same one without the early activation now recorded
             for key in superseded:
                 records[key] = {**records[key], "superseded_at": _stamp(moment)}
             records[approval_ref] = record

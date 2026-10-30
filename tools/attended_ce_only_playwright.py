@@ -439,7 +439,8 @@ def _parse_subscription_date(value: Any) -> date | None:
         return None
 
 
-def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False, active_only: bool = False) -> tuple[date, date]:
+def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False, active_only: bool = False,
+                           pending_if_no_active: bool = False) -> tuple[date, date]:
     """Select the CE license subscription dates, failing closed.
 
     Uses "Pentera Core Plus ..." baseline rows of any tier (Commercial,
@@ -452,6 +453,9 @@ def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False, acti
     Core Plus term is no longer ambiguous (rows without a status key keep
     the old behaviour). ``prefer_latest`` (renewals: the old active term and
     the new pending term coexist) keeps only the rows with the latest start.
+
+    ``pending_if_no_active`` (owner decision 2026-10-29, CO-0801 early activation on a CSM request): with ``active_only``,
+    when NO Active Core Plus row exists, the Pending Core Plus rows are used instead; they must agree on one term.
     """
     matches: list[tuple[date, date]] = []
     for row in rows:
@@ -474,6 +478,8 @@ def select_ce_subscription(rows: list[Any], *, prefer_latest: bool = False, acti
         if start is None or end is None or end <= start:
             raise RuntimeError("ce_subscription_ambiguous")
         matches.append((start, end))
+    if not matches and active_only and pending_if_no_active:
+        return select_ce_subscription([row for row in rows if isinstance(row, dict) and _row_status(row) == "pending"])
     if not matches:
         raise RuntimeError("ce_subscription_unavailable")
     if prefer_latest:
@@ -566,7 +572,7 @@ class RouteMismatch(RuntimeError):
         super().__init__("ce_route_mismatch")
 
 
-def ce_fill_source(reference: str) -> CeFillSource:
+def ce_fill_source(reference: str, early_activation: bool = False) -> CeFillSource:
     """Fresh, fixed-field CE fill source read (CO + DealHub subscription).
 
     Fails closed (RuntimeError) on any missing or ambiguous value: the CO
@@ -610,7 +616,8 @@ def ce_fill_source(reference: str) -> CeFillSource:
             "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
             "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c "
             "WHERE DealHub_Account__c = '" + account_id + "' LIMIT 100")
-        subscription_start, subscription_end = select_ce_subscription(subscription_rows, active_only=True)
+        subscription_start, subscription_end = select_ce_subscription(
+            subscription_rows, active_only=True, pending_if_no_active=early_activation is True)
         return CeFillSource(
             reference, revision, account_id, " ".join(account_name.split()),
             email_domain, " ".join(country.split()),
@@ -8186,7 +8193,15 @@ def _production_expectation(reference: str, product: Any = None,
     if engine is None:
         engine = _validation_route(reference)[0]  # one fixed read; renewals and unknown pairs fail closed
     contract = ROUTES[engine]
-    source = contract.load_source(reference)
+    pending_term = False
+    try:
+        source = contract.load_source(reference)
+    except RuntimeError as error:
+        # Owner decision 2026-10-29 (CO-0801): a CE-only CO whose only Core Plus term is Pending can still be shown (and
+        # checked once onboarded) with that term; ``pending_term`` says the create needs the early activation box.
+        if engine != CE_ENGINE or str(error) != "ce_subscription_unavailable":
+            raise
+        source, pending_term = ce_fill_source(reference, early_activation=True), True
     start = source.surface.subscription_start if engine == CASE3_ENGINE else source.subscription_start
     plan = contract.build_fill(source, start)
     primary = source.email_domain if engine == CE_ENGINE else source.main_domain
@@ -8195,7 +8210,7 @@ def _production_expectation(reference: str, product: Any = None,
     return engine, {"tenant_names": (source.tenant_name,), "domains": (primary, *alternates, *extra)}, {
         "primary_domain": primary, "alternate_domains": alternates, "license_type": plan["selects"]["Type"],
         "license_end": plan["license_end"], "license_start": plan["license_start"],
-        "spycloud_shown": engine in SPYCLOUD_ROUTES}
+        "spycloud_shown": engine in SPYCLOUD_ROUTES, **({"pending_term": True} if pending_term else {})}
 
 
 def production_review_inputs(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
@@ -9092,8 +9107,7 @@ def run_production_probe(environ: Any | None = None, now: datetime | None = None
             except Exception:
                 pass
             _release_automation_tab(tab)
-            if tab.persist:  # end the loopback CDP exposure of the signed-in production session
-                _close_automation_browser_at(tab.profile_dir)
+            _finish_production_window(tab)  # kept up to 8 h (owner decision 2026-10-29), else closed
     report = production_probe.build_report(reference, now, result, collected)
     try:
         path = production_probe.write_report(report_base or _probe_report_base(), report, now)
@@ -9919,9 +9933,83 @@ def _pdr_fill_and_verify(page: Any, guard: Any, clicks: Any, intended: Any, extr
             raise production_create.FormRefusal("form_left_open")
 
 
+# Owner decision 2026-10-29: the desktop production window (its own persisted profile, never the work Chrome and never the
+# Development window) stays open between runs for at most PRODUCTION_WINDOW_KEEP, so a run inside that time reuses the
+# BackOffice sign-in instead of asking for SSO and MFA again. The deadline is set when the run that LAUNCHED the window ends
+# and is never extended by a reuse. Past it, at dashboard sign-out and at dashboard start the window is closed (close_production_window).
+# A VM-started run keeps its brand-new temporary profile (persist=False): it never keeps or reuses anything.
+PRODUCTION_WINDOW_KEEP = timedelta(hours=8)
+PRODUCTION_KEEP_SUFFIX = ".keep-open-until"  # beside the profile folder, never inside it; holds one UTC time, no secret
+
+
+def _production_keep_path(profile_dir: Path) -> Path:
+    return profile_dir.with_name(profile_dir.name + PRODUCTION_KEEP_SUFFIX)
+
+
+def production_window_deadline(profile_dir: Path) -> datetime | None:
+    """The kept production window's closing time, or None (no file, unreadable, or not a UTC time)."""
+    try:
+        moment = datetime.fromisoformat(_production_keep_path(profile_dir).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return moment if moment.tzinfo is not None and moment.utcoffset() == timedelta(0) else None
+
+
+def _close_production_window_at(profile_dir: Path) -> str:
+    result = _close_automation_browser_at(profile_dir)
+    if result != "automation_browser_close_unavailable":
+        try:
+            _production_keep_path(profile_dir).unlink()
+        except OSError:
+            pass
+    return result
+
+
+def _finish_production_window(tab: _AutomationTab, now: datetime | None = None) -> None:
+    """After a production run: a window this run launched is kept for PRODUCTION_WINDOW_KEEP; a reused one is kept only
+    until its existing deadline. No deadline, an unreadable one, or one that has passed closes the window (fail closed)."""
+    if not tab.persist:
+        return
+    moment = now or datetime.now(timezone.utc)
+    if not tab.reused:
+        try:
+            _production_keep_path(tab.profile_dir).write_text(
+                (moment + PRODUCTION_WINDOW_KEEP).astimezone(timezone.utc).isoformat(), encoding="utf-8")
+            return
+        except OSError:
+            pass
+    else:
+        deadline = production_window_deadline(tab.profile_dir)
+        if deadline is not None and moment < deadline:
+            return
+    _close_production_window_at(tab.profile_dir)
+
+
+def close_production_window(*, only_if_expired: bool = False, expire: bool = False, now: datetime | None = None) -> str:
+    """Close the kept desktop production window. ``only_if_expired``: only once its deadline has passed (or it has none).
+    ``expire``: first move the deadline to now, so a run still using the window closes it when it ends. Returns the close
+    result, "production_window_kept" or "production_window_expired"."""
+    profile_dir, persist = leonardo_profile(production_probe.probe_target())
+    if not persist:
+        return "automation_browser_not_running"
+    moment = now or datetime.now(timezone.utc)
+    if expire:
+        try:
+            _production_keep_path(profile_dir).write_text(moment.astimezone(timezone.utc).isoformat(), encoding="utf-8")
+        except OSError:
+            pass
+        return "production_window_expired"
+    if only_if_expired:
+        deadline = production_window_deadline(profile_dir)
+        if deadline is not None and moment < deadline:
+            return "production_window_kept"
+    return _close_production_window_at(profile_dir)
+
+
 @contextmanager
 def _pdr_browser_page(target: RunTarget, wait_seconds: float):
-    """Open the dedicated production profile, wait for the human to sign in (MFA), yield the one page. Always cleans up."""
+    """Open (or reuse, while kept) the dedicated production profile, wait for the human to sign in (MFA; immediate when the
+    kept window is still signed in), yield the one page. Always cleans up: this run's tab, and the window once not kept."""
     try:
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError:
@@ -9945,8 +10033,7 @@ def _pdr_browser_page(target: RunTarget, wait_seconds: float):
             except Exception:
                 pass
             _release_automation_tab(tab)
-            if tab.persist:  # end the loopback CDP exposure of the signed-in production session
-                _close_automation_browser_at(tab.profile_dir)
+            _finish_production_window(tab)  # kept up to 8 h (owner decision 2026-10-29), else closed
 
 
 def run_production_dry_run(reference: str, acknowledged_revision: str, *, route: str = CE_ENGINE,
@@ -11018,11 +11105,17 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     approval_record = production_approval.record_for(approval_file, reference_value)
     if approval_record is None or not create_ui._owner_ok(operator, approval_record):
         return refused("operator_not_owner")
+    # Owner decision 2026-10-29 (CO-0801): the CSM early-activation exception is ONLY the owner's flag on this CE-only
+    # approval. It opens the timing gate (csm_request_recorded) and lets the one Pending Core Plus term stand in when no
+    # Active term exists. The licence still starts on the run day and ends on that term's end.
+    early_activation = not case3 and approval_record.get("early_activation") is True
+    read_source = load_source or ((lambda ref: ce_fill_source(ref, early_activation=True)) if early_activation
+                                  else ROUTES[route].load_source)
 
     # 2. Intended values: the fixed Salesforce reads of the Dev runner; start date = the day of creation.
     day = run_day or _run_day()
     try:
-        source = (load_source or ROUTES[route].load_source)(reference)
+        source = read_source(reference)
         if case3 and getattr(source, "tenant_name_unconfirmed", False):
             raise production_dry_run.MappingError("tenant_name_not_confirmed")  # docs/60: the owner confirms a long name first
         plan = _pdr_plan(route, source, day) if case3 else build_ce_only_fill(source, day)
@@ -11061,7 +11154,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         duplicate_found=facts.get("duplicate_found") is not False,
         live_paid_tenant_count=facts.get("live_paid_tenant_count", 99),
         timing_allowed=onboarding_allowed_now(source.subscription_start, now.date(), environment="prod"),
-        csm_request_recorded=False, sessions_ready=True, schema_ok=True,
+        csm_request_recorded=early_activation, sessions_ready=True, schema_ok=True,
         expected_tenant_name=source.tenant_name,
         expected_domains=(contract_intended["primary_domain"],) if case3 else (source.email_domain,),
         plan_summary=("Surface and Credential Exposure (Case 3) create" if case3 else "Credential Exposure CE-only create"))
@@ -11078,7 +11171,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
 
     def source_check(_inputs: Any) -> tuple[str, bool]:
         """Re-read the CO from Salesforce (the guarded fixed read): current revision and whether an Account UUID exists."""
-        again = (load_source or ROUTES[route].load_source)(reference)
+        again = read_source(reference)
         return again.source_revision, bool(again.salesforce_id_present)
 
     def run_live(candidate: Any, fill: Any, click: Any, read: Any, duplicate_check: Any, recheck: Any = None) -> Any:

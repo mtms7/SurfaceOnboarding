@@ -131,6 +131,14 @@ GATE_TEXT = {
     "co_row_unreadable": "The CO row could not be read completely: nothing is written.",
     "revision_changed": "The CO changed in Salesforce since it was read: review the page again.",
     "write_blocked": "The Salesforce write could not be prepared: nothing was sent.",
+    "ce_subscription_unavailable": ("No Active Pentera Core Plus subscription for this account (a Pending renewal term does not "
+                                    "count). Nothing was opened or created. For a CSM early-activation request, tick the early "
+                                    "activation box and start again."),
+    "ce_subscription_ambiguous": "The Pentera Core Plus subscription rows disagree. Nothing was opened or created; check DealHub.",
+    "timing_window_not_met": ("The licence starts more than 2 days from now. Nothing was opened or created. For a CSM "
+                              "early-activation request, tick the early activation box and start again."),
+    "early_activation_not_allowed": "Early activation is only for CE-only New onboardings.",
+    "approval_not_issued": "The approval could not be recorded. Nothing was started.",
 }
 
 
@@ -512,15 +520,36 @@ def _status_html(code: str, route: object = None) -> str:
             + "</div><p class='note'>" + escape(note) + "</p>")
 
 
-def _onboard_form(reference: str, token: str, issue_approval: bool) -> str:
-    """The ONE button of a production CO page: no typed reference, no checkbox (owner decision 2026-10-23)."""
+EARLY_ACTIVATION_TEXT = ("Early activation (CSM exception): activate now, before the licence start. Use only when the CSM asked "
+                         "for it in writing. The licence starts today and ends on the Pentera Core Plus end date; when no Active "
+                         "Core Plus term exists yet, the one Pending (renewal) term is used.")
+
+
+def _onboard_form(reference: str, token: str, issue_approval: bool, early: str = "") -> str:
+    """The ONE button of a production CO page: no typed reference (owner decision 2026-10-23). ``early`` (CE-only):
+    ``"offer"`` adds the optional early-activation box (owner decision 2026-10-29, CO-0801), ``"recorded"`` says the
+    approval already carries it; "" shows neither."""
+    early_html = ""
+    if early == "offer":
+        early_html = ("<p class='note'><label><input type='checkbox' name='early_activation' value='1'> "
+                      + escape(EARLY_ACTIVATION_TEXT) + "</label></p>")
+    elif early == "recorded":
+        early_html = ("<p class='note'>" + _chip("chip-warn", "Early activation recorded") + " "
+                      + escape(EARLY_ACTIVATION_TEXT) + "</p>")
     return ("<p class='note'>The CO is Approved in Salesforce. One click checks everything, creates ONE tenant in BackOffice "
             "production (SSO and MFA in the app.pentera.io window), reads it back and records it in Salesforce. There is no retry.</p>"
             "<form class='start-form' method='post' action='" + CREATE_PATH + "'>"
             "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
             "<input type='hidden' name='nonce' value='" + escape(token) + "'>"
             + ("<input type='hidden' name='issue_approval' value='1'>" if issue_approval else "")
-            + "<button type='submit'>Onboard in production</button></form>")
+            + early_html + "<button type='submit'>Onboard in production</button></form>")
+
+
+def _early_state(route: Any, approval: Mapping[str, Any] | None) -> str:
+    """``_onboard_form``'s ``early`` value: CE-only offers the box, or shows it as recorded on the approval."""
+    if route != production_approval.ALLOWED_ROUTE:
+        return ""
+    return "recorded" if isinstance(approval, Mapping) and approval.get("early_activation") is True else "offer"
 
 
 def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str:
@@ -560,13 +589,14 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
                           "create nothing is written to Salesforce until you review and confirm it on this page.</p>")
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
                 "<h2 id='co-create-title' class='pill'>Create in production</h2>" + _chip("chip-warn", "Production")
-                + "</div>" + route_note + _onboard_form(reference, token, False) + "</section>")
+                + "</div>" + route_note + _onboard_form(reference, token, False, _early_state(ctx.get("route"), approval))
+                + "</section>")
     if reason == "approval_missing" and isinstance(inputs.row, Mapping) and inputs.row.get("Onboarding_Approval_Status__c") == "Approved":
         revision = str(inputs.row.get("LastModifiedDate") or "")
         token = TOKENS.issue("create", reference, _binding(reference, revision, "no-approval", "create"))
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
                 "<h2 id='co-create-title' class='pill'>Onboard in production</h2>" + _chip("chip-warn", "Production")
-                + "</div>" + _onboard_form(reference, token, True) + "</section>")
+                + "</div>" + _onboard_form(reference, token, True, _early_state(_row_route(inputs.row), None)) + "</section>")
     if status is not None and status["code"] == CREATED_VERIFIED and _row_route(inputs.row) == production_approval.CASE3_ROUTE:
         from . import case3_followup  # lazy: case3_followup imports this module
         return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
@@ -688,20 +718,38 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
     ``launch(reference, revision, env)`` starts the runner and returns its process handle (None on failure); it is called
     at most once, inside the single-run registry, and never after any refusal. ``issue(reference, revision, route)``
     records the one-CO approval when none exists (the single "Onboard in production" button); it is called only for an
-    Approved CO whose only open gate is the missing approval.
+    Approved CO whose only open gate is the missing approval. A ticked early-activation box (CE-only, owner decision
+    2026-10-29) calls ``issue(reference, revision, route, early_activation=True)``, also to replace a live approval that
+    does not carry it yet; the run then reads the flag from the approval file only.
     """
     reference = _form(values, "reference")
     if reference != inputs.reference or not isinstance(reference, str) or not CO_PATTERN.fullmatch(reference):
         return "invalid_request"
     reason, ctx = gate(inputs)
     token = _form(values, "nonce")
+    early = _form(values, "early_activation") == "1"
+    early_args: dict[str, Any] = {"early_activation": True} if early else {}
+    if early and _row_route(inputs.row) != production_approval.ALLOWED_ROUTE:
+        TOKENS.consume("create", reference, "", token)
+        return "early_activation_not_allowed"
     if (reason == "approval_missing" and _form(values, "issue_approval") == "1" and issue is not None
             and isinstance(inputs.row, Mapping) and inputs.row.get("Onboarding_Approval_Status__c") == "Approved"):
         revision = str(inputs.row.get("LastModifiedDate") or "")
         if not TOKENS.consume("create", reference, _binding(reference, revision, "no-approval", "create"), token):
             return "confirmation_invalid"
         route = _row_route(inputs.row)
-        if route is None or not issue(reference, revision, route):
+        if route is None or not issue(reference, revision, route, **early_args):
+            return "approval_not_issued"
+        reason, ctx = gate(inputs)
+        if reason is not None:
+            return reason
+        token = TOKENS.issue("create", reference, _create_binding(reference, revision, ctx["approval"]["approval_ref"], ctx))
+    elif reason is None and early and ctx["approval"].get("early_activation") is not True:
+        revision = str(inputs.row["LastModifiedDate"])
+        if not TOKENS.consume("create", reference, _create_binding(reference, revision, ctx["approval"]["approval_ref"], ctx),
+                              token):
+            return "confirmation_invalid"
+        if issue is None or not issue(reference, revision, ctx["route"], **early_args):
             return "approval_not_issued"
         reason, ctx = gate(inputs)
         if reason is not None:
@@ -711,6 +759,8 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
         TOKENS.consume("create", reference, "", token)  # a refused attempt also spends the token
         return reason
     approval = ctx["approval"]
+    if early and approval.get("early_activation") is not True:
+        return "approval_not_issued"  # never start without the flag the owner ticked
     revision = str(inputs.row["LastModifiedDate"])
     if not TOKENS.consume("create", reference, _create_binding(reference, revision, approval["approval_ref"], ctx), token):
         return "confirmation_invalid"
@@ -1205,14 +1255,15 @@ def progress_card_html(progress: Mapping[str, Any]) -> str:
     if progress.get("done"):
         chip, head = _chip("chip-ok", "Onboarded"), "Done"
     elif progress.get("failed"):
-        chip, head = _chip("chip-bad", "Stopped"), "Stopped: " + gate_text(progress["failed"])
+        chip, head = _chip("chip-bad", "Stopped"), "Stopped: " + gate_text(progress["failed"]).rstrip(".")
     else:
         chip, head = _chip("chip-warn", "Running"), "In progress"
     percent = str(int(progress.get("percent") or 0))
     return ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
             "<h2 id='co-create-title' class='pill'>Production create</h2>" + chip + "</div>"
-            "<div class='runprog' aria-live='polite'><div class='runprog-head'><span>" + escape(head) + ": "
-            + escape(str(progress.get("current") or "")) + "</span><span>" + percent + "%</span></div>"
+            "<div class='runprog' aria-live='polite'><div class='runprog-head'><span>" + escape(head)
+            + ("" if progress.get("failed") and not progress.get("done") else ": " + escape(str(progress.get("current") or "")))
+            + "</span><span>" + percent + "%</span></div>"
             "<div class='runprog-bar' role='progressbar' aria-label='Production create progress' aria-valuemin='0' "
             "aria-valuemax='100' aria-valuenow='" + percent + "'><span class='runprog-fill' style='width:" + percent
             + "%'></span></div><ol class='runprog-steps'>" + items + "</ol></div></section>")
