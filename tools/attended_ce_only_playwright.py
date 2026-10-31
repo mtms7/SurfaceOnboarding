@@ -56,6 +56,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import contextvars
 import subprocess
 import sys
 import tempfile
@@ -8283,6 +8284,14 @@ def _apply_verified_tenant(result: dict[str, Any], reference: str, uuid_value: A
     return verified_tenant.apply(result, verified, state)
 
 
+# Page speed (owner report 2026-10-30): the dashboard keyed every CO's whole match on the clone/records stamp, so each new
+# scan check, create or clone push re-read every open CO through the Salesforce CLI (~5 s per read, ~50 s per page). When
+# the dashboard sets this to (expectation, identity) callables, the match takes its two Salesforce reads from them (the
+# dashboard's own per-CO display cache, same freshness limits); unset, the reads below are used exactly as before.
+MATCH_SOURCE_ERRORS = (RuntimeError, ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.SubprocessError)
+MATCH_READS: contextvars.ContextVar[tuple[Any, Any] | None] = contextvars.ContextVar("match_reads", default=None)
+
+
 def production_match_for(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
     """Read-only production match of one CO (see ``integration.onboarding.production_match``).
 
@@ -8293,14 +8302,16 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     """
     from integration.onboarding import production_match as match
 
+    reads = MATCH_READS.get()
+    expectation_of, identity_of = reads if reads is not None else (_production_expectation, _identity_for)
     snapshot = match.load_snapshot(clone_root(), datetime.now(timezone.utc))
     co_source: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     engine = None
     if not isinstance(snapshot, str) and REFERENCE.fullmatch(reference):
         try:
-            engine, co_source, plan = _production_expectation(reference, product, onboarding_type)
-        except (RuntimeError, ValueError, KeyError, TypeError, AttributeError, OSError, subprocess.SubprocessError):
+            engine, co_source, plan = expectation_of(reference, product, onboarding_type)
+        except MATCH_SOURCE_ERRORS:
             co_source = plan = None
     from integration.onboarding import state_paths
 
@@ -8308,11 +8319,11 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     identity = None
     if not isinstance(snapshot, str) and REFERENCE.fullmatch(reference) and (co_source is None or plan is None):
         if not state_paths.vm_mode():  # desktop: one fixed read of the CO itself (the VM has only the published snapshot)
-            identity = _identity_for(reference)
+            identity = identity_of(reference)
         else:  # the VM: the identity the refresher published beside the inputs (same names, domains and clone rules)
             identity = _snapshot_identity(reference, product, onboarding_type, uuid_value)
     elif not state_paths.vm_mode() and not isinstance(snapshot, str):
-        identity = _identity_for(reference)  # the full match gets the CO's own UUID on the desktop too
+        identity = identity_of(reference)  # the full match gets the CO's own UUID on the desktop too
     if identity is not None and uuid_value is None and not state_paths.vm_mode():
         uuid_value = identity["uuid"] or ""
     if identity is not None and (co_source is None or plan is None):

@@ -6385,8 +6385,37 @@ def _match_stamp() -> str:
 def production_match_display(reference: str, product: str = "", onboarding_type: str = "", stamp: str = "") -> dict[str, Any]:
     """The production match of one CO as a cached display read (read-only Salesforce source + clone snapshot).
 
-    ``stamp`` (see ``_match_stamp``) is only a cache key: it makes a new clone or snapshot miss the cache."""
-    return production_match_for(reference, product or None, onboarding_type or None)
+    ``stamp`` (see ``_match_stamp``) is only a cache key: it makes a new clone or snapshot miss the cache. The two Salesforce
+    reads come from their own per-CO display cache (not keyed by the stamp), so a new stamp only redoes the local clone
+    comparison (owner report 2026-10-30: every new scan check or create re-read all open COs, ~50 s per page)."""
+    token = attended_runner.MATCH_READS.set((_cached_expectation, production_identity_display))
+    try:
+        return production_match_for(reference, product or None, onboarding_type or None)
+    finally:
+        attended_runner.MATCH_READS.reset(token)
+
+
+@_display_cached
+def production_expectation_display(reference: str, product: str = "", onboarding_type: str = "") -> tuple[str, Any]:
+    """The CO's Salesforce source and plan for the match, as ("ok", value) or ("error", text): a refusal is cached like the
+    match built from it always was, so a CO without production inputs is not re-read on every page."""
+    try:
+        return "ok", attended_runner._production_expectation(reference, product or None, onboarding_type or None)
+    except attended_runner.MATCH_SOURCE_ERRORS as error:
+        return "error", str(error)
+
+
+def _cached_expectation(reference: str, product: Any = None, onboarding_type: Any = None) -> Any:
+    state, value = production_expectation_display(reference, str(product or ""), str(onboarding_type or ""))
+    if state != "ok":
+        raise RuntimeError(value)
+    return value
+
+
+@_display_cached
+def production_identity_display(reference: str) -> dict[str, Any] | None:
+    """The CO's identity for the clone check (one read-only Salesforce read; None when unreadable)."""
+    return attended_runner._identity_for(reference)
 
 
 def _unreadable_match(reason: str = "co_source_unreadable") -> dict[str, Any]:
@@ -9619,9 +9648,11 @@ class Handler(BaseHTTPRequestHandler):
                     review_row: dict[str, str | None] | None = detail_row(review.group(1))
                 except ReadUnavailable:
                     review_row = None  # the Account UUID check then shows as not verified
-                self.send_page(HTTPStatus.OK, page_onboard_review(
+                html = page_onboard_review(
                     review_summary, review_extras, parse_qs(parsed.query).get("notice", [""])[0], row=review_row,
-                    country=_read_sheet_country(review.group(1)) if review_summary["route"] == CE_ENGINE else None)); return
+                    country=_read_sheet_country(review.group(1)) if review_summary["route"] == CE_ENGINE else None)
+                record_timing("page_build", "onboard_co", started, True)  # 2026-10-30: the CO page was slow and untimed
+                self.send_page(HTTPStatus.OK, html); return
             match = re.fullmatch(r"/co/(CO-[0-9]{4,10})", path)
             notice = parse_qs(parsed.query).get("comment-update", [""])[0]
             if notice not in {"verified", "blocked"}: notice = ""
