@@ -31,7 +31,7 @@ import shutil
 import socket
 import subprocess
 import sys
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, local
 from time import monotonic, sleep
 from types import SimpleNamespace
 import webbrowser
@@ -8807,14 +8807,37 @@ def _read_case3_followup_row(reference: str) -> dict[str, str | None] | None:
         return None
 
 
+# 2026-10-30: every automatic Onboarding Completed move (CO-0811 ... CO-0806) ended write_uncertain with the CLI error thrown
+# away. A failed run now leaves, per thread, the exit code and Salesforce's API error code (an UPPER_CASE token such as
+# FIELD_CUSTOM_VALIDATION_EXCEPTION), never the message text, which can quote record data.
+_SF_FAILURE = local()
+_SF_ERROR_CODE = re.compile(r"\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b")
+
+
+def _sf_failure_code(returncode: int, output: str) -> str:
+    match = _SF_ERROR_CODE.search(output or "")
+    return f"sf_exit_{returncode}" + (":" + match.group(0)[:64] if match else "")
+
+
 def _run_sf_argv(argv: list[str]) -> bool | None:
     """Run the fixed Salesforce CLI argument list from salesforce_uuid_writeback (no shell). True only on exit code 0."""
+    _SF_FAILURE.reason = ""
     try:
         done = subprocess.run([salesforce_cli_command(), *argv[1:]], capture_output=True, text=True, encoding="utf-8",
                               errors="replace", timeout=35, check=False, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
+    except subprocess.TimeoutExpired:
+        _SF_FAILURE.reason = "sf_timeout"
         return None
-    return True if done.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        _SF_FAILURE.reason = "sf_unavailable"
+        return None
+    if done.returncode == 0:
+        return True
+    _SF_FAILURE.reason = _sf_failure_code(done.returncode, (done.stderr or "") + "\n" + (done.stdout or ""))
+    return None
+
+
+_run_sf_argv.failure_reason = lambda: getattr(_SF_FAILURE, "reason", "")  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------------------------------------------

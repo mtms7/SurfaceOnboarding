@@ -957,7 +957,19 @@ def last_stage_write(parent: Path, co: str) -> tuple[str, str] | None:
     return last
 
 
-def _stage_move(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None], run_argv: Callable[[list[str]], bool],
+_RUN_FAILURE_REASON = re.compile(r"[A-Za-z0-9_:]{1,96}")
+
+
+def _run_failure_reason(run_argv: Any) -> str:
+    """Fixed words the runner left for its last failed write (exit and Salesforce error code, never message text), or ""."""
+    try:
+        reason = run_argv.failure_reason()
+    except Exception:
+        return ""
+    return reason if isinstance(reason, str) and _RUN_FAILURE_REASON.fullmatch(reason) else ""
+
+
+def _stage_move(inputs: Inputs,read_row: Callable[[], Mapping[str, Any] | None], run_argv: Callable[[list[str]], bool],
                 target_org: str, to_stage: str) -> str:
     """One guarded stage move: never after an uncertain earlier move; exact from-stage; intent line; ONE write; read back."""
     if inputs.vm is True:
@@ -986,18 +998,20 @@ def _stage_move(inputs: Inputs, read_row: Callable[[], Mapping[str, Any] | None]
         accepted = run_argv(argv)
     except Exception:
         accepted = None
+    reason = ""
     if accepted is False:
         outcome = "write_rejected"
     elif accepted is not True:
-        outcome = "write_uncertain"
+        outcome, reason = "write_uncertain", _run_failure_reason(run_argv)
     else:
         try:
             after = read_row()
         except Exception:
             after = None
-        outcome = "written_verified" if stage_wb.verify_after_write(after, to_stage) == "verified" else "write_uncertain"
+        verdict = stage_wb.verify_after_write(after, to_stage)
+        outcome, reason = ("written_verified", "") if verdict == "verified" else ("write_uncertain", "readback_" + verdict)
     try:
-        record_stage_write(inputs.records_parent, inputs.reference, to_stage, outcome, inputs.now)
+        record_stage_write(inputs.records_parent, inputs.reference, to_stage, outcome, inputs.now, reason)
     except Exception:
         return "record_write_failed"
     return outcome
