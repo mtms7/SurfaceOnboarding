@@ -282,7 +282,11 @@ class RunnerGlueTests(unittest.TestCase):
         expectation = (runner.CE_ENGINE, {"tenant_names": ("Acme - CE Only",), "domains": ("mail.example",)},
                        {"primary_domain": "mail.example", "alternate_domains": (), "license_type": "Prepaid annual subscription",
                         "license_end": date(2027, 10, 18), "license_start": date(2026, 10, 1), "spycloud_shown": True})
-        with patch.object(runner, "_production_expectation", return_value=expectation) as read, self.clock():
+        # The CO's own read is pinned (no UUID): unpinned it read live Salesforce on the PC and failed on CI, where a failed
+        # read is now "not checked" (2026-11-02).
+        identity = {"names": ("Acme - CE Only",), "domains": ("mail.example",), "uuid": None}
+        with patch.object(runner, "_production_expectation", return_value=expectation) as read, \
+                patch.object(runner, "_identity_for", return_value=identity), self.clock():
             found = runner.production_match_for("CO-0801", "Credential Exposure", "New Product Onboarding")
         read.assert_called_once_with("CO-0801", "Credential Exposure", "New Product Onboarding")
         self.assertEqual((found["status"], found["route"]), ("exists_matches", runner.CE_ENGINE))
