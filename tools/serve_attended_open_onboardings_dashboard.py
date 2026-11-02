@@ -6398,9 +6398,13 @@ def production_match_display(reference: str, product: str = "", onboarding_type:
 @_display_cached
 def production_expectation_display(reference: str, product: str = "", onboarding_type: str = "") -> tuple[str, Any]:
     """The CO's Salesforce source and plan for the match, as ("ok", value) or ("error", text): a refusal is cached like the
-    match built from it always was, so a CO without production inputs is not re-read on every page."""
+    match built from it always was, so a CO without production inputs is not re-read on every page.
+
+    The value comes from ``production_review_inputs_display``, the same cached read the CO page's summary uses: before
+    2026-11-02 the two made the same CO + DealHub reads twice (a cold CO page waited ~21 s)."""
     try:
-        return "ok", attended_runner._production_expectation(reference, product or None, onboarding_type or None)
+        inputs = production_review_inputs_display(reference, product or None, onboarding_type or None)
+        return "ok", (inputs["engine"], inputs["co_source"], inputs["plan"])
     except attended_runner.MATCH_SOURCE_ERRORS as error:
         return "error", str(error)
 
@@ -6692,7 +6696,9 @@ def prefetch_onboard_page(reference: str) -> None:
     elif route in SURFACE_ROUTES:
         prefetch_display_read(evaluate_surface_fill_preflight, reference, route)
     if route == CE_ENGINE or route in SURFACE_ROUTES:
-        prefetch_display_read(production_review_inputs_display, reference, product, kind)
+        prefetch_display_read(production_review_inputs_display, reference, product or None, kind or None)
+    if not state_paths.vm_mode():  # the match's own CO read starts with the others (the VM never reads Salesforce)
+        prefetch_display_read(production_identity_display, reference)
     prefetch_display_read(production_match_display, reference, product or "", kind or "", _match_stamp())
 
 
@@ -6728,7 +6734,7 @@ def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]
     if isinstance(scope, dict):
         summary["values"]["scope"] = _plain(scope)
     try:
-        inputs = production_review_inputs_display(reference, product, kind)
+        inputs = production_review_inputs_display(reference, product or None, kind or None)  # one key with the match
     except Exception:  # noqa: BLE001 - any failure to read the values blocks approval
         blockers.append("summary_source_unreadable")
     else:
