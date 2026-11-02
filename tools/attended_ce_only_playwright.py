@@ -1657,8 +1657,11 @@ CASE3_ROUTE = RouteContract(
                                *source.alternate_domains, *source.subdomains, source.ce_email_domain,
                                surface_primary_user_email(source)),
     allow_scan_started=True,
-    # 4a: an existing CE-only tenant for the customer is found by its email domain.
-    extra_lookups=lambda source: (("ce_email_domain", source.ce_email_domain, source.ce_email_domain),),
+    # 4a: an existing CE-only tenant for the customer is found by its email domain. Owner go 2026-11-02 (CO-0757): every
+    # alternate domain the create types is searched too.
+    extra_lookups=lambda source: (("ce_email_domain", source.ce_email_domain, source.ce_email_domain),
+                                  *((f"alternate_domain_{index}", domain, domain)
+                                    for index, domain in enumerate(source.alternate_domains, 1))),
 )
 ROUTES = {CE_ENGINE: CE_ROUTE, SURFACE_ENGINE: SURFACE_ROUTE, CASE3_ENGINE: CASE3_ROUTE}
 
@@ -9559,9 +9562,12 @@ def _pdr_duplicate_problem(page: Any, tenant_name: str, domains: tuple[str, ...]
 
 
 def case3_domain_problem(source: Any) -> str | None:
-    """The Case 3 production create does not type alternate domains or subdomains (CO-0800 listed none). Shared by the run and
-    the dashboard's readiness list, which showed "Create ready" for CO-0757 (one alternate domain) before the run refused it."""
-    return "case3_alternate_domains_not_supported" if source.alternate_domains or source.subdomains else None
+    """The Case 3 domain rule of the production create, shared by the run and the dashboard's readiness list.
+
+    Owner go 2026-11-02 (CO-0757): alternate domains are typed into the production form (the roots the Dev runner already
+    typed and verified on Leonardo Development), read back before Confirm, sent as the ``alternateDomains`` list and
+    searched by the duplicate checks. Subdomains are still refused: that control is not proven on production yet."""
+    return "case3_subdomains_not_supported" if source.subdomains else None
 
 
 def _pdr_plan(route: str, source: Any, run_day: date) -> dict[str, Any]:
@@ -9581,8 +9587,8 @@ def _pdr_plan(route: str, source: Any, run_day: date) -> dict[str, Any]:
 def _pdr_clone_facts(source: Any, now: datetime, route: str = CE_ENGINE) -> dict[str, Any]:
     """Facts from the production-clone snapshot (Redash, read only): captured time, usable, duplicate, live paid count.
 
-    The duplicate check covers every domain the route brings: the CE email domain for CE-only; the main domain and the CE
-    email domain for Case 3."""
+    The duplicate check covers every domain the route brings: the CE email domain for CE-only; the main domain, the CE
+    email domain and every alternate domain for Case 3 (2026-11-02)."""
     from integration.onboarding import leonardo_inventory as inventory
 
     facts: dict[str, Any] = {"collected_at": None, "clone_matches": False, "duplicate_found": False,
@@ -11101,6 +11107,17 @@ def _pcr_live_duplicate_problems(page: Any, tenant_name: str, domains: tuple[str
     return None
 
 
+def _plan_alternates(texts: dict[str, Any]) -> tuple[str, ...]:
+    """The alternate domains the plan types (``()`` when it types none); a malformed value raises ``alternate_domains_invalid``."""
+    value = texts.get(production_dry_run.ALTERNATE_DOMAINS_LABEL)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ()
+    found = production_dry_run.alternate_domains(value)
+    if found is None:
+        raise ValueError("alternate_domains_invalid")
+    return found
+
+
 def case3_live_intended(source: Case3FillSource, plan: dict[str, Any], run_day: date | None = None) -> dict[str, Any]:
     """The Case 3 ``intended`` values of the live create: ``case3_intended`` fed from the SAME fill plan the form is typed from.
 
@@ -11117,7 +11134,9 @@ def case3_live_intended(source: Case3FillSource, plan: dict[str, Any], run_day: 
         user_email_domain=texts["User email domains (Comma Separated Values)"],
         license_end=end.isoformat() if isinstance(end, date) else end, tier=tier,
         first_name=texts.get("First name"), last_name=texts.get("Last name"),
-        organization_email=texts.get("Organization Email"))
+        organization_email=texts.get("Organization Email"), alternate_domains=_plan_alternates(texts))
+    if built["alternate_domains"] != tuple(source.alternate_domains):
+        raise ValueError("case3_tier_values_mismatch")  # the typed alternate domains are exactly the CO's own (2026-11-02)
     if texts.get("Number of subdomains") != str(built["subdomains_number"]) or texts["Company name"] != source.tenant_name:
         raise ValueError("case3_tier_values_mismatch")  # also: the typed name is the one the approval is bound to
     if built["leaked_domain"] != source.ce_email_domain or texts.get("User email domains (Comma Separated Values)") != built["email_domain"]:
@@ -11367,9 +11386,10 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     except Exception:
         return refused("salesforce_fill_source_unavailable")
     live_email_domain = source.ce_email_domain if case3 else source.email_domain
-    # The domains the live duplicate check searches besides the name: the CE email domain for CE-only; the main domain and the
-    # single CE email domain for Case 3 (deduplicated).
-    live_domains = tuple(dict.fromkeys((contract_intended["primary_domain"], live_email_domain))) if case3 else (live_email_domain,)
+    # The domains the live duplicate check searches besides the name: the CE email domain for CE-only; the main domain, the
+    # single CE email domain and every typed alternate domain for Case 3 (deduplicated).
+    live_domains = (tuple(dict.fromkeys((contract_intended["primary_domain"], live_email_domain,
+                                         *contract_intended["alternate_domains"]))) if case3 else (live_email_domain,))
     try:
         facts = (clone_facts or ((lambda src, moment: _pdr_clone_facts(src, moment, route)) if case3 else _pdr_clone_facts))(source, now)
     except Exception:

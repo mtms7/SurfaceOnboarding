@@ -42,7 +42,7 @@ class BuilderGoldenTests(unittest.TestCase):
     def test_the_builder_output_has_exactly_the_keys_the_contract_reads(self):
         self.assertEqual(set(build()), {"tenant_name", "primary_domain", "email_domain", "leaked_domain", "license_end",
                                         "country_code", "operator_name", "organization_email", "first_name", "last_name",
-                                        "scanning_interval", "subdomains_number"})
+                                        "scanning_interval", "subdomains_number", "alternate_domains"})
 
     def test_the_leaked_credentials_domain_is_the_ce_email_domain_and_domains_are_folded(self):
         built = build()

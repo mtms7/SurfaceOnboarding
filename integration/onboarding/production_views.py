@@ -490,7 +490,9 @@ _NOT_EVALUATED = "not_evaluated"
 DATA_SOURCE_UNREADABLE = "source_unreadable"
 DATA_PROBLEM_TEXT = {
     "case3_alternate_domains_not_supported": "The CO lists alternate domains or subdomains; the Case 3 production create does not "
-                                             "enter them yet, so the run would stop before opening BackOffice."}
+                                             "enter them yet, so the run would stop before opening BackOffice.",
+    "case3_subdomains_not_supported": "The CO lists subdomains; the Case 3 production create does not enter subdomains yet, so the "
+                                      "run would stop before opening BackOffice."}
 
 
 def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone: dict[str, Any] | None,

@@ -190,15 +190,14 @@ class DuplicateTests(unittest.TestCase):
 
 
 class RefusalTests(unittest.TestCase):
-    def test_alternate_domains_and_subdomains_are_refused_explicitly_before_any_browser(self):
-        for label, source in (("alternate", make_case3_source(alternates=("alt.example",))),
-                              ("subdomain", make_case3_source(subdomains=("app.example-klinik.example",)))):
-            with self.subTest(listed=label):
-                h = C3Harness(self)
-                h.source = source
-                out = h.go()
-                self.assertEqual((out["result"], out["outcome"]), ("case3_alternate_domains_not_supported", "refused"))
-                self.assertEqual((h.opened, h.page.clicks), (0, []))
+    def test_subdomains_are_refused_explicitly_before_any_browser(self):
+        # Owner go 2026-11-02 (CO-0757): alternate domains are typed now (test_case3_alternate_domains_2026_11_02); subdomains
+        # are still refused before any browser.
+        h = C3Harness(self)
+        h.source = make_case3_source(subdomains=("app.example-klinik.example",))
+        out = h.go()
+        self.assertEqual((out["result"], out["outcome"]), ("case3_subdomains_not_supported", "refused"))
+        self.assertEqual((h.opened, h.page.clicks), (0, []))
 
     def test_any_other_route_is_refused_before_a_source_read_or_a_browser(self):
         for route in ("case_1_new_surface_only", "case_4_renew_surface_new_ce", "renewal_run", "", "bogus"):

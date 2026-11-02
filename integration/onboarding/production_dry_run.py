@@ -138,7 +138,8 @@ KNOWN_REASONS = frozenset({
     "browser_tab_unavailable", "production_dry_run_form_not_reached", "dry_run_line_not_redacted",
     "invalid_co_reference", "confirm_preflight_failed", "unexpected_error", *(f"production_locked_{s}" for s in _LOCKED_SUFFIXES),
     # Case 3 (Surface & Credential Exposure) dry run, owner decision 2026-10-20: the source's own fixed codes, never free text.
-    "case3_alternate_domains_not_supported", "case3_term_mismatch", "case3_route_mismatch", "case3_ce_email_domain_invalid",
+    "case3_alternate_domains_not_supported", "case3_subdomains_not_supported", "alternate_domains_invalid",
+    "case3_term_mismatch", "case3_route_mismatch", "case3_ce_email_domain_invalid",
     "case3_core_plus_missing", "case3_source_unavailable", "max_scan_duration_control_absent", "ce_subscription_ambiguous", "ce_subscription_unavailable",
     "surface_route_mismatch", "surface_source_unavailable", "surface_subscription_invalid", "surface_product_unrecognized",
     "surface_baseline_unavailable", "surface_baseline_ambiguous", "surface_tier_unknown", "surface_main_domain_invalid",
@@ -316,6 +317,10 @@ BLANK_LABELS = (
     "Alternate Domains (Comma Separated Values)", "SubDomains (Comma Separated Values)",
     "Networks (Comma Separated Values)", "Phone number", "Job title",
 )
+# Typed only when the plan carries a value, otherwise verified blank (owner go 2026-11-02, CO-0757: Case 3 alternate domains).
+ALTERNATE_DOMAINS_LABEL = "Alternate Domains (Comma Separated Values)"
+OPTIONAL_TEXT_LABELS = (ALTERNATE_DOMAINS_LABEL,)
+_DOMAIN_ITEM = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 OPERATOR_LABEL = "Select Operator Accounts"
 SCAN_NOW_LABEL = "Scan now"
 SELECT_NAMES = ("accountType", "accountCountry", "scanningInterval", "leakedCredentialsScanningInterval", "licenseType")
@@ -372,7 +377,7 @@ def map_plan(plan: Mapping[str, Any], select_names: Mapping[str, str], early_lab
         start, end = plan["license_start"], plan["license_end"]
     except (KeyError, TypeError) as exc:
         raise MappingError("plan_shape_unexpected") from exc
-    by_key = {label_key(label): label for label in TEXT_LABELS}
+    by_key = {label_key(label): label for label in (*TEXT_LABELS, *OPTIONAL_TEXT_LABELS)}
     texts = []
     for dev_label, value in raw_texts.items():
         canonical = by_key.get(label_key(dev_label))
@@ -380,9 +385,16 @@ def map_plan(plan: Mapping[str, Any], select_names: Mapping[str, str], early_lab
             raise MappingError("unmapped_text_label")
         if re.search(r"[\x00-\x1f\x7f]", value):  # a newline in a typed value could submit a form: never typed
             raise MappingError("value_has_control_character")
+        if canonical in OPTIONAL_TEXT_LABELS:
+            if not value.strip():
+                continue  # nothing to type: the control stays in the verified-blank list
+            if alternate_domains(value) is None:
+                raise MappingError("alternate_domains_invalid")
         texts.append((canonical, value))
-    if {label for label, _ in texts} != set(TEXT_LABELS):
+    if {label for label, _ in texts} - set(OPTIONAL_TEXT_LABELS) != set(TEXT_LABELS):
         raise MappingError("text_labels_incomplete")
+    typed = {label for label, _ in texts}
+    blanks = tuple(label for label in BLANK_LABELS if label not in typed)
     selects = []
     for dev_label, option in raw_selects.items():
         name = select_names.get(dev_label)
@@ -417,8 +429,19 @@ def map_plan(plan: Mapping[str, Any], select_names: Mapping[str, str], early_lab
         if not isinstance(value, str) or not _DURATION_VALUE.fullmatch(value):
             raise MappingError("fill_value_invalid")
         advanced_texts.append((label, value))
-    return IntendedForm(tuple(texts), BLANK_LABELS, tuple(selects), tuple(toggles), tuple(targets),
+    return IntendedForm(tuple(texts), blanks, tuple(selects), tuple(toggles), tuple(targets),
                         (("license_start", start), ("license_end", end)), scan_now, tuple(advanced_texts))
+
+
+def alternate_domains(value: object) -> tuple[str, ...] | None:
+    """The domains of an "Alternate Domains (Comma Separated Values)" value, in typed order; None unless every entry is a plain
+    lower-case domain with no duplicate (the Dev plan joins the CO's roots with ", "). Never echoes the value."""
+    if not isinstance(value, str):
+        return None
+    items = [part.strip() for part in value.split(",")]
+    if not items or any(not _DOMAIN_ITEM.fullmatch(item) for item in items) or len(set(items)) != len(items):
+        return None
+    return tuple(items)
 
 
 def field_keys(intended: IntendedForm) -> list[str]:

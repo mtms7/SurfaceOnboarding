@@ -77,13 +77,15 @@ def _optional_text(value: Any, reason: str) -> str | None:
 
 def case3_intended(*, tenant_name: Any, main_domain: Any, ce_email_domains: Any, user_email_domain: Any, license_end: Any, tier: Any,
                    country_code: Any = None, operator_name: Any = None, organization_email: Any = None,
-                   first_name: Any = None, last_name: Any = None) -> dict[str, Any]:
+                   first_name: Any = None, last_name: Any = None, alternate_domains: Any = ()) -> dict[str, Any]:
     """The ``intended`` values of a Case 3 New create from plain facts. Pure (no I/O); raises ValueError(reason), never echoing a value.
 
     ``tenant_name`` is the name step (b) bound the approval to (bare or the owner-confirmed short name, never the alias).
     ``ce_email_domains`` is the CO's Salesforce CE e-mail domain (exactly one): it is the Leaked Credentials scanned domain.
     ``user_email_domain`` is the form's "User email domains" value (the internal domain the plan types, one domain).
     The tier becomes the interval and subdomain count (``TIER_RULE``).
+    ``alternate_domains`` are the domains typed into "Alternate Domains" (owner go 2026-11-02, CO-0757), in typed order; each must
+    be a plain domain, not the main domain and not repeated.
     """
     if not isinstance(tier, str) or tier not in TIER_RULE:
         raise ValueError("tier_unknown")
@@ -107,8 +109,15 @@ def case3_intended(*, tenant_name: Any, main_domain: Any, ce_email_domains: Any,
         raise ValueError("license_end_invalid") from None
     if country_code is not None and (not isinstance(country_code, str) or not re.fullmatch(r"[A-Z]{2}", country_code)):
         raise ValueError("country_code_invalid")
+    if isinstance(alternate_domains, (str, bytes)) or not isinstance(alternate_domains, Sequence):
+        raise ValueError("alternate_domains_invalid")
+    alternates = [_one_domain(item) for item in alternate_domains]
+    if (any(item is None or item != raw for item, raw in zip(alternates, alternate_domains))
+            or len(set(alternates)) != len(alternates) or main in alternates):
+        raise ValueError("alternate_domains_invalid")
     interval, subdomains = TIER_RULE[tier]
     return {"tenant_name": tenant_name, "primary_domain": main, "email_domain": user_email, "leaked_domain": leaked,
+            "alternate_domains": tuple(alternates),
             "license_end": license_end, "country_code": country_code,
             "operator_name": _optional_text(operator_name, "operator_name_invalid"),
             "organization_email": _optional_text(organization_email, "organization_email_invalid"),
@@ -132,7 +141,7 @@ def expected_case3_create_payload(intended: Mapping[str, Any]) -> dict[str, Any]
         "accountCountryCode": country if isinstance(country, str) and re.fullmatch(r"[A-Z]{2}", country) else pc.SHAPE_ISO2,
         "organizationEmail": pc._optional(intended, "organization_email"),
         "firstName": pc._optional(intended, "first_name"), "lastName": pc._optional(intended, "last_name"),
-        "mfaRequired": True, "alternateDomains": [], "subDomains": [], "additionalNetworks": None,
+        "mfaRequired": True, "alternateDomains": _alternates(intended), "subDomains": [], "additionalNetworks": None,
         "userEmailDomains": [email_domain],
         "operatorAccountNames": [operator] if isinstance(operator, str) and operator.strip() else [],
         "scanningInterval": interval, "scanNow": OBSERVED_SCAN_NOW,
@@ -155,6 +164,15 @@ def expected_case3_create_payload(intended: Mapping[str, Any]) -> dict[str, Any]
     for allowed in LICENSE_ALLOWS_ON:
         expected["license." + allowed] = True
     return expected
+
+
+def _alternates(intended: Mapping[str, Any]) -> list[str]:
+    """The ``alternateDomains`` list of the body: the typed alternate domains in order (sent as a list, like the other
+    "(Comma Separated Values)" controls: ``userEmailDomains``, ``leakedCredentialsScannedDomains``); [] when none."""
+    value = intended.get("alternate_domains", ())
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence) or any(_one_domain(v) != v for v in value):
+        raise ValueError("alternate_domains_invalid")
+    return list(value)
 
 
 def compare_case3_payload(expected: Mapping[str, Any], observed: Any) -> list[str]:

@@ -39,28 +39,28 @@ def checklist(**overrides):
 
 class DomainRuleTests(unittest.TestCase):
     def test_the_rule_matches_the_run(self):
-        self.assertEqual(runner.case3_domain_problem(SimpleNamespace(alternate_domains=("a.example",), subdomains=())),
-                         "case3_alternate_domains_not_supported")
+        # Since the same day's owner go, alternate domains pass (they are typed); subdomains are still refused.
+        self.assertIsNone(runner.case3_domain_problem(SimpleNamespace(alternate_domains=("a.example",), subdomains=())))
         self.assertEqual(runner.case3_domain_problem(SimpleNamespace(alternate_domains=(), subdomains=("x.a.example",))),
-                         "case3_alternate_domains_not_supported")
+                         "case3_subdomains_not_supported")
         self.assertIsNone(runner.case3_domain_problem(SimpleNamespace(alternate_domains=(), subdomains=())))
 
     def test_the_run_still_refuses_with_the_same_code(self):
-        source = SimpleNamespace(alternate_domains=("a.example",), subdomains=())
+        source = SimpleNamespace(alternate_domains=(), subdomains=("x.a.example",))
         with self.assertRaises(runner.production_dry_run.MappingError) as raised:
             runner._pdr_plan(runner.CASE3_ENGINE, source, date(2026, 11, 2))
-        self.assertEqual(str(raised.exception), "case3_alternate_domains_not_supported")
+        self.assertEqual(str(raised.exception), "case3_subdomains_not_supported")
 
     def test_the_readiness_row_is_blocked_with_a_plain_reason(self):
-        item = checklist(data_problem="case3_alternate_domains_not_supported")
+        item = checklist(data_problem="case3_subdomains_not_supported")
         self.assertEqual(item["status"], "blocked")
-        self.assertIn("alternate domains", item["detail"])
+        self.assertIn("subdomains", item["detail"])
 
     def test_an_unreadable_source_is_unavailable_never_ready(self):
         self.assertEqual(checklist(data_problem=views.DATA_SOURCE_UNREADABLE)["status"], "unavailable")
 
     def test_a_set_uuid_still_wins_and_no_problem_is_ready(self):
-        self.assertEqual(checklist(uuid_state="set", data_problem="case3_alternate_domains_not_supported")["detail"],
+        self.assertEqual(checklist(uuid_state="set", data_problem="case3_subdomains_not_supported")["detail"],
                          "Salesforce already holds an Account UUID for this CO.")
         self.assertEqual(checklist()["status"], "ready")
 

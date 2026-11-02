@@ -55,7 +55,7 @@ class MilestoneTests(Base):
                 self.assertEqual(self.steps(), expected)
 
     def test_a_refusal_before_the_browser_records_only_what_was_reached(self):
-        for label, setup, expected in (("alternates", lambda h: setattr(h, "source", c3.make_case3_source(alternates=("a.example",))), []),
+        for label, setup, expected in (("subdomains", lambda h: setattr(h, "source", c3.make_case3_source(subdomains=("app." + c3.MAIN,))), []),
                                        ("source", lambda h: setattr(h, "source", runner.SurfaceSourceError("case3_core_plus_missing")), []),
                                        ("clone", None, ["pdr_source"])):
             with self.subTest(refused_at=label):

@@ -5129,9 +5129,11 @@ class Case3RouteTests(unittest.TestCase):
 
     def test_duplicate_check_also_searches_the_ce_email_domain(self):
         source = _case3_source()
+        # 2026-11-02 (CO-0757): every alternate domain is searched too, after the CE email domain.
         self.assertEqual(runner.CASE3_ROUTE.duplicate_lookups(source),
                          (("tenant_name", SURFACE_TENANT), ("primary_domain", SURFACE_MAIN),
-                          ("ce_email_domain", CASE3_EMAIL)))
+                          ("ce_email_domain", CASE3_EMAIL),
+                          *((f"alternate_domain_{i}", d) for i, d in enumerate(source.alternate_domains, 1))))
         self.assertEqual(runner.CASE3_ROUTE.lookup_domain(source, "ce_email_domain"), CASE3_EMAIL)
         self.assertEqual(runner.CASE3_ROUTE.lookup_domain(source, "primary_domain"), SURFACE_MAIN)
         # The other routes are unchanged.
