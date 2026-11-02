@@ -4266,7 +4266,7 @@ class ApprovedPendingBaselineTests(unittest.TestCase):
 
     def test_the_readers_ask_salesforce_for_the_approval_status(self):
         import inspect
-        for reader in (runner.surface_fill_source, runner.case3_fill_source):
+        for reader in (runner.surface_fill_source, runner.read_case3_fill_source):  # the query moved there 2026-11-02
             self.assertIn("Onboarding_Approval_Status__c", inspect.getsource(reader))
         self.assertIn('approved=row.get("Onboarding_Approval_Status__c") == APPROVED_STATUS',
                       inspect.getsource(runner._surface_source_from_row))

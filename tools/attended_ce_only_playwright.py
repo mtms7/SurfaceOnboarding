@@ -1189,7 +1189,19 @@ class Case3FillSource:
         return getattr(self.surface, name)
 
 
+# Set only by the dashboard: its per-CO display read of the source (2026-11-02, CO-0757: one Case 3 page read the same CO +
+# DealHub three times). Outside a dashboard page build that read is fresh, so the create and every other caller are unchanged.
+CASE3_SOURCE_READ: Any = None
+
+
 def case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillSource:
+    """The Case 3 source of ``read_case3_fill_source``, through the dashboard's display read when one is set."""
+    if CASE3_SOURCE_READ is not None and run_day is None:
+        return CASE3_SOURCE_READ(reference)
+    return read_case3_fill_source(reference, run_day)
+
+
+def read_case3_fill_source(reference: str, run_day: date | None = None) -> Case3FillSource:
     """Fresh, fixed-field Case 3 source read (one CO read, one DealHub read).
 
     The CO must be exactly "Surface & Credential Exposure" / "New Product
@@ -9546,6 +9558,12 @@ def _pdr_duplicate_problem(page: Any, tenant_name: str, domains: tuple[str, ...]
     return production_dry_run.duplicate_verdict(replies, reader.demo_reply(domains), tenant_name, domains)
 
 
+def case3_domain_problem(source: Any) -> str | None:
+    """The Case 3 production create does not type alternate domains or subdomains (CO-0800 listed none). Shared by the run and
+    the dashboard's readiness list, which showed "Create ready" for CO-0757 (one alternate domain) before the run refused it."""
+    return "case3_alternate_domains_not_supported" if source.alternate_domains or source.subdomains else None
+
+
 def _pdr_plan(route: str, source: Any, run_day: date) -> dict[str, Any]:
     """The Dev fill plan for a production dry run of ``route`` (CE-only, or Case 3 from the owner's 2026-10-20 decision).
 
@@ -9553,8 +9571,9 @@ def _pdr_plan(route: str, source: Any, run_day: date) -> dict[str, Any]:
     starts the licence on the run day and ends it on the subscription end (``case3_license_dates``).
     """
     if route == CASE3_ENGINE:
-        if source.alternate_domains or source.subdomains:
-            raise production_dry_run.MappingError("case3_alternate_domains_not_supported")
+        problem = case3_domain_problem(source)
+        if problem:
+            raise production_dry_run.MappingError(problem)
         return build_case3_fill(source, run_day)
     return build_ce_only_fill(source, source.subscription_start)
 

@@ -486,13 +486,19 @@ _APPROVAL_CODES = frozenset({"approval_unreadable", "approval_missing", "approva
 _DRY_RUN_CODES = frozenset({"dry_run_required", "dry_run_old"})
 _AFTER_DRY_RUN = frozenset({"prior_attempt_needs_review", "launch_in_progress"})
 _NOT_EVALUATED = "not_evaluated"
+# A route rule the run applies before any browser opens, shown in the "Salesforce data valid" row (2026-11-02, CO-0757).
+DATA_SOURCE_UNREADABLE = "source_unreadable"
+DATA_PROBLEM_TEXT = {
+    "case3_alternate_domains_not_supported": "The CO lists alternate domains or subdomains; the Case 3 production create does not "
+                                             "enter them yet, so the run would stop before opening BackOffice."}
 
 
 def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone: dict[str, Any] | None,
                       match: dict[str, Any] | None, domain_count: int | None, uuid_state: str, ce_route: bool,
                       start_iso: str | None, today: date, days_before: int, approval: dict[str, Any] | None,
                       create: dict[str, Any] | None, gate: dict[str, Any] | None = None,
-                      session: dict[str, Any] | None = None, approved_in_salesforce: bool = False) -> list[dict[str, str]]:
+                      session: dict[str, Any] | None = None, approved_in_salesforce: bool = False,
+                      data_problem: str | None = None) -> list[dict[str, str]]:
     """The eight production onboarding checks as ``{"key", "label", "status", "detail"}``, in display order.
 
     ``status`` is ``locked``, ``ready``, ``blocked`` or ``unavailable``. Pure: every input is already read by the caller
@@ -559,6 +565,10 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone:
         items.append(_item("data", "blocked", "Salesforce already holds an Account UUID for this CO."))
     elif ce_route and domain_count != 1:
         items.append(_item("data", "blocked", "Exactly one email domain is required for CE-only (found " + str(domain_count) + ")."))
+    elif data_problem == DATA_SOURCE_UNREADABLE:
+        items.append(_item("data", "unavailable", "The CO's route values could not be read for this check."))
+    elif data_problem:
+        items.append(_item("data", "blocked", DATA_PROBLEM_TEXT.get(data_problem, "The run would refuse this CO: " + data_problem + ".")))
     else:
         items.append(_item("data", "ready", ("One email domain, " if ce_route else "") + "no prior Account UUID."))
     # 6 timing window

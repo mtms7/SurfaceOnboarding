@@ -6683,23 +6683,54 @@ def production_review_inputs_display(reference: str, product: str | None, kind: 
     return production_review_inputs(reference, product, kind)
 
 
-def prefetch_onboard_page(reference: str) -> None:
-    """Start the CO page's display reads together (they ran one after another): row, preflight, values, match, country."""
-    queued = next((r for r in peek_display_cache("queue_source_rows") or [] if r.get("Name") == reference), None)
-    prefetch_display_read(detail_row, reference)
+def prefetch_onboard_page(reference: str, row: dict[str, Any] | None = None) -> bool:
+    """Start the CO page's display reads together (they ran one after another): row, preflight, values, match, country.
+
+    The route comes from the cached queue row, or from ``row`` (the CO's detail row) when the queue list is not cached, e.g.
+    right after a click cleared it (2026-11-02, CO-0757: only the row read started, the rest ran one by one, 25 s).
+    Returns False when the route is still unknown (the caller passes the row once it has it).
+
+    Only reads are started (the page decides from its own fresh row). The four-worker pool runs the reads that reach
+    Salesforce first; the reads built on them (preflight, values, match) follow and wait on those instead of re-reading."""
+    if row is None:
+        prefetch_display_read(detail_row, reference)
+    queued = row or next((r for r in peek_display_cache("queue_source_rows") or [] if r.get("Name") == reference), None)
+    if queued is None:  # a click clears the queue lists: the product and type this CO had on an earlier page
+        queued = _ROUTE_HINTS.get(reference)
     if queued is None:
-        return
+        return False
     route, product, kind = route_for(queued), queued.get("Onboarding_Product__c"), queued.get("Onboarding_Type__c")
+    _ROUTE_HINTS[reference] = {"Name": reference, "Onboarding_Product__c": product, "Onboarding_Type__c": kind}
+    if route == CASE3_ENGINE:  # 2026-11-02 (CO-0757): preflight, values card and match each read this CO + DealHub
+        prefetch_display_read(case3_source_display, reference)
+    if not state_paths.vm_mode():  # the match's own CO read starts with the others (the VM never reads Salesforce)
+        prefetch_display_read(production_identity_display, reference)
+    if _queued_start_date(reference) is None:  # the start date card read last, one CO at a time
+        prefetch_display_read(queue_start_dates, (reference,))
     if route == CE_ENGINE:
         prefetch_display_read(evaluate_ce_only_fill_preflight, reference)
         prefetch_display_read(_read_sheet_country, reference)
     elif route in SURFACE_ROUTES:
         prefetch_display_read(evaluate_surface_fill_preflight, reference, route)
+    if route == CASE3_ENGINE:
+        prefetch_display_read(case3_values_display, reference)
     if route == CE_ENGINE or route in SURFACE_ROUTES:
         prefetch_display_read(production_review_inputs_display, reference, product or None, kind or None)
-    if not state_paths.vm_mode():  # the match's own CO read starts with the others (the VM never reads Salesforce)
-        prefetch_display_read(production_identity_display, reference)
     prefetch_display_read(production_match_display, reference, product or "", kind or "", _match_stamp())
+    return True
+
+
+# Product and type per CO from earlier pages (they do not change with a click); only used to start reads early.
+_ROUTE_HINTS: dict[str, dict[str, Any]] = {}
+
+
+def _prefetch_with_row(reference: str) -> None:
+    """``prefetch_onboard_page``, and when the queue list is not cached, again as soon as the CO's own row is read."""
+    if not prefetch_onboard_page(reference):
+        try:
+            prefetch_onboard_page(reference, detail_row(reference))
+        except ReadUnavailable:
+            pass  # the page's own read shows the failure
 
 
 def build_review_summary(reference: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -7705,12 +7736,19 @@ def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: 
         session = production_views.backoffice_session_status(production_records_parent(), missing_is_unavailable=published)
     except Exception:  # noqa: BLE001 - the row then names no last run
         session = None
+    data_problem = None
+    if isinstance(row, dict) and route_for(row) == CASE3_ENGINE:  # the run's own Case 3 rule, from the page's cached source read
+        try:
+            data_problem = attended_runner.case3_domain_problem(case3_source_display(reference))
+        except Exception:  # noqa: BLE001 - an unreadable source is "unavailable", never "ready"
+            data_problem = production_views.DATA_SOURCE_UNREADABLE
     items = production_views.onboard_checklist(
         vm=vm, locked=locked, lock_reason=reason, clone=_clone_status(), match=match, domain_count=domain_count,
         uuid_state=uuid_state, ce_route=ce_route, start_iso=start_iso, today=now.date(), days_before=ONBOARD_DAYS_BEFORE_START,
         approval=production_views.approval_for_co(approvals_read_path(), reference, now, missing_is_unavailable=published),
         create=production_views.create_state(records, reference, locked=locked), gate=state, session=session,
-        approved_in_salesforce=isinstance(row, dict) and row.get("Onboarding_Approval_Status__c") == "Approved")
+        approved_in_salesforce=isinstance(row, dict) and row.get("Onboarding_Approval_Status__c") == "Approved",
+        data_problem=data_problem)
     # The link is a plain GET navigation: the owner's own browser resolves 127.0.0.1 to the owner's PC, so the create (browser,
     # SSO, MFA, every gate) still runs only on the desktop dashboard. Nothing is posted or started from the VM.
     desktop_url = DESKTOP_DASHBOARD_ADDRESS + "/onboard/" + quote(reference, safe="")
@@ -7926,7 +7964,7 @@ def _case3_values_card(reference: str, row: dict[str, str | None] | None) -> str
     if str(row.get("Surface_Account_ID__c") or "").strip():
         return refused("surface_account_id_set")
     try:
-        _revision, plan = case3_values(reference)
+        _revision, plan = case3_values_display(reference)
         rows = case3_sheet.rows(plan)
         steps = case3_sheet.after_steps(str(plan["texts"]["Company name"]), reference)
         overview = _case3_summary_html(case3_summary.build(plan), reference)
@@ -7954,7 +7992,39 @@ def _add_account_values_card(reference: str, row: dict[str, str | None] | None, 
     return _onboarding_sheet_card(reference, row, match=match, ce_route=route == CE_ENGINE, start_iso=start_iso, country=country)
 
 
+@_display_cached
+def case3_source_display(reference: str) -> Any:
+    """One Case 3 source read (CO + DealHub) per CO for a page's preflight, values card and production match.
+
+    Fresh outside a display GET (``_display_cached``); a failed read is not cached."""
+    return attended_runner.read_case3_fill_source(reference)
+
+
+attended_runner.CASE3_SOURCE_READ = case3_source_display
+
+
+@_display_cached
+def case3_values_display(reference: str) -> tuple[str, dict[str, Any]]:
+    """``case3_values`` as a cached display read, so the CO page can start it with its other reads (a failure is not cached)."""
+    return case3_values(reference)
+
+
+def _queued_start_date(reference: str) -> str | None:
+    """The CO's start date from a finished, unexpired batched read the queue already made (never reads Salesforce)."""
+    with _display_cache_lock:
+        keys = [key for key in _display_cache if key[0] == "queue_start_dates" and len(key) == 2
+                and isinstance(key[1], tuple) and reference in key[1]]
+    for key in keys:
+        found = peek_display_cache("queue_start_dates", key[1])
+        if isinstance(found, dict) and reference in found:
+            return found[reference]
+    return None
+
+
 def _prod_view_start(reference: str) -> str | None:
+    queued = _queued_start_date(reference)
+    if queued is not None:
+        return queued
     try:
         return queue_start_dates((reference,)).get(reference)
     except Exception:  # noqa: BLE001 - the card shows the start date as unavailable
@@ -9663,7 +9733,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.OK, page_ce_only_runner_status(state, ref)); return
             review = re.fullmatch(r"/onboard/(CO-[0-9]{4,10})", path)
             if review:
-                prefetch_onboard_page(review.group(1))
+                _prefetch_with_row(review.group(1))
                 review_summary, review_extras = build_review_summary(review.group(1))
                 try:
                     review_row: dict[str, str | None] | None = detail_row(review.group(1))
@@ -9696,8 +9766,11 @@ class Handler(BaseHTTPRequestHandler):
                 prefetch_display_read(detail_row, match.group(1))
                 if dealhub_needed(queued):
                     prefetch_display_read(dealhub_rows_for_co, match.group(1))
+                prod_view = parse_qs(parsed.query).get("env", [""])[0] == "prod"
+                if prod_view:  # 2026-11-02 (CO-0757, 23 s): start the production view's reads together, as the CO page does
+                    _prefetch_with_row(match.group(1))
                 row = detail_row(match.group(1))
-                if parse_qs(parsed.query).get("env", [""])[0] == "prod":
+                if prod_view:
                     # Production view: read-only comparison with the production clone; no forms, no writes.
                     html = page_detail_production(match.group(1), row, _match_of(
                         match.group(1), row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")),
