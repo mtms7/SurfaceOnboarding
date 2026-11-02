@@ -306,7 +306,9 @@ def create_state(records: dict[str, Any], co_reference: str, *, locked: bool) ->
 
 NOT_CHECKED_TEXT = {
     "production_inputs_not_prepared": "Production inputs are only prepared for CE-only COs; the clone itself is fine.",
-    "co_source_unreadable": "The CO's name or domains could not be read; the clone itself is fine."}
+    "co_source_unreadable": "The CO's name or domains could not be read; the clone itself is fine.",
+    "co_identity_unreadable": "The CO (name, domains, Account UUID) could not be read from Salesforce; it is read again on a "
+                              "later page. The clone itself is fine."}
 
 
 REVIEW_LABEL_WARNINGS = frozenset({"identity_mismatch", "tenant_deleted", "tenant_disabled"})

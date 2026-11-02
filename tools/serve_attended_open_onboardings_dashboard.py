@@ -6388,7 +6388,7 @@ def production_match_display(reference: str, product: str = "", onboarding_type:
     ``stamp`` (see ``_match_stamp``) is only a cache key: it makes a new clone or snapshot miss the cache. The two Salesforce
     reads come from their own per-CO display cache (not keyed by the stamp), so a new stamp only redoes the local clone
     comparison (owner report 2026-10-30: every new scan check or create re-read all open COs, ~50 s per page)."""
-    token = attended_runner.MATCH_READS.set((_cached_expectation, production_identity_display))
+    token = attended_runner.MATCH_READS.set((_cached_expectation, _cached_identity))
     try:
         return production_match_for(reference, product or None, onboarding_type or None)
     finally:
@@ -6412,10 +6412,25 @@ def _cached_expectation(reference: str, product: Any = None, onboarding_type: An
     return value
 
 
+class _IdentityUnreadable(RuntimeError):
+    """A CO identity read that failed: raised so the display cache never keeps it."""
+
+
 @_display_cached
-def production_identity_display(reference: str) -> dict[str, Any] | None:
-    """The CO's identity for the clone check (one read-only Salesforce read; None when unreadable)."""
-    return attended_runner._identity_for(reference)
+def production_identity_display(reference: str) -> dict[str, Any]:
+    """The CO's identity for the clone check (one read-only Salesforce read; raises when unreadable, so a failed read is
+    tried again on the next page instead of being served for up to 30 min: owner report 2026-11-02, CO-0825)."""
+    identity = attended_runner._identity_for(reference)
+    if identity is None:
+        raise _IdentityUnreadable(reference)
+    return identity
+
+
+def _cached_identity(reference: str) -> dict[str, Any] | None:
+    try:
+        return production_identity_display(reference)
+    except _IdentityUnreadable:
+        return None
 
 
 def _unreadable_match(reason: str = "co_source_unreadable") -> dict[str, Any]:

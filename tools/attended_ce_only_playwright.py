@@ -8317,6 +8317,7 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
 
     uuid_value = _snapshot_account_uuid(reference)
     identity = None
+    uuid_unread = False
     if not isinstance(snapshot, str) and REFERENCE.fullmatch(reference) and (co_source is None or plan is None):
         if not state_paths.vm_mode():  # desktop: one fixed read of the CO itself (the VM has only the published snapshot)
             identity = identity_of(reference)
@@ -8324,9 +8325,14 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
             identity = _snapshot_identity(reference, product, onboarding_type, uuid_value)
     elif not state_paths.vm_mode() and not isinstance(snapshot, str):
         identity = identity_of(reference)  # the full match gets the CO's own UUID on the desktop too
+        uuid_unread = identity is None and REFERENCE.fullmatch(reference) is not None
     if identity is not None and uuid_value is None and not state_paths.vm_mode():
         uuid_value = identity["uuid"] or ""
-    if identity is not None and (co_source is None or plan is None):
+    if uuid_unread:
+        # Owner report 2026-11-02 (CO-0825): without the CO's own UUID a tenant missing from the clone showed as "Clear".
+        # A failed read of the CO is "not checked", never a match run as if the CO had no UUID.
+        result = match.identity_match({}, snapshot, renewal=False)
+    elif identity is not None and (co_source is None or plan is None):
         renewal = "renewal" in str(onboarding_type or "").casefold()
         result = match.identity_match(identity, snapshot, renewal=renewal)
     else:
