@@ -188,8 +188,8 @@ class NoRealWindowTests(unittest.TestCase):
 
     def test_profiles_resolve_inside_the_test_folder(self):
         import os
-        temp = Path(os.environ["LOCALAPPDATA"]).resolve()
-        self.assertIn("surface_test_state_", str(temp))
+        temp = Path(os.environ["LOCALAPPDATA"]).resolve().parent  # the test folder; Linux profiles are mkdtemp folders in it
+        self.assertIn("surface_test_state_", temp.name)
         for target in (runner.production_probe.probe_target(), None):
             profile = runner.leonardo_profile(target)[0] if target else runner.leonardo_profile()[0]
             self.assertTrue(str(Path(profile).resolve()).startswith(str(temp)), profile)

@@ -47,6 +47,11 @@ import os  # noqa: E402
 os.environ["LOCALAPPDATA"] = str(_STATE_DIR / "localappdata")
 for _name in ("SURFACE_LEONARDO_PROFILE_DIR", "SURFACE_ONBOARDING_PRODUCTION_FRESH_SIGNIN"):
     os.environ.pop(_name, None)  # an inherited override could point back at a real profile
+if os.name != "nt":
+    # 2026-11-02: off Windows a profile is a fresh mkdtemp folder, not under %LOCALAPPDATA% (CI on Linux, team repo run
+    # #1); every temporary folder a test makes lives inside the test folder there. Not on Windows: one more level breaks
+    # the 260-character path limit for the snapshot tests under a long %TEMP%.
+    tempfile.tempdir = str(_STATE_DIR)
 
 import tools.attended_ce_only_playwright as _runner  # noqa: E402
 
