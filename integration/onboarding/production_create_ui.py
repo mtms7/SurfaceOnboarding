@@ -82,6 +82,8 @@ STATUS_TEXT = {
 GATE_TEXT = {
     "no_verified_create": "There is no verified production create for this CO, so there is nothing to check.",
     "uuid_not_written": "The Account UUID is not written to Salesforce yet; the CE scan check comes after it.",
+    "case3_scan_manual": "Case 3 (Surface + CE): the automatic CE scan check and the later stage moves are CE-only. Check the scan in "
+                         "BackOffice (Duration Per Scan) and move the later stages by hand.",
     "stage_not_account_scanning": "The Salesforce stage is not Account Scanning (moved by this dashboard), so no scan check runs.",
     "onboarding_completed": "This CO is already Onboarding Completed.",
     "scan_check_running": "A CE scan check is already running.",
@@ -1345,6 +1347,9 @@ def scan_check_problem(parent: Path, co: str) -> str | None:
         return "records_unreadable"
     if co_status(history)["code"] != CREATED_VERIFIED:
         return "no_verified_create"
+    if any(r.get("route") == case3_ids.CASE3_ROUTE and r.get("outcome") == production_create.OUTCOME_VERIFIED
+           for r in active_history(history)):
+        return "case3_scan_manual"  # 2026-11-02 (CO-0757): the card said "UUID not written" although the Case 3 IDs were
     if last_uuid_write(parent, co) != "written_verified":
         return "uuid_not_written"
     stage = last_stage_write(parent, co)

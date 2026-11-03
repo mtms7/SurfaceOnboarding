@@ -62,12 +62,13 @@ class LaunchTests(Fixture):
         _process, popen = self.launch()
         self.assertEqual(popen.call_args.args[0][2:], ["--production-create", "--co", CO, "--revision", REV, "--owner-go"])
 
-    def test_a_case_3_run_starts_no_automatic_follow_up_and_records_its_route(self):
+    def test_a_case_3_run_starts_its_automatic_follow_up_and_records_its_route(self):
+        # Owner request 2026-11-02 (CO-0757): the IDs and the stage are written when the runner ends, no review click.
         started = []
         with mock.patch.object(dashboard, "_launch_production_create", return_value=Process(True)), \
                 mock.patch.object(dashboard, "Thread", side_effect=lambda **kw: started.append(kw) or mock.Mock()):
             dashboard._launch_production_create_followed(CO, REV, {}, route=CASE3)
-        self.assertEqual(started, [])
+        self.assertEqual([kw["target"] for kw in started], [dashboard._follow_case3_create])
         self.assertEqual(dashboard.PRODUCTION_RUNS[CO]["route"], CASE3)
 
     def test_a_ce_only_run_still_starts_its_follow_up_worker(self):
@@ -84,7 +85,7 @@ class LaunchTests(Fixture):
 
 
 class ProgressTests(Fixture):
-    def test_the_case_3_bar_waits_for_the_review_and_never_spins_on_a_missing_follow_up(self):
+    def test_the_case_3_bar_shows_the_automatic_id_write_while_the_follow_up_runs(self):
         since = "2026-10-22T11:00:00Z"
         dashboard.PRODUCTION_RUNS[CO] = {"since": since, "follow": None, "route": CASE3}
         self.record(outcome="readback_verified", when=NOW.replace(hour=11, minute=30), account_id=ACCOUNT_ID,
@@ -92,7 +93,7 @@ class ProgressTests(Fixture):
         progress = dashboard._production_run_progress(CO)
         self.assertEqual([state for _l, state in progress["steps"]][:4], ["done", "done", "done", "active"])
         self.assertIsNone(progress["failed"])
-        self.assertIn("review", progress["current"].lower())
+        self.assertIn("writing the account id and uuid", progress["current"].lower())  # automatic since 2026-11-02
 
     def test_a_ce_only_run_keeps_the_ce_progress(self):
         dashboard.PRODUCTION_RUNS[CO] = {"since": "2026-10-22T11:00:00Z", "follow": None}

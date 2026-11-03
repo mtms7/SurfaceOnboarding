@@ -16,12 +16,15 @@ Secrets and values: the readback keeps only the compared fields of ONE row; no t
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from . import production_contract, production_dry_run, production_probe
 
 CREATE_PATH = "/api/v1/backoffice/account/add"
+# The one Edit Account after a verified Case 3 create (owner go 2026-11-02): only for the created tenant's id, only while armed.
+EDIT_PATH = re.compile(r"/api/v1/backoffice/account/([0-9a-f]{24})/edit")
 CONFIRM_LABEL = "Confirm"
 CLICK_CONFIRM_CREATE = "confirm_create"
 SUBMITTED = "submitted"           # same words as production_create (the orchestrator compares them)
@@ -143,6 +146,14 @@ def is_create_request(method: object, url: object) -> bool:
             and production_probe.url_path(url) == CREATE_PATH)
 
 
+def edit_request_id(method: object, url: object) -> str | None:
+    """The tenant id of a POST to the exact production edit path (query ignored), else None."""
+    if str(method).upper() != "POST" or production_probe.url_origin(url) != production_probe.PRODUCTION_ORIGIN:
+        return None
+    found = EDIT_PATH.fullmatch(production_probe.url_path(url) or "")
+    return found.group(1) if found else None
+
+
 def live_request_decision(method: str, url: str, *, armed: bool, post_data: object = None) -> tuple[bool, str]:
     """(allowed, reason): the dry-run table (a table POST needs a validated read body), plus the create POST while ``armed``.
     Everything else is aborted."""
@@ -167,6 +178,11 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         self.expected_payload: Mapping[str, Any] | None = None  # docs/49 s.1, set before the click
         self.create_body: dict[str, Any] | None = None          # the ONE allowed body, redacted (never persisted raw)
         self.create_matched: frozenset[str] = frozenset()       # identifying fields that equalled the expectation
+        # The one post-create Edit Account (Case 3, owner go 2026-11-02): its own arm, one tenant id, one request.
+        self.edit_target: str | None = None
+        self.edit_armed = False
+        self.edit_used = False
+        self.edit_blocked = 0
 
     def install(self, page: Any) -> None:
         """Route the PAGE exactly like the dry-run guard (``page.route("**/*")``, proven live in dry runs #5-#7) and count
@@ -207,6 +223,10 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         except Exception:
             route.abort()
             return
+        edit = edit_request_id(method, url)
+        if edit is not None:
+            self._handle_edit(route, method, url, edit)
+            return
         if not is_create_request(method, url):
             super().handle(route)
             return
@@ -224,6 +244,26 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
             self.create_body, self.create_matched = kept if kept is not None else (None, frozenset())
         except Exception:
             self.create_body, self.create_matched = None, frozenset()
+        route.continue_()
+
+    def arm_edit(self, account_id: str) -> None:
+        """Allow ONE edit POST for ``account_id`` (only after the create was used; never a second edit)."""
+        if self.create_used and not self.edit_used and isinstance(account_id, str):
+            self.edit_target, self.edit_armed = account_id, True
+
+    def disarm_edit(self) -> None:
+        self.edit_armed = False
+
+    def _handle_edit(self, route: Any, method: str, url: str, account_id: str) -> None:
+        where = self._where(url)
+        if not (self.edit_armed and not self.edit_used and account_id == self.edit_target):
+            self.blocked[(method, where)] = self.blocked.get((method, where), 0) + 1
+            self.edit_blocked += 1
+            route.abort()
+            return
+        self.edit_used, self.edit_armed = True, False  # disarmed before it is continued: a repeat is aborted and counted
+        entry = self.api_calls.setdefault((method, where), {"count": 0, "statuses": set()})
+        entry["count"] += 1
         route.continue_()
 
     def payload_mismatches(self) -> list[str]:

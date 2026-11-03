@@ -8355,10 +8355,11 @@ _PRODUCTION_RUNS_LOCK = Lock()
 
 
 def _launch_production_create_followed(reference: str, revision: str, env: dict[str, str], route: str | None = None) -> Any:
-    """Start the runner (``_launch_production_create``) and, for CE-only, a worker that runs the follow-up when it ends.
+    """Start the runner (``_launch_production_create``) and a worker that runs the follow-up when it ends.
 
-    A Case 3 run (``route`` given) starts NO automatic follow-up: after a verified create the IDs and the stage are written only
-    by the owner's separate review and confirmation on the CO page (``case3_followup``)."""
+    CE-only: the UUID write and Account Scanning (``create_ui.after_verified_create``). Case 3 (``route`` given): since 2026-11-02
+    (owner request, CO-0757) the Account ID / UUID write and Account Scanning also run automatically
+    (``case3_followup.after_verified_create``); the review page remains for a follow-up that did not run."""
     since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     process = (_launch_production_create(reference, revision, env, route=route) if route is not None
                else _launch_production_create(reference, revision, env))
@@ -8366,9 +8367,36 @@ def _launch_production_create_followed(reference: str, revision: str, env: dict[
         return None
     with _PRODUCTION_RUNS_LOCK:
         PRODUCTION_RUNS[reference] = {"since": since, "follow": None, **({"route": route} if route is not None else {})}
-    if route is None:
-        Thread(target=_follow_production_create, args=(reference, process), daemon=True).start()
+    follow = _follow_production_create if route is None else _follow_case3_create
+    Thread(target=follow, args=(reference, process), daemon=True).start()
     return process
+
+
+def _follow_case3_create(reference: str, process: Any) -> None:
+    """When a Case 3 runner ends: the guarded Account ID / UUID write and Request Approved -> Account Scanning."""
+    try:
+        process.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        inputs = _create_ui_inputs(reference, None)
+        follow_inputs = case3_followup.FollowupInputs(reference=reference, records_parent=inputs.records_parent, now=inputs.now,
+                                                      vm=inputs.vm, sf_ready=inputs.sf_ready)
+
+        def run_and_forget_cached_reads(argv: list[str]) -> bool:
+            ok = _run_sf_argv(argv)
+            clear_display_cache_for(reference)
+            return ok
+
+        follow = case3_followup.after_verified_create(
+            follow_inputs, create_ui.load_co_records(inputs.records_parent, reference),
+            lambda: _read_case3_followup_row(reference), run_and_forget_cached_reads, create_ui.PINNED_SF_ALIAS)
+    except Exception:  # noqa: BLE001 - recorded, never raised in the worker
+        follow = {"ids": "follow_up_failed", "stage": "follow_up_failed"}
+    with _PRODUCTION_RUNS_LOCK:
+        if reference in PRODUCTION_RUNS:
+            PRODUCTION_RUNS[reference]["follow"] = follow
+    clear_display_cache_for(reference)
 
 
 def _follow_production_create(reference: str, process: Any) -> None:
@@ -8401,7 +8429,8 @@ def _production_run_progress(reference: str) -> dict[str, Any] | None:
     if not run:
         return None
     if run.get("route") == "case_3_combined_baseline":
-        return case3_followup.progress(production_records_parent(), reference, run["since"], running=create_ui.LAUNCHES.busy())
+        return case3_followup.progress(production_records_parent(), reference, run["since"],
+                                       running=create_ui.LAUNCHES.busy() or run.get("follow") is None, follow=run.get("follow"))
     running = create_ui.LAUNCHES.busy() or run.get("follow") is None
     return create_ui.production_progress(production_records_parent(), reference, run["since"], running=running,
                                          follow=run.get("follow"))

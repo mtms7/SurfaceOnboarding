@@ -226,6 +226,29 @@ def confirm(values: Mapping[str, Any], inputs: FollowupInputs, verified_records:
     return {"result": "completed" if done else "stopped", "ids": ids, "stage": stage}
 
 
+def after_verified_create(inputs: FollowupInputs, verified_records: Any, read_row: Callable[[], Mapping[str, Any] | None],
+                          run_argv: Callable[[list[str]], bool], target_org: str) -> dict[str, str]:
+    """The automatic follow-up the dashboard runs when a Case 3 create runner ends (owner request 2026-11-02, CO-0757: the IDs and
+    the stage waited ~8 min for a review click). ``{"ids", "stage"}``: the same gate, intent lines, fixed-argv writes and
+    read-after-write as ``confirm``; never retried (a recorded write blocks a repeat). Nothing is written without a verified create."""
+    lock = build_lock(inputs)
+    if lock is not None:
+        return {"ids": lock, "stage": "skipped_ids_not_verified"}
+    try:
+        row = read_row()
+    except Exception:
+        row = None
+    code, evidence, revision = _blocker(inputs, row, verified_records)
+    if code == "already_complete":
+        return {"ids": "already_present", "stage": "already_present"}
+    if code is not None:
+        return {"ids": code, "stage": "skipped_ids_not_verified"}
+    ids = _write_ids(inputs, read_row, run_argv, target_org, verified_records, evidence, revision)
+    if ids not in ("written_verified", "already_present"):
+        return {"ids": ids, "stage": "skipped_ids_not_verified"}
+    return {"ids": ids, "stage": _write_stage(inputs, read_row, run_argv, target_org)}
+
+
 def _write_ids(inputs: FollowupInputs, read_row: Callable[[], Mapping[str, Any] | None], run_argv: Callable[[list[str]], bool],
                target_org: str, verified_records: Any, evidence: Mapping[str, Any], revision: str) -> str:
     try:
@@ -330,12 +353,28 @@ MANUAL_AFTER_TEXT = ("Still manual in BackOffice after the create: Edit Account,
                      "does not keep it: CO-0800 and CO-0802 both showed 24), then pick the Operator Account of the Technical Advisor.")
 
 
+def edit_note(parent: Path, co: str) -> str:
+    """What the card says about Operator and Maximum scan Duration: the recorded post-create Edit Account result, or the manual
+    steps for a create without one (before 2026-11-02, or a run that stopped before the edit)."""
+    from . import production_case3_edit as edit
+
+    result = _last(parent, co, edit.STEP)
+    if result is None:
+        return MANUAL_AFTER_TEXT
+    if result in edit.TEXT:
+        return edit.TEXT[result]
+    if result in ("write_started", "write_uncertain"):
+        result = "edit_save_no_signal"
+    return ("The automatic Edit Account did not finish (" + result + "): open Edit Account in BackOffice, check Maximum scan "
+            "Duration (hours) is 90 and the Operator Account is the Technical Advisor's; it is not repeated automatically.")
+
+
 def followup_card_html(parent: Path, co: str) -> str:
     """The Case 3 follow-up part of the create card after a verified create: one review button, or the recorded state."""
     from html import escape
 
     ids, stage = _last(parent, co, "ids"), _last(parent, co, "stage")
-    manual = "<p class='note'>" + escape(MANUAL_AFTER_TEXT) + "</p>"
+    manual = "<p class='note'>" + escape(edit_note(parent, co)) + "</p>"
     if ids == "written_verified" and stage == "written_verified":
         return ("<p class='note'><strong>Onboarded:</strong> the Account ID and UUID are written to Salesforce and read back, "
                 "and the stage is Account Scanning.</p>" + manual)
@@ -357,16 +396,17 @@ PROGRESS_STEPS = (
     "Signing in to BackOffice and checking duplicates and the form (sign in with SSO + MFA in the app.pentera.io window)",
     "Creating the tenant in BackOffice (one Confirm)",
     "Reading the tenant back",
-    "Your review: writing the Account ID and UUID to Salesforce",
-    "Your review: moving the Salesforce stage to Account Scanning",
+    "Writing the Account ID and UUID to Salesforce",
+    "Moving the Salesforce stage to Account Scanning",
 )
 
 
-def progress(parent: Path, co: str, since: str, *, running: bool) -> dict[str, Any]:
+def progress(parent: Path, co: str, since: str, *, running: bool, follow: Mapping[str, str] | None = None) -> dict[str, Any]:
     """Steps of the Case 3 create started at ``since`` from recorded evidence only (records and the follow-up log).
 
-    Same shape as ``production_create_ui.production_progress``. A verified create waits for the owner's review (active, not
-    failed): nothing is written to Salesforce automatically on this route.
+    Same shape as ``production_create_ui.production_progress``. Since 2026-11-02 the IDs and the stage are written automatically
+    when the runner ends (``after_verified_create``); ``follow`` is that result, so a follow-up that refused before any write
+    shows as failed instead of waiting.
     """
     from .production_create_ui import load_co_records
 
@@ -384,6 +424,9 @@ def progress(parent: Path, co: str, since: str, *, running: bool) -> dict[str, A
         ids, stage = _last(parent, co, "ids"), _last(parent, co, "stage")
         if ids in ("written_verified", None) and stage in ("written_verified", None):
             reached = 3 + (ids == "written_verified") + (stage == "written_verified")
+            refused = (follow or {}).get("ids") if reached == 3 else (follow or {}).get("stage") if reached == 4 else None
+            if refused and refused not in ("written_verified", "already_present"):
+                failed = str(refused)  # the automatic follow-up stopped before writing: shown, not an endless wait
         else:
             failed = next(r for r in (ids, stage) if r not in ("written_verified", None))
             reached = 3 + (ids == "written_verified")

@@ -11144,6 +11144,186 @@ def case3_live_intended(source: Case3FillSource, plan: dict[str, Any], run_day: 
     return built
 
 
+PCR_EDIT_RESPONSE_MS = 30_000
+PCR_EDIT_OPTION_POLLS = 10  # x 500 ms: the operator options load after typing
+PCR_EDIT_REREADS = 3        # x 2 s: the row re-read after the edit reply
+
+
+def _pcr_selected_operators(page: Any) -> list[str] | None:
+    """The chip labels of the Operator Account select (``react-select``), or None when they cannot be read."""
+    try:
+        labels = page.locator(OPERATOR_ACCOUNT_INPUT_SELECTOR).first.evaluate(
+            """el => {
+                const box = el.closest('[class*="container"]') || el.parentElement;
+                if (!box) return null;
+                const chips = box.querySelectorAll('[class*="multiValue"], [class*="multi-value"]');
+                const out = [];
+                chips.forEach(chip => {
+                    if (chip.parentElement && chip.parentElement.closest('[class*="multiValue"], [class*="multi-value"]')) return;
+                    out.push((chip.innerText || '').replace(/\\u00d7\\s*$/, '').trim());
+                });
+                return out;
+            }""")
+    except Exception:
+        return None
+    return [" ".join(str(label).split()) for label in labels] if isinstance(labels, list) else None
+
+
+def _pcr_pick_operator(page: Any, operator: str) -> str | None:
+    """Select exactly the one option named ``operator`` in the empty Operator Account select; None when it is the only chip."""
+    control = page.locator(OPERATOR_ACCOUNT_INPUT_SELECTOR)
+    try:
+        if control.count() != 1:
+            return "edit_operator_control_absent"
+    except Exception:
+        return "edit_operator_control_absent"
+    if _verify_operator_account_empty(page) is not None:
+        return "edit_operator_not_empty"
+    try:
+        control.first.click(timeout=FIELD_TIMEOUT_MS)
+        control.first.fill(operator, timeout=FIELD_TIMEOUT_MS)
+        options = page.get_by_role("option", name=operator, exact=True)
+        count = 0
+        for _ in range(PCR_EDIT_OPTION_POLLS):
+            count = options.count()
+            if count:
+                break
+            page.wait_for_timeout(500)
+        if count != 1:
+            control.first.fill("", timeout=FIELD_TIMEOUT_MS)  # never Escape here: it could close the Edit form
+            return "edit_operator_not_found" if count == 0 else "edit_operator_ambiguous"
+        options.first.click(timeout=FIELD_TIMEOUT_MS)
+    except Exception:
+        return "edit_operator_select_failed"
+    chips = _pcr_selected_operators(page)
+    if chips is not None and chips != [operator]:
+        return "edit_operator_select_failed"  # unreadable chips are left to the row re-read after the save
+    return None
+
+
+def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_row: dict[str, Any], account_id: str,
+                    operator: str | None, record: Any) -> str:
+    """The one Edit Account after a verified Case 3 create (owner go 2026-11-02): Operator "<Technical Advisor> Operator" and
+    Maximum scan Duration 90, then ONE Confirm and a row re-read (``production_case3_edit``).
+
+    Same tenant only: the row is found by name and domain and must carry the verified Account ID; the guard lets exactly one
+    ``POST /account/{that id}/edit`` through. Nothing else in the form is touched. Every stop before the Confirm cancels the
+    form (nothing saved); after it the result is recorded and never repeated. ``record(result)`` writes the result line."""
+    from integration.onboarding import production_case3_edit as edit
+    from integration.onboarding import production_create_live as live
+
+    name = intended["tenant_name"]
+
+    def read() -> Any:
+        return _pdr_reader(page, in_app=False).readback(name)
+
+    try:
+        before = edit.before_edit(read(), intended, account_id, operator)
+    except Exception:
+        before = "edit_row_unavailable"
+    if before != "ok":
+        return before
+
+    def stop(code: str) -> str:
+        return code if _spycloud_cancel(page) else code + "_form_left_open"
+
+    try:
+        _open_row_action(page, name, SPYCLOUD_EDIT_SELECTOR)
+    except Exception:
+        return stop("edit_form_unavailable")
+    confirm = page.get_by_role("button", name=live.CONFIRM_LABEL, exact=True)
+    try:
+        for _ in range(PCR_EDIT_OPTION_POLLS):
+            if confirm.count() == 1 and page.locator(OPERATOR_ACCOUNT_INPUT_SELECTOR).count() == 1:
+                break
+            page.wait_for_timeout(500)
+        else:
+            return stop("edit_form_unavailable")
+    except Exception:
+        return stop("edit_form_unavailable")
+    if operator:
+        problem = _pcr_pick_operator(page, operator)
+        if problem:
+            return stop(problem)
+    label = production_dry_run.MAX_SCAN_DURATION_LABEL
+    try:
+        control = _pdr_advanced_text(page, label)
+        if control is None:  # open "Advanced options" (one or two sections) until the duration control shows
+            expanders = page.get_by_text(production_dry_run.ADVANCED_BUTTON_TEXT, exact=True)
+            for index in range(min(expanders.count(), 2)):
+                expanders.nth(index).click(timeout=FIELD_TIMEOUT_MS)
+                control = _pdr_advanced_text(page, label)
+                if control is not None:
+                    break
+        if control is None or not control.first.is_enabled():
+            return stop("edit_scan_control_absent")
+        control.first.fill(edit.SCAN_HOURS_TEXT, timeout=FIELD_TIMEOUT_MS)
+        if control.first.input_value() != edit.SCAN_HOURS_TEXT:
+            return stop("edit_fill_mismatch")
+        if confirm.count() != 1 or not confirm.first.is_enabled():
+            return stop("edit_confirm_unavailable")
+    except Exception:
+        return stop("edit_scan_control_absent")
+    try:
+        record("write_started")
+    except Exception:
+        return stop("edit_record_failed")
+    guard.arm_edit(account_id)
+    try:
+        with page.expect_response(lambda r: live.edit_request_id(r.request.method, r.url) is not None,
+                                  timeout=PCR_EDIT_RESPONSE_MS) as info:
+            confirm.first.click(timeout=FIELD_TIMEOUT_MS)
+        response = info.value
+    except Exception:
+        return "edit_id_mismatch" if guard.edit_blocked else "edit_save_no_signal"  # never clicked again
+    finally:
+        guard.disarm_edit()
+    problem = edit.edit_response_problem(response.request.method, live.edit_request_id(response.request.method, response.url),
+                                         response.status, account_id)
+    if problem:
+        return problem
+    verdict = "edit_saved_unverified"
+    for _ in range(PCR_EDIT_REREADS):
+        page.wait_for_timeout(2_000)
+        try:
+            verdict = edit.after_edit(read(), intended, expected_row, account_id, operator)
+        except Exception:
+            verdict = "edit_saved_unverified"
+        if verdict not in ("edit_saved_unverified", "edit_values_not_kept"):
+            break
+    return verdict
+
+
+def _pcr_case3_edit_step(page: Any, guard: Any, parent: Path, reference: str, intended: dict[str, Any],
+                         strict_state: dict[str, Any], source: Any, stamp: Any) -> str:
+    """Run ``_pcr_case3_edit`` once after a verified Case 3 create and record its result (never raises; never repeated:
+    the run ends after it, and a new run needs a new approval and an uncreated CO)."""
+    from integration.onboarding import case3_followup
+    from integration.onboarding import production_case3_edit as edit
+
+    operator = edit.operator_name(getattr(source, "technical_advisor", ""))
+    detail = {"operator": "named" if operator else "unknown"}
+
+    def record(result: str) -> None:
+        case3_followup._record(parent, reference, edit.STEP, result, stamp(), detail)
+
+    account_id = strict_state.get("account_id")
+    if not isinstance(account_id, str) or not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, account_id):
+        result = "edit_account_id_unknown"
+    else:
+        try:
+            result = _pcr_case3_edit(page, guard, intended, strict_state["expected"], account_id, operator, record)
+        except Exception:
+            result = "edit_failed"
+    if result == edit.VERIFIED and operator is None:
+        result = "edit_operator_unknown"  # 90 is set; the operator is left for the Technical Advisor
+    try:
+        record(result)
+    except Exception:
+        pass
+    return result
+
+
 def _pcr_finish_line(result: Any) -> str:
     """The one printed line of a live run: a result word or reason from the fixed enums and a record name only."""
     from integration.onboarding import production_create_live as live
@@ -11527,6 +11707,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 found = live.poll_readback(fetch, contract_intended, strict_state["expected"], page.wait_for_timeout)
                 if isinstance(found, dict):  # names only; a non-empty list makes the result created_mismatch, never verified
                     found["payload_mismatches"] = guard.payload_mismatches()
+                    strict_state["account_id"] = found.get("account_id")  # the post-create Case 3 edit targets only this id
                 # A popup, new page or service worker that appeared AFTER the click (even after the poll window) means the
                 # outcome cannot be trusted: returning None records ``created_unverified`` / ``readback_unavailable``, which the
                 # dashboard shows and treats as create_outcome_unknown (CO blocked, no VERIFIED record).
@@ -11541,6 +11722,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 return found
 
             result = run_live(final, fill, click, read, duplicate_check, form_recheck)
+            if case3 and result.outcome == production_create.OUTCOME_VERIFIED:
+                _pcr_case3_edit_step(page, guard, parent, reference, contract_intended, strict_state, source, stamp)
             if clicks.confirm_clicks == 0 and production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds:
                 # Nothing was confirmed: leave no half-filled form behind (Cancel, never Confirm).
                 if not _pdr_close_form(page, clicks):
