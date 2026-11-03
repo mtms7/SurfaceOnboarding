@@ -83,6 +83,19 @@ def _tenant_dates(value: Any) -> set[str]:
     return {iso} if iso else set()
 
 
+def _backoffice_day(value: Any) -> str | None:
+    """The calendar day BackOffice shows for a clone licence date: it stores midnight Israel time (UTC+2/+3), so an epoch of
+    2027-01-14T22:00Z is Jan 15, 2027 (CO-0834). ISO text is taken as is; None when unreadable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return (datetime.fromtimestamp(value / 1000, tz=timezone.utc) + timedelta(hours=3)).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            return None
+    return _iso(value)
+
+
 def _shown_date(value: Any) -> str:
     dates = _tenant_dates(value)
     if isinstance(value, (int, float)) and not isinstance(value, bool) and dates:
@@ -107,7 +120,11 @@ def _summary(tenant: Mapping[str, Any]) -> dict[str, Any]:
     return {"id": tenant.get("id"), "name": tenant.get("account_name"), "domain": tenant.get("account_domain"),
             "created": tenant.get("created"), "deleted": tenant.get("is_deleted") is True,
             "enabled": tenant.get("enabled") is True, "live_paid": is_live_paid_tenant(tenant),
-            "license_type": lic.get("type")}
+            "license_type": lic.get("type"),
+            # The licence end as BackOffice shows it and the scan interval: a renewal's queue row reads them (owner request
+            # 2026-11-03, CO-0834 showed "overdue 1022d" although its tenant was already renewed).
+            "license_end": _backoffice_day(lic.get("expiration_date")),
+            "scanning_interval": tenant.get("scanning_interval")}
 
 
 def compare_fields(tenant: Mapping[str, Any], plan: Mapping[str, Any], tenant_names: Any = ()) -> list[dict[str, Any]]:

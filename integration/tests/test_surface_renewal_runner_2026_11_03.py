@@ -363,3 +363,51 @@ class QueueLinkTests(unittest.TestCase):
         page = self.render("Credential Exposure")
         self.assertNotIn("href='/co/CO-0829", page)
         self.assertIn("No automated route", page)
+
+
+class RenewalCoverageTests(unittest.TestCase):
+    """Owner request 2026-11-03: CO-0834 showed "overdue 1022d" although its tenant already runs to the DealHub end."""
+
+    @staticmethod
+    def match(end, live=True, status="tenant_found", others=0):
+        tenant = {"id": "x", "name": "Respec", "live_paid": live, "license_end": end, "scanning_interval": "MONTHLY"}
+        return {"status": status, "candidates": [tenant] + [{"live_paid": False, "license_end": "2020-01-01"}] * others}
+
+    def test_rule(self):
+        from integration.onboarding import production_views as views
+        self.assertEqual(views.renewal_coverage(self.match("2027-01-14"), "2027-01-15")["state"], "renewed")  # 22:00 UTC
+        self.assertEqual(views.renewal_coverage(self.match("2027-02-01", others=6), "2027-01-15")["state"], "renewed")
+        self.assertEqual(views.renewal_coverage(self.match("2026-10-30"), "2027-10-31")["state"], "due")
+        self.assertIsNone(views.renewal_coverage(self.match("2027-01-14", live=False), "2027-01-15"))
+        self.assertIsNone(views.renewal_coverage(self.match("2027-01-14"), None))
+        self.assertIsNone(views.renewal_coverage(self.match(None), "2027-01-15"))
+        self.assertIsNone(views.renewal_coverage(self.match("2027-01-14", status="tenant_missing"), "2027-01-15"))
+
+    def test_the_match_summary_carries_the_licence_end(self):
+        from integration.onboarding import production_match as pm
+        summary = pm._summary({"id": "x", "license": {"expiration_date": 1799964000000}, "scanning_interval": "MONTHLY"})
+        self.assertEqual(summary["license_end"], "2027-01-15")
+        self.assertEqual(summary["scanning_interval"], "MONTHLY")
+
+    def test_queue_row_of_an_already_renewed_tenant_is_done(self):
+        parent = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, parent, True)
+        row = {"Name": "CO-0834", "Onboarding_Product__c": "Surface & Credential Exposure",
+               "Onboarding_Type__c": "Renewal of Existing Product", "Onboarding_Approval_Status__c": "Approved",
+               "Onboarding_Stage__c": "Request Approved", "Account__r.Name": "Respec Inc", "Submission_Date__c": "2026-11-03"}
+
+        def starts(_refs):
+            dashboard.QUEUE_END_DATES["CO-0834"] = "2027-01-15"
+            return {"CO-0834": "2024-01-16"}
+
+        with mock.patch.object(dashboard, "queue_rows", return_value=[row]), \
+                mock.patch.object(dashboard, "queue_start_dates", side_effect=starts), \
+                mock.patch.object(dashboard, "prefetch_display_read"), \
+                mock.patch.object(dashboard, "_match_of", return_value=self.match("2027-01-15")), \
+                mock.patch.object(dashboard, "_clone_payload_for_job", return_value=None), \
+                mock.patch.object(dashboard, "_clone_strip", return_value=""), \
+                mock.patch.object(dashboard, "production_records_parent", return_value=parent), \
+                mock.patch.object(dashboard, "approvals_read_path", return_value=parent / "approvals.json"):
+            page = dashboard.render_onboard_queue()
+        self.assertNotIn("overdue", page)
+        self.assertIn("Renewed in production: licence until 2027-01-15 (DealHub end 2027-01-15); scanning Monthly.", page)

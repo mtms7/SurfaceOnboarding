@@ -362,6 +362,30 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
     return unusable
 
 
+def renewal_coverage(match: Any, term_end: Any) -> dict[str, Any] | None:
+    """A renewal CO's tenant against the DealHub term end (owner request 2026-11-03, CO-0834): ``{"state": "renewed" |
+    "due", "license_end", "scanning_interval"}`` for the ONE live, paid tenant of the clone match, else None (no decision).
+
+    "renewed": its licence already reaches the term end (one day of tolerance: BackOffice stores midnight Israel time, the
+    clone shows the UTC day before). Pure; display only, never a gate."""
+    try:
+        end = date.fromisoformat(str(term_end)[:10])
+    except ValueError:
+        return None
+    if not isinstance(match, dict) or match.get("status") not in ("tenant_found", "onboarded"):
+        return None
+    live = [item for item in match.get("candidates") or () if isinstance(item, dict) and item.get("live_paid") is True]
+    if len(live) != 1:
+        return None
+    try:
+        have = date.fromisoformat(str(live[0].get("license_end") or "")[:10])
+    except ValueError:
+        return None
+    interval = live[0].get("scanning_interval")
+    return {"state": "renewed" if have + timedelta(days=1) >= end else "due", "license_end": have.isoformat(),
+            "scanning_interval": interval if isinstance(interval, str) else None}
+
+
 def _name_key(value: Any) -> str:
     return " ".join(str(value or "").casefold().split())
 

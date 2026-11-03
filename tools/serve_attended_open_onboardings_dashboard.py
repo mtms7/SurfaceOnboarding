@@ -3223,7 +3223,16 @@ def queue_start_dates(references: tuple[str, ...]) -> dict[str, str]:
             dates[reference] = date.fromisoformat(summary["Subscription_Start"]).isoformat()
         except ValueError:
             continue
+        try:  # the same read's end date, kept for the renewal rows of the queue (no second Salesforce read)
+            QUEUE_END_DATES[reference] = date.fromisoformat(summary["Subscription_End"]).isoformat()
+        except (KeyError, ValueError):
+            QUEUE_END_DATES.pop(reference, None)
     return dates
+
+
+# The DealHub end per CO from the last ``queue_start_dates`` read (owner request 2026-11-03: a renewal whose tenant already
+# runs to that end is done, not "overdue" from a start years ago, CO-0834). Display only.
+QUEUE_END_DATES: dict[str, str] = {}
 
 
 def _start_cell(start: str | None, key: str, today: date) -> str:
@@ -7375,14 +7384,18 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         ref = str(row["Name"])
         route = route_for(row)
         supported = route == CE_ENGINE or route in SURFACE_ROUTES
-        check = production_views.production_check(_match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")))
+        match = _match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+        check = production_views.production_check(match)
+        coverage = (production_views.renewal_coverage(match, QUEUE_END_DATES.get(ref))
+                    if "renewal" in str(row.get("Onboarding_Type__c") or "").casefold() else None)
+        renewed = bool(coverage and coverage["state"] == "renewed")
         approval = production_views.pick_approval(approvals, ref)
         create = production_views.create_state(records, ref, locked=locked and not vm_mode())  # the header chip already says the VM cannot create
         hand_entered = hand_entered_onboarded(check, row.get("Onboarding_Stage__c"))
         created = (create["code"] in production_views.CREATED_OUTCOMES or bool(check and check["code"] == "onboarded")
-                   or hand_entered)
+                   or hand_entered or renewed)
         items.append({"row": row, "ref": ref, "supported": supported, "check": check, "approval": approval, "create": create,
-                      "hand_entered": hand_entered,
+                      "hand_entered": hand_entered, "coverage": coverage,
                       "flags": {"blocked": supported and bool(check and check["blocked"]) and not hand_entered,
                                 "ready": supported and bool(check) and not check["blocked"] and not created,
                                 "approved": supported and approval["state"] == "valid", "created": created}})
@@ -7482,7 +7495,17 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                                                                                  ("onboarded", "tenant_found")) else "") + "</span>")
             approval_cell = create_cell = "<span class='muted'>—</span>"
             onboarding = "<span class='co'>" + escape(ref) + "</span>"
-        done = created_here or bool(check and check["code"] == "onboarded") or item["hand_entered"]
+        coverage = item["coverage"]
+        if coverage is not None:  # a renewal: what the tenant already has against the DealHub end
+            end = QUEUE_END_DATES.get(ref, "")
+            checks += ("<span class='sub'>" + escape(
+                ("Renewed in production: licence until " + coverage["license_end"] + " (DealHub end " + end + ")"
+                 if coverage["state"] == "renewed" else
+                 "Renewal due: licence until " + coverage["license_end"] + ", DealHub end " + end)
+                + ("; scanning " + coverage["scanning_interval"].title() if coverage["scanning_interval"] else "")
+                + ".") + "</span>")
+        done = (created_here or bool(check and check["code"] == "onboarded") or item["hand_entered"]
+                or bool(coverage and coverage["state"] == "renewed"))
         linked = item["supported"] or onboarding.startswith("<a ")
         body += ("<tr" + ("" if linked else " class='locked'") + "><td class='c-start'>"
                  + ("<span class='muted'>done</span>" if done
