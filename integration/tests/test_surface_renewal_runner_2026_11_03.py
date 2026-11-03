@@ -332,3 +332,34 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QueueLinkTests(unittest.TestCase):
+    """Owner report 2026-11-03: CO-0829 was listed without a link; a Surface renewal links its production CO page."""
+
+    def render(self, product="Surface"):
+        parent = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, parent, True)
+        row = dict(CO_ROW, Onboarding_Product__c=product, **{"Account__r.Name": "Royal Reesink"},
+                   Onboarding_Stage__c="Request Approved", Submission_Date__c="2026-11-02")
+        check = {"css": "chip-ok", "label": "In production", "reason": "", "blocked": False, "code": "tenant_found"}
+        with mock.patch.object(dashboard, "queue_rows", return_value=[row]), \
+                mock.patch.object(dashboard, "queue_start_dates", return_value={"CO-0829": "2026-11-01"}), \
+                mock.patch.object(dashboard, "prefetch_display_read"), \
+                mock.patch.object(dashboard, "_match_of", return_value=None), \
+                mock.patch.object(dashboard.production_views, "production_check", return_value=check), \
+                mock.patch.object(dashboard, "_clone_payload_for_job", return_value=None), \
+                mock.patch.object(dashboard, "_clone_strip", return_value=""), \
+                mock.patch.object(dashboard, "production_records_parent", return_value=parent), \
+                mock.patch.object(dashboard, "approvals_read_path", return_value=parent / "approvals.json"):
+            return dashboard.render_onboard_queue()
+
+    def test_a_surface_renewal_links_the_production_co_page(self):
+        page = self.render()
+        self.assertIn("href='/co/CO-0829?env=prod'", page)
+        self.assertIn("Surface renewal · one Edit Account", page)
+
+    def test_a_ce_renewal_stays_unlinked(self):
+        page = self.render("Credential Exposure")
+        self.assertNotIn("href='/co/CO-0829", page)
+        self.assertIn("No automated route", page)

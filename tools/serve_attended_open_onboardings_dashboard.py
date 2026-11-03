@@ -47,6 +47,7 @@ from integration.onboarding import production_create_ui as create_ui
 from integration.onboarding import remote_start
 from integration.onboarding import case3_followup
 from integration.onboarding import surface_renewal_followup
+from integration.onboarding import production_surface_renewal as surface_renewal
 from integration.onboarding import production_case3_sheet as case3_sheet
 from integration.onboarding import production_case3_summary as case3_summary
 from integration.onboarding import tenant_name_decision
@@ -7463,6 +7464,17 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                            and item["create"]["code"] not in production_views.CREATED_OUTCOMES
                            else _chip(item["create"]["css"], item["create"]["label"]))
             onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
+        elif create_ui._row_route(row) == production_approval.SURFACE_RENEWAL_ROUTE:
+            # Surface renewal (owner go 2026-11-03): no create, one Edit Account from the production CO page (the review page
+            # is built for creates). The tenant exists, so "In production" is the expected match here.
+            renewed = surface_renewal_followup.last(production_records_parent(), ref, surface_renewal.STEP)
+            checks = (_chip(check["css"], check["label"]) + "<span class='sub'>Surface renewal · one Edit Account on the existing "
+                      "tenant (Scanning interval and Expiration date) from the CO page</span>")
+            approval_cell = _create_approval_chip(item["approval"])
+            create_cell = (_chip("chip-ok", "Renewed") if renewed == surface_renewal.VERIFIED
+                           else _chip("chip-warn", "Renewal: " + renewed.replace("_", " ")) if renewed
+                           else "<span class='muted'>—</span>")
+            onboarding = "<a class='co' href='" + escape("/co/" + ref + "?env=prod") + "'>" + escape(ref) + "</a>"
         else:  # no automated create route: the clone validation still shows, so the list says what is next for every CO
             checks = (_chip(check["css"], check["label"]) + "<span class='sub'>No automated route · Exact Product and Type pair not "
                       "supported · validated against the clone only"
@@ -7471,7 +7483,8 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             approval_cell = create_cell = "<span class='muted'>—</span>"
             onboarding = "<span class='co'>" + escape(ref) + "</span>"
         done = created_here or bool(check and check["code"] == "onboarded") or item["hand_entered"]
-        body += ("<tr" + ("" if item["supported"] else " class='locked'") + "><td class='c-start'>"
+        linked = item["supported"] or onboarding.startswith("<a ")
+        body += ("<tr" + ("" if linked else " class='locked'") + "><td class='c-start'>"
                  + ("<span class='muted'>done</span>" if done
                     else _prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='c-days'>"
                  + _prod_days_cell(start, today, row.get("Onboarding_Approval_Status__c"), done, ref == next_ref)
