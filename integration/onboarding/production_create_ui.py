@@ -101,6 +101,8 @@ GATE_TEXT = {
     "approval_unreadable": "The approval record cannot be read.",
     "approval_revision_drift": "The CO changed in Salesforce since the approval: issue a new approval.",
     "route_not_ce_only_new": "This CO is not a CE-only New onboarding.",
+    "renewal_already_attempted": ("The production renewal edit of this CO already reached Confirm: check the tenant in BackOffice. "
+                                  "It is never repeated automatically."),
     "salesforce_not_fresh": "The Salesforce data is not fresh: refresh the page.",
     "salesforce_session_not_ready": "The Salesforce session is not ready: sign in again.",
     "salesforce_prior_uuid_present": "The CO already has an Account UUID.",
@@ -391,7 +393,7 @@ def _clone_fresh(clone: Mapping[str, Any] | None) -> bool:
 
 
 def _row_route(row: Mapping[str, Any] | None) -> str | None:
-    """The approvable route of a CO row (CE-only New or Case 3 New), else None."""
+    """The approvable route of a CO row (CE-only New, Case 3 New or the Surface renewal), else None."""
     if not isinstance(row, Mapping):
         return None
     pair = (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
@@ -399,6 +401,8 @@ def _row_route(row: Mapping[str, Any] | None) -> str | None:
         return production_approval.ALLOWED_ROUTE
     if pair == (case3_ids.CASE3_PRODUCT, case3_ids.CASE3_TYPE):
         return production_approval.CASE3_ROUTE
+    if case3_ids.ROUTE_PAIRS.get(case3_ids.SURFACE_RENEWAL_ROUTE) == pair:
+        return production_approval.SURFACE_RENEWAL_ROUTE
     return None
 
 
@@ -460,6 +464,14 @@ def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
         return "salesforce_not_fresh", ctx
     if inputs.sf_ready is not True:
         return "salesforce_session_not_ready", ctx
+    if route == production_approval.SURFACE_RENEWAL_ROUTE:
+        # An existing tenant: no empty-ID or clone duplicate gate (the run finds the ONE row by name and domain). One edit per CO.
+        from . import surface_renewal_followup  # lazy: it imports case3_followup, which imports this module
+        if surface_renewal_followup.edit_attempted(inputs.records_parent, inputs.reference):
+            return "renewal_already_attempted", ctx
+        if inputs.launching is True or LAUNCHES.busy():
+            return "launch_in_progress", ctx
+        return None, ctx
     if "Account_UUID__c" not in inputs.row or str(inputs.row.get("Account_UUID__c") or "").strip():
         return "salesforce_prior_uuid_present", ctx
     if case3 and ("Surface_Account_ID__c" not in inputs.row or str(inputs.row.get("Surface_Account_ID__c") or "").strip()):
@@ -530,7 +542,13 @@ EARLY_ACTIVATION_TEXT = ("Early activation (CSM exception): activate now, before
                          "Core Plus term exists yet, the one Pending (renewal) term is used.")
 
 
-def _onboard_form(reference: str, token: str, issue_approval: bool, early: str = "") -> str:
+RENEWAL_FORM_TEXT = ("The CO is Approved in Salesforce. One click finds the ONE existing tenant (name and primary domain) in "
+                     "BackOffice production (SSO and MFA in the app.pentera.io window), changes only the Scanning interval and "
+                     "the Expiration date by one Edit Account, reads it back, then writes the Account ID and UUID to Salesforce "
+                     "and moves the stage to User Created. There is no retry.")
+
+
+def _onboard_form(reference: str, token: str, issue_approval: bool, early: str = "", renewal: bool = False) -> str:
     """The ONE button of a production CO page: no typed reference (owner decision 2026-10-23). ``early`` (CE-only):
     ``"offer"`` adds the optional early-activation box (owner decision 2026-10-29, CO-0801), ``"recorded"`` says the
     approval already carries it; "" shows neither."""
@@ -541,13 +559,16 @@ def _onboard_form(reference: str, token: str, issue_approval: bool, early: str =
     elif early == "recorded":
         early_html = ("<p class='note'>" + _chip("chip-warn", "Early activation recorded") + " "
                       + escape(EARLY_ACTIVATION_TEXT) + "</p>")
-    return ("<p class='note'>The CO is Approved in Salesforce. One click checks everything, creates ONE tenant in BackOffice "
-            "production (SSO and MFA in the app.pentera.io window), reads it back and records it in Salesforce. There is no retry.</p>"
+    text = RENEWAL_FORM_TEXT if renewal else (
+        "The CO is Approved in Salesforce. One click checks everything, creates ONE tenant in BackOffice "
+        "production (SSO and MFA in the app.pentera.io window), reads it back and records it in Salesforce. There is no retry.")
+    return ("<p class='note'>" + escape(text) + "</p>"
             "<form class='start-form' method='post' action='" + CREATE_PATH + "'>"
             "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
             "<input type='hidden' name='nonce' value='" + escape(token) + "'>"
             + ("<input type='hidden' name='issue_approval' value='1'>" if issue_approval else "")
-            + early_html + "<button type='submit'>Onboard in production</button></form>")
+            + early_html + "<button type='submit'>" + ("Renew in production" if renewal else "Onboard in production")
+            + "</button></form>")
 
 
 def _early_state(route: Any, approval: Mapping[str, Any] | None, offer: bool = True) -> str:
@@ -586,6 +607,8 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
     if inputs.vm is True:
         return ""
     reason, ctx = gate(inputs)
+    if _row_route(inputs.row) == production_approval.SURFACE_RENEWAL_ROUTE:
+        return _renewal_card_html(inputs, reason, ctx)
     if reason is None:
         approval = ctx["approval"]
         revision = str(inputs.row["LastModifiedDate"])
@@ -626,6 +649,34 @@ def create_card_html(inputs: Inputs, uuid_write_state: str | None = None) -> str
                   + _chip("chip-warn", "Blocked") + "</div>")
                + "<p class='note'>" + escape(gate_text(reason)) + "</p></section>")
     return blocked
+
+
+def _renewal_card_html(inputs: Inputs, reason: str | None, ctx: Mapping[str, Any]) -> str:
+    """The production Surface renewal card (owner go 2026-11-03): the recorded result, the one button, or the closed gate."""
+    from . import surface_renewal_followup  # lazy: it imports case3_followup, which imports this module
+
+    reference = inputs.reference
+    head = ("<section class='card' aria-labelledby='co-create-title'><div class='card-head'>"
+            "<h2 id='co-create-title' class='pill'>{}</h2>{}</div>")
+    recorded = surface_renewal_followup.card_html(inputs.records_parent, reference)
+    if recorded and surface_renewal_followup.edit_attempted(inputs.records_parent, reference):
+        return head.format("Production renewal", _chip("chip-ok", "Recorded")) + recorded + "</section>"
+    # A stop before the Confirm saved nothing: its note stays above the button (a new click needs a new approval if it was used).
+    route_note = recorded + ("<p class='note'>Route: Surface renewal (Renewal of Existing Product). The licence counts, domains, "
+                             "operators and every other setting stay as they are.</p>")
+    if reason is None:
+        approval = ctx["approval"]
+        revision = str(inputs.row["LastModifiedDate"])
+        token = TOKENS.issue("create", reference, _create_binding(reference, revision, approval["approval_ref"], ctx))
+        return (head.format("Renew in production", _chip("chip-warn", "Production")) + route_note
+                + _onboard_form(reference, token, False, renewal=True) + "</section>")
+    if reason == "approval_missing" and inputs.row.get("Onboarding_Approval_Status__c") == "Approved":
+        revision = str(inputs.row.get("LastModifiedDate") or "")
+        token = TOKENS.issue("create", reference, _binding(reference, revision, "no-approval", "create"))
+        return (head.format("Renew in production", _chip("chip-warn", "Production")) + route_note
+                + _onboard_form(reference, token, True, renewal=True) + "</section>")
+    return (head.format("Production renewal", _chip("chip-warn", "Blocked")) + "<p class='note'>" + escape(gate_text(reason))
+            + "</p></section>")
 
 
 # --- UUID write (decision D3): its own confirmation step ----------------------------------------------------------------
@@ -779,9 +830,10 @@ def handle_create_post(values: Mapping[str, Any], inputs: Inputs, launch: Callab
             production_launch_ticket.mint(root, reference, revision, approval["approval_ref"], str(inputs.operator), inputs.now)
         except (OSError, ValueError, production_launch_ticket.TicketRootError):
             return None
-        # CE-only keeps its three-argument call; a Case 3 launch also names the route (the runner needs it).
+        # CE-only keeps its three-argument call; a Case 3 or Surface renewal launch also names the route (the runner needs it).
         handle = (launch(reference, revision, ctx["env"], route=ctx["route"])
-                  if ctx.get("route") == production_approval.CASE3_ROUTE else launch(reference, revision, ctx["env"]))
+                  if ctx.get("route") in (production_approval.CASE3_ROUTE, production_approval.SURFACE_RENEWAL_ROUTE)
+                  else launch(reference, revision, ctx["env"]))
         if handle is None:
             production_launch_ticket.discard(root, reference)  # a failed launch leaves no usable ticket
         return handle

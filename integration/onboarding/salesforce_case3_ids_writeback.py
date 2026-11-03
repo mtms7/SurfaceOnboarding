@@ -19,6 +19,9 @@ ENVIRONMENTS = ("production", "development")
 CASE3_ROUTE = "case_3_combined_baseline"
 CASE3_PRODUCT = "Surface & Credential Exposure"
 CASE3_TYPE = "New Product Onboarding"
+# The same two-field write after a verified production Surface renewal edit (owner 2026-11-03, CO-0829: a renewal CO has no IDs).
+SURFACE_RENEWAL_ROUTE = "surface_renewal"
+ROUTE_PAIRS = {CASE3_ROUTE: (CASE3_PRODUCT, CASE3_TYPE), SURFACE_RENEWAL_ROUTE: ("Surface", "Renewal of Existing Product")}
 
 _UUID = re.compile(r"[0-9a-f]{32}")
 _ID = re.compile(r"[0-9a-f]{24}")
@@ -50,9 +53,8 @@ def plan(environment: Any, route: Any, co_row: Any, verified: Any, source_revisi
         return _blocked("environment_not_named")
     if not isinstance(co_row, Mapping):
         return _blocked("co_row_unreadable")
-    if (route != CASE3_ROUTE or co_row.get("Onboarding_Product__c") != CASE3_PRODUCT
-            or co_row.get("Onboarding_Type__c") != CASE3_TYPE):
-        return _blocked("route_not_case3_new")
+    if ROUTE_PAIRS.get(route) != (co_row.get("Onboarding_Product__c"), co_row.get("Onboarding_Type__c")):
+        return _blocked("route_not_surface_renewal" if route == SURFACE_RENEWAL_ROUTE else "route_not_case3_new")
     if not isinstance(verified, Mapping):
         return _blocked("tenant_not_verified")
     account_id, uuid = _norm(verified.get("account_id"), _ID), _norm(verified.get("account_uuid"), _UUID)

@@ -288,6 +288,18 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         return self.create_blocked if not self.create_used else 0
 
 
+class RenewalEditGuard(LiveRequestGuard):
+    """The live guard of a production Surface renewal (owner go 2026-11-03): NO create is ever let through (``arm`` does
+    nothing) and exactly ONE edit POST for the one tenant id armed just before its Confirm; every other write is aborted."""
+
+    def arm(self) -> None:
+        self.armed = False
+
+    def arm_edit(self, account_id: str) -> None:
+        if not self.create_used and not self.edit_used and isinstance(account_id, str):
+            self.edit_target, self.edit_armed = account_id, True
+
+
 # --- Click log: the one Confirm ----------------------------------------------------------------------------------------
 
 class LiveClickLog(production_dry_run.ClickLog):

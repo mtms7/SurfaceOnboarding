@@ -46,6 +46,7 @@ from integration.onboarding import production_views
 from integration.onboarding import production_create_ui as create_ui
 from integration.onboarding import remote_start
 from integration.onboarding import case3_followup
+from integration.onboarding import surface_renewal_followup
 from integration.onboarding import production_case3_sheet as case3_sheet
 from integration.onboarding import production_case3_summary as case3_summary
 from integration.onboarding import tenant_name_decision
@@ -8293,7 +8294,8 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
         progress = _production_run_progress(reference)
         if progress is not None:
             if not progress["done"] and (progress["failed"]
-                                         or (PRODUCTION_RUNS.get(reference) or {}).get("route") == "case_3_combined_baseline"):
+                                         or (PRODUCTION_RUNS.get(reference) or {}).get("route") in (
+                                             "case_3_combined_baseline", production_approval.SURFACE_RENEWAL_ROUTE)):
                 # Case 3: nothing is written automatically, so the owner's review button must stay reachable under the bar.
                 # A stopped run (a refusal before anything was created): the button stays under the reason so it can be retried;
                 # the gate itself still blocks it after a real attempt (prior_attempt_needs_review) or a consumed approval.
@@ -8326,8 +8328,9 @@ def runner_log_dir() -> Path | None:
 def _launch_production_create(reference: str, revision: str, env: dict[str, str], route: str | None = None) -> Any:
     """Start the one visible production runner process (desktop only); None when it cannot be started.
 
-    ``route`` is None for CE-only (the argument list is unchanged) or the Case 3 route (``--route`` is added)."""
-    if route not in (None, "case_3_combined_baseline"):
+    ``route`` is None for CE-only (the argument list is unchanged), the Case 3 route (``--route`` is added) or the Surface
+    renewal (its own ``--production-surface-renewal`` run, owner go 2026-11-03)."""
+    if route not in (None, "case_3_combined_baseline", production_approval.SURFACE_RENEWAL_ROUTE):
         return None
     if (not REFERENCE.fullmatch(reference) or not revision or not local_browser_launch_allowed()
             or not ATTENDED_CE_ONLY_RUNNER.is_file()):
@@ -8339,9 +8342,9 @@ def _launch_production_create(reference: str, revision: str, env: dict[str, str]
         child[runner_child_log.LOG_ENV] = str(folder / (reference + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                                                         + ".log"))
     try:
-        argv = [sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-create", "--co", reference,
-                "--revision", revision, "--owner-go"]
-        if route is not None:
+        mode = "--production-surface-renewal" if route == production_approval.SURFACE_RENEWAL_ROUTE else "--production-create"
+        argv = [sys.executable, str(ATTENDED_CE_ONLY_RUNNER), mode, "--co", reference, "--revision", revision, "--owner-go"]
+        if route not in (None, production_approval.SURFACE_RENEWAL_ROUTE):
             argv += ["--route", route]
         return subprocess.Popen(argv, env=child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
@@ -8367,9 +8370,23 @@ def _launch_production_create_followed(reference: str, revision: str, env: dict[
         return None
     with _PRODUCTION_RUNS_LOCK:
         PRODUCTION_RUNS[reference] = {"since": since, "follow": None, **({"route": route} if route is not None else {})}
-    follow = _follow_production_create if route is None else _follow_case3_create
+    follow = (_follow_production_create if route is None else _follow_surface_renewal if route == production_approval.SURFACE_RENEWAL_ROUTE
+              else _follow_case3_create)
     Thread(target=follow, args=(reference, process), daemon=True).start()
     return process
+
+
+def _follow_surface_renewal(reference: str, process: Any) -> None:
+    """When a Surface renewal runner ends: nothing more to write (the runner writes the IDs and User Created itself, with the
+    verified row's IDs in memory only); the display reads are refreshed."""
+    try:
+        process.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    with _PRODUCTION_RUNS_LOCK:
+        if reference in PRODUCTION_RUNS:
+            PRODUCTION_RUNS[reference]["follow"] = {"runner": "ended"}
+    clear_display_cache_for(reference)
 
 
 def _follow_case3_create(reference: str, process: Any) -> None:
@@ -8428,6 +8445,15 @@ def _production_run_progress(reference: str) -> dict[str, Any] | None:
         run = dict(PRODUCTION_RUNS.get(reference) or {})
     if not run:
         return None
+    if run.get("route") == production_approval.SURFACE_RENEWAL_ROUTE:
+        parent = production_records_parent()
+        try:
+            refusal = next((str(r.get("refusal_reason") or "refused") for r in reversed(create_ui.load_co_records(parent, reference))
+                            if str(r.get("recorded_at") or "") >= run["since"] and r.get("outcome") == "refused"), None)
+        except Exception:  # noqa: BLE001 - the bar then waits for the edit lines
+            refusal = None
+        return surface_renewal_followup.progress(parent, reference, run["since"],
+                                                 running=create_ui.LAUNCHES.busy() or run.get("follow") is None, refusal=refusal)
     if run.get("route") == "case_3_combined_baseline":
         return case3_followup.progress(production_records_parent(), reference, run["since"],
                                        running=create_ui.LAUNCHES.busy() or run.get("follow") is None, follow=run.get("follow"))

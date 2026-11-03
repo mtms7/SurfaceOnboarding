@@ -74,22 +74,23 @@ def stage_plan(co_row: Any) -> stage_wb.StagePlan:
 
 # --- append-only result lines (no full IDs) -----------------------------------------------------------------------------
 
-def _record(parent: Path, co: str, step: str, result: str, now: datetime, detail: Mapping[str, str] | None = None) -> None:
+def _record(parent: Path, co: str, step: str, result: str, now: datetime, detail: Mapping[str, str] | None = None,
+            file: str = WRITES_FILE) -> None:
     folder = Path(parent) / records.RECORDS_SUBDIR
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     line = json.dumps({"co_reference": co, "step": step, "result": result, **(detail or {}),
                        "recorded_at": now.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}, sort_keys=True)
-    fd = os.open(folder / WRITES_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    fd = os.open(folder / file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     with os.fdopen(fd, "a", encoding="utf-8") as handle:
         handle.write(line + "\n")
         handle.flush()
         os.fsync(handle.fileno())
 
 
-def _last(parent: Path, co: str, step: str) -> str | None:
+def _last(parent: Path, co: str, step: str, file: str = WRITES_FILE) -> str | None:
     """Newest result of one step of one CO; ``write_uncertain`` for an unreadable log; None when there is none."""
     try:
-        lines = (Path(parent) / records.RECORDS_SUBDIR / WRITES_FILE).read_text(encoding="utf-8").splitlines()
+        lines = (Path(parent) / records.RECORDS_SUBDIR / file).read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return None
     except OSError:

@@ -37,6 +37,10 @@ CE_ENGINE = production_approval.ALLOWED_ROUTE
 CASE3_PRODUCT = "Surface & Credential Exposure"
 CASE3_TYPE = "New Product Onboarding"
 CASE3_ENGINE = production_approval.CASE3_ROUTE
+# Owner go 2026-11-03 (CO-0829): the production Surface renewal (one Edit Account on the existing tenant).
+SURFACE_RENEWAL_PRODUCT = "Surface"
+SURFACE_RENEWAL_TYPE = "Renewal of Existing Product"
+SURFACE_RENEWAL_ENGINE = production_approval.SURFACE_RENEWAL_ROUTE
 APPROVED = "Approved"
 ISSUERS_ENV = "SURFACE_ONBOARDING_APPROVAL_ISSUERS"
 ALLOWED_USERS_ENV = "SURFACE_DASHBOARD_ALLOWED_USERS"  # fallback only when it holds exactly one address
@@ -104,12 +108,12 @@ def issuer_allow_list(environ: Mapping[str, str]) -> frozenset[str]:
 
 
 def default_approval_ref(co: str, now: datetime, route: str = CE_ENGINE) -> str:
-    prefix = "PROD-C3-" if route == CASE3_ENGINE else "PROD-CE-"
+    prefix = {CASE3_ENGINE: "PROD-C3-", SURFACE_RENEWAL_ENGINE: "PROD-SR-"}.get(route, "PROD-CE-")
     return prefix + co.removeprefix("CO-") + "-" + now.astimezone(timezone.utc).strftime("%Y%m%d")
 
 
 def route_for_row(row: Mapping[str, Any] | None) -> str | None:
-    """The approvable route of a CO row (CE-only New or Case 3), else None."""
+    """The approvable route of a CO row (CE-only New, Case 3 or the Surface renewal), else None."""
     if not isinstance(row, Mapping):
         return None
     pair = (row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
@@ -117,6 +121,8 @@ def route_for_row(row: Mapping[str, Any] | None) -> str | None:
         return CE_ENGINE
     if pair == (CASE3_PRODUCT, CASE3_TYPE):
         return CASE3_ENGINE
+    if pair == (SURFACE_RENEWAL_PRODUCT, SURFACE_RENEWAL_TYPE):
+        return SURFACE_RENEWAL_ENGINE
     return None
 
 
@@ -137,6 +143,11 @@ def eligibility_problem(row: Mapping[str, Any] | None, co: str) -> str | None:
         return "route_not_ce_only"
     if row.get("Onboarding_Approval_Status__c") != APPROVED:
         return "approval_status_not_approved"
+    if route == SURFACE_RENEWAL_ENGINE:  # an existing tenant: no email domain, IDs may already be on the CO
+        if not _one_domain(row.get("Main_Domain__c")):
+            return "main_domain_missing"
+        revision = row.get("LastModifiedDate")
+        return None if isinstance(revision, str) and revision.strip() else "source_revision_missing"
     if route == CASE3_ENGINE and not _one_domain(row.get("Main_Domain__c")):
         return "main_domain_missing"
     if not _one_domain(row.get("Email_Domains__c")):

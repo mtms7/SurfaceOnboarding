@@ -10776,6 +10776,9 @@ def main() -> int:
                         help="With --co, --revision and --owner-go: the guarded LIVE production CE-only create (docs/53). Started only by "
                              "the dashboard after the owner's typed confirmation; locked by PRODUCTION_RUNNER_SUPPORTED and "
                              "PRODUCTION_DRY_RUN_SUPPORTED (both False) until a reviewed owner-approved commit.")
+    parser.add_argument("--production-surface-renewal", action="store_true",
+                        help="With --co, --revision and --owner-go: the guarded LIVE production Surface renewal (one Edit Account: "
+                             "Scanning interval and Expiration date only, owner go 2026-11-03). Started only by the dashboard.")
     parser.add_argument("--production-search-probe", action="store_true",
                         help="One attended READ-ONLY proof that the name and domain-only searches return a known clone tenant "
                              "(needs SURFACE_ONBOARDING_PRODUCTION_PROBE=1 and _REF; you sign in with MFA; nothing is typed or clicked).")
@@ -10786,7 +10789,8 @@ def main() -> int:
                         help="Only with --production-scan-check: use the kept, signed-in production window or stop (no launch, "
                              "no sign-in wait). The dashboard's automatic check.")
     parser.add_argument("--owner-go", action="store_true",
-                        help="Only with --production-create: the owner's explicit go for this one create (never implied).")
+                        help="Only with --production-create or --production-surface-renewal: the owner's explicit go for this one "
+                             "run (never implied).")
     args = parser.parse_args()
     if args.production_scan_check:
         if (not args.co or args.revision or args.production_create or args.production_dry_run or args.production_probe
@@ -10800,6 +10804,13 @@ def main() -> int:
         if args.co or args.revision or args.production_create or args.dry_run or args.confirm_write:
             parser.error("--production-search-probe is a separate read-only run")
         print(run_production_search_probe())
+        return 0
+    if args.production_surface_renewal:
+        if (not args.co or not args.revision or not args.owner_go or args.production_create or args.dry_run
+                or args.confirm_write or args.production_probe or args.production_dry_run or args.production_readback
+                or args.diagnose_confirm or args.readback_only or args.route != CE_ENGINE):
+            parser.error("--production-surface-renewal needs --co, --revision and --owner-go and is a separate run")
+        print(run_production_surface_renewal(args.co, args.revision, owner_go=args.owner_go))
         return 0
     if args.owner_go and not args.production_create:
         parser.error("--owner-go is only valid with --production-create")
@@ -11736,6 +11747,301 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
         return refused(_pdr_reason(str(error)))
     except Exception:
         return refused("production_create_crashed")
+
+
+# ---- Production Surface renewal (owner go 2026-11-03, first CO-0829 Royal Reesink) -------------------------------------------
+# Surface + Renewal of Existing Product: ONE Edit Account on the existing tenant changes only the Scanning interval (tier: Prime
+# weekly, Go monthly) and the Expiration date (DealHub Surface term end); every other value stays (``production_surface_renewal``).
+# The tenant is the one row whose name and primary domain equal the CO's (a renewal CO carries no IDs); the guard lets exactly one
+# ``POST /account/{that id}/edit`` through and never a create. After a verified edit the run writes the row's Account ID and UUID
+# to the CO and moves it to User Created (``surface_renewal_followup``), the IDs held in memory only.
+# Not live-proven yet (first run = CO-0829): the production Edit form's interval select and expiration picker (the create's
+# controls, same names), the edit reply, and which row path shows the new interval; any difference stops before Confirm or is
+# caught by the row re-read.
+
+def surface_renewal_intended(reference: str, run_day: date | None = None) -> tuple[Any, dict[str, Any]]:
+    """(intended values, CO row) from one fixed CO read and one DealHub read; ``RenewalRefused(code)`` otherwise."""
+    from integration.onboarding import production_surface_renewal as psr
+
+    if not REFERENCE.fullmatch(reference):
+        raise psr.RenewalRefused("renewal_source_unavailable")
+    try:
+        rows = _sf_records(
+            "SELECT Id, Name, LastModifiedDate, Account__c, Account_Name__c, Main_Domain__c, Onboarding_Product__c, "
+            "Onboarding_Type__c, Onboarding_Approval_Status__c, Onboarding_Stage__c, Surface_Account_ID__c, Account_UUID__c "
+            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+            raise ValueError()
+        row = rows[0]
+        account = row.get("Account__c")
+        if not isinstance(account, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account):
+            raise ValueError()
+        subscriptions = _sf_records(
+            "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
+            "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c WHERE DealHub_Account__c = '" + account + "' LIMIT 100")
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        raise psr.RenewalRefused("renewal_source_unavailable") from None
+    day = run_day or _run_day()
+    plan = build_renewal_plan(row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"), subscriptions, day)
+    return psr.intended_from(row, plan, day), row
+
+
+def _psr_followup_row(reference: str) -> dict[str, Any] | None:
+    """Fresh fixed-field read of the one CO for the guarded ID write and stage move (None on any problem)."""
+    try:
+        rows = _sf_records(
+            "SELECT Id, Name, LastModifiedDate, Onboarding_Product__c, Onboarding_Type__c, Surface_Account_ID__c, "
+            "Account_UUID__c, Onboarding_Stage__c FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+    if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+        return None
+    return {key: value for key, value in rows[0].items() if key != "attributes"}
+
+
+def _psr_run_sf(argv: list[str]) -> bool | None:
+    """Run one fixed Salesforce CLI write argument list (no shell). True only on exit code 0; None when the outcome is unknown."""
+    try:
+        done = subprocess.run([sf_command(), *argv[1:]], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              stdin=subprocess.DEVNULL, timeout=35, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return True if done.returncode == 0 else None
+
+
+def _psr_edit(page: Any, guard: Any, intended: Any, record: Any, consume: Any, fill_date: Any,
+              date_kept: Any) -> tuple[str, dict[str, str] | None]:
+    """The one Edit Account of a production Surface renewal: (result code, the verified row's IDs or None).
+
+    The row is found by name and domain (``before_edit``); the open form must show the row's own interval and expiration;
+    only the Scanning interval and the Expiration date are set and re-read, the start date must not move; then the approval
+    is consumed, the intent line written, ONE Confirm, the app's own edit reply and the row re-read (``after_edit``). Every stop
+    before the Confirm cancels the form (nothing saved)."""
+    from integration.onboarding import production_create_live as live
+    from integration.onboarding import production_surface_renewal as psr
+
+    def read() -> Any:
+        return _pdr_reader(page, in_app=False).readback(intended.tenant_name)
+
+    try:
+        before, row = psr.before_edit(read(), intended)
+    except Exception:
+        before, row = "renewal_row_unavailable", None
+    if row is None:
+        return before, None
+    ids = {"account_id": str(row["id"]), "account_uuid": str(row["accountUuid"])}
+    if before == psr.ALREADY_CURRENT:
+        return before, ids
+    account_id, kept, current = ids["account_id"], psr.fingerprint(row), psr.current_values(row)
+
+    def stop(code: str) -> tuple[str, None]:
+        return (code if _spycloud_cancel(page) else code + "_form_left_open"), None
+
+    try:
+        _open_row_action(page, intended.tenant_name, SPYCLOUD_EDIT_SELECTOR)
+    except Exception:
+        return stop("renewal_edit_unavailable")
+    confirm = page.get_by_role("button", name=live.CONFIRM_LABEL, exact=True)
+    interval = SELECT_NAMES[psr.INTERVAL_LABEL]
+    try:
+        for _ in range(PCR_EDIT_OPTION_POLLS):
+            if confirm.count() == 1 and page.locator(f'select[name="{interval}"]').count() == 1:
+                break
+            page.wait_for_timeout(500)
+        else:
+            return stop("renewal_edit_unavailable")
+        # The same tenant: the form shows the row's interval and expiration (the picker's time zone may shift one day).
+        shown = _pdr_read_selected(page, interval)
+        if shown is None or _norm_enum(shown) != current["interval"]:
+            return stop("renewal_form_mismatch")
+        shown_end = _license_date_value(page, psr.EXPIRATION_KEY)
+        if shown_end is None or abs((shown_end - date.fromisoformat(current["expiration"])).days) > 1:
+            return stop("renewal_form_mismatch")
+        start_before = _license_date_value(page, "license_start")
+        if start_before is None:
+            return stop("renewal_form_unreadable")
+        failure, _target = _pdr_select_by_name(page, interval, intended.interval)
+        if failure:
+            return stop("renewal_value_mismatch" if failure == "fill_value_mismatch" else "renewal_field_unavailable")
+        if not fill_date(page, psr.EXPIRATION_KEY, intended.expiration) or not date_kept(page, psr.EXPIRATION_KEY,
+                                                                                         intended.expiration):
+            return stop("renewal_value_mismatch")
+        if _license_date_value(page, "license_start") != start_before:
+            return stop("renewal_start_date_changed")
+        if _pdr_read_selected(page, interval) != intended.interval:
+            return stop("renewal_value_mismatch")
+        if confirm.count() != 1 or not _confirm_enabled(page, confirm):
+            return stop("renewal_confirm_unavailable")
+        problem = live.pre_arm_problem(page, guard)
+        if problem:
+            return stop(problem)
+    except Exception:
+        return stop("renewal_form_unreadable")
+    used = consume()
+    if used is not None:
+        return stop(str(used))
+    try:
+        record("write_started")
+    except Exception:
+        return stop("renewal_record_failed")
+    guard.arm_edit(account_id)
+    try:
+        with page.expect_response(lambda r: live.edit_request_id(r.request.method, r.url) is not None,
+                                  timeout=PCR_EDIT_RESPONSE_MS) as info:
+            confirm.first.click(timeout=FIELD_TIMEOUT_MS)
+        response = info.value
+    except Exception:
+        return ("renewal_save_id_mismatch" if guard.edit_blocked else "renewal_save_no_signal"), None  # never clicked again
+    finally:
+        guard.disarm_edit()
+    problem = psr.edit_response_problem(response.request.method, live.edit_request_id(response.request.method, response.url),
+                                        response.status, account_id)
+    if problem:
+        return problem, None
+    verdict = "renewal_saved_unverified"
+    for _ in range(PCR_EDIT_REREADS):
+        page.wait_for_timeout(2_000)
+        try:
+            verdict = psr.after_edit(read(), intended, account_id, kept)
+        except Exception:
+            verdict = "renewal_saved_unverified"
+        if verdict not in ("renewal_saved_unverified", "renewal_values_not_kept"):
+            break
+    if verdict == psr.VERIFIED and (guard.edit_blocked or live.post_click_problem(page, guard) is not None):
+        verdict = "renewal_saved_unverified"  # another write was aborted, or an extra page appeared: never VERIFIED
+    return verdict, (ids if verdict == psr.VERIFIED else None)
+
+
+def run_production_surface_renewal(reference: str, acknowledged_revision: str, *, owner_go: bool = False,
+                                   environ: Any | None = None, now: datetime | None = None, records_parent: Path | None = None,
+                                   approval_path: Path | None = None, wait_seconds: float = MAX_WAIT_SECONDS,
+                                   load_intended: Any = None, open_page: Any = None, fill_date: Any = None,
+                                   date_kept: Any = None, run_day: date | None = None, ticket_parent: Path | None = None,
+                                   org_probe: Any = None, read_row: Any = None, run_argv: Any = None) -> str:
+    """One guarded LIVE production Surface renewal for one CO (owner go 2026-11-03). Returns the printed line.
+
+    Order: arguments, owner go, both lock constants, the live production target, the one-time launch ticket, the pinned org,
+    the approval (owner, CO, route, CURRENT revision), no earlier edit of this CO, the Salesforce source (CO + DealHub) and its
+    revision; then in the signed-in page the service-worker check and ``_psr_edit`` (approval consumed right before the one
+    Confirm); after a verified edit the Salesforce follow-up. Every external step is injectable (tests)."""
+    from integration.onboarding import production_create_live as live
+    from integration.onboarding import production_create_ui as create_ui
+    from integration.onboarding import production_launch_ticket as launch_ticket
+    from integration.onboarding import production_surface_renewal as psr
+    from integration.onboarding import session_readiness as readiness
+    from integration.onboarding import surface_renewal_followup as followup
+
+    environ = dict(os.environ if environ is None else environ)
+    given_now = now
+    now = now or datetime.now(timezone.utc)
+    route = production_approval.SURFACE_RENEWAL_ROUTE
+    if (not isinstance(reference, str) or not REFERENCE.fullmatch(reference)
+            or not production_dry_run.revision_ok(acknowledged_revision)):
+        return _pcr_line("production_create_arguments_invalid")
+    if environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", PINNED_SF_ALIAS):
+        return _pcr_line("salesforce_alias_not_pinned")
+    parent = records_parent or _pdr_records_parent()
+    approval_file = approval_path or _pdr_approval_path()
+    reference_value = environ.get(production_create.SESSION_REF_ENV, "")
+
+    def stamp() -> datetime:
+        return given_now or datetime.now(timezone.utc)
+
+    def refused(reason: str) -> str:
+        data = {"co_reference": reference, "route": route, "outcome": production_create.OUTCOME_REFUSED,
+                "refusal_reason": str(reason).replace(":", "_"), "salesforce_revision": acknowledged_revision}
+        if production_approval.REFERENCE_PATTERN.fullmatch(reference_value):
+            data["approval_ref"] = reference_value
+        try:
+            name = production_create_record.record(parent, data, stamp()).name
+        except Exception:
+            name = None
+        return _pcr_line(data["refusal_reason"], outcome="refused", record=name)
+
+    if owner_go is not True:
+        return refused("owner_go_missing")
+    if readiness.PRODUCTION_DRY_RUN_SUPPORTED is not True or readiness.PRODUCTION_RUNNER_SUPPORTED is not True:
+        return refused("production_locked")
+    if reference_value and not (environ.get(PDR_ENV_ISSUED) and environ.get(PDR_ENV_EXPIRES)):
+        record = production_approval.record_for(approval_file, reference_value)
+        if record is not None:
+            try:
+                for key, value in production_approval.unlock_environ(record).items():
+                    environ.setdefault(key, value)
+            except production_approval.ApprovalRefused:
+                pass
+    try:
+        target = production_target(environ, now)
+    except ProductionLocked as locked:
+        return refused(f"production_locked_{locked.reason}")
+    except ValueError as error:
+        return refused(str(error))
+    try:
+        ticket_folder = ticket_parent or launch_ticket.ticket_root()
+    except launch_ticket.TicketRootError:
+        return refused("launch_ticket_invalid")
+    operator, ticket_reason = launch_ticket.consume(ticket_folder, reference, acknowledged_revision, reference_value, now)
+    if operator is None:
+        return refused(ticket_reason)
+    org_problem = _pcr_org_problem(environ, org_probe)
+    if org_problem:
+        return refused(org_problem)
+    approval_record = production_approval.record_for(approval_file, reference_value)
+    if approval_record is None or not create_ui._owner_ok(operator, approval_record):
+        return refused("operator_not_owner")
+    problem = production_approval.check(approval_file, reference_value, reference, route, acknowledged_revision, now)
+    if problem is not None:
+        return refused(problem)
+    if followup.edit_attempted(parent, reference):
+        return refused("renewal_already_attempted")
+    try:
+        intended, _row = (load_intended or surface_renewal_intended)(reference, run_day)
+    except psr.RenewalRefused as error:
+        return refused(str(error))
+    except Exception:
+        return refused("renewal_source_unavailable")
+    if intended.revision != acknowledged_revision:
+        return refused("approval_revision_drift")
+    detail = {"interval": intended.interval, "expiration": intended.expiration.isoformat()}
+
+    def record(result: str) -> None:
+        followup.record(parent, reference, psr.STEP, result, stamp(), detail)
+
+    def consume() -> str | None:
+        return production_approval.consume(approval_file, reference_value, reference, route, acknowledged_revision, stamp())
+
+    try:
+        with (open_page or _pdr_browser_page)(target, wait_seconds) as page:
+            guard = live.RenewalEditGuard()
+            guard.install(page)
+            try:
+                worker = page.evaluate(production_dry_run.SERVICE_WORKER_JS)
+            except Exception:
+                worker = None
+            worker_problem = production_dry_run.service_worker_verdict(worker)
+            if worker_problem:
+                return refused(worker_problem)
+            try:
+                result, ids = _psr_edit(page, guard, intended, record, consume, fill_date or _fill_license_date,
+                                        date_kept or _license_date_kept)
+            except Exception:
+                result, ids = "renewal_failed", None
+    except production_dry_run.ClickRefused:
+        return refused("production_create_click_not_allowed")
+    except RuntimeError as error:
+        return refused(_pdr_reason(str(error)))
+    except Exception:
+        return refused("renewal_crashed")
+    try:
+        record(result)
+    except Exception:
+        pass
+    if ids is None:
+        return _pcr_line(result)
+    follow = followup.after_verified_edit(parent, reference, ids, stamp(), read_row or (lambda: _psr_followup_row(reference)),
+                                          run_argv or _psr_run_sf, PINNED_SF_ALIAS)
+    return json.dumps({"result": result, "salesforce_writeback": follow.get("ids"), "stage": follow.get("stage")},
+                      separators=(",", ":"))
 
 
 def run_production_search_probe(*, environ: Any | None = None, now: datetime | None = None, report_base: Path | None = None,

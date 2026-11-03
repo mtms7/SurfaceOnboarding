@@ -31,7 +31,10 @@ SCOPE = "ce_only_single_co"
 # bound, consumed once, exactly as CE-only; the CREATE gates stay CE-only (they compare against ALLOWED_ROUTE).
 CASE3_ROUTE = EngineValue.CASE_3.value
 CASE3_SCOPE = "case3_single_co"
-ROUTE_SCOPES = {ALLOWED_ROUTE: SCOPE, CASE3_ROUTE: CASE3_SCOPE}
+# Owner go 2026-11-03 (CO-0829): a production Surface renewal (one Edit Account on the existing tenant) is approved the same way.
+SURFACE_RENEWAL_ROUTE = "surface_renewal"
+SURFACE_RENEWAL_SCOPE = "surface_renewal_single_co"
+ROUTE_SCOPES = {ALLOWED_ROUTE: SCOPE, CASE3_ROUTE: CASE3_SCOPE, SURFACE_RENEWAL_ROUTE: SURFACE_RENEWAL_SCOPE}
 
 
 def scope_for(route: Any) -> str | None:
