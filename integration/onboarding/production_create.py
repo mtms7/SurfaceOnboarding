@@ -109,11 +109,14 @@ def _aware(value: Any) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None and value.utcoffset() is not None
 
 
-def _domain_problem(domains: Any) -> bool:
-    if not isinstance(domains, (list, tuple)) or len(domains) != 1:
+def _domain_problem(domains: Any, many: bool = False) -> bool:
+    """Exactly one valid email domain; with ``many`` (CE-only, owner 2026-11-03, CO-0814) one or more, each valid, no
+    repeats. Case 3 keeps exactly one CE email domain."""
+    if not isinstance(domains, (list, tuple)) or not domains or (not many and len(domains) != 1):
         return True
-    domain = domains[0]
-    return not (isinstance(domain, str) and _DOMAIN.fullmatch(domain.strip().lower()))
+    if not all(isinstance(domain, str) and _DOMAIN.fullmatch(domain.strip().lower()) for domain in domains):
+        return True
+    return len({domain.strip().lower() for domain in domains}) != len(domains)
 
 
 def _specific(inputs: CreateInputs, generic: str) -> str:
@@ -181,7 +184,7 @@ def evaluate_gate(inputs: CreateInputs,
     allowed = DRY_RUN_ROUTES if (dry_run is True or case3_create is True) else (production_approval.ALLOWED_ROUTE,)
     if inputs.route not in allowed:
         return "route_not_ce_only_new"
-    if _domain_problem(inputs.sf_email_domains):
+    if _domain_problem(inputs.sf_email_domains, many=inputs.route == production_approval.ALLOWED_ROUTE):
         return "salesforce_email_domain_not_single"
     if inputs.sf_source_consistent is not True:
         return "salesforce_source_mismatch"

@@ -133,9 +133,18 @@ def _one_domain(raw: Any) -> bool:
     return len(items) == 1 and DOMAIN.fullmatch(items[0].casefold()) is not None
 
 
+def _valid_domains(raw: Any) -> bool:
+    """CE-only (owner 2026-11-03, CO-0814): one or more email domains, each valid."""
+    if not isinstance(raw, str):
+        return False
+    items = [item.removeprefix("@") for item in re.split(r"[,;\s]+", raw.strip()) if item]
+    return bool(items) and all(DOMAIN.fullmatch(item.casefold()) is not None for item in items)
+
+
 def eligibility_problem(row: Mapping[str, Any] | None, co: str) -> str | None:
-    """None when the row is the CE-only New route or Case 3 (Surface & Credential Exposure New), Approved, one valid email
-    domain (Case 3 also a valid main domain), no UUID (Case 3 also no Surface Account ID), with a revision."""
+    """None when the row is the CE-only New route or Case 3 (Surface & Credential Exposure New), Approved, valid email
+    domains (CE-only one or more; Case 3 exactly one, and a valid main domain), no UUID (Case 3 also no Surface Account ID),
+    with a revision."""
     if not isinstance(row, Mapping) or row.get("Name") != co:
         return "co_not_found"
     route = route_for_row(row)
@@ -150,8 +159,8 @@ def eligibility_problem(row: Mapping[str, Any] | None, co: str) -> str | None:
         return None if isinstance(revision, str) and revision.strip() else "source_revision_missing"
     if route == CASE3_ENGINE and not _one_domain(row.get("Main_Domain__c")):
         return "main_domain_missing"
-    if not _one_domain(row.get("Email_Domains__c")):
-        return "email_domain_not_single"
+    if not (_valid_domains if route == CE_ENGINE else _one_domain)(row.get("Email_Domains__c")):
+        return "email_domain_not_single" if route != CE_ENGINE else "email_domain_invalid"
     uuid = row.get("Account_UUID__c")
     if uuid is not None and (not isinstance(uuid, str) or uuid.strip()):
         return "account_uuid_present"

@@ -589,14 +589,15 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone:
         items.append(_item("data", "unavailable", "The CO could not be read for this check."))
     elif uuid_state == "set":
         items.append(_item("data", "blocked", "Salesforce already holds an Account UUID for this CO."))
-    elif ce_route and domain_count != 1:
-        items.append(_item("data", "blocked", "Exactly one email domain is required for CE-only (found " + str(domain_count) + ")."))
+    elif ce_route and not domain_count:
+        items.append(_item("data", "blocked", "At least one valid email domain is required for CE-only (found none)."))
     elif data_problem == DATA_SOURCE_UNREADABLE:
         items.append(_item("data", "unavailable", "The CO's route values could not be read for this check."))
     elif data_problem:
         items.append(_item("data", "blocked", DATA_PROBLEM_TEXT.get(data_problem, "The run would refuse this CO: " + data_problem + ".")))
     else:
-        items.append(_item("data", "ready", ("One email domain, " if ce_route else "") + "no prior Account UUID."))
+        items.append(_item("data", "ready", ((str(domain_count) + " email domains, " if (domain_count or 0) > 1 else "One email domain, ")
+                                         if ce_route else "") + "no prior Account UUID."))
     # 6 timing window
     window = timing_window(start_iso, today, days_before)
     if window["state"] == "open":
@@ -651,7 +652,7 @@ SHEET_CLOSING = "Production create stays locked in the dashboard: this sheet is 
 SHEET_BACKOFFICE = "https://app.pentera.io"
 SHEET_REFUSALS = {
     "one_email_domain_required": "Exactly one email domain is required for CE-only, so there is no single primary domain to enter.",
-    "email_domain_invalid": "The one email domain is not a valid domain name, so it must not be entered.",
+    "email_domain_invalid": "An email domain is not a valid domain name, so it must not be entered.",
     "account_uuid_set": "Salesforce already holds an Account UUID for this CO: a tenant exists, do not create another.",
     "account_uuid_unread": "The Account UUID of this CO could not be read, so an empty field is not confirmed.",
     "account_name_unavailable": "The account name could not be read, so the tenant name cannot be derived.",
@@ -761,10 +762,12 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
         return {**base, "state": "not_applicable"}
     raw = co.get("email_domains")
     tokens = [item for item in re.split(r"[,;\s]+", raw.strip()) if item] if isinstance(raw, str) else []
-    try:
-        domain = rules["domain_of"](raw) if len(tokens) == 1 else None
+    try:  # one or more email domains when the rules allow it (owner 2026-11-03, CO-0814); the first is the primary domain
+        domains = (tuple(rules["domains_of"](raw) or ()) if "domains_of" in rules
+                   else (rules["domain_of"](raw),) if len(tokens) == 1 else ())
     except (ValueError, TypeError):
-        domain = None
+        domains = ()
+    domain = domains[0] if domains and domains[0] else None
     base["eligibility"] = _sheet_eligibility(co, today=today, days_before=days_before, clone=clone, match=match,
                                              domain_ok=domain is not None, as_of=as_of)
     name = co.get("account_name")
@@ -790,7 +793,7 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
               else "match_not_checked" if check_code == "not_checked"
               else "live_paid_in_production" if check_code == "live_paid"
               else "duplicate_in_production" if check_code in ("duplicate", "other_tenants", "ambiguous")
-              else "one_email_domain_required" if len(tokens) != 1
+              else "one_email_domain_required" if not tokens or ("domains_of" not in rules and len(tokens) != 1)
               else "email_domain_invalid" if domain is None
               else "account_name_unavailable" if tenant is None else "")
     dates = extract_dealhub_dates(co.get("comments"))
@@ -831,7 +834,9 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
     base["rows"] = [
         _row("Company name", tenant, "Account name + ' - CE Only'."),
         _row("Account Type", "Customer"),
-        _row("Company primary domain", domain, "The single Salesforce email domain. It must not be a demo domain."),
+        _row("Company primary domain", domain, ("The first of the " + str(len(domains)) + " Salesforce email domains."
+                                                 if len(domains) > 1 else "The single Salesforce email domain.")
+             + " It must not be a demo domain."),
         leave("Alternate Domains", "Leave empty"), leave("SubDomains", "Leave empty"),
         _row("User email domains", str(rules["email_domain"]), "Internal domain, not the customer's."),
         leave("Networks", "Leave empty"), country_row,
@@ -844,7 +849,9 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
         off("Notifications"), off("Multiple users"), off("API access"), off("Phishing"),
         _row("Leaked Credentials", "On", "Turn ON."),
         _row("Leaked Credentials scanning interval", "Weekly"),
-        _row("Leaked Credentials scanned domains", domain, "The same primary domain."),
+        _row("Leaked Credentials scanned domains", ", ".join(domains),
+             "Every email domain, comma separated (" + str(len(domains)) + ")." if len(domains) > 1
+             else "The same primary domain."),
         _row("Include Provisioning", "On"), _row("Include subdomains", "On"),
         off("Advanced switches", "Leave every Advanced switch off."),
         _row("License Type", str(rules["license_type"])),

@@ -127,9 +127,10 @@ class IssueToolTests(unittest.TestCase):
             ("route_not_ce_only", {**GOOD_ROW, "Onboarding_Product__c": "Surface"}),
             ("route_not_ce_only", {**GOOD_ROW, "Onboarding_Type__c": "Renewal"}),
             ("approval_status_not_approved", {**GOOD_ROW, "Onboarding_Approval_Status__c": "Pending"}),
-            ("email_domain_not_single", {**GOOD_ROW, "Email_Domains__c": "a.example, b.example"}),
-            ("email_domain_not_single", {**GOOD_ROW, "Email_Domains__c": "not a domain"}),
-            ("email_domain_not_single", {**GOOD_ROW, "Email_Domains__c": None}),
+            # CE-only may hold several valid email domains (owner 2026-11-03, CO-0814); any invalid one refuses.
+            ("email_domain_invalid", {**GOOD_ROW, "Email_Domains__c": "a.example, b..example"}),
+            ("email_domain_invalid", {**GOOD_ROW, "Email_Domains__c": "not a domain"}),
+            ("email_domain_invalid", {**GOOD_ROW, "Email_Domains__c": None}),
             ("account_uuid_present", {**GOOD_ROW, "Account_UUID__c": "a" * 32}),
             ("source_revision_missing", {**GOOD_ROW, "LastModifiedDate": None}),
             ("source_revision_missing", {**GOOD_ROW, "LastModifiedDate": ""}),

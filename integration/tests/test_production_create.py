@@ -72,7 +72,7 @@ BREAKERS = [
     ("approval_revision_drift", {"source_revision_now": "r30"}),
     ("approval_expired", {"_check": lambda *a: "approval_expired"}),
     ("route_not_ce_only_new", {"route": "case_1_surface_only"}),
-    ("salesforce_email_domain_not_single", {"sf_email_domains": ("a.com", "b.com")}),
+    ("salesforce_email_domain_not_single", {"sf_email_domains": ("a.com", "a.com")}),  # CE-only may hold several (CO-0814)
     ("salesforce_source_mismatch", {"sf_source_consistent": False}),
     ("salesforce_prior_uuid_present", {"prior_account_uuid": UUID}),
     ("clone_missing", {"clone_collected_at": None}),

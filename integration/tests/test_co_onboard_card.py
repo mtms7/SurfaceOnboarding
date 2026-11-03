@@ -94,7 +94,7 @@ class ChecklistTests(unittest.TestCase):
 
     def test_salesforce_data(self):
         self.assertEqual(checklist()["data"]["status"], "ready")
-        self.assertEqual(checklist(domain_count=2)["data"]["status"], "blocked")
+        self.assertEqual(checklist(domain_count=2)["data"]["status"], "ready")  # CE-only may hold several (CO-0814)
         self.assertEqual(checklist(domain_count=0)["data"]["status"], "blocked")
         self.assertEqual(checklist(uuid_state="set")["data"]["status"], "blocked")
         self.assertEqual(checklist(uuid_state="unread")["data"]["status"], "unavailable")

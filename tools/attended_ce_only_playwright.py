@@ -343,6 +343,24 @@ def one_email_domain(value: object) -> str | None:
     return domain if re.fullmatch(pattern, domain) else None
 
 
+def ce_email_domains(value: object) -> tuple[str, ...] | None:
+    """Every CE-only email domain, normalised (owner 2026-11-03, CO-0814 "seidor.com seidor.es"): split on spaces, commas and
+    semicolons, one leading "@" stripped, lower case, repeats dropped, Salesforce order kept. None when there is none or any
+    item is not a valid domain (never a partial list). The first is the primary domain."""
+    if not isinstance(value, str):
+        return None
+    items = [item for item in re.split(r"[,;\s]+", value.strip()) if item]
+    found = [one_email_domain(item) for item in items]
+    if not found or any(domain is None for domain in found):
+        return None
+    return tuple(dict.fromkeys(found))
+
+
+def ce_scanned_domains(source: Any) -> tuple[str, ...]:
+    """The CE-only Leaked Credentials scanned domains of a fill source: all its email domains (primary first)."""
+    return tuple(getattr(source, "email_domains", ()) or ()) or (source.email_domain,)
+
+
 class SalesforceUnavailableInVmMode(OSError, RuntimeError):
     """The VM has no Salesforce connection (docs/41): handled like a missing CLI by every caller (fail closed)."""
 
@@ -564,6 +582,8 @@ class CeFillSource:
     # The CO's Account_UUID__c text, kept only for the read-only production readback comparison (never printed,
     # never in a repr, never part of equality).
     salesforce_account_uuid: str = field(default="", repr=False, compare=False)
+    # Every normalised email domain, primary first (owner 2026-11-03, CO-0814); empty means just ``email_domain``.
+    email_domains: tuple[str, ...] = ()
 
 
 class RouteMismatch(RuntimeError):
@@ -609,9 +629,10 @@ def ce_fill_source(reference: str, early_activation: bool = False) -> CeFillSour
             raise ValueError()
         if not isinstance(country, str) or not " ".join(country.split()):
             raise ValueError()
-        email_domain = one_email_domain(row.get("Email_Domains__c"))
-        if email_domain is None:
+        domains = ce_email_domains(row.get("Email_Domains__c"))
+        if domains is None:
             raise ValueError()
+        email_domain = domains[0]
         names = ce_only_names(account_name)
         subscription_rows = _sf_records(
             "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
@@ -626,7 +647,7 @@ def ce_fill_source(reference: str, early_activation: bool = False) -> CeFillSour
             names.tenant_name, names.primary_user_alias,
             salesforce_id_present=bool((row.get("Account_UUID__c") or "").strip()),
             salesforce_account_uuid=(row.get("Account_UUID__c") or "").strip()
-            if isinstance(row.get("Account_UUID__c"), str) else "")
+            if isinstance(row.get("Account_UUID__c"), str) else "", email_domains=domains)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("salesforce_fill_source_unavailable") from exc
 
@@ -655,7 +676,8 @@ def build_ce_only_fill(source: CeFillSource, run_day: date | None = None) -> dic
             "Last name": CE_PRIMARY_USER_LAST_NAME,
             "Organization Email": (
                 f"{CE_PRIMARY_USER_EMAIL_LOCAL}+{source.primary_user_alias}@{CE_USER_EMAIL_DOMAIN}"),
-            "Leaked Credentials scanned domains (Comma Separated Values)": source.email_domain,
+            # Every email domain, comma separated (owner 2026-11-03, CO-0814: "seidor.com, seidor.es").
+            "Leaked Credentials scanned domains (Comma Separated Values)": ", ".join(ce_scanned_domains(source)),
             **CE_LICENSE_QUANTITIES,
         },
         "selects": {
@@ -1633,7 +1655,7 @@ CE_ROUTE = RouteContract(
     build_fill=lambda source, run_day=None: build_ce_only_fill(source, run_day),
     primary_domain=lambda source: source.email_domain,
     redactions=lambda source: (source.account_name, source.tenant_name, source.email_domain,
-                               surface_primary_user_email(source)),
+                               *ce_scanned_domains(source)[1:], surface_primary_user_email(source)),
     allow_scan_started=False,
 )
 SURFACE_ROUTE = RouteContract(
@@ -8222,7 +8244,8 @@ def _production_expectation(reference: str, product: Any = None,
     plan = contract.build_fill(source, start)
     primary = source.email_domain if engine == CE_ENGINE else source.main_domain
     alternates = () if engine == CE_ENGINE else tuple(source.alternate_domains)
-    extra = (source.ce_email_domain,) if engine == CASE3_ENGINE else ()
+    extra = ((source.ce_email_domain,) if engine == CASE3_ENGINE
+             else ce_scanned_domains(source)[1:] if engine == CE_ENGINE else ())  # every CE email domain is matched
     return engine, {"tenant_names": (source.tenant_name,), "domains": (primary, *alternates, *extra)}, {
         "primary_domain": primary, "alternate_domains": alternates, "license_type": plan["selects"]["Type"],
         "license_end": plan["license_end"], "license_start": plan["license_start"],
@@ -10481,6 +10504,7 @@ def ce_production_intended(source: CeFillSource, run_day: date | None = None) ->
         "first_name": texts["First name"], "last_name": texts["Last name"],
         "organization_email": texts["Organization Email"],
         "license_start": plan["license_start"], "license_end": plan["license_end"],
+        "leaked_domains": list(ce_scanned_domains(source)),
     }
 
 
@@ -11580,7 +11604,8 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     # The domains the live duplicate check searches besides the name: the CE email domain for CE-only; the main domain, the
     # single CE email domain and every typed alternate domain for Case 3 (deduplicated).
     live_domains = (tuple(dict.fromkeys((contract_intended["primary_domain"], live_email_domain,
-                                         *contract_intended["alternate_domains"]))) if case3 else (live_email_domain,))
+                                         *contract_intended["alternate_domains"]))) if case3
+                    else ce_scanned_domains(source))  # CE-only: every email domain (owner 2026-11-03)
     try:
         facts = (clone_facts or ((lambda src, moment: _pdr_clone_facts(src, moment, route)) if case3 else _pdr_clone_facts))(source, now)
     except Exception:
@@ -11589,7 +11614,7 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     inputs = production_create.CreateInputs(
         co_reference=reference, route=route, approval_ref=reference_value, approval_path=approval_file,
         source_revision=acknowledged_revision, source_revision_now=source.source_revision, now=now, environ=environ,
-        sf_email_domains=(live_email_domain,), sf_source_consistent=True,
+        sf_email_domains=(live_email_domain,) if case3 else ce_scanned_domains(source), sf_source_consistent=True,
         prior_account_uuid="present" if source.salesforce_id_present else None,
         clone_collected_at=facts.get("collected_at"), clone_matches=facts.get("clone_matches") is True,
         duplicate_found=facts.get("duplicate_found") is not False,

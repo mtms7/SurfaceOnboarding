@@ -94,6 +94,7 @@ from tools.attended_ce_only_playwright import (
     CE_USER_EMAIL_DOMAIN,
     ce_only_names,
     one_email_domain,
+    ce_email_domains,
     format_surface_domains,
     CE_ROUTE_PRODUCT,
     CE_ROUTE_TYPE,
@@ -2167,9 +2168,8 @@ def evaluate_ce_only_fill_preflight(reference: str) -> CredentialExposureFillPre
             blockers.append("not_a_new_credential_exposure_onboarding")
         raw_email_domains = co.get("Email_Domains__c")
         email_domains = [item.removeprefix("@") for item in re.split(r"[,;\s]+", raw_email_domains.strip()) if item] if isinstance(raw_email_domains, str) else []
-        domain = email_domains[0].casefold() if len(email_domains) == 1 else ""
-        if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", domain):
-            blockers.append("exactly_one_email_domain_required")
+        if ce_email_domains(raw_email_domains) is None:  # one or more valid domains (owner 2026-11-03, CO-0814)
+            blockers.append("valid_email_domains_required")
         return CredentialExposureFillPreflight(reference, revision, len(email_domains),
                                                tuple(sorted(set(blockers))))
     except (KeyError, TypeError, ValueError):
@@ -3186,6 +3186,23 @@ def _run_chip(record: dict[str, str] | None) -> str:
     return "<span class='chip chip-bad'>Onboarding failed</span>"
 
 
+def ce_domains_note(domains: Any) -> str:
+    """"Credential Exposure with N email domains: a, b" for a CE-only CO with more than one (owner request 2026-11-03,
+    CO-0814); "" otherwise. Escaped HTML."""
+    items = [str(item) for item in domains or () if item] if isinstance(domains, (list, tuple)) else []
+    if len(items) < 2:
+        return ""
+    return escape("Credential Exposure with " + str(len(items)) + " email domains: " + ", ".join(items))
+
+
+def _ce_domains_head(row: dict[str, str | None] | None) -> str:
+    """The CO page header note for a CE-only CO with several email domains (from its own Email Domains value)."""
+    if not row or route_for(row) != CE_ENGINE:
+        return ""
+    note = ce_domains_note(ce_email_domains(row.get("Email_Domains__c")))
+    return "<p class='note'>" + _chip("chip-info", "CE-only") + " " + note + "</p>" if note else ""
+
+
 def _route_chip(row: dict[str, str | None]) -> str:
     route = route_for(row)
     if route == CE_ENGINE:
@@ -3414,10 +3431,9 @@ def page_queue(rows: list[dict[str, str | None]], selected_queue: str = "", *,
 
 
 def ce_only_eligible(row: dict[str, str | None]) -> bool:
-    """True when the detail row has exactly one valid Email_Domains__c value.
+    """True when the detail row has one or more valid Email_Domains__c values (owner 2026-11-03, CO-0814).
 
-    This mirrors the CE-only owner gate used by the fill preflight (exactly one
-    valid email domain). It is used only to decide whether the automated CE-only
+    This mirrors the CE-only owner gate used by the fill preflight (``ce_email_domains``). It is used only to decide whether the automated CE-only
     Onboard action is surfaced on a CO detail page; the preflight re-reads the
     source and is the authoritative gate before any run starts.
     """
@@ -3428,10 +3444,10 @@ def ce_only_eligible(row: dict[str, str | None]) -> bool:
     raw = row.get("Email_Domains__c")
     if not isinstance(raw, str):
         return False
+    if ce_email_domains(raw) is None:
+        return False
     # Salesforce often holds "@example.com"; one leading "@" is stripped (nothing else is normalised).
     domains = [item.removeprefix("@") for item in re.split(r"[,;\s]+", raw.strip()) if item]
-    if len(domains) != 1:
-        return False
     domain = domains[0].casefold()
     return bool(re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", domain))
 
@@ -7192,7 +7208,8 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     remote_card = ("<section class='card' aria-labelledby='co-remote-title'><div class='card-head'><h2 id='co-remote-title' "
                    "class='pill'>Onboard in production</h2><span class='chip chip-warn'>Runs on your PC</span></div>"
                    + remote + "</section>") if remote else ""
-    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + remote_card + _production_create_html(reference, row)
+    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _ce_domains_head(row) + remote_card
+                 + _production_create_html(reference, row)
                  + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)
     refresh = ("<meta http-equiv='refresh' content='5'>"
@@ -7472,6 +7489,10 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                 checks = (_chip("chip-ok", "Onboarded (UUID in Salesforce)") + "<span class='sub'>Account UUID set in Salesforce, "
                           "stage " + escape(str(row.get("Onboarding_Stage__c"))) + "; the tenant is not in the clone yet (the "
                           "clone may be older than the create). Do not create another.</span>")
+            if route_for(row) == CE_ENGINE:
+                cached = peek_display_cache("production_review_inputs_display", ref, product or None, kind or None)
+                note = ce_domains_note(((cached or {}).get("co_source") or {}).get("domains")) if isinstance(cached, dict) else ""
+                checks += "<span class='sub'>" + note + "</span>" if note else ""
             approval_cell = _create_approval_chip(item["approval"])
             create_cell = (_chip("chip-neutral", "Created by hand") if item["hand_entered"] and not created_here
                            and item["create"]["code"] not in production_views.CREATED_OUTCOMES
@@ -7600,10 +7621,13 @@ def _other_checks(summary: dict[str, Any], row: dict[str, str | None] | None) ->
         failed += 1
         timing = _check_item("Timing window", "Start date not verified.", _chip("chip-warn", "Not determined"))
     domains = values.get("domains") or []
-    if route == CE_ENGINE:
-        email = _check_item("Email domain", "Exactly one valid domain is required for CE-only.",
-                            _chip("chip-ok" if len(domains) == 1 else "chip-warn", str(len(domains))))
-        failed += int(len(domains) != 1)
+    if route == CE_ENGINE:  # one or more email domains (owner 2026-11-03, CO-0814): the first is the primary domain
+        email = _check_item("Email domains", (("Credential Exposure with " + str(len(domains)) + " email domains: "
+                                               if len(domains) > 1 else "One email domain: ")
+                                              + escape(", ".join(str(item) for item in domains)) + ".") if domains
+                            else "At least one valid email domain is required for CE-only.",
+                            _chip("chip-ok" if domains else "chip-warn", str(len(domains))))
+        failed += int(not domains)
     elif route == CASE3_ENGINE:  # owner decision 2026-10-20: Case 3 needs a main domain and exactly one CE email domain
         primary = str(plan.get("primary_domain") or "")
         known = {primary, *[str(item) for item in plan.get("alternate_domains") or ()]}
@@ -7815,7 +7839,8 @@ def _sheet_names(account: str) -> tuple[str, str]:
 
 def _sheet_rules() -> dict[str, Any]:
     """The Dev CE-only mapping the production onboarding sheet follows (the runner's own names, constants and domain rule)."""
-    return {"names_of": _sheet_names, "domain_of": one_email_domain, "first_name": CE_PRIMARY_USER_FIRST_NAME,
+    return {"names_of": _sheet_names, "domain_of": one_email_domain, "domains_of": ce_email_domains,
+            "first_name": CE_PRIMARY_USER_FIRST_NAME,
             "last_name": CE_PRIMARY_USER_LAST_NAME, "email_local": CE_PRIMARY_USER_EMAIL_LOCAL,
             "email_domain": CE_USER_EMAIL_DOMAIN, "license_type": SHEET_LICENSE_TYPE, "license_dates": ce_license_dates,
             "quantities": {"assets": CE_LICENSE_QUANTITIES["Number of assets"], "domains": CE_LICENSE_QUANTITIES["Number of domains"],
@@ -8140,7 +8165,7 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
                            start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE, state=state)
     sheet = _add_account_values_card(ref, row, summary["route"], match=check, start_iso=str(plan.get("license_start") or ""),
                                      country=country)
-    main = (head + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
+    main = (head + _ce_domains_head(row) + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
             + _production_create_html(ref, row, state) + ready + blocked
             + "<details class='card more'><summary>All details (Salesforce facts, checks, values, approvals, record)</summary>"
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"

@@ -43,6 +43,7 @@ _MISSING = object()
 _UUID = re.compile(r"[0-9a-f]{32}")
 _ISO_UTC = re.compile(r"(\d{4}-\d{2}-\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
 _ISO2 = re.compile(r"[A-Z]{2}")
+_DOMAIN = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+")
 
 
 class _Shape:
@@ -120,6 +121,18 @@ def _checked(intended: Mapping[str, Any]) -> tuple[str, str, str]:
     return name, domain, email_domain
 
 
+def _leaked_domains(intended: Mapping[str, Any], domain: str) -> list[str]:
+    """The Leaked Credentials scanned domains of a CE-only create: ``leaked_domains`` (owner 2026-11-03, CO-0814: every email
+    domain, primary first, no repeats) or just the primary domain."""
+    value = intended.get("leaked_domains")
+    if value is None:
+        return [domain]
+    if (isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)) or not value or value[0] != domain
+            or len(set(value)) != len(value) or not all(isinstance(item, str) and _DOMAIN.fullmatch(item) for item in value)):
+        raise ValueError("intended_leaked_domains_invalid")
+    return list(value)
+
+
 def _optional(intended: Mapping[str, Any], key: str) -> Any:
     value = intended.get(key)
     return value if isinstance(value, str) and value.strip() else SHAPE_TEXT
@@ -140,7 +153,7 @@ def expected_create_payload(intended: Mapping[str, Any]) -> dict[str, Any]:
         "alternateDomains": [], "subDomains": [], "additionalNetworks": None, "userEmailDomains": [email_domain],
         "operatorAccountNames": [],
         "scanningInterval": SCANNING_INTERVAL, "scanNow": False,
-        "leakedCredentialsScanningInterval": LC_INTERVAL, "leakedCredentialsScannedDomains": [domain],
+        "leakedCredentialsScanningInterval": LC_INTERVAL, "leakedCredentialsScannedDomains": _leaked_domains(intended, domain),
         "campaignsTimeoutInHours": CAMPAIGN_TIMEOUT_HOURS,
         "license.assetsNumber": LICENSE_COUNT_TEXT, "license.domainsNumber": LICENSE_COUNT_TEXT,
         "license.subDomainsNumber": LICENSE_COUNT, "license.licenseType": LICENSE_TYPE,

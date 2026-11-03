@@ -170,9 +170,14 @@ class SheetRefusalTests(unittest.TestCase):
         self.assertIn(reason, views.SHEET_REFUSALS)
 
     def test_two_domains(self):
-        self.refused("one_email_domain_required", email_domains="@a.example, @b.example")
-        self.assertEqual(dict((i["label"], i["status"]) for i in sheet(email_domains="a.example b.example")["eligibility"])["Email domain"],
+        # Owner 2026-11-03 (CO-0814): several valid email domains are typed comma separated; an invalid one refuses.
+        self.refused("email_domain_invalid", email_domains="@a.example, @b..example")
+        self.assertEqual(dict((i["label"], i["status"]) for i in sheet(email_domains="a.example b..example")["eligibility"])["Email domain"],
                          "blocked")
+        two = sheet(email_domains="a.example b.example")
+        self.assertEqual(two["state"], "ready")
+        self.assertEqual(dict((row["label"], row["value"]) for row in two["rows"])["Leaked Credentials scanned domains"],
+                         "a.example, b.example")
 
     def test_no_domain(self):
         self.refused("one_email_domain_required", email_domains="")
@@ -235,7 +240,7 @@ class EligibilityTests(unittest.TestCase):
         cases = (("approval_not_approved", dict(approval_status="Pending")),
                  ("approval_not_approved", dict(approval_status=None)),
                  ("account_uuid_set", dict(uuid_state="set")),
-                 ("one_email_domain_required", dict(email_domains="@a.example @b.example")),
+                 ("email_domain_invalid", dict(email_domains="@a.example @b..example")),
                  ("duplicate_in_production", dict(match=self.DUP)),
                  ("duplicate_in_production", dict(match=self.OTHER)),
                  ("live_paid_in_production", dict(match=self.TWO_LIVE)),
@@ -407,11 +412,11 @@ class CardTests(PageBase):
             self.assertIn("chip-warn'>Unavailable</span>", card, name)
 
     def test_two_domains_refuses_with_the_reason_and_no_table(self):
-        row = {**ROW, "Email_Domains__c": "@a.example, @b.example"}
+        row = {**ROW, "Email_Domains__c": "@a.example, @b..example"}  # an invalid domain (two valid ones are typed, CO-0814)
         for name, page in self.pages(row=row).items():
             card = self.card(page)
             self.assertIn("Do not onboard this CO:", card, name)
-            self.assertIn(views.SHEET_REFUSALS["one_email_domain_required"], card, name)
+            self.assertIn(views.SHEET_REFUSALS["email_domain_invalid"], card, name)
             self.assertNotIn("<table", card, name)
             self.assertNotIn("stays locked", card, name)
 

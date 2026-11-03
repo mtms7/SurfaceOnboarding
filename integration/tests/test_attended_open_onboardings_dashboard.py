@@ -1072,12 +1072,12 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         source = {"status": 0, "result": {"records": [{
             "Id": "a0B000000000702", "Name": "CO-0702", "LastModifiedDate": "2026-09-17T10:00:00Z",
             "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding",
-            "Email_Domains__c": "one.test,two.test",
+            "Email_Domains__c": "one.test,two..test",
         }]}}
         with patch("tools.serve_attended_open_onboardings_dashboard.sf_json", return_value=source):
             evaluation = evaluate_ce_only_fill_preflight("CO-0702")
         self.assertFalse(evaluation.eligible_for_fill_review)
-        self.assertEqual(evaluation.blockers, ("exactly_one_email_domain_required",))
+        self.assertEqual(evaluation.blockers, ("valid_email_domains_required",))
 
     def test_ce_route_requires_exact_credential_exposure_new_product(self):
         # 2026-09-29 audit: a Surface or combined CO with one email domain must
@@ -1393,7 +1393,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         ce = {"Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"}
         self.assertTrue(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@orlandohealth.com"}))
         self.assertFalse(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@@orlandohealth.com"}))
-        self.assertFalse(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@one.test, @two.test"}))
+        self.assertTrue(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@one.test, @two.test"}))  # CO-0814
+        self.assertFalse(dashboard.ce_only_eligible({**ce, "Email_Domains__c": "@one.test, @two..test"}))
         self.assertFalse(dashboard.ce_only_eligible({"Email_Domains__c": "one.test, two.test"}))
         self.assertFalse(dashboard.ce_only_eligible({"Email_Domains__c": ""}))
         self.assertFalse(dashboard.ce_only_eligible({"Email_Domains__c": None}))

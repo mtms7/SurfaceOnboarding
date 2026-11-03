@@ -191,7 +191,7 @@ class VerdictTests(PageBase):
 
     def test_hard_blockers_refuse_with_one_reason(self):
         for over, code in (({"Account_UUID__c": "a" * 32}, "account_uuid_set"),
-                           ({"Email_Domains__c": "@a.example, @b.example"}, "one_email_domain_required"),
+                           ({"Email_Domains__c": "@a.example, @b..example"}, "email_domain_invalid"),
                            ({"Onboarding_Approval_Status__c": "Pending"}, "approval_not_approved"),
                            ({"Onboarding_Comments__c": ""}, "dealhub_range_missing")):
             page = self.page(row={**ROW, **over})
