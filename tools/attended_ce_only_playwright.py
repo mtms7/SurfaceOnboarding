@@ -8249,7 +8249,10 @@ def _production_expectation(reference: str, product: Any = None,
     return engine, {"tenant_names": (source.tenant_name,), "domains": (primary, *alternates, *extra)}, {
         "primary_domain": primary, "alternate_domains": alternates, "license_type": plan["selects"]["Type"],
         "license_end": plan["license_end"], "license_start": plan["license_start"],
-        "spycloud_shown": engine in SPYCLOUD_ROUTES, **({"pending_term": True} if pending_term else {})}
+        "spycloud_shown": engine in SPYCLOUD_ROUTES, **({"pending_term": True} if pending_term else {}),
+        # The DealHub term the create uses (owner 2026-11-03): the CE sheet takes it over the Onboarding Comments dates.
+        **({"term_start": source.subscription_start.isoformat(), "term_end": source.subscription_end.isoformat()}
+           if engine == CE_ENGINE else {})}
 
 
 def production_review_inputs(reference: str, product: Any = None, onboarding_type: Any = None) -> dict[str, Any]:
@@ -11049,6 +11052,16 @@ def main() -> int:
 # any Salesforce read, browser or network call. Started only by the dashboard after the owner's typed confirmation
 # (``--owner-go``). One create click, no retry; the approval is consumed by the create; the result is a redacted record.
 # It never writes Salesforce: the separate UUID write is a dashboard step with its own confirmation (decision D3).
+def _pcr_note(reference: str, step: str, outcome: str, stamp: Any) -> None:
+    """One milestone of a live create's checks for the dashboard bar (owner request 2026-11-03). Best effort: a progress
+    file that cannot be written never changes the run. Codes and counts only."""
+    try:
+        run_progress.record_milestone(PROGRESS_PATH, reference, {"t": stamp().strftime(PDR_STAMP), "step": step,
+                                                                 "outcome": outcome})
+    except Exception:
+        pass
+
+
 def _pcr_line(result: str, **extra: Any) -> str:
     return json.dumps({"result": result, **extra, "salesforce_writeback": "not_performed"}, separators=(",", ":"))
 
@@ -11665,8 +11678,11 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
             worker_problem = production_dry_run.service_worker_verdict(worker)
             if worker_problem:
                 return refused(worker_problem)
+            _pcr_note(reference, "pcr_signed_in", "ok", stamp)
             control = facts.get("control")
             early = _pcr_live_duplicate_problems(page, source.tenant_name, live_domains, control, extras)
+            searches = "ok_" + str(1 + len(live_domains))  # the tenant name, then each domain
+            _pcr_note(reference, "pcr_dup_early", early or searches, stamp)
             session_codes = ("production_session_expired", "production_session_not_ready")
             if early in session_codes:
                 extras["form_fields_checked"] = _pdr_session_stage_fields(page)  # names which read stage failed
@@ -11682,12 +11698,14 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 started = (clock or stamp)()  # stamped BEFORE the reads: the age covers the oldest of them
                 problem = _pcr_live_duplicate_problems(page, source.tenant_name, live_domains, control, extras)
                 pre_form.update(at=started, problem=problem)
+                _pcr_note(reference, "pcr_dup_preform", problem or searches, stamp)
                 if problem is not None:
                     raise production_create.FormRefusal(problem, _pdr_session_stage_fields(page)
                                                         if problem in session_codes else None)
                 fields = _pdr_fill_and_verify(page, guard, clicks, intended, extras, fill_date or _fill_license_date,
                                               date_kept or _license_date_kept, keep_open=True, confirm_preflight=True,
                                               form_state=strict_state)
+                _pcr_note(reference, "pcr_form", "ok", stamp)
                 code = _pcr_selected_country_code(page)  # the exact value the form submits, compared exactly in the readback
                 strict_state["code"] = code
                 try:

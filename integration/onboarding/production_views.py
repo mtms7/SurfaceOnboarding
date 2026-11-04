@@ -689,6 +689,15 @@ def _uuid_disagrees(co: dict[str, Any], match: dict[str, Any] | None) -> bool:
     return co.get("uuid_state") == "empty" and isinstance(match, dict) and match.get("co_uuid_set") is True
 
 
+def _dealhub_term(value: Any) -> tuple[date, date] | None:
+    """``(start, end)`` from the caller's DealHub subscription term (ISO texts or dates), else None."""
+    try:
+        start, end = (item if isinstance(item, date) else date.fromisoformat(str(item)[:10]) for item in value)
+    except (TypeError, ValueError):
+        return None
+    return (start, end) if end > start else None
+
+
 def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clone: dict[str, Any] | None,
                        match: dict[str, Any] | None, domain_ok: bool, as_of: str | None = None) -> list[dict[str, str]]:
     """The "before you start" chips: ``{"label", "status": ok | blocked | unavailable, "detail"}``."""
@@ -699,7 +708,8 @@ def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clo
     items.append(chip("Salesforce approval", "ok" if approval == "Approved" else "blocked" if approval else "unavailable",
                       "Approved" if approval == "Approved" else ("Status is " + _text(approval)) if approval else "Not read"))
     items.append(chip("Email domain", "ok" if domain_ok else "blocked",
-                      "Exactly one valid domain" if domain_ok else "Exactly one valid domain is required"))
+                      "Valid email domains (the first is the primary domain)" if domain_ok
+                      else "At least one valid email domain is required"))
     uuid_state = co.get("uuid_state")
     if _uuid_disagrees(co, match):
         items.append(chip("Account UUID", "blocked", "UUID sources disagree (the snapshot holds one, the read shows none)"))
@@ -798,6 +808,21 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
               else "account_name_unavailable" if tenant is None else "")
     dates = extract_dealhub_dates(co.get("comments"))
     expiry = None
+    # Owner 2026-11-03 (CO-0814, comment "2026-11-02 - 2029-22-01"): the DealHub subscription rows the create itself uses win
+    # over the dates typed in Onboarding Comments; a wrong or missing comment range is only a note then.
+    term = _dealhub_term(co.get("dealhub_term"))
+    source_words = "Onboarding Comments"
+    if term is not None:
+        comment_range = ((str(dates.get("dealhub_start_date")), str(dates.get("dealhub_end_date")))
+                         if dates.get("result") == "dealhub_dates_extracted" else None)
+        if comment_range != (term[0].isoformat(), term[1].isoformat()):
+            base["dates_note"] = (("The date range in Onboarding Comments is wrong or missing" if comment_range is None
+                                   else "Onboarding Comments show " + comment_range[0] + " - " + comment_range[1])
+                                  + "; the DealHub subscription dates " + term[0].isoformat() + " - " + term[1].isoformat()
+                                  + " are used (the same the create uses).")
+        dates = {"result": "dealhub_dates_extracted", "dealhub_start_date": term[0].isoformat(),
+                 "dealhub_end_date": term[1].isoformat()}
+        source_words = "DealHub subscription"
     if not reason:
         try:
             if dates.get("result") != "dealhub_dates_extracted":
@@ -829,8 +854,8 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
         country_row = _unavailable("Country", "The published snapshot does not carry the country." if vm
                                    else "The country could not be read from Salesforce: take it from the Account.")
     expiry_row = _row("Expiration date", expiry.isoformat(),
-                      "One year minus a day from the DealHub range start " + str(dates.get("dealhub_start_date"))
-                      + ", never later than the range end " + str(dates.get("dealhub_end_date")) + " (Onboarding Comments).")
+                      "The DealHub range end (range " + str(dates.get("dealhub_start_date")) + " - "
+                      + str(dates.get("dealhub_end_date")) + ", " + source_words + ").")
     base["rows"] = [
         _row("Company name", tenant, "Account name + ' - CE Only'."),
         _row("Account Type", "Customer"),
@@ -878,7 +903,7 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
 # Pure view model over ``onboarding_sheet``: nothing is read or written here. The gates are shown once (the strip) and the
 # verdict names only the single most important blocker. A missing match is never a clearance.
 
-GUIDE_KEYS = (("route", "Route"), ("approval", "Approved in Salesforce"), ("domain", "One email domain"),
+GUIDE_KEYS = (("route", "Route"), ("approval", "Approved in Salesforce"), ("domain", "Email domains"),
               ("uuid", "Account UUID empty"), ("clone", "Duplicate check"))
 GUIDE_LEAVE_SENTENCE = ("Also set exactly: Alternate Domains, SubDomains and Networks empty; Operator Account None; Scanning interval "
                         "None; MFA required on; Scan now, Notifications, Multiple users, API access and Phishing off; every "
@@ -921,7 +946,8 @@ def production_co_guide(sheet: dict[str, Any], *, clone: dict[str, Any] | None,
                "detail": items[key]["detail"]} for key, label in GUIDE_KEYS if key in items]
     out: dict[str, Any] = {"state": state, "verdict": "blocked", "headline": "", "checks": checks, "rows": [], "leave": "",
                            "after": [], "closing": GUIDE_CLOSING, "as_of": sheet.get("as_of") or "",
-                           "recorded_duplicates": recorded_duplicates}
+                           "recorded_duplicates": recorded_duplicates,
+                           "dates_note": _text(sheet.get("dates_note") or "")}  # wrong comment dates, DealHub used
     if state == "not_applicable":
         out["headline"] = "Not applicable: this CO is not a CE-only New Product Onboarding."
         return out

@@ -54,8 +54,19 @@ _PRODUCTION_DRY_RUN_STEPS: tuple[tuple[str, tuple[tuple[str, frozenset[str] | No
     ("Recording the result", (("pdr_recorded", None),)),
 )
 
-MILESTONE_STEPS = frozenset(step for table in (_CREATE_STEPS, _RENEWAL_STEPS, _PRODUCTION_DRY_RUN_STEPS)
-                            for _label, matchers in table for step, _outcomes in matchers)
+# The checks of a LIVE production create before its one Confirm (owner request 2026-11-03, CO-0814: the bar showed only
+# "Signing in ... checking duplicates and the form" while they ran). Outcome "ok_<n>" (n = searches: the tenant name and
+# each domain) or the refusal code; never a name or domain value.
+PRODUCTION_CREATE_CHECKS: tuple[tuple[str, str], ...] = (
+    ("pcr_signed_in", "Signed in to BackOffice production"),
+    ("pcr_dup_early", "Duplicate check in production: tenant name and every domain"),
+    ("pcr_dup_preform", "Duplicate check again, right before the Add Account form opens"),
+    ("pcr_form", "Add Account form filled and every value read back"),
+)
+
+MILESTONE_STEPS = frozenset([*(step for table in (_CREATE_STEPS, _RENEWAL_STEPS, _PRODUCTION_DRY_RUN_STEPS)
+                               for _label, matchers in table for step, _outcomes in matchers),
+                             *(step for step, _label in PRODUCTION_CREATE_CHECKS)])
 
 PENDING, ACTIVE, DONE, FAILED = "pending", "active", "done", "failed"
 
@@ -113,6 +124,29 @@ def build_progress(route: str | None, events: Any, result: str | None = None, su
     percent = min(MAX_RUNNING_PERCENT, START_PERCENT + (MAX_RUNNING_PERCENT - START_PERCENT) * done // total)
     current = table[done][0] if done < total else table[-1][0]
     return RunProgress(steps, percent, current if seen and last >= 0 else "Starting…", "running")
+
+
+def production_create_checks(events: Any, *, running: bool) -> list[tuple[str, str]]:
+    """``[(label, done|active|pending|failed)]`` of the live create's checks from its recorded milestones only (the newest
+    outcome per step). A duplicate check shows how many searches it made; the first unrecorded check is active while the
+    run is running and nothing failed."""
+    found = dict(_seen(events))
+    rows: list[tuple[str, str]] = []
+    blocked = False
+    for step, label in PRODUCTION_CREATE_CHECKS:
+        outcome = found.get(step)
+        if outcome is None:
+            state = ACTIVE if running and not blocked and all(s != PENDING and s != ACTIVE for _l, s in rows) else PENDING
+            blocked = True
+        elif outcome == "ok" or outcome.startswith("ok_"):
+            count = outcome[3:]
+            if count.isdigit() and step != "pcr_signed_in":
+                label += ": " + count + " searches, no match"
+            state = DONE
+        else:
+            label, state, blocked = label + ": stopped (" + outcome + ")", FAILED, True
+        rows.append((label, state))
+    return rows
 
 
 # --- the small local progress file (milestone events only; no details) -----------------------------------------

@@ -7130,7 +7130,8 @@ def _production_guide_html(guide: dict[str, Any], match: dict[str, Any]) -> str:
     verdict = ("<div class='banner " + tone + "' role='status'><strong>"
                + escape(guide["headline"]) + "</strong>"
                + ("<br><a href='" + escape(guide["review_href"]) + "'>Open the review page</a>" if guide.get("review_href") else "")
-               + "</div>")
+               + "</div>"
+               + ("<p class='note'>" + escape(guide["dates_note"]) + "</p>" if guide.get("dates_note") else ""))
     strip = ""
     if guide["checks"]:
         strip = ("<section class='card' aria-labelledby='co-before-title'><h2 id='co-before-title' class='pill'>Before you start</h2>"
@@ -7896,6 +7897,18 @@ SHEET_ROW_CHIPS = {"enter": ("chip-info", "Enter"), "leave": ("chip-neutral", "L
 SHEET_CHECK_CHIPS = {"ok": ("chip-ok", "OK"), "blocked": ("chip-bad", "Blocked"), "unavailable": ("chip-warn", "Unavailable")}
 
 
+def _ce_dealhub_term(row: dict[str, str | None] | None) -> tuple[str, str] | None:
+    """The CE-only DealHub subscription term the create uses (the cached source read of the CO page), else None."""
+    if not row or not REFERENCE.fullmatch(str(row.get("Name") or "")):
+        return None
+    try:
+        plan = production_review_inputs_display(str(row["Name"]), row.get("Onboarding_Product__c") or None,
+                                                row.get("Onboarding_Type__c") or None)["plan"]
+        return (str(plan["term_start"]), str(plan["term_end"]))
+    except Exception:  # noqa: BLE001 - no term: the sheet falls back to the Onboarding Comments dates
+        return None
+
+
 def _sheet_result(row: dict[str, str | None] | None, *, match: dict[str, Any] | None, ce_route: bool,
                   start_iso: str | None, country: str | None, clone: dict[str, Any] | None = None) -> dict[str, Any]:
     """The pure sheet of one CO (``production_views.onboarding_sheet``); a failure is ``{"state": "unavailable"}``."""
@@ -7905,7 +7918,7 @@ def _sheet_result(row: dict[str, str | None] | None, *, match: dict[str, Any] | 
     co = {"ce_route": ce_route, "approval_status": fields.get("Onboarding_Approval_Status__c"),
           "account_name": fields.get("Account_Name__c"), "email_domains": fields.get("Email_Domains__c"),
           "uuid_state": uuid_state, "country": country, "comments": fields.get("Onboarding_Comments__c"),
-          "start_iso": start_iso}
+          "start_iso": start_iso, "dealhub_term": _ce_dealhub_term(row) if ce_route and not vm else None}
     as_of, stale = _snapshot_as_of() if vm else (None, False)
     try:
         return production_views.onboarding_sheet(co, rules=_sheet_rules(), today=production_now().date(),
@@ -8501,7 +8514,22 @@ def _follow_production_create(reference: str, process: Any) -> None:
 
 
 def _production_run_progress(reference: str) -> dict[str, Any] | None:
-    """The progress of the create this dashboard started for ``reference`` (None when it started none)."""
+    """The progress of the create this dashboard started for ``reference`` (None when it started none). A create also lists
+    its recorded checks under the first step (sign-in, both duplicate checks, the form; owner request 2026-11-03)."""
+    progress = _production_run_progress_steps(reference)
+    with _PRODUCTION_RUNS_LOCK:
+        run = dict(PRODUCTION_RUNS.get(reference) or {})
+    if progress is not None and run.get("route") != production_approval.SURFACE_RENEWAL_ROUTE:
+        try:
+            events = run_progress.read_milestones(attended_runner.PROGRESS_PATH, reference, run["since"])
+            progress["checks"] = run_progress.production_create_checks(
+                events, running=not progress["done"] and not progress["failed"])
+        except Exception:  # noqa: BLE001 - the bar still shows its main steps
+            pass
+    return progress
+
+
+def _production_run_progress_steps(reference: str) -> dict[str, Any] | None:
     with _PRODUCTION_RUNS_LOCK:
         run = dict(PRODUCTION_RUNS.get(reference) or {})
     if not run:

@@ -1355,8 +1355,12 @@ def production_progress(parent: Path, co: str, since: str, *, running: bool,
 
 def progress_card_html(progress: Mapping[str, Any]) -> str:
     """CSS-only progress card (no script, no form, no value): step labels, percent and state only."""
+    checks = progress.get("checks") or ()
+    sub = ("<ol class='runprog-steps'>" + "".join("<li class='s-" + escape(state) + "'>" + escape(label)
+                                                   + (" (running)" if state == "active" else "") + "</li>"
+                                                   for label, state in checks) + "</ol>") if checks else ""
     items = "".join("<li class='s-" + escape(state) + "'>" + escape(label) + (" (running)" if state == "active" else "")
-                    + "</li>" for label, state in progress["steps"])
+                    + (sub if index == 0 else "") + "</li>" for index, (label, state) in enumerate(progress["steps"]))
     if progress.get("done"):
         chip, head = _chip("chip-ok", "Onboarded"), "Done"
     elif progress.get("failed"):

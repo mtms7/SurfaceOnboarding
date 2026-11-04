@@ -76,7 +76,7 @@ class LayoutTests(PageBase):
         main = self.main(self.page())
         strip = main[main.index("Before you start"):main.index("Enter in BackOffice")]
         labels = re.findall(r"<span class='what'>([^<]+)", strip)
-        self.assertEqual(labels, ["Route", "Approved in Salesforce", "One email domain", "Account UUID empty", "Duplicate check"])
+        self.assertEqual(labels, ["Route", "Approved in Salesforce", "Email domains", "Account UUID empty", "Duplicate check"])
 
     def test_no_form_button_input_or_script_and_no_create_control(self):
         for vm in (False, True):
