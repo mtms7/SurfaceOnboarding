@@ -8212,6 +8212,25 @@ def _snapshot_identity(reference: str, product: Any, onboarding_type: Any, accou
     return {"names": names, "domains": domains, "uuid": account_uuid.strip() if isinstance(account_uuid, str) and account_uuid.strip() else None}
 
 
+VM_REGION_UNKNOWN = "?"  # not a region code: production_match.region_of gives None -> "region_not_checked" (fail closed)
+
+
+def _snapshot_region(reference: str) -> str:
+    """VM mode: the CO's Surface Tenant Region as the publisher read it ("" = blank = EU), or ``VM_REGION_UNKNOWN`` when no
+    region was published for it (an older snapshot, a failed read). Owner go 2026-11-05: a US CO is never "Clear" on the VM."""
+    from integration.onboarding import state_paths, vm_snapshot
+
+    folder = state_paths.state_dir()
+    if folder is None:
+        return VM_REGION_UNKNOWN
+    try:
+        data = vm_snapshot.load_current_json(vm_snapshot.snapshots_root(folder), vm_snapshot.PRODUCTION_INPUTS_FILE)
+        value = data["inputs"][reference]["region"]
+    except (vm_snapshot.SnapshotError, KeyError, TypeError, AttributeError):
+        return VM_REGION_UNKNOWN
+    return value if isinstance(value, str) and len(value) <= 16 else VM_REGION_UNKNOWN
+
+
 def _production_expectation(reference: str, product: Any = None,
                             onboarding_type: Any = None) -> tuple[str, dict[str, Any], dict[str, Any]]:
     """(engine, co_source, plan) for the production match, from read-only Salesforce reads (raises on any problem).
@@ -8399,8 +8418,10 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
         result["reason"] = "production_inputs_not_prepared"
     result["route"] = engine
     result = _apply_verified_tenant(result, reference, uuid_value)
-    if isinstance(identity, dict) and "region" in identity:  # the desktop read carries the region; the VM snapshot does not yet
+    if isinstance(identity, dict) and "region" in identity:  # the desktop read carries the region
         result = match.apply_region(result, identity["region"])
+    elif state_paths.vm_mode() and REFERENCE.fullmatch(reference):  # the VM: the region the publisher read (owner go 2026-11-05)
+        result = match.apply_region(result, _snapshot_region(reference))
     return result
 
 

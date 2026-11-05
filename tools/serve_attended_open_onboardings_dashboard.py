@@ -1255,6 +1255,74 @@ def clear_display_cache_for(reference: str) -> None:
 DISPLAY_WARM_WAKE = Event()
 
 
+# Salesforce change watch (owner report 2026-11-05, CO-0839: approved in Salesforce, but the queue and the CO page kept the
+# cached "Pending" and offered no approval or onboard step). One read-only query lists the COs modified since the last check;
+# only those COs (and the queue-wide lists) are dropped from the display cache, so the next page re-reads them. Runs in the
+# warm-up loop about once a minute, and right before a CO page renders (at most every CHANGE_CHECK_PAGE_SECONDS), so the page
+# that decides "can we move forward" shows Salesforce's current approval and stage. Desktop only; creates and writes still
+# re-read Salesforce themselves.
+CHANGE_CHECK_LOOP_SECONDS = 60.0
+CHANGE_CHECK_PAGE_SECONDS = 15.0
+CHANGE_CHECK_OVERLAP = timedelta(minutes=2)  # Salesforce timestamps are per second; overlap so nothing falls between checks
+_CHANGE_FIRST_LOOKBACK = timedelta(seconds=DISPLAY_STALE_MAX_SECONDS + 300)  # covers anything the cache may still hold
+_SF_DATETIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,3})?(Z|[+-][0-9]{2}:?[0-9]{2})")
+_change_lock = Lock()
+_change_state: dict[str, Any] = {"checked_at": None, "since": None, "seen": {}}
+
+
+def _reset_change_watch() -> None:
+    with _change_lock:
+        _change_state.update(checked_at=None, since=None, seen={})
+
+
+def refresh_changed_cos(min_interval: float, now: datetime | None = None) -> list[str]:
+    """Drop the cached display values of every CO changed in Salesforce since the last check; returns those references.
+    Skipped (returns []) on the VM, when a check ran less than ``min_interval`` seconds ago, or when another check is running.
+    A failed read changes nothing (the normal 5-minute display TTL still applies). Never raises."""
+    if vm_mode():
+        return []
+    now = now or datetime.now(timezone.utc)
+    if not _change_lock.acquire(blocking=False):
+        return []
+    try:
+        checked_at = _change_state["checked_at"]
+        if isinstance(checked_at, datetime) and timedelta(0) <= now - checked_at < timedelta(seconds=min_interval):
+            return []
+        since = _change_state["since"] or now - _CHANGE_FIRST_LOOKBACK
+        literal = (since - CHANGE_CHECK_OVERLAP).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            response = sf_json(["data", "query", "--query", "SELECT Name, LastModifiedDate FROM Customer_Onboarding__c "
+                                "WHERE LastModifiedDate >= " + literal + " ORDER BY LastModifiedDate DESC LIMIT 200", "--json"])
+            records = response["result"]["records"]  # type: ignore[index]
+            if response["status"] != 0 or not isinstance(records, list):  # type: ignore[index]
+                raise ReadUnavailable()
+            found: dict[str, str] = {}
+            for record in records:
+                name, modified = record.get("Name"), record.get("LastModifiedDate")
+                if isinstance(name, str) and REFERENCE.fullmatch(name) and isinstance(modified, str) and _SF_DATETIME.fullmatch(modified):
+                    found[name] = modified
+        except Exception:  # noqa: BLE001 - no change list: keep the cache, try again next time
+            return []
+        seen: dict[str, str] = _change_state["seen"]
+        first = _change_state["since"] is None
+        changed = sorted(name for name, modified in found.items() if seen.get(name) != modified)
+        seen.update(found)
+        if len(seen) > 2000:  # bounded: keep the newest only
+            for name in sorted(seen, key=lambda key: seen[key])[:-1000]:
+                del seen[name]
+        _change_state.update(checked_at=now, since=now)
+        if first:
+            # The first check only learns the current timestamps, unless the cache already holds those COs (served stale).
+            with _display_cache_lock:
+                cached_keys = list(_display_cache)
+            changed = [name for name in changed if any(name in key[1:] or key[0] in _QUEUE_WIDE_READS for key in cached_keys)]
+        for name in changed:
+            clear_display_cache_for(name)
+        return changed
+    finally:
+        _change_lock.release()
+
+
 def _store_display_value(key: tuple[object, ...], value: Any, generation: int) -> None:
     """Store a finished background read, unless a clear happened since it started."""
     future: Future = Future()
@@ -2291,6 +2359,31 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
         if set(summaries) != set(references):
             raise ReadUnavailable()
         return summaries
+    except (KeyError, TypeError):
+        raise ReadUnavailable() from None
+
+
+def co_regions(references: tuple[str, ...]) -> dict[str, str]:
+    """The Surface Tenant Region of each CO as read ("" = blank, which means EU; owner 2026-11-04), one batched read-only
+    query. Used by the snapshot publisher so the VM applies the same region rule as the desktop (owner go 2026-11-05).
+    Raises ReadUnavailable on any problem (the publisher then publishes no region and the VM fails closed)."""
+    if not references or any(not REFERENCE.fullmatch(reference) for reference in references):
+        raise ReadUnavailable()
+    quoted = ", ".join(f"'{reference}'" for reference in references)
+    response = sf_json(["data", "query", "--query", "SELECT Name, Surface_Tenant_Region__c FROM Customer_Onboarding__c "
+                        "WHERE Name IN (" + quoted + ")", "--json"])
+    try:
+        records = response["result"]["records"]  # type: ignore[index]
+        if response["status"] != 0 or not isinstance(records, list):  # type: ignore[index]
+            raise ReadUnavailable()
+        regions: dict[str, str] = {}
+        for record in records:
+            reference, value = record["Name"], record["Surface_Tenant_Region__c"]
+            if (not isinstance(reference, str) or reference not in references or reference in regions
+                    or (value is not None and not isinstance(value, str))):
+                raise ReadUnavailable()
+            regions[reference] = (value or "").strip()
+        return regions
     except (KeyError, TypeError):
         raise ReadUnavailable() from None
 
@@ -7326,7 +7419,13 @@ def _clone_strip() -> str:
             "<p class='note'>No production check is trusted until the clone is fresh. Refresh it with " + _collect_hint_html() + ".</p>")
     if info["state"] != "fresh" and clone_autorefresh.describe():
         note += "<p class='note'>" + escape(clone_autorefresh.describe()) + "</p>"
-    return ("<div class='strip'>" + chip + "<span class='chip chip-neutral'>Source: Redash, personal data removed</span></div>" + note)
+    if info["state"] != "unusable" and clone_autorefresh.waiting_for_daily_load(datetime.now(timezone.utc),
+                                                                                  info.get("data_age_seconds")):
+        note += ("<p class='note'>Today's clone load (about 00:00 UTC) is not in this data yet"
+                 + ("" if vm_mode() or not clone_autorefresh.enabled() else
+                    "; the dashboard reads Redash every 15 min until it arrives") + ".</p>")
+    return ("<div class='strip'>" + chip + "<span class='chip chip-neutral'>Source: Redash, personal data removed</span>"
+            "<span class='chip chip-neutral'>Covers EU (app.pentera.io) only: US / IL COs are not checked</span></div>" + note)
 
 
 def _create_approval_chip(view: dict[str, Any]) -> str:
@@ -7825,7 +7924,8 @@ CREATE_PHASE_CHIPS = {"ready": ("chip-ok", "Create ready"), "blocked": ("chip-wa
 
 
 def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: dict[str, Any] | None,
-                   domain_count: int | None, start_iso: str | None, ce_route: bool, state: dict[str, Any]) -> str:
+                   domain_count: int | None, start_iso: str | None, ce_route: bool, state: dict[str, Any],
+                   phase_out: dict[str, str] | None = None) -> str:
     """The "Production readiness" card of the production CO page (/onboard/CO-x). Read-only: a checklist, never a control.
 
     ``state`` is ``create_ui.page_state`` for this CO: the same gate result the Create card shows, so no row contradicts it
@@ -7868,6 +7968,8 @@ def _co_ready_card(reference: str, row: dict[str, str | None] | None, *, match: 
     if (state.get("reason") == "approval_missing" and isinstance(row, dict) and row.get("Onboarding_Approval_Status__c") == "Approved"
             and all(item["status"] == "ready" for item in items)):
         phase, text = "ready", "Approved in Salesforce and every check passed: click Onboard in production."  # one-click flow
+    if phase_out is not None:  # the page header shows the same phase as this card (owner report 2026-11-05, CO-0839)
+        phase_out["phase"] = phase
     return ("<section class='card onboard-card' aria-labelledby='co-ready-title'><div class='card-head'>"
             "<h2 id='co-ready-title' class='pill'>Production readiness</h2>" + _chip(*CREATE_PHASE_CHIPS[phase])
             + "</div>" + where + "<ol class='checks'>" + rows + "</ol><p class='note'>" + escape(text) + "</p></section>")
@@ -8215,11 +8317,13 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     head = ("<a class='crumb' href='/'>&larr; Onboarding</a><div class='page-head'><h1>" + escape(ref) + "</h1>"
             + ("<span class='acct'>" + escape(summary["account"]) + "</span>" if summary["account"] else "")
             + (_chip("chip-info", route_label) if route_label else _chip("chip-neutral", "No automated route"))
-            + (_chip("chip-bad", "Blocked") if blockers else _chip("chip-ok", "Checks clear"))
-            + _chip(*CREATE_PHASE_CHIPS[state["phase"]]) + "</div>")
+            + (_chip("chip-bad", "Blocked") if blockers else _chip("chip-ok", "Checks clear")))
     domains = values.get("domains")
+    shown: dict[str, str] = {}
     ready = _co_ready_card(ref, row, match=check, domain_count=len(domains) if isinstance(domains, list) else None,
-                           start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE, state=state)
+                           start_iso=str(plan.get("license_start") or ""), ce_route=summary["route"] == CE_ENGINE, state=state,
+                           phase_out=shown)
+    head += _chip(*CREATE_PHASE_CHIPS[shown.get("phase", state["phase"])]) + "</div>"
     sheet = _add_account_values_card(ref, row, summary["route"], match=check, start_iso=str(plan.get("license_start") or ""),
                                      country=country)
     main = (head + _ce_domains_head(row) + ("<p class='note'>" + escape(notes[notice]) + "</p>" if notice in notes else "")
@@ -9029,6 +9133,8 @@ def _wait_for_warm_reason(halt: Any) -> None:
                 return
         except Exception:  # noqa: BLE001
             pass
+        if refresh_changed_cos(CHANGE_CHECK_LOOP_SECONDS):  # a CO changed in Salesforce: re-read it before a page needs it
+            return
 
 
 # Build 3: the owner's read-only CE scan checks started by THIS dashboard process: {"running": bool, "stages": list | None}.
@@ -9976,6 +10082,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.OK, page_ce_only_runner_status(state, ref)); return
             review = re.fullmatch(r"/onboard/(CO-[0-9]{4,10})", path)
             if review:
+                refresh_changed_cos(CHANGE_CHECK_PAGE_SECONDS)  # owner 2026-11-05: the CO page shows Salesforce's current approval
                 _prefetch_with_row(review.group(1))
                 review_summary, review_extras = build_review_summary(review.group(1))
                 try:
@@ -9996,6 +10103,7 @@ class Handler(BaseHTTPRequestHandler):
             id_write = parse_qs(parsed.query).get("id-write", [""])[0]
             if id_write in ID_WRITEBACK_RESULTS: notice = "id-write:" + id_write
             if match:
+                refresh_changed_cos(CHANGE_CHECK_PAGE_SECONDS)  # owner 2026-11-05: the CO page shows Salesforce's current state
                 # Overlap the onboarding preflight with the CO read when the
                 # cached queue already tells us the route.
                 queued = next((r for r in peek_display_cache("queue_source_rows") or [] if r.get("Name") == match.group(1)), None)

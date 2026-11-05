@@ -157,13 +157,28 @@ def collect_dashboard_reads(extra_references: Iterable[str] = (), failed_countri
                 inputs[reference] = dash._plain({"product": row.get("Onboarding_Product__c"), "type": row.get("Onboarding_Type__c"),
                                                  "identity": {"names": list(identity.get("names") or ()),
                                                               "domains": list(identity.get("domains") or ())}})
+    # Surface Tenant Region per published CO (owner go 2026-11-05): the VM applies the desktop's region rule. One batched
+    # read; on failure no region is published and the VM treats the region as unknown (never Clear).
+    regions_read = 0
+    regions_unavailable = 0
+    if inputs:
+        try:
+            regions = dash.co_regions(tuple(sorted(inputs)))
+        except Exception:  # noqa: BLE001 - fail closed on the VM
+            regions = {}
+            regions_unavailable = len(inputs)
+        for reference, region in regions.items():
+            if reference in inputs and isinstance(region, str) and len(region) <= 16:
+                inputs[reference]["region"] = region
+                regions_read += 1
     files = {
         vm_snapshot.QUEUE_FILE: json.dumps({"rows": queue}, sort_keys=True).encode("utf-8"),
         vm_snapshot.CO_DETAILS_FILE: json.dumps({"details": details}, sort_keys=True).encode("utf-8"),
         vm_snapshot.PRODUCTION_INPUTS_FILE: json.dumps({"inputs": inputs}, sort_keys=True).encode("utf-8"),
     }
     return files, {"queue_rows": len(queue), "co_details": len(details), "co_details_unavailable": missing,
-                   "production_inputs": len(inputs), "production_inputs_unavailable": inputs_missing}
+                   "production_inputs": len(inputs), "production_inputs_unavailable": inputs_missing,
+                   "co_regions": regions_read, "co_regions_unavailable": regions_unavailable}
 
 
 def output_path(out_dir: Path, autopublish: bool, now: datetime) -> Path:

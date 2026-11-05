@@ -16,16 +16,16 @@ Pentera VPN on. Salesforce SSO sign-in if asked.
 4. Anything other than created and verified: do not click again, paste the result to Claude.
 
 
-# VM to Redash connectivity test, read-only (PC tab, PowerShell; 2026-10-26, IT ticket 16160)
+# VM to Redash connectivity test, read-only (PC tab, PowerShell; updated 2026-11-05, IT ticket 16160)
 
 Pentera VPN on. Password prompt = the `workato` VM password, typed in your own window (never paste it to Claude).
 Runs on the VM through ssh; sends no key and changes nothing. Do not type into an already open ssh tab: open a new PC tab.
+The load balancer's IPs change over time (10.10.24.16 in October, 10.10.26.136 / 10.10.23.228 on 2026-11-04), so this tests every IP the name resolves to right now, plus a route trace.
 
-    ssh workato@172.26.37.20 "getent hosts redash.pentera.io; timeout 8 bash -c '</dev/tcp/10.10.24.16/443' && echo TCP_OK || echo TCP_FAIL; curl -sS -m 10 -o /dev/null -w 'HTTP %{http_code}\n' https://redash.pentera.io/ping"
+    ssh workato@172.26.37.20 "for i in `$(getent ahostsv4 redash.pentera.io | awk '{print `$1}' | sort -u); do timeout 6 bash -c '</dev/tcp/'`$i'/443' 2>/dev/null && echo `$i TCP_OK || echo `$i TCP_FAIL; done; curl -sS -m 10 -o /dev/null -w 'HTTP %{http_code} connect=%{time_connect}\n' https://redash.pentera.io/ping; ip route get 10.10.26.136 | head -1; tracepath -n -m 8 10.10.26.136 2>&1 | tail -4"
 
-Expect: an IP line for redash.pentera.io (10.10.24.16), TCP_OK, HTTP 200.
-TCP_FAIL or a timeout = the firewall path is still closed (reply on ticket 16160 with the result).
-Paste only the output lines to Claude.
+Expect: every IP TCP_OK, HTTP 200.
+Any TCP_FAIL or a curl timeout = the path is still closed. Paste only the output lines to Claude (they go into the ticket 16160 reply).
 
 
 # Deploy release r38 to the VM (adds "Open this CO on my PC", the Days to start column and the stale-banner fix), 2026-10-27

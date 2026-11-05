@@ -74,3 +74,47 @@ two current onboardings where this happened.
 
 Thanks,
 <your name>
+
+---
+
+## 2026-11-05: Omer's answer and what we found (verified read-only from Redash in the owner's Chrome)
+
+**Omer (2026-11-05 01:26):** added "Prod US (Cloned) - Mgmt" and "Prod US (Cloned) - Attack" and gave the customer
+solutions group Full Access. Items 3 (key via secure channel) and 4 (clone refresh 2-3 times a day) were not answered yet.
+
+**Checks (2026-11-05 ~18:15Z, nothing saved in Redash):**
+
+| Data source | Redash id | Collections (schema refresh) | `tenantsMView` rows | `accounts` rows |
+|---|---|---|---|---|
+| Prod (Cloned) - Mgmt (EU) | 2 | 100 | 5,469 | n/a |
+| Prod US (Cloned) - Mgmt | 14 | **0** | **0** | **0** |
+| Prod US (Cloned) - Attack | 13 | not checked | **0** | n/a |
+
+- The US sources connect without an error but are empty: most likely the database name in the data source, or the US
+  clone has not been loaded yet. A US saved query cannot be built until this is fixed.
+- EU clone freshness: newest `_modified` 2026-11-05 00:00:00Z, newest `_created` 2026-11-03 21:36Z. Query 253 already has an
+  hourly schedule (interval 3600) and its last result was 17:29Z, so the daily clone load is the only freshness limit.
+
+### Reply to Omer (draft; the owner sends it, Reply all)
+
+Subject: RE: Request: US production tenant data source in Redash (Surface onboarding duplicate check)
+
+> Hi Omer,
+>
+> Thanks for adding them so fast. I can see both US sources, but they look empty:
+>
+> 1. **Prod US (Cloned) - Mgmt:** the schema refresh returns 0 collections, and `tenantsMView` and `accounts` return 0 rows.
+>    The EU "Prod (Cloned) - Mgmt" returns 100 collections and 5,469 tenants with the same queries.
+> 2. **Prod US (Cloned) - Attack:** also 0 rows.
+>
+> Could you check the database name on the two US data sources, or whether the US clone has been loaded yet?
+>
+> Two open items from my first mail:
+>
+> 1. **Clone refresh:** the EU clone still loads once a day (newest data 00:00 UTC). Can it run 2-3 times a day (e.g.
+>    00:00, 08:00, 14:00 UTC), and the US one the same? If another team owns the clone job, who should I ask?
+> 2. **Key:** once the US source has data I will create one read-only saved query on it (same columns as 253) and send you
+>    its id. Please share its API key through your secure channel, not email or chat.
+>
+> Thanks,
+> Milton

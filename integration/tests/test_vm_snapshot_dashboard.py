@@ -370,7 +370,8 @@ class VmProductionMatchTests(SnapshotDashboardCase):
                  "co_source": {"tenant_names": ["Acme Snapshot Customer - CE Only"], "domains": ["snapshot-customer.example"]},
                  "plan": {"primary_domain": "snapshot-customer.example", "alternate_domains": [],
                           "license_type": "Prepaid annual subscription", "license_end": "2027-10-18",
-                          "license_start": "2026-10-01", "spycloud_shown": True}}
+                          "license_start": "2026-10-01", "spycloud_shown": True},
+                 "region": ""}  # 2026-11-05: the publisher adds each CO's Surface Tenant Region ("" = blank = EU)
         value.update(over)
         return value
 
@@ -522,7 +523,8 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         value = {"engine": runner.CE_ENGINE, "product": self.PRODUCT, "type": self.KIND,
                  "co_source": {"tenant_names": [self.NAME], "domains": [self.DOMAIN]},
                  "plan": {"primary_domain": self.DOMAIN, "alternate_domains": [], "license_type": "Prepaid annual subscription",
-                          "license_end": "2027-10-18", "license_start": "2026-10-01", "spycloud_shown": True}}
+                          "license_end": "2027-10-18", "license_start": "2026-10-01", "spycloud_shown": True},
+                 "region": ""}  # 2026-11-05: the publisher adds each CO's Surface Tenant Region ("" = blank = EU)
         value.update(over)
         return value
 
@@ -624,7 +626,8 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
 
     def test_a_co_with_a_published_identity_is_checked_by_identity_like_the_desktop(self):
         # CO-0812 2026-10-27: the desktop showed Clear / Other tenants only, the VM "Not checked" (no DealHub plan to build).
-        ident = {"product": self.PRODUCT, "type": self.KIND, "identity": {"names": ["Brand New Co"], "domains": ["brandnew.example"]}}
+        ident = {"product": self.PRODUCT, "type": self.KIND, "identity": {"names": ["Brand New Co"], "domains": ["brandnew.example"]},
+                 "region": ""}
         self.publish({"CO-0001": self.item(), "CO-0002": ident})
         self.push_clone()
         found = self.match("CO-0002")
@@ -634,6 +637,18 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         ident2 = {**ident, "identity": {"names": [self.NAME], "domains": ["brandnew.example"]}}
         self.publish({"CO-0001": self.item(), "CO-0002": ident2})
         self.assertEqual(self.match("CO-0002")["status"], "exists_differs")
+
+    def test_the_vm_applies_the_published_region_like_the_desktop(self):
+        # Owner go 2026-11-05: a US CO is never "Clear" on the VM; no published region is "unknown" (fail closed).
+        self.push_clone("Other Co", "other.example")  # the CO itself is not in this clone: EU would be "Clear"
+        self.publish({"CO-0001": self.item(region="US")})
+        found = self.match("CO-0001")
+        self.assertEqual((found["status"], found["region"]), ("region_not_checked", "US"))
+        self.publish({"CO-0001": {key: value for key, value in self.item().items() if key != "region"}})
+        found = self.match("CO-0001")
+        self.assertEqual((found["status"], found["region"]), ("region_not_checked", "unknown"))
+        self.publish({"CO-0001": self.item(region="EU")})
+        self.assertEqual(self.match("CO-0001")["status"], "not_in_production")
 
     def test_an_identity_for_another_product_or_a_malformed_one_stays_not_checked(self):
         bad_type = {"product": self.PRODUCT, "type": "Renewal of Existing Product",

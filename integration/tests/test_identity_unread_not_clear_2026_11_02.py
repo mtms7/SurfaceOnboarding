@@ -76,7 +76,7 @@ class IdentityUnreadNotClearTests(unittest.TestCase):
 
     def test_the_vm_path_is_unchanged(self):
         with mock.patch("integration.onboarding.state_paths.vm_mode", return_value=True), \
-                mock.patch.object(runner, "_production_expectation", return_value=("ce", {"s": 1}, {"p": 1})):
+                mock.patch.object(runner, "_production_expectation", return_value=("ce", {"s": 1}, {"p": 1})),                 mock.patch.object(runner, "_snapshot_region", return_value=""):  # 2026-11-05: published region blank = EU
             result = runner.production_match_for(CO, PRODUCT, KIND)
         self.identity.assert_not_called()
         self.assertEqual(result["status"], "not_in_production")
