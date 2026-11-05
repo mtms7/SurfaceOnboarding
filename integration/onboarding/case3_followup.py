@@ -107,6 +107,26 @@ def _last(parent: Path, co: str, step: str, file: str = WRITES_FILE) -> str | No
     return last
 
 
+def last_stage(parent: Path, co: str) -> str | None:
+    """The Salesforce stage the newest Case 3 ``stage`` line wrote and read back (``written_verified``), else None
+    (no line, another result, or an unreadable log: never guessed)."""
+    try:
+        lines = (Path(parent) / records.RECORDS_SUBDIR / WRITES_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    last: dict[str, Any] | None = None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return None
+        if isinstance(item, dict) and item.get("co_reference") == co and item.get("step") == "stage":
+            last = item
+    if last is None or last.get("result") != "written_verified" or not isinstance(last.get("to_stage"), str):
+        return None
+    return last["to_stage"]
+
+
 # --- the shared gate ------------------------------------------------------------------------------------------------------
 
 def _newest_verified(verified_records: Any, co: str) -> dict[str, Any] | None:

@@ -1011,6 +1011,24 @@ def last_stage_write(parent: Path, co: str) -> tuple[str, str] | None:
     return last
 
 
+def last_verified_stage(parent: Path, co: str) -> str | None:
+    """The stage of the newest ``written_verified`` stage line of one CO (display only), else None."""
+    try:
+        lines = (Path(parent) / records.RECORDS_SUBDIR / STAGE_WRITES_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    found = None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            return None
+        if (isinstance(item, dict) and item.get("co_reference") == co and item.get("result") == "written_verified"
+                and isinstance(item.get("to_stage"), str) and item["to_stage"]):
+            found = item["to_stage"]
+    return found
+
+
 _RUN_FAILURE_REASON = re.compile(r"[A-Za-z0-9_:]{1,96}")
 
 
@@ -1265,14 +1283,26 @@ def onboarded_summary(parent: Path, co: str, clone_payload: Mapping[str, Any] | 
     status = co_status(history)
     if status["code"] != CREATED_VERIFIED:
         return None
-    if last_uuid_write(parent, co) != "written_verified":
+    # A Case 3 create writes the Account ID + UUID and its stage through the Case 3 follow-up log, not the CE-only logs
+    # (owner report 2026-11-05: CO-0841 showed "UUID not written" although Salesforce held it).
+    from . import case3_followup  # lazy: case3_followup imports this module
+
+    case3_ids = case3_followup._last(parent, co, "ids")
+    case3_stage = case3_followup.last_stage(parent, co)
+    if last_uuid_write(parent, co) != "written_verified" and case3_ids not in ("written_verified", "already_present"):
         return {"label": "Created: UUID not written", "css": "chip-warn", "stage": None, "scan": None,
                 "text": "Created and verified in BackOffice; the Account UUID is not written to Salesforce yet."}
     last = last_stage_write(parent, co)
-    stage = last[0] if last is not None and last[1] == "written_verified" else None
-    parts = ["Account UUID written and read back"]
+    stage = last_verified_stage(parent, co)  # owner 2026-11-05 (CO-0839): a later unconfirmed move must not hide this one
+    unconfirmed = last[0] if last is not None and last[1] != "written_verified" and last[0] and last[0] != stage else None
+    if case3_stage is not None:  # a CO is either CE-only (stage log) or Case 3 (follow-up log), never both
+        stage = case3_stage
+    parts = ["Account ID and UUID written and read back" if case3_ids in ("written_verified", "already_present")
+             else "Account UUID written and read back"]
     if stage:
         parts.append("Salesforce stage " + stage)
+    if unconfirmed and case3_stage is None:
+        parts.append("the move to " + unconfirmed + " was sent but not read back (the Status column shows Salesforce's stage)")
     scan = None
     if stage != "Onboarding Completed" and clone_payload is not None:
         uuid = salesforce_uuid_writeback.normalise_uuid(status.get("uuid"))

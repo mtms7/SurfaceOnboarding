@@ -118,3 +118,37 @@ Subject: RE: Request: US production tenant data source in Redash (Surface onboar
 >
 > Thanks,
 > Milton
+
+---
+
+## 2026-11-05 (evening): clone timing evidence and follow-up to Omer
+
+**What we can and cannot do from Redash (verified read-only):**
+
+- The data behind "Prod (Cloned) - Mgmt" is a database copy. Its newest change is about 00:00 UTC each day in November
+  (2026-11-04 00:02:02Z, 2026-11-05 00:00:00Z), so the copy is taken once a night.
+- The copy schedule is set by whoever runs the copy job, not by Redash. (Correction 2026-11-05 22:20Z: the October times
+  17:00Z / 21:01Z / 17:02Z noted earlier were when our collector captured the clone, not when the clone data was loaded;
+  they say nothing about the copy schedule.)
+- Query 253 already re-runs every hour in Redash (schedule 3600 s). Running it more often only re-reads the same copy: Redash
+  cannot make the copy itself fresher. Forcing a second daily load needs the copy job's owner.
+- The US sources ("Prod US (Cloned) - Mgmt" id 14, "- Attack" id 13) were still empty at 20:53Z (0 collections). Until data
+  appears we cannot see when the US copy loads; once it does, the newest change time shows its schedule (same check as EU).
+
+### Follow-up to Omer (draft; the owner sends it, Reply all on the same thread)
+
+> Hi Omer,
+>
+> Two short questions on the clones:
+>
+> 1. **Who runs the copy job** behind "Prod (Cloned) - Mgmt"? Its newest data is from 00:00 UTC each day, so a tenant created
+>    in the morning is invisible until the next night. Could it run twice a day (e.g. 00:00 and 12:00 UTC)?
+> 2. **US copy:** the two US sources are still empty for us (0 collections). When it is loaded, will it follow the same
+>    schedule as EU, or can it be set to twice a day from the start?
+>
+> Thanks,
+> Milton
+
+### Final message to Omer (2026-11-05 22:20Z, facts re-checked: US sources 14 and 13 still 0 collections; EU 5,469 tenants, newest data 2026-11-05 00:00Z)
+
+See the chat copy; it supersedes the two drafts above (no October claim; the owner is not a Redash admin).
