@@ -271,7 +271,7 @@ class RunnerGlueTests(unittest.TestCase):
             with self.subTest(error=error), patch.object(runner, "_production_expectation", side_effect=error), \
                     patch.object(runner, "_identity_for", return_value=None), self.clock():
                 found = runner.production_match_for("CO-0801", "Credential Exposure", "New Product Onboarding")
-                self.assertEqual((found["status"], found["reason"]), ("not_checked", "production_inputs_not_prepared"))
+                self.assertEqual((found["status"], found["reason"]), ("not_checked", "co_identity_unreadable"))
         with self.clock():
             self.assertEqual(runner.production_match_for("not-a-co")["reason"], "production_inputs_not_prepared")
 

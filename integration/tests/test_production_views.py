@@ -267,7 +267,7 @@ class ProductionCheckTests(unittest.TestCase):
         self.assertEqual(self.check("uuid_not_in_clone")["label"], "UUID set, not in clone")
         chip = self.check("not_checked", reason="production_inputs_not_prepared")
         self.assertEqual((chip["label"], chip["blocked"]), ("Not checked", True))
-        self.assertIn("only prepared for CE-only", chip["reason"])
+        self.assertIn("could not be built", chip["reason"])
         self.assertNotIn("Clone", chip["label"] + chip["reason"].split("clone itself")[0])
 
     def test_anything_unexpected_is_blocked_never_clear(self):

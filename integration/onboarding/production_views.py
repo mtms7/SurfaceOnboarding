@@ -305,7 +305,8 @@ def create_state(records: dict[str, Any], co_reference: str, *, locked: bool) ->
 # --- Production checks chip -----------------------------------------------------------------------------------------
 
 NOT_CHECKED_TEXT = {
-    "production_inputs_not_prepared": "Production inputs are only prepared for CE-only COs; the clone itself is fine.",
+    "production_inputs_not_prepared": "The CO's production inputs (name, domains and plan) could not be built; the clone itself "
+                                      "is fine.",
     "co_source_unreadable": "The CO's name or domains could not be read; the clone itself is fine.",
     "co_identity_unreadable": "The CO (name, domains, Account UUID) could not be read from Salesforce; it is read again on a "
                               "later page. The clone itself is fine."}
@@ -351,6 +352,9 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
         return {**base, "code": "tenant_missing", "css": "chip-warn", "label": "Not in production"}
     if status == "not_in_production":
         return {**base, "code": "clear", "css": "chip-ok", "label": "Clear", "blocked": False}
+    if status == "region_not_checked":  # owner 2026-11-04: a US / IL CO is never cleared by the EU clone
+        return {**base, "code": "region_not_checked", "css": "chip-warn",
+                "label": "Region " + _text(match.get("region") or "unknown") + ": not checked"}
     if status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
         if live > 1:
             return {**base, "code": "live_paid", "css": "chip-bad", "label": "Live paid x " + str(live)}

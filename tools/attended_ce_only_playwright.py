@@ -584,6 +584,8 @@ class CeFillSource:
     salesforce_account_uuid: str = field(default="", repr=False, compare=False)
     # Every normalised email domain, primary first (owner 2026-11-03, CO-0814); empty means just ``email_domain``.
     email_domains: tuple[str, ...] = ()
+    # Surface_Tenant_Region__c as read (owner 2026-11-04: blank means EU; the production create covers EU only).
+    tenant_region: str = field(default="", compare=False)
 
 
 class RouteMismatch(RuntimeError):
@@ -606,7 +608,8 @@ def ce_fill_source(reference: str, early_activation: bool = False) -> CeFillSour
     try:
         rows = _sf_records(
             "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, "
-            "Email_Domains__c, Account_Country__c, Onboarding_Product__c, Onboarding_Type__c, Account_UUID__c "
+            "Email_Domains__c, Account_Country__c, Onboarding_Product__c, Onboarding_Type__c, Account_UUID__c, "
+            "Surface_Tenant_Region__c "
             "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
             raise ValueError()
@@ -647,7 +650,8 @@ def ce_fill_source(reference: str, early_activation: bool = False) -> CeFillSour
             names.tenant_name, names.primary_user_alias,
             salesforce_id_present=bool((row.get("Account_UUID__c") or "").strip()),
             salesforce_account_uuid=(row.get("Account_UUID__c") or "").strip()
-            if isinstance(row.get("Account_UUID__c"), str) else "", email_domains=domains)
+            if isinstance(row.get("Account_UUID__c"), str) else "", email_domains=domains,
+            tenant_region=row.get("Surface_Tenant_Region__c") if isinstance(row.get("Surface_Tenant_Region__c"), str) else "")
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("salesforce_fill_source_unavailable") from exc
 
@@ -1203,6 +1207,8 @@ class Case3FillSource:
     # The Account's "Technical Advisor" (Delivery_Engineer__c, a User lookup) name, shown on the dashboard only (owner 2026-10-21);
     # "" when absent or odd, never a guess.
     technical_advisor: str = field(default="", repr=False, compare=False)
+    # Surface_Tenant_Region__c as read (owner 2026-11-04: blank means EU; the production create covers EU only).
+    tenant_region: str = field(default="", compare=False)
 
     def __getattr__(self, name: str) -> Any:
         # Surface fields (reference, source_revision, tenant_name, ...) by delegation.
@@ -1237,7 +1243,7 @@ def read_case3_fill_source(reference: str, run_day: date | None = None) -> Case3
         rows = _sf_records(
             "SELECT Name, LastModifiedDate, Account__c, Account_Name__c, Account_Country__c, "
             "Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Onboarding_Product__c, Onboarding_Type__c, "
-            "Surface_Account_ID__c, Account_UUID__c, Onboarding_Approval_Status__c, "
+            "Surface_Account_ID__c, Account_UUID__c, Onboarding_Approval_Status__c, Surface_Tenant_Region__c, "
             "Account__r.Delivery_Engineer__r.Name "
             "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
@@ -1264,7 +1270,9 @@ def read_case3_fill_source(reference: str, run_day: date | None = None) -> Case3
                                salesforce_account_uuid=uuid.strip() if isinstance(uuid, str) else "",
                                salesforce_surface_account_id=(row.get("Surface_Account_ID__c") or "").strip()
                                if isinstance(row.get("Surface_Account_ID__c"), str) else "",
-                               technical_advisor=_person_name(row))
+                               technical_advisor=_person_name(row),
+                               tenant_region=row.get("Surface_Tenant_Region__c")
+                               if isinstance(row.get("Surface_Tenant_Region__c"), str) else "")
     except SurfaceSourceError:
         raise
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
@@ -8288,8 +8296,8 @@ def _identity_for(reference: str) -> dict[str, Any] | None:
     if not REFERENCE.fullmatch(reference):
         return None
     try:
-        rows = _sf_records("SELECT Name, Account_Name__c, Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Account_UUID__c "
-                           "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+        rows = _sf_records("SELECT Name, Account_Name__c, Main_Domain__c, Alternate_Domains__c, Email_Domains__c, Account_UUID__c, "
+                           "Surface_Tenant_Region__c FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
     except Exception:  # noqa: BLE001 - fail closed: the CO is then "not checked", never clear
         return None
     if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
@@ -8299,8 +8307,10 @@ def _identity_for(reference: str) -> dict[str, Any] | None:
     domains = tuple(dict.fromkeys(d for field in ("Main_Domain__c", "Alternate_Domains__c", "Email_Domains__c")
                                   for d in _domain_tokens(row.get(field))))
     uuid = row.get("Account_UUID__c")
+    region = row.get("Surface_Tenant_Region__c")  # owner 2026-11-04: blank means EU; the clone covers EU only
     return {"names": (" ".join(name.split()),) if isinstance(name, str) and name.strip() else (), "domains": domains,
-            "uuid": uuid.strip() if isinstance(uuid, str) and uuid.strip() else None}
+            "uuid": uuid.strip() if isinstance(uuid, str) and uuid.strip() else None,
+            "region": region if isinstance(region, str) else None}
 
 
 def _apply_verified_tenant(result: dict[str, Any], reference: str, uuid_value: Any, parent: Path | None = None) -> dict[str, Any]:
@@ -8369,9 +8379,13 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
         uuid_unread = identity is None and REFERENCE.fullmatch(reference) is not None
     if identity is not None and uuid_value is None and not state_paths.vm_mode():
         uuid_value = identity["uuid"] or ""
-    if uuid_unread:
+    identity_unread_fallback = (identity is None and (co_source is None or plan is None) and not state_paths.vm_mode()
+                                and not isinstance(snapshot, str) and REFERENCE.fullmatch(reference) is not None)
+    if uuid_unread or identity_unread_fallback:
         # Owner report 2026-11-02 (CO-0825): without the CO's own UUID a tenant missing from the clone showed as "Clear".
-        # A failed read of the CO is "not checked", never a match run as if the CO had no UUID.
+        # A failed read of the CO is "not checked", never a match run as if the CO had no UUID. Owner report 2026-11-04
+        # (CO-0816): the same holds when the plan cannot be built AND the identity read failed; before, that case reached
+        # production_match(None, ...) and showed the wrong reason "Production inputs are only prepared for CE-only COs".
         result = match.identity_match({}, snapshot, renewal=False)
     elif identity is not None and (co_source is None or plan is None):
         renewal = "renewal" in str(onboarding_type or "").casefold()
@@ -8384,7 +8398,10 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     if result["status"] == "not_checked" and result["reason"] == "co_source_unreadable":
         result["reason"] = "production_inputs_not_prepared"
     result["route"] = engine
-    return _apply_verified_tenant(result, reference, uuid_value)
+    result = _apply_verified_tenant(result, reference, uuid_value)
+    if isinstance(identity, dict) and "region" in identity:  # the desktop read carries the region; the VM snapshot does not yet
+        result = match.apply_region(result, identity["region"])
+    return result
 
 
 def _combine_duplicate(ui: str, api: str) -> str:
@@ -11593,6 +11610,13 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
     day = run_day or _run_day()
     try:
         source = read_source(reference)
+        from integration.onboarding import production_match as _region_rule
+
+        # Owner 2026-11-04: only EU (blank = EU) tenants are created here (https://app.pentera.io); US / IL are refused
+        # before any browser opens.
+        region_problem = _region_rule.region_problem(getattr(source, "tenant_region", ""))
+        if region_problem:
+            raise production_dry_run.MappingError(region_problem)
         if case3 and getattr(source, "tenant_name_unconfirmed", False):
             raise production_dry_run.MappingError("tenant_name_not_confirmed")  # docs/60: the owner confirms a long name first
         plan = _pdr_plan(route, source, day) if case3 else build_ce_only_fill(source, day)
@@ -11811,17 +11835,23 @@ def surface_renewal_intended(reference: str, run_day: date | None = None) -> tup
     try:
         rows = _sf_records(
             "SELECT Id, Name, LastModifiedDate, Account__c, Account_Name__c, Main_Domain__c, Onboarding_Product__c, "
-            "Onboarding_Type__c, Onboarding_Approval_Status__c, Onboarding_Stage__c, Surface_Account_ID__c, Account_UUID__c "
-            "FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
+            "Onboarding_Type__c, Onboarding_Approval_Status__c, Onboarding_Stage__c, Surface_Account_ID__c, Account_UUID__c, "
+            "Surface_Tenant_Region__c FROM Customer_Onboarding__c WHERE Name = '" + reference + "' LIMIT 2")
         if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
             raise ValueError()
         row = rows[0]
+        from integration.onboarding import production_match as _region_rule
+
+        if _region_rule.region_problem(row.get("Surface_Tenant_Region__c")):  # owner 2026-11-04: EU (blank) only
+            raise psr.RenewalRefused("surface_region_not_supported")
         account = row.get("Account__c")
         if not isinstance(account, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", account):
             raise ValueError()
         subscriptions = _sf_records(
             "SELECT Product_Full_Name__c, DealHub_Status__c, DealHub_Subscription_Start_Date__c, "
             "DealHub_Subscription_End_Date__c FROM DealHub_Subscription__c WHERE DealHub_Account__c = '" + account + "' LIMIT 100")
+    except psr.RenewalRefused:  # a ValueError subclass: the region refusal keeps its own code
+        raise
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         raise psr.RenewalRefused("renewal_source_unavailable") from None
     day = run_day or _run_day()

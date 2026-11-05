@@ -473,7 +473,8 @@ class LoginFlowTests(unittest.TestCase):
                         # Sign-out keeps the automation window: it also hosts the dashboard tab.
                         patch.object(dashboard, "close_automation_browser", side_effect=AssertionError("window stays"))):
             patcher.start(); self.addCleanup(patcher.stop)
-        for cleanup in (dashboard._login_attempt.clear, dashboard._dashboard_sessions.clear):
+        for cleanup in (dashboard._login_attempt.clear, dashboard._dashboard_sessions.clear,
+                        dashboard._active_session_cache.clear):
             cleanup(); self.addCleanup(cleanup)
         for system in ("salesforce", "leonardo"):
             self.addCleanup(dashboard.set_session_status, system, r.NOT_SIGNED_IN)
@@ -537,7 +538,9 @@ class LoginFlowTests(unittest.TestCase):
             self.assertEqual(self._request("GET", "/", [dashboard.SESSION_COOKIE + "=forged"])[:2], (303, "/login"))
         status, _, _, body = self._request("GET", "/login")
         self.assertEqual(status, 200)
-        self.assertIn("Sign in with Salesforce", body)
+        # Owner request 2026-11-04: a still-valid CLI session of the operator is offered first; a new sign-in stays available.
+        self.assertIn("Continue as milton.stevenson@pentera.io", body)
+        self.assertIn("Sign in with a new Salesforce session", body)
         self.assertNotIn("type='password'", body)
         self.assertNotIn('type="password"', body)
 
@@ -545,8 +548,8 @@ class LoginFlowTests(unittest.TestCase):
         _attempt, (status, location, cookies, _) = self._sign_in()
         self.assertEqual((status, location), (303, "/connection"))
         session = self._session(cookies)
-        # A fresh SSO each time: the alias's previous CLI session was ended before the browser sign-in.
-        self.assertEqual(self.quiet[0][:2], ("org", "logout"))
+        # Owner request 2026-11-04: the alias's CLI session is no longer ended before the browser sign-in.
+        self.assertEqual(self.quiet, [])
         self.assertEqual(self.workers, [])  # owner decision 2026-10-19: signing in starts no Leonardo work
         self.assertEqual(dashboard.session_statuses(include_runs=False)["salesforce"].state, SessionState.READY)
         status, _, _, body = self._request("GET", "/connection", [session])

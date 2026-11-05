@@ -1230,7 +1230,7 @@ def clear_display_cache() -> None:
 
 
 _QUEUE_WIDE_READS = frozenset({"queue_source_rows", "queue_start_dates", "closed_history"})
-_POSTS_KEEPING_DISPLAY_CACHE = frozenset({"/login/start", "/login/cancel", "/logout", "/attended/prepare-sessions",
+_POSTS_KEEPING_DISPLAY_CACHE = frozenset({"/login/start", "/login/cancel", "/login/continue", "/logout", "/attended/prepare-sessions",
                                           "/attended/session-recheck", "/attended/salesforce-login"})
 
 
@@ -2260,7 +2260,8 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
     if vm_mode():  # no live read on the VM: the published CO details already carry the comment (docs/41)
         return _snapshot_subscription_summaries(references)
     quoted = ", ".join(f"'{reference}'" for reference in references)
-    response = sf_json(["data", "query", "--query", "SELECT Name, Onboarding_Comments__c FROM Customer_Onboarding__c WHERE Name IN (" + quoted + ")", "--json"])
+    response = sf_json(["data", "query", "--query", "SELECT Name, Onboarding_Comments__c, Account_UUID__c FROM Customer_Onboarding__c "
+                        "WHERE Name IN (" + quoted + ")", "--json"])
     try:
         records = response["result"]["records"]  # type: ignore[index]
         if response["status"] != 0 or not isinstance(records, list) or len(records) != len(references):
@@ -2272,6 +2273,13 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
             if (not isinstance(reference, str) or reference not in references or reference in summaries
                     or (comment is not None and not isinstance(comment, str))):
                 raise ReadUnavailable()
+            # Same read, no extra Salesforce call (owner report 2026-11-04, CO-0816): only whether the CO holds an Account
+            # UUID is kept (a bool, never the value); a record without the field leaves the CO unknown.
+            if "Account_UUID__c" in record:
+                uuid_value = record["Account_UUID__c"]
+                QUEUE_UUID_SET[reference] = isinstance(uuid_value, str) and bool(uuid_value.strip())
+            else:
+                QUEUE_UUID_SET.pop(reference, None)
             parsed = extract_dealhub_dates(comment)
             if parsed["ready_for_cse_review"]:
                 summaries[reference] = {
@@ -3250,6 +3258,9 @@ def queue_start_dates(references: tuple[str, ...]) -> dict[str, str]:
 # The DealHub end per CO from the last ``queue_start_dates`` read (owner request 2026-11-03: a renewal whose tenant already
 # runs to that end is done, not "overdue" from a start years ago, CO-0834). Display only.
 QUEUE_END_DATES: dict[str, str] = {}
+# Whether each CO held an Account UUID in the last ``subscription_summaries`` read (owner report 2026-11-04, CO-0816: a CO
+# at User Created with a UUID showed "Not created" / "overdue" because its own identity read had failed). Display only.
+QUEUE_UUID_SET: dict[str, bool] = {}
 
 
 def _start_cell(start: str | None, key: str, today: date) -> str:
@@ -4853,6 +4864,7 @@ RUNNER_RESULT_MESSAGES: dict[str, tuple[str, str]] = {
     "readback_write_unavailable": ("blocked", "The read-back evidence could not be written to the local file."),
     "playwright_runtime_unavailable": ("blocked", "The Playwright runtime was unavailable."),
     "salesforce_fill_source_unavailable": ("blocked", "The Salesforce source could not be read."),
+    "surface_region_not_supported": ("blocked", "Surface Tenant Region is US or IL in Salesforce: this automation creates and renews EU tenants only (https://app.pentera.io). Nothing was started; use BackOffice in that region."),
     "attended_ce_runner_unavailable": ("blocked", "The runner encountered an unexpected error."),
     "leonardo_profile_unavailable": ("blocked", "The dedicated automation profile could not be created. Free the path or reset the session."),
     "browser_tab_unavailable": ("blocked", "The automation browser did not open a new tab. No tenant was created or changed. Close the automation browser and retry."),
@@ -6491,11 +6503,23 @@ def _fresh_match(match: Any, now: datetime | None = None) -> Any:
     return {**match, "age_seconds": max(0, int(age))}
 
 
+def _forget_display(name: str, *args: Any) -> None:
+    """Drop one cached display value so the next page computes it again."""
+    with _display_cache_lock:
+        _display_cache.pop((name, *args), None)
+
+
 def _match_of(reference: str, product: str | None, onboarding_type: str | None) -> dict[str, Any]:
+    stamp = _match_stamp()
     try:
-        return _fresh_match(production_match_display(reference, product or "", onboarding_type or "", _match_stamp()))
+        match = production_match_display(reference, product or "", onboarding_type or "", stamp)
     except Exception:  # noqa: BLE001 - a failed read never clears a CO: it shows as unavailable
         return _unreadable_match()
+    if isinstance(match, dict) and match.get("status") == "not_checked" and match.get("reason") == "co_identity_unreadable":
+        # Owner report 2026-11-04 (CO-0816): a failed Salesforce read is shown once, never kept for the match TTL; the next
+        # page reads the CO again.
+        _forget_display("production_match_display", reference, product or "", onboarding_type or "", stamp)
+    return _fresh_match(match)
 
 
 def _match_chip(status: str) -> str:
@@ -7374,6 +7398,20 @@ def hand_entered_onboarded(check: dict[str, Any] | None, stage: str | None) -> b
     return bool(check and check["code"] in ("onboarded", "uuid_not_in_clone")) and stage in _ONBOARDED_STAGES
 
 
+# A clone check that could not decide (a failed read, an unusable or stale clone). It never names a duplicate, so a CO whose
+# Salesforce row already holds an Account UUID past approval is shown onboarded, "not verified" (owner report 2026-11-04).
+_UNDECIDED_CHECKS = frozenset({"not_checked", "unavailable", "clone_stale", "region_not_checked"})
+
+
+def onboarded_unverified(check: dict[str, Any] | None, stage: str | None, uuid_set: bool | None) -> bool:
+    """Pure: Salesforce says onboarded (Account UUID set, stage past approval) while the clone check could not decide.
+
+    ``uuid_set`` is True only when the queue's own Salesforce read saw a UUID; None (unknown) or False never counts. A
+    check that found anything (duplicate, live paid, ambiguous, clear) is never overridden. Display only: the create gate
+    refuses any CO that already holds a UUID."""
+    return uuid_set is True and stage in _ONBOARDED_STAGES and bool(check) and check["code"] in _UNDECIDED_CHECKS
+
+
 def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> str:
     """The production landing (``/`` and ``/onboard``): every open CO with its production checks, approval and create state.
 
@@ -7409,11 +7447,13 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         renewed = bool(coverage and coverage["state"] == "renewed")
         approval = production_views.pick_approval(approvals, ref)
         create = production_views.create_state(records, ref, locked=locked and not vm_mode())  # the header chip already says the VM cannot create
-        hand_entered = hand_entered_onboarded(check, row.get("Onboarding_Stage__c"))
+        unverified = (starts is not None
+                      and onboarded_unverified(check, row.get("Onboarding_Stage__c"), QUEUE_UUID_SET.get(ref)))
+        hand_entered = hand_entered_onboarded(check, row.get("Onboarding_Stage__c")) or unverified
         created = (create["code"] in production_views.CREATED_OUTCOMES or bool(check and check["code"] == "onboarded")
                    or hand_entered or renewed)
         items.append({"row": row, "ref": ref, "supported": supported, "check": check, "approval": approval, "create": create,
-                      "hand_entered": hand_entered, "coverage": coverage,
+                      "hand_entered": hand_entered, "unverified": unverified, "coverage": coverage,
                       "flags": {"blocked": supported and bool(check and check["blocked"]) and not hand_entered,
                                 "ready": supported and bool(check) and not check["blocked"] and not created,
                                 "approved": supported and approval["state"] == "valid", "created": created}})
@@ -7490,6 +7530,10 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                 checks = (_chip("chip-ok", "Onboarded (UUID in Salesforce)") + "<span class='sub'>Account UUID set in Salesforce, "
                           "stage " + escape(str(row.get("Onboarding_Stage__c"))) + "; the tenant is not in the clone yet (the "
                           "clone may be older than the create). Do not create another.</span>")
+            elif not created_here and item["unverified"]:
+                checks = (_chip("chip-warn", "Onboarded (UUID in Salesforce), not verified") + "<span class='sub'>Account UUID "
+                          "set in Salesforce, stage " + escape(str(row.get("Onboarding_Stage__c"))) + "; the clone check could "
+                          "not run: " + escape(check["reason"] or check["label"]) + " Do not create another.</span>")
             if route_for(row) == CE_ENGINE:
                 cached = peek_display_cache("production_review_inputs_display", ref, product or None, kind or None)
                 note = ce_domains_note(((cached or {}).get("co_source") or {}).get("domains")) if isinstance(cached, dict) else ""
@@ -8272,6 +8316,7 @@ LOGIN_REASON_TEXT = {
     "salesforce_wrong_org": "That sign-in belongs to a different Salesforce org. Its CLI session was ended.",
     "desktop_runtime_required": "Sign-in is only available on the attended Windows desktop.",
     "run_in_progress": "An attended run is in progress. Sign out after it finishes.",
+    "salesforce_session_inactive": "The Salesforce CLI session is no longer active. Sign in with Salesforce instead.",
 }
 
 
@@ -9455,8 +9500,9 @@ def start_dashboard_login() -> tuple[str | None, str | None]:
         if salesforce_login_port_busy():
             # Checked before the logout: a refused start leaves the current session untouched.
             return None, "salesforce_login_port_busy"
-        # A fresh SSO + MFA every time: the previous CLI session for the alias is ended first.
-        _sf_quiet("org", "logout", "--target-org", salesforce_target_org(), "--no-prompt")
+        # Owner request 2026-11-04: the existing CLI session is no longer signed out first; a new web sign-in replaces it
+        # (Chrome's own OneLogin session then decides whether SSO / MFA is asked again). A foreign or wrong-org session is
+        # still ended after the sign-in (finish_dashboard_login).
         try:
             process = subprocess.Popen([salesforce_cli_command(), "org", "login", "web", "--alias", salesforce_target_org(),
                                         "--browser", salesforce_login_browser()],
@@ -9530,6 +9576,49 @@ def finish_dashboard_login(attempt_token: str | None) -> tuple[str, str | None]:
     return "signed_in", session
 
 
+ACTIVE_SESSION_CACHE_SECONDS = 60
+_active_session_cache: dict[str, Any] = {}  # "at" (monotonic), "operator" (str | None); never a token
+
+
+def active_salesforce_operator(*, fresh: bool = False) -> str | None:
+    """The allowed operator of the pinned alias's STILL VALID Salesforce CLI session, else None (owner request 2026-11-04:
+    reuse the active session instead of a new SSO). One read-only userinfo call, the same identity rules as a new sign-in
+    (allowed operator, pinned org); only the operator label is kept, for ``ACTIVE_SESSION_CACHE_SECONDS``, for the login
+    page. Desktop only."""
+    if not login_required() or vm_mode():
+        return None
+    now = monotonic()
+    with _login_lock:
+        if not fresh and _active_session_cache and now - _active_session_cache["at"] < ACTIVE_SESSION_CACHE_SECONDS:
+            return _active_session_cache["operator"]
+    allowed = readiness.allowed_operators(os.environ.get("SURFACE_DASHBOARD_ALLOWED_USERS"))
+    userinfo = salesforce_userinfo()
+    operator = None
+    if userinfo is not None and readiness.identity_problem(userinfo, allowed,
+                                                          os.environ.get("SURFACE_SF_EXPECTED_ORG_ID")) is None:
+        operator = readiness.operator_label(userinfo, allowed)  # type: ignore[arg-type]
+    with _login_lock:
+        _active_session_cache.update(at=monotonic(), operator=operator)
+    return operator
+
+
+def continue_dashboard_login() -> tuple[str, str | None]:
+    """("signed_in", session token) when the CLI session is still valid for an allowed operator in the pinned org (checked
+    fresh, never from the page cache); else ("failed", reason). No browser, no new SSO, no CLI sign-out."""
+    with _login_lock:
+        process = _login_attempt.get("process")
+        if process is not None and process.poll() is None:
+            return "failed", "login_in_progress"
+    operator = active_salesforce_operator(fresh=True)
+    if operator is None:
+        return "failed", "salesforce_session_inactive"
+    session = token_urlsafe(32)
+    with _login_lock:
+        _dashboard_sessions[session] = (monotonic() + DASHBOARD_SESSION_SECONDS, operator)
+    set_session_status("salesforce", SessionStatus(SessionState.READY, "salesforce_ready", readiness_now()))
+    return "signed_in", session
+
+
 def end_dashboard_session(cookie_header: str | None) -> str | None:
     """Sign out: the dashboard session and the alias's CLI session. Refused mid-run.
 
@@ -9543,6 +9632,8 @@ def end_dashboard_session(cookie_header: str | None) -> str | None:
         if token:
             _dashboard_sessions.pop(token, None)
     _sf_quiet("org", "logout", "--target-org", salesforce_target_org(), "--no-prompt")
+    with _login_lock:
+        _active_session_cache.clear()
     set_session_status("salesforce", readiness.NOT_SIGNED_IN)
     set_session_status("leonardo", readiness.NOT_SIGNED_IN)
     return None
@@ -9580,8 +9671,9 @@ def preflight_snapshot() -> dict[str, Any]:
         return dict(_preflight)
 
 
-def page_login(state: str = "", reason: str | None = None) -> str:
-    """The sign-in page: Salesforce SSO only; the dashboard never sees a password."""
+def page_login(state: str = "", reason: str | None = None, active_operator: str | None = None) -> str:
+    """The sign-in page: Salesforce SSO only; the dashboard never sees a password. With ``active_operator`` (the CLI session
+    is still valid for that allowed operator) it offers "Continue as ..." first (owner request 2026-11-04)."""
     pending = state == "pending"
     banner = ""
     if pending:
@@ -9595,8 +9687,14 @@ def page_login(state: str = "", reason: str | None = None) -> str:
     reset_url = os.environ.get("SURFACE_PASSWORD_RESET_URL", "")
     reset = ("<a href='" + escape(reset_url) + "' rel='noreferrer'>Pentera's password reset page</a>"
              if re.fullmatch(r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~/?=&%-]*)?", reset_url) else "Pentera's standard SSO password reset")
-    form = ("" if pending else "<form method='post' action='/login/start'><button type='submit'>Sign in with Salesforce"
-            "</button></form>")
+    form = ("" if pending else "<form method='post' action='/login/start'><button type='submit'"
+            + (" class='ghost'" if active_operator else "") + ">"
+            + ("Sign in with a new Salesforce session" if active_operator else "Sign in with Salesforce") + "</button></form>")
+    if active_operator and not pending:
+        form = ("<p><strong>Salesforce session active</strong> for " + escape(active_operator) + " (the dashboard's CLI "
+                "session is still valid). Continue without signing in again.</p>"
+                "<form method='post' action='/login/continue'><button type='submit'>Continue as " + escape(active_operator)
+                + "</button></form>" + form)
     body = (
         "<div class='page-head'><h1>Sign in</h1></div><section class='card'>" + banner +
         "<p>Sign in with your Pentera Salesforce account (SSO and MFA). Only the operators configured on this desktop "
@@ -9783,7 +9881,8 @@ class Handler(BaseHTTPRequestHandler):
                 SESSION_COOKIE + "=" + str(value) + "; Path=/" + cookie_attributes() + "; Max-Age=" + str(DASHBOARD_SESSION_SECONDS),
                 clear_attempt])
             return
-        self.send_page(HTTPStatus.OK, page_login(state, value))
+        active = active_salesforce_operator() if state in ("none", "failed") else None
+        self.send_page(HTTPStatus.OK, page_login(state, value, active))
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
@@ -9938,6 +10037,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/login/cancel":
             cancel_dashboard_login(_cookie(cookie_header, ATTEMPT_COOKIE))
             self.send_redirect("/login"); return
+        if path == "/login/continue":
+            state, value = continue_dashboard_login()
+            if state != "signed_in":
+                self.send_page(HTTPStatus.CONFLICT, page_login("failed", value)); return
+            self.send_redirect_with_cookies("/connection", [
+                SESSION_COOKIE + "=" + str(value) + "; Path=/" + cookie_attributes() + "; Max-Age="
+                + str(DASHBOARD_SESSION_SECONDS)])
+            return
         token, reason = start_dashboard_login()
         if token is None:
             self.send_page(HTTPStatus.CONFLICT, page_login("failed", reason)); return
@@ -10205,14 +10312,14 @@ class Handler(BaseHTTPRequestHandler):
             if role != ROLE_OPERATOR:
                 self._vm_refuse(HTTPStatus.FORBIDDEN, "Read-only access",
                                 "Viewers cannot change anything. Nothing was started or recorded."); return
-            if path in ("/login/start", "/login/cancel"):
+            if path in ("/login/start", "/login/cancel", "/login/continue"):
                 self._vm_refuse(HTTPStatus.SERVICE_UNAVAILABLE, "Sign-in unavailable",
                                 "Sign-in is handled by the single sign-on proxy on this VM, not by the dashboard."); return
             if path not in VM_OPERATOR_POSTS and not (path == REMOTE_START_PATH and vm_remote_start_enabled()):
                 self._vm_refuse(HTTPStatus.FORBIDDEN, "Not available on the VM",
                                 "The VM dashboard is read-only in phase 1: runs start from the owner's Windows desktop. "
                                 "Nothing was started or changed."); return
-        if path in ("/login/start", "/login/cancel"):
+        if path in ("/login/start", "/login/cancel", "/login/continue"):
             self._post_login(path); return
         if login_required() and dashboard_operator(self.headers.get("Cookie")) is None:
             # Not signed in: no form parse, Salesforce read, or launch.

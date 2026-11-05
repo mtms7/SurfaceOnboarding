@@ -152,7 +152,7 @@ class ProductionMatchForTests(unittest.TestCase):
     def test_an_unreadable_identity_stays_not_checked_never_clear(self):
         found = self.run_for(expectation=self.boom, ident=None)
         self.assertEqual(found["status"], "not_checked")
-        self.assertEqual(found["reason"], "production_inputs_not_prepared")
+        self.assertEqual(found["reason"], "co_identity_unreadable")  # 2026-11-04: the honest reason (CO-0816)
 
     def test_a_full_match_still_wins_when_the_inputs_exist(self):
         co = {"tenant_names": ("Acme",), "domains": ("acme.example",)}

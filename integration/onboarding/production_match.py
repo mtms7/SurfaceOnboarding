@@ -33,10 +33,45 @@ from integration.onboarding.leonardo_inventory import (
     load_latest)
 
 STATUSES = ("clone_unavailable", "not_checked", "onboarded", "uuid_not_in_clone", "not_in_production", "exists_other", "ambiguous", "exists_matches", "exists_differs",
-            "tenant_found", "tenant_missing")
+            "tenant_found", "tenant_missing", "region_not_checked")
 REQUIRED_FIELDS = ("tenant_name", "primary_domain", "alternate_domains", "license_type", "license_end")
 NOT_A_CLEARANCE = "No tenant found. This is not a clearance: the clone can lag up to a day."
 MAX_LISTED = 8
+
+# Surface Tenant Region (Salesforce Customer_Onboarding__c.Surface_Tenant_Region__c, picklist US / EU / IL; owner 2026-11-04):
+# blank means EU, the default. The clone (Redash "Prod (Cloned) - Mgmt") and the production create cover EU only.
+CLONE_REGION = "EU"
+REGION_ORIGINS = {"EU": "https://app.pentera.io", "US": "https://us.app.pentera.io", "IL": "https://il.app.pentera.io"}
+# A result that would read as "no tenant / tenant found" in the EU clone says nothing about another region's tenants.
+_REGION_UNDECIDED = frozenset({"not_in_production", "uuid_not_in_clone", "tenant_missing", "tenant_found"})
+
+
+def region_of(value: Any) -> str | None:
+    """"EU" for blank / None (owner rule: blank means EU), the known code for EU / US / IL, None for anything else
+    (an unknown value is never treated as EU). Pure."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return CLONE_REGION
+    code = value.strip().upper() if isinstance(value, str) else ""
+    return code if code in REGION_ORIGINS else None
+
+
+def region_problem(value: Any) -> str | None:
+    """None when the CO's region is the one the clone and the create cover (EU or blank), else
+    ``surface_region_not_supported``. Pure."""
+    return None if region_of(value) == CLONE_REGION else "surface_region_not_supported"
+
+
+def apply_region(result: dict[str, Any], region_value: Any) -> dict[str, Any]:
+    """A CO outside the EU region is never cleared (or "found") by the EU clone: such a result becomes
+    ``region_not_checked`` (blocking). Results that block anyway, and ``onboarded`` (the CO's own UUID found), stay. Pure."""
+    region = region_of(region_value)
+    if region == CLONE_REGION or not isinstance(result, dict) or result.get("status") not in _REGION_UNDECIDED:
+        return result
+    origin = REGION_ORIGINS.get(region or "", "")
+    label = region or "unknown"
+    reason = ("Surface Tenant Region " + label + (" (" + origin + ")" if origin else "") + ": the clone holds EU tenants only "
+              "(https://app.pentera.io), so this CO was not checked. Check BackOffice in its region.")
+    return {**result, "status": "region_not_checked", "reason": reason, "region": label, "region_was": result.get("status")}
 
 
 def load_snapshot(root: Any, now: datetime, max_age: timedelta = PRODUCTION_GATE_MAX_AGE) -> Mapping[str, Any] | str:

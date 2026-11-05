@@ -122,6 +122,7 @@ KNOWN_REASONS = frozenset({
     "approval_ref_mismatch", "approval_revision_drift", "approval_unreadable", "approval_missing", "approval_consumed",
     "approval_expired", "approval_co_mismatch", "approval_route_mismatch", "approval_locked", "approval_locked_stale",
     "route_not_ce_only_new", "salesforce_email_domain_not_single", "salesforce_source_mismatch",
+    "surface_region_not_supported",  # owner 2026-11-04: only EU (blank) tenants are created on app.pentera.io
     "salesforce_prior_uuid_present", "clone_missing", "clone_stale", "clone_mismatch", "duplicate_in_production",
     "multiple_live_paid_tenants", "timing_window_not_met", "sessions_not_ready", "schema_unexpected",
     "dry_run_flag_invalid", "form_fill_failed", "form_verification_failed", "clock_unavailable", "record_write_failed",

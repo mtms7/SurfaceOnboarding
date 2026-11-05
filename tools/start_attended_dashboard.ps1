@@ -139,12 +139,19 @@ if (-not $ExpectedOrgId) {
     Write-Warning 'No expected Salesforce org Id is configured. The dashboard will show "org not pinned" and refuse Start/Validate until -ExpectedOrgId (or the org-id file) is set.'
 }
 
-if (-not (Test-SalesforceCliSession)) {
+$salesforceSessionActive = Test-SalesforceCliSession
+if (-not $salesforceSessionActive) {
     if ($NoLogin) {
         Write-Host 'No usable Salesforce CLI session is available. The dashboard will start and show its attended Salesforce sign-in action.'
     } else {
         Write-Host 'No usable Salesforce CLI session is available. The dashboard will start and offer the attended browser SSO/MFA sign-in action.'
     }
+}
+# Owner request 2026-11-04: the saved BackOffice session in the automation profile is reused until it expires (never the
+# operator's own Chrome profile; nothing is copied). This line only reports whether that profile exists.
+$backofficeProfile = Join-Path $env:LOCALAPPDATA 'SurfaceOnboarding\backoffice-production-automation'
+if ($ProductionSessions -and (Test-Path -LiteralPath $backofficeProfile)) {
+    Write-Host 'BackOffice: the automation profile keeps its saved sign-in; SSO/MFA is asked only when that session has expired.'
 }
 
 $listeners = @(Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
@@ -233,4 +240,8 @@ if (-not $NoBrowser) {
         Start-Process "http://127.0.0.1:$Port/login"
     }
 }
-Write-Host "Next: select Sign in with Salesforce (OneLogin SSO and MFA) at http://127.0.0.1:$Port/login."
+if ($salesforceSessionActive) {
+    Write-Host "Next: the Salesforce session is still active; select Continue at http://127.0.0.1:$Port/login (no new SSO/MFA)."
+} else {
+    Write-Host "Next: select Sign in with Salesforce (OneLogin SSO and MFA) at http://127.0.0.1:$Port/login."
+}
