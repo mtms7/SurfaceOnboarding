@@ -154,6 +154,15 @@ def edit_request_id(method: object, url: object) -> str | None:
     return found.group(1) if found else None
 
 
+def scan_now_request_id(method: object, url: object) -> str | None:
+    """The tenant id of a POST to the exact production "Scan now" path (query ignored), else None (owner request 2026-11-05)."""
+    from . import production_case3_scan_now as scan_now
+
+    if production_probe.url_origin(url) != production_probe.PRODUCTION_ORIGIN:
+        return None
+    return scan_now.request_id(method, production_probe.url_path(url) or "")
+
+
 def live_request_decision(method: str, url: str, *, armed: bool, post_data: object = None) -> tuple[bool, str]:
     """(allowed, reason): the dry-run table (a table POST needs a validated read body), plus the create POST while ``armed``.
     Everything else is aborted."""
@@ -183,6 +192,11 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         self.edit_armed = False
         self.edit_used = False
         self.edit_blocked = 0
+        # The one "Scan now" after a verified Case 3 create (owner request 2026-11-05): its own arm, one tenant id, one request.
+        self.scan_target: str | None = None
+        self.scan_armed = False
+        self.scan_used = False
+        self.scan_blocked = 0
 
     def install(self, page: Any) -> None:
         """Route the PAGE exactly like the dry-run guard (``page.route("**/*")``, proven live in dry runs #5-#7) and count
@@ -227,6 +241,10 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         if edit is not None:
             self._handle_edit(route, method, url, edit)
             return
+        scan = scan_now_request_id(method, url)
+        if scan is not None:
+            self._handle_scan_now(route, method, url, scan)
+            return
         if not is_create_request(method, url):
             super().handle(route)
             return
@@ -266,6 +284,26 @@ class LiveRequestGuard(production_dry_run.DryRunRequestGuard):
         entry["count"] += 1
         route.continue_()
 
+    def arm_scan_now(self, account_id: str) -> None:
+        """Allow ONE "Scan now" POST for ``account_id`` (only after the create was used; never a second one)."""
+        if self.create_used and not self.scan_used and isinstance(account_id, str):
+            self.scan_target, self.scan_armed = account_id, True
+
+    def disarm_scan_now(self) -> None:
+        self.scan_armed = False
+
+    def _handle_scan_now(self, route: Any, method: str, url: str, account_id: str) -> None:
+        where = self._where(url)
+        if not (self.scan_armed and not self.scan_used and account_id == self.scan_target):
+            self.blocked[(method, where)] = self.blocked.get((method, where), 0) + 1
+            self.scan_blocked += 1
+            route.abort()
+            return
+        self.scan_used, self.scan_armed = True, False  # disarmed before it is continued: a repeat is aborted and counted
+        entry = self.api_calls.setdefault((method, where), {"count": 0, "statuses": set()})
+        entry["count"] += 1
+        route.continue_()
+
     def payload_mismatches(self) -> list[str]:
         """Field NAMES where the captured create body differs from ``expected_payload`` (docs/49 s.1); never values."""
         if not isinstance(self.expected_payload, Mapping):
@@ -298,6 +336,9 @@ class RenewalEditGuard(LiveRequestGuard):
     def arm_edit(self, account_id: str) -> None:
         if not self.create_used and not self.edit_used and isinstance(account_id, str):
             self.edit_target, self.edit_armed = account_id, True
+
+    def arm_scan_now(self, account_id: str) -> None:
+        self.scan_armed = False  # a renewal never starts a scan
 
 
 # --- Click log: the one Confirm ----------------------------------------------------------------------------------------

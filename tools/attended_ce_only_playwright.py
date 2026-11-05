@@ -11288,7 +11288,7 @@ def _pcr_pick_operator(page: Any, operator: str) -> str | None:
 
 
 def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_row: dict[str, Any], account_id: str,
-                    operator: str | None, record: Any) -> str:
+                    operator: str | None, record: Any, diag: dict[str, str] | None = None) -> str:
     """The one Edit Account after a verified Case 3 create (owner go 2026-11-02): Operator "<Technical Advisor> Operator" and
     Maximum scan Duration 90, then ONE Confirm and a row re-read (``production_case3_edit``).
 
@@ -11324,6 +11324,13 @@ def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_ro
                 break
             page.wait_for_timeout(500)
         else:
+            if diag is not None:  # CO-0841 2026-11-05: which part never showed (counts only, never page text)
+                try:
+                    diag.update(confirm_buttons=str(confirm.count()),
+                                operator_inputs=str(page.locator(OPERATOR_ACCOUNT_INPUT_SELECTOR).count()),
+                                dialogs=str(page.get_by_role("dialog").count()))
+                except Exception:
+                    pass
             return stop("edit_form_unavailable")
     except Exception:
         return stop("edit_form_unavailable")
@@ -11397,12 +11404,137 @@ def _pcr_case3_edit_step(page: Any, guard: Any, parent: Path, reference: str, in
     if not isinstance(account_id, str) or not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, account_id):
         result = "edit_account_id_unknown"
     else:
+        diag: dict[str, str] = {}
         try:
-            result = _pcr_case3_edit(page, guard, intended, strict_state["expected"], account_id, operator, record)
+            result = _pcr_case3_edit(page, guard, intended, strict_state["expected"], account_id, operator, record, diag)
         except Exception:
             result = "edit_failed"
+        detail.update(diag)
     if result == edit.VERIFIED and operator is None:
         result = "edit_operator_unknown"  # 90 is set; the operator is left for the Technical Advisor
+    try:
+        record(result)
+    except Exception:
+        pass
+    return result
+
+
+PCR_SCAN_NOW_RESPONSE_MS = 20_000
+PCR_SCAN_NOW_REREADS = 8
+
+
+def _pcr_case3_scan_now(page: Any, guard: Any, intended: dict[str, Any], account_id: str, record: Any,
+                        diag: dict[str, str]) -> str:
+    """The one "Scan now" after a verified Case 3 create (owner request 2026-11-05, CO-0841): the tenant's row menu item
+    "Scan now", exactly like the owner's manual start. Same tenant only (row found by name and domain, carrying the verified
+    Account ID); the guard lets exactly one ``POST /account/{that id}/campaign/executeReconCampaign`` through. Skipped when the
+    row already shows a scan. Never clicked twice; the result is recorded."""
+    from integration.onboarding import production_case3_scan_now as scan_now
+    from integration.onboarding import production_contract
+    from integration.onboarding import production_create_live as live
+
+    name = intended["tenant_name"]
+
+    def row() -> Any:
+        reply = _pdr_reader(page, in_app=False).readback(name)
+        status = reply.get("status") if isinstance(reply, dict) else None
+        if status in (401, 403):
+            raise RuntimeError("scan_now_session_expired")
+        rows = reply.get("rows") if isinstance(reply, dict) else None
+        if status != 200 or not isinstance(rows, list):
+            raise RuntimeError("scan_now_row_unavailable")
+        found, _code = production_contract.select_unique_row(rows, str(name), str(intended.get("primary_domain") or ""))
+        if found is None or found.get("id") != account_id:
+            raise RuntimeError("scan_now_row_not_found")
+        return found
+
+    try:
+        if scan_now.started(row()):
+            return scan_now.ALREADY
+    except RuntimeError as error:
+        return str(error)
+    except Exception:
+        return "scan_now_row_unavailable"
+    label = re.compile(r"^\s*" + re.escape(scan_now.MENU_LABEL) + r"\s*$", re.IGNORECASE)
+    try:  # the row, its menu, then exactly one item whose text is "Scan now" and whose token names nothing destructive
+        page.locator("tr, [role='row']").filter(has_text=name).first.click(timeout=FIELD_TIMEOUT_MS)
+        page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
+        items = page.locator(ROW_MENU_ITEMS_SELECTOR).filter(has_text=label)
+        for _ in range(6):
+            if items.count():
+                break
+            page.wait_for_timeout(500)
+        count = items.count()
+        if count != 1:
+            try:
+                tokens = [token for token in page.locator(ROW_MENU_ITEMS_SELECTOR).evaluate_all(
+                    "els => els.map(e => e.getAttribute('data-am'))") if scan_now.menu_token_allowed(token)]
+                diag["menu_items"] = ",".join(tokens)[:300]  # grid tokens only (Button-Grid_...), never row text
+            except Exception:
+                pass
+            page.keyboard.press("Escape")
+            return "scan_now_item_not_found" if count == 0 else "scan_now_item_ambiguous"
+        token = items.first.get_attribute("data-am")
+        diag["menu_item"] = token if isinstance(token, str) and scan_now.MENU_TOKEN.fullmatch(token) else "unreadable"
+        if not scan_now.menu_token_allowed(token):
+            page.keyboard.press("Escape")
+            return "scan_now_item_not_allowed"
+    except Exception:
+        return "scan_now_menu_unavailable"
+    try:
+        record("write_started")
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return "scan_now_record_failed"
+    guard.arm_scan_now(account_id)
+    try:
+        with page.expect_response(lambda r: live.scan_now_request_id(r.request.method, r.url) is not None,
+                                  timeout=PCR_SCAN_NOW_RESPONSE_MS) as info:
+            items.first.click(timeout=FIELD_TIMEOUT_MS)
+        response = info.value
+    except Exception:
+        return "scan_now_id_mismatch" if guard.scan_blocked else "scan_now_no_signal"  # never clicked again
+    finally:
+        guard.disarm_scan_now()
+    problem = scan_now.response_problem(response.request.method, live.scan_now_request_id(response.request.method, response.url),
+                                        response.status, account_id)
+    if problem:
+        return problem
+    for _ in range(PCR_SCAN_NOW_REREADS):
+        page.wait_for_timeout(2_000)
+        try:
+            if scan_now.started(row()):
+                return scan_now.VERIFIED
+        except Exception:
+            continue
+    return "scan_now_unverified"
+
+
+def _pcr_case3_scan_now_step(page: Any, guard: Any, parent: Path, reference: str, intended: dict[str, Any],
+                             strict_state: dict[str, Any], edit_result: str, stamp: Any) -> str:
+    """Run ``_pcr_case3_scan_now`` once after the post-create Edit Account and record its result (never raises). Skipped
+    (recorded) when the Edit form may still be open: a click on the page then could land in that form."""
+    from integration.onboarding import case3_followup
+    from integration.onboarding import production_case3_scan_now as scan_now
+
+    detail: dict[str, str] = {}
+
+    def record(result: str) -> None:
+        case3_followup._record(parent, reference, scan_now.STEP, result, stamp(), detail)
+
+    account_id = strict_state.get("account_id")
+    if not isinstance(account_id, str) or not re.fullmatch(SURFACE_ACCOUNT_ID_PATTERN, account_id):
+        result = "scan_now_account_id_unknown"
+    elif str(edit_result).endswith("_form_left_open"):
+        result = "scan_now_skipped_form_open"
+    else:
+        try:
+            result = _pcr_case3_scan_now(page, guard, intended, account_id, record, detail)
+        except Exception:
+            result = "scan_now_failed"
     try:
         record(result)
     except Exception:
@@ -11822,7 +11954,9 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
 
             result = run_live(final, fill, click, read, duplicate_check, form_recheck)
             if case3 and result.outcome == production_create.OUTCOME_VERIFIED:
-                _pcr_case3_edit_step(page, guard, parent, reference, contract_intended, strict_state, source, stamp)
+                edit_result = _pcr_case3_edit_step(page, guard, parent, reference, contract_intended, strict_state, source,
+                                                   stamp)
+                _pcr_case3_scan_now_step(page, guard, parent, reference, contract_intended, strict_state, edit_result, stamp)
             if clicks.confirm_clicks == 0 and production_dry_run.CLICK_OPEN_CREATE_FORM in clicks.kinds:
                 # Nothing was confirmed: leave no half-filled form behind (Cancel, never Confirm).
                 if not _pdr_close_form(page, clicks):

@@ -7641,6 +7641,14 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             create_cell = (_chip("chip-neutral", "Created by hand") if item["hand_entered"] and not created_here
                            and item["create"]["code"] not in production_views.CREATED_OUTCOMES
                            else _chip(item["create"]["css"], item["create"]["label"]))
+            if route_for(row) == CASE3_ENGINE and item["create"]["code"] in production_views.CREATED_OUTCOMES:
+                try:  # owner request 2026-11-05 (CO-0841): what the run could not finish in BackOffice, on the queue too
+                    actions = case3_followup.action_items(production_records_parent(), ref)
+                except Exception:  # noqa: BLE001 - unreadable follow-up log: the CO page shows the details
+                    actions = []
+                if actions:
+                    create_cell += (_chip("chip-warn", "Action needed in BackOffice") + "<span class='sub'>"
+                                    + escape(" ".join(actions)) + "</span>")
             onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
         elif create_ui._row_route(row) == production_approval.SURFACE_RENEWAL_ROUTE:
             # Surface renewal (owner go 2026-11-03): no create, one Edit Account from the production CO page (the review page

@@ -370,12 +370,86 @@ def edit_note(parent: Path, co: str) -> str:
             "Duration (hours) is 90 and the Operator Account is the Technical Advisor's; it is not repeated automatically.")
 
 
+EDIT_DONE = frozenset({"edit_verified", "edit_already_set"})
+
+
+def clone_tenant(parent: Path, co: str) -> Mapping[str, Any] | None:
+    """The production clone row of this CO's verified tenant (matched by the recorded Account UUID), or None: not in the
+    clone yet (it is a nightly copy), no verified create, or anything unreadable. Read-only, local files only."""
+    from datetime import timedelta
+
+    from . import leonardo_inventory as inventory
+    from .production_create_ui import CREATED_VERIFIED, co_status, load_co_records
+
+    try:
+        status = co_status(load_co_records(parent, co))
+        uuid = str(status.get("uuid") or "").lower() if status.get("code") == CREATED_VERIFIED else ""
+        if not re.fullmatch(r"[0-9a-f]{32}", uuid):
+            return None
+        payload = inventory.load_latest(inventory.clone_root(), "prod-clone", max_age=timedelta(hours=48),
+                                        now=datetime.now(timezone.utc))
+        matches = [row for row in payload.get("tenants") or []
+                   if isinstance(row, Mapping) and str(row.get("account_uuid") or "").lower() == uuid]
+    except Exception:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def clone_shows(tenant: Mapping[str, Any] | None) -> dict[str, bool]:
+    """What the clone row proves was done by hand after the run: ``edit`` (Maximum scan Duration 90 and an operator) and
+    ``scan`` (a Surface scan status, or a recon scan after the tenant's creation). Unknown shapes prove nothing."""
+    from . import production_case3_scan_now as scan_now
+
+    if not isinstance(tenant, Mapping):
+        return {"edit": False, "scan": False}
+    scan = tenant.get("scan") if isinstance(tenant.get("scan"), Mapping) else {}
+    last, created = scan.get("last_recon_scan_ms"), tenant.get("created")
+    scanned = scan.get("status") in scan_now.STARTED_STATUSES or (
+        type(last) is int and type(created) is int and last > created)
+    edited = tenant.get("campaigns_timeout_hours") == 90 and tenant.get("operator_assigned") is True
+    return {"edit": edited, "scan": scanned}
+
+
+def action_items(parent: Path, co: str, tenant: Any = "load") -> list[str]:
+    """What still needs a hand in BackOffice after a Case 3 create from 2026-11-02 on (owner request 2026-11-05, CO-0841):
+    the Edit Account (Operator / Maximum scan Duration 90) when it did not verify, and the first scan when the run did not
+    confirm it started. An item disappears once the production clone shows it done (``clone_shows``). [] when nothing is
+    needed or the create predates the automatic edit (no line). ``tenant``: the clone row, or "load" to read it."""
+    from . import production_case3_scan_now as scan_now
+
+    edit_result = _last(parent, co, "bo_edit")
+    scan_text = scan_now.action_needed(_last(parent, co, scan_now.STEP), edit_result)
+    edit_open = edit_result is not None and edit_result not in EDIT_DONE
+    if not edit_open and not scan_text:
+        return []
+    shown = clone_shows(clone_tenant(parent, co) if tenant == "load" else tenant)
+    items: list[str] = []
+    if edit_open and not shown["edit"]:
+        items.append(edit_note(parent, co))
+    if scan_text and not shown["scan"]:
+        items.append(scan_text)
+    return items
+
+
+def scan_note(parent: Path, co: str) -> str | None:
+    from . import production_case3_scan_now as scan_now
+
+    return scan_now.note(_last(parent, co, scan_now.STEP))
+
+
 def followup_card_html(parent: Path, co: str) -> str:
     """The Case 3 follow-up part of the create card after a verified create: one review button, or the recorded state."""
     from html import escape
 
     ids, stage = _last(parent, co, "ids"), _last(parent, co, "stage")
-    manual = "<p class='note'>" + escape(edit_note(parent, co)) + "</p>"
+    actions = action_items(parent, co)
+    if actions:
+        manual = ("<div class='note'><strong>Action needed in BackOffice:</strong><ul>"
+                  + "".join("<li>" + escape(text) + "</li>" for text in actions) + "</ul></div>")
+    else:
+        scanned = scan_note(parent, co)
+        manual = ("<p class='note'>" + escape(edit_note(parent, co)) + "</p>"
+                  + ("<p class='note'>" + escape(scanned) + "</p>" if scanned else ""))
     if ids == "written_verified" and stage == "written_verified":
         return ("<p class='note'><strong>Onboarded:</strong> the Account ID and UUID are written to Salesforce and read back, "
                 "and the stage is Account Scanning.</p>" + manual)
