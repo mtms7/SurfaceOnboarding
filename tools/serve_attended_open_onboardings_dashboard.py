@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import functools
 import hmac
 import importlib.util
+from collections.abc import Mapping
 from typing import Any
 from datetime import date, datetime, timedelta, timezone
 from hashlib import sha256
@@ -2328,8 +2329,8 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
     if vm_mode():  # no live read on the VM: the published CO details already carry the comment (docs/41)
         return _snapshot_subscription_summaries(references)
     quoted = ", ".join(f"'{reference}'" for reference in references)
-    response = sf_json(["data", "query", "--query", "SELECT Name, Onboarding_Comments__c, Account_UUID__c FROM Customer_Onboarding__c "
-                        "WHERE Name IN (" + quoted + ")", "--json"])
+    response = sf_json(["data", "query", "--query", "SELECT Name, Onboarding_Comments__c, Account_UUID__c, LastModifiedDate "
+                        "FROM Customer_Onboarding__c WHERE Name IN (" + quoted + ")", "--json"])
     try:
         records = response["result"]["records"]  # type: ignore[index]
         if response["status"] != 0 or not isinstance(records, list) or len(records) != len(references):
@@ -2348,6 +2349,11 @@ def subscription_summaries(references: tuple[str, ...]) -> dict[str, dict[str, s
                 QUEUE_UUID_SET[reference] = isinstance(uuid_value, str) and bool(uuid_value.strip())
             else:
                 QUEUE_UUID_SET.pop(reference, None)
+            modified = record.get("LastModifiedDate")  # the queue's "Done" fallback date (owner request 2026-11-05)
+            if isinstance(modified, str) and _SF_DATETIME.fullmatch(modified):
+                QUEUE_LAST_MODIFIED[reference] = modified
+            else:
+                QUEUE_LAST_MODIFIED.pop(reference, None)
             parsed = extract_dealhub_dates(comment)
             if parsed["ready_for_cse_review"]:
                 summaries[reference] = {
@@ -3354,6 +3360,7 @@ QUEUE_END_DATES: dict[str, str] = {}
 # Whether each CO held an Account UUID in the last ``subscription_summaries`` read (owner report 2026-11-04, CO-0816: a CO
 # at User Created with a UUID showed "Not created" / "overdue" because its own identity read had failed). Display only.
 QUEUE_UUID_SET: dict[str, bool] = {}
+QUEUE_LAST_MODIFIED: dict[str, str] = {}  # Salesforce LastModifiedDate per queued CO (the queue's batched read)
 
 
 def _start_cell(start: str | None, key: str, today: date) -> str:
@@ -5306,6 +5313,23 @@ PENTERA_CSS = (
     ".dense .co{display:block;font-weight:700}.dense .run{display:block;margin-top:4px}"
     ".dense .c-start{white-space:nowrap}.dense .c-start b{display:block}.dense .c-act{white-space:nowrap;text-align:right}"
     ".dense tbody tr:hover td{background:#f8fafc}"
+    ".dense .c-done{white-space:nowrap}.dense .c-done b{display:block}"
+    ".dense details.why summary{list-style:none;cursor:pointer;display:inline-block}"
+    ".dense details.why summary::-webkit-details-marker{display:none}"
+    ".dense details.why summary::after{content:' \\25B8';color:var(--muted);font-size:11px}"
+    ".dense details.why[open] summary::after{content:' \\25BE'}"
+    ".dense th details.hmenu{display:inline-block;position:relative;margin-left:2px}"
+    ".dense th details.hmenu summary{list-style:none;cursor:pointer;padding:0 3px;border-radius:4px}"
+    ".dense th details.hmenu summary::-webkit-details-marker{display:none}"
+    ".dense th details.hmenu summary:hover{background:#eef2f7}"
+    ".dense th details.hmenu>div{position:absolute;top:18px;left:0;z-index:5;min-width:170px;background:#fff;"
+    "border:1px solid var(--line);border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.08);padding:4px 0}"
+    ".dense th details.hmenu a{display:block;padding:5px 12px;color:var(--heading);font-weight:500}"
+    ".dense th details.hmenu a:hover{background:#f3f7fe;text-decoration:none}.dense th details.hmenu a.on{font-weight:700}"
+    ".fform{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:0 0 12px;font-size:12.5px}"
+    ".fform label{color:var(--muted);font-weight:600}.fform select,.fform input{font:inherit;padding:4px 6px;"
+    "border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--text)}"
+    ".fform button{font:inherit;padding:4px 12px}.fform .fcount{margin-left:auto;color:var(--muted)}"
     ".dense tr.is-ready td{background:#f6fdf0}.dense tr.is-ready td:first-child{box-shadow:inset 3px 0 0 var(--ok)}"
     ".dense tbody tr.is-ready:hover td{background:#eef9e4}"
     ".btn{display:inline-block;background:var(--primary);color:#fff;border-radius:6px;padding:4px 12px;font-weight:600}"
@@ -7326,7 +7350,7 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     remote_card = ("<section class='card' aria-labelledby='co-remote-title'><div class='card-head'><h2 id='co-remote-title' "
                    "class='pill'>Onboard in production</h2><span class='chip chip-warn'>Runs on your PC</span></div>"
                    + remote + "</section>") if remote else ""
-    main_html = ("<a class='crumb' href='/'>&larr; Onboarding</a>" + header + _ce_domains_head(row) + remote_card
+    main_html = ("<a class='crumb' href='" + escape(_QUEUE_BACK.get()) + "'>&larr; Onboarding</a>" + header + _ce_domains_head(row) + remote_card
                  + _production_create_html(reference, row)
                  + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)
@@ -7341,7 +7365,45 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
 # an approval issue. The one form is the existing 4-hour summary approval on the CO page (a local record, nothing else).
 PRODUCTION_APPROVAL_PATH = state_file(Path(__file__).resolve().parents[1] / "integration" / PRODUCTION_APPROVAL_FILE)
 PROD_FILTERS = (("ready", "Ready to onboard"), ("blocked", "Blocked"), ("approved", "Approved"), ("created", "Created"))
-PROD_SORTS = frozenset({"start", "co", "age"})
+# Queue sorting and filters (owner request 2026-11-05): every column sorts, each tab has its own default, and a small filter
+# bar (product, stage, check result, search) combines with the tab. Server-side only: the page CSP allows no script.
+PROD_SORTS = {"start": "asc", "days": "asc", "co": "asc", "account": "asc", "product": "asc", "stage": "asc", "check": "asc",
+              "done": "desc", "age": "desc"}  # key -> the direction a first click uses
+PROD_TAB_DEFAULT_SORT = {"": "start", "ready": "start", "approved": "start", "blocked": "age", "created": "done"}
+PROD_CHECK_GROUPS = (("blocked", "Blocked"), ("undecided", "Not decided"), ("clear", "Clear"), ("onboarded", "Onboarded / done"))
+PROD_STAGE_OTHER = "other"
+PROD_SEARCH_MAX = 60
+_SAFE_BACK = re.compile(r"/(\?[A-Za-z0-9_.~%=&+\-]{1,600})?")
+_QUEUE_BACK: contextvars.ContextVar[str] = contextvars.ContextVar("queue_back", default="/")
+
+
+def safe_back(value: Any) -> str:
+    """The queue view a CO page links back to: only a relative "/" or "/?..." of plain query characters, else "/"."""
+    return value if isinstance(value, str) and _SAFE_BACK.fullmatch(value) else "/"
+
+
+def _with_back(href: str, back: str) -> str:
+    """``href`` plus ``back=<the queue view>`` when the view is not the plain landing."""
+    if back in ("", "/"):
+        return href
+    return href + ("&" if "?" in href else "?") + "back=" + quote(back, safe="")
+
+
+def queue_filters(query: Mapping[str, Any] | None) -> dict[str, str]:
+    """The queue's column filters from GET params, each checked against its allow-list (anything else is dropped)."""
+    def first(name: str) -> str:
+        value = (query or {}).get(name)
+        value = value[0] if isinstance(value, list) and value else value
+        return value if isinstance(value, str) else ""
+    product, stage, check = first("product"), first("stage"), first("check")
+    q = " ".join(first("q").split())[:PROD_SEARCH_MAX]
+    return {"product": product if product in _PRODUCT_SHORT else "",
+            "stage": stage if stage in ONBOARDING_STAGES or stage == PROD_STAGE_OTHER else "",
+            "check": check if check in dict(PROD_CHECK_GROUPS) else "",
+            "q": q if REFERENCE_SEARCH.fullmatch(q) else ""}
+
+
+REFERENCE_SEARCH = re.compile(r"[^<>\"'`]{0,60}")
 WRONG_CREATE_NOTE = "Wrong create: the owner edits the parameters in BackOffice; the delete path is unknown."
 
 
@@ -7511,7 +7573,56 @@ def onboarded_unverified(check: dict[str, Any] | None, stage: str | None, uuid_s
     return uuid_set is True and stage in _ONBOARDED_STAGES and bool(check) and check["code"] in _UNDECIDED_CHECKS
 
 
-def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> str:
+def _short_day(value: Any) -> str:
+    """``Nov 1`` for an ISO date, else the text as given."""
+    try:
+        day = date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return str(value or "")
+    return f"{day:%b} {day.day}"
+
+
+def _queue_done_at(reference: str, record: Mapping[str, Any] | None) -> str:
+    """When a finished CO was done: the verified create time this dashboard recorded, else Salesforce's last update of the
+    CO (the queue's batched read; on the VM the published CO details). "" when unknown."""
+    stamp = record.get("recorded_at") if isinstance(record, Mapping) else None
+    if isinstance(stamp, str) and _SF_DATETIME.fullmatch(stamp):
+        return stamp
+    modified = QUEUE_LAST_MODIFIED.get(reference)
+    if modified is None and vm_mode():
+        try:
+            modified = snapshot_detail_row(reference).get("LastModifiedDate")
+        except Exception:  # noqa: BLE001 - no detail: no date
+            modified = None
+    return modified if isinstance(modified, str) and _SF_DATETIME.fullmatch(modified) else ""
+
+
+def _queue_check_group(item: Mapping[str, Any], done: bool) -> str:
+    """blocked / undecided / clear / onboarded: the check-result group the queue sorts and filters by."""
+    check = item.get("check") or {}
+    if done or check.get("code") == "onboarded":
+        return "onboarded"
+    if (item.get("flags") or {}).get("blocked"):
+        return "blocked"
+    return "clear" if check.get("code") in ("clear", "not_in_production") else "undecided"
+
+
+def _done_cell(stamp: str) -> str:
+    if not stamp:
+        return "<span class='muted'>—</span>"
+    return "<b>" + escape(_short_day(stamp)) + "</b><span class='sub'>" + escape(stamp[:10]) + "</span>"
+
+
+def _fold_check(cell: str) -> str:
+    """The check chip with its long grey reason folded under it (click the chip to read it). CSS only."""
+    marker = "<span class='sub'>"
+    at = cell.find(marker)
+    if at <= 0:
+        return cell
+    return "<details class='why'><summary>" + cell[:at] + "</summary>" + cell[at:] + "</details>"
+
+
+def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "", filters: Mapping[str, str] | None = None) -> str:
     """The production landing (``/`` and ``/onboard``): every open CO with its production checks, approval and create state.
 
     Read-only. A queue read failure propagates (ReadUnavailable); every other missing value shows as unavailable.
@@ -7557,61 +7668,34 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                                 "ready": supported and bool(check) and not check["blocked"] and not created,
                                 "approved": supported and approval["state"] == "valid", "created": created}})
     flt = flt if flt in {key for key, _label in PROD_FILTERS} else ""
-    sort = sort if sort in PROD_SORTS else "start"
+    sort = sort if sort in PROD_SORTS else PROD_TAB_DEFAULT_SORT[flt]
     if direction not in ("asc", "desc"):
-        direction = "desc" if sort == "age" else "asc"
+        direction = PROD_SORTS[sort]
     descending = direction == "desc"
+    picked = queue_filters({key: value for key, value in (filters or {}).items()})
 
     def start_of(item: dict[str, Any]) -> str:
         return (starts or {}).get(item["ref"], "") if starts is not None else str(item["row"].get("Submission_Date__c") or "")[:10]
 
-    def sort_value(item: dict[str, Any]) -> str:
-        if sort == "co":
-            return item["ref"]
-        if sort == "age":
-            try:
-                return f"{(today - date.fromisoformat(str(item['row'].get('Submission_Date__c') or '')[:10])).days + 100000:06d}"
-            except ValueError:
-                return ""
-        return start_of(item)
+    def view_params(**changes: str) -> dict[str, str]:
+        params = {"filter": flt, "sort": sort, "dir": direction, **picked, **changes}
+        if params["sort"] == PROD_TAB_DEFAULT_SORT[params["filter"]] and params["dir"] == PROD_SORTS[params["sort"]]:
+            params["sort"] = params["dir"] = ""  # the tab's own default needs no parameter
+        return {name: value for name, value in params.items() if value}
 
     def link(**changes: str) -> str:
-        params = {"filter": flt, "sort": sort if sort != "start" else "",
-                  "dir": direction if direction != ("desc" if sort == "age" else "asc") else "", **changes}
-        query = urlencode({name: value for name, value in params.items() if value})
+        query = urlencode(view_params(**changes))
         return "/?" + query if query else "/"
 
-    shown = [item for item in items if not flt or item["flags"][flt]]
-    base = sorted(shown, key=lambda item: item["ref"])
-    ordered = sorted((item for item in base if sort_value(item)), key=sort_value, reverse=descending)
-    ordered += [item for item in base if not sort_value(item)]  # blanks always last
-    chips = ("<a class='fchip" + (" on" if not flt else "") + "' href='" + escape(link(filter="")) + "'>All <b>" + str(len(items))
-             + "</b></a>")
-    for key, label in PROD_FILTERS:
-        chips += ("<a class='fchip" + (" on" if flt == key else "") + "' href='" + escape(link(filter=key)) + "'>" + escape(label)
-                  + " <b>" + str(sum(1 for item in items if item["flags"][key])) + "</b></a>")
+    back_view = safe_back(link())
 
-    def header(key: str, label: str, css: str = "") -> str:
-        active = key == sort
-        target = link(sort=key, dir=("asc" if descending else "desc") if active else "")
-        aria = " aria-sort='" + ("descending" if descending else "ascending") + "'" if active else ""
-        return ("<th scope='col'" + (" class='" + css + "'" if css else "") + aria + "><a class='sort' href='" + escape(target)
-                + "'>" + escape(label) + "</a></th>")
-
-    head = ("<thead><tr>" + header("start", "Start") + "<th scope='col'>Days to start<span class='sub'>Salesforce approval</span></th>"
-            + header("co", "Onboarding", "stick") + "<th scope='col'>Account</th>"
-            "<th scope='col'>Product</th><th scope='col'>Status<span class='sub'>Salesforce stage</span></th>"
-            "<th scope='col'>Production checks</th>"
-            "<th scope='col'>Approval<span class='sub'>create · 7 days</span></th><th scope='col'>Create</th>"
-            + header("age", "Age", "num") + "</tr></thead>")
     def _eligible(item: dict[str, Any]) -> bool:
         return (item["supported"] and item["row"].get("Onboarding_Approval_Status__c") == "Approved"
                 and not item["flags"]["created"] and not item["flags"]["blocked"] and bool(start_of(item)))
 
     candidates = sorted((item for item in items if _eligible(item)), key=lambda item: (start_of(item), item["ref"]))
     next_ref = candidates[0]["ref"] if candidates and starts is not None else None
-    body = ""
-    for item in ordered:
+    for item in items:  # each row's cells first; the view below filters, sorts and counts them
         row, ref, check = item["row"], item["ref"], item["check"]
         product, kind = row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")
         start = (starts or {}).get(ref) if starts is not None else None
@@ -7649,7 +7733,7 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
                 if actions:
                     create_cell += (_chip("chip-warn", "Action needed in BackOffice") + "<span class='sub'>"
                                     + escape(" ".join(actions)) + "</span>")
-            onboarding = "<a class='co' href='" + escape(_co_page_href(ref)) + "'>" + escape(ref) + "</a>"
+            onboarding = "<a class='co' href='" + escape(_with_back(_co_page_href(ref), back_view)) + "'>" + escape(ref) + "</a>"
         elif create_ui._row_route(row) == production_approval.SURFACE_RENEWAL_ROUTE:
             # Surface renewal (owner go 2026-11-03): no create, one Edit Account from the production CO page (the review page
             # is built for creates). The tenant exists, so "In production" is the expected match here.
@@ -7660,7 +7744,8 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
             create_cell = (_chip("chip-ok", "Renewed") if renewed == surface_renewal.VERIFIED
                            else _chip("chip-warn", "Renewal: " + renewed.replace("_", " ")) if renewed
                            else "<span class='muted'>—</span>")
-            onboarding = "<a class='co' href='" + escape("/co/" + ref + "?env=prod") + "'>" + escape(ref) + "</a>"
+            onboarding = ("<a class='co' href='" + escape(_with_back("/co/" + ref + "?env=prod", back_view)) + "'>" + escape(ref)
+                          + "</a>")
         else:  # no automated create route: the clone validation still shows, so the list says what is next for every CO
             checks = (_chip(check["css"], check["label"]) + "<span class='sub'>No automated route · Exact Product and Type pair not "
                       "supported · validated against the clone only"
@@ -7680,26 +7765,125 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "") -> 
         done = (created_here or bool(check and check["code"] == "onboarded") or item["hand_entered"]
                 or bool(coverage and coverage["state"] == "renewed"))
         linked = item["supported"] or onboarding.startswith("<a ")
-        body += ("<tr" + ("" if linked else " class='locked'") + "><td class='c-start'>"
-                 + ("<span class='muted'>done</span>" if done
+        record = (records.get("by_co") or {}).get(ref) if isinstance(records, dict) else None
+        item["done"] = done
+        item["done_at"] = _queue_done_at(ref, record if created_here else None) if done else ""
+        item["check_group"] = _queue_check_group(item, done)
+        item["tr"] = ("<tr" + ("" if linked else " class='locked'") + "><td class='c-start'>"
+                 + ((("<b>" + escape(_short_day(start)) + "</b>") if start else "") + "<span class='muted'>done</span>" if done
                     else _prod_start_cell(start, today) if start else "<span class='muted'>—</span>") + "</td><td class='c-days'>"
                  + _prod_days_cell(start, today, row.get("Onboarding_Approval_Status__c"), done, ref == next_ref)
                  + "</td><td class='stick'>"
                  + onboarding + "</td><td>" + escape(str(row.get("Account__r.Name") or "Account unavailable")) + "</td><td>"
                  + escape(_PRODUCT_SHORT.get(product or "", product or "—")) + "<span class='sub'>"
                  + escape(_TYPE_SHORT.get(kind or "", kind or "—")) + "</span></td><td>"
-                 + _prod_status_cell(row.get("Onboarding_Stage__c")) + "</td><td>" + checks + "</td><td>" + approval_cell
-                 + "</td><td>" + create_cell + "</td><td class='num'>" + _age_days(row.get("Submission_Date__c"), today) + "</td></tr>")
+                 + _prod_status_cell(row.get("Onboarding_Stage__c")) + "</td><td>" + _fold_check(checks) + "</td><td>"
+                 + approval_cell + "</td><td>" + create_cell + "</td><td class='c-done'>" + _done_cell(item["done_at"])
+                 + "</td><td class='num'>" + _age_days(row.get("Submission_Date__c"), today) + "</td></tr>")
+
+    def matches(item: dict[str, Any]) -> bool:
+        row = item["row"]
+        stage = row.get("Onboarding_Stage__c")
+        if picked["product"] and row.get("Onboarding_Product__c") != picked["product"]:
+            return False
+        if picked["stage"] and (stage if stage in ONBOARDING_STAGES else PROD_STAGE_OTHER) != picked["stage"]:
+            return False
+        if picked["check"] and item["check_group"] != picked["check"]:
+            return False
+        needle = picked["q"].casefold()
+        return not needle or needle in item["ref"].casefold() or needle in str(row.get("Account__r.Name") or "").casefold()
+
+    pool = [item for item in items if matches(item)]  # the column filters apply to every tab and to the tab counts
+    shown = [item for item in pool if not flt or item["flags"][flt]]
+
+    def sort_value(item: dict[str, Any]) -> str:
+        row = item["row"]
+        if sort == "co":
+            return item["ref"]
+        if sort == "account":
+            return str(row.get("Account__r.Name") or "").casefold()
+        if sort == "product":
+            product = row.get("Onboarding_Product__c") or ""
+            return (_PRODUCT_SHORT.get(product, product) + " " + str(row.get("Onboarding_Type__c") or "")).strip().casefold()
+        if sort == "stage":
+            stage = row.get("Onboarding_Stage__c")
+            return f"{ONBOARDING_STAGES.index(stage):02d}" if stage in ONBOARDING_STAGES else ("99" if stage else "")
+        if sort == "check":
+            return str([key for key, _label in PROD_CHECK_GROUPS].index(item["check_group"]))
+        if sort == "done":
+            return item["done_at"]
+        if sort == "age":
+            try:
+                return f"{(today - date.fromisoformat(str(row.get('Submission_Date__c') or '')[:10])).days + 100000:06d}"
+            except ValueError:
+                return ""
+        return start_of(item)  # start and days
+
+    base = sorted(shown, key=lambda item: item["ref"])
+    ordered = sorted((item for item in base if sort_value(item)), key=sort_value, reverse=descending)
+    ordered += [item for item in base if not sort_value(item)]  # blanks always last, by CO
+    chips = ("<a class='fchip" + (" on" if not flt else "") + "' href='" + escape(link(filter="", sort="", dir="")) + "'>All <b>"
+             + str(len(pool)) + "</b></a>")
+    for key, label in PROD_FILTERS:
+        chips += ("<a class='fchip" + (" on" if flt == key else "") + "' href='" + escape(link(filter=key, sort="", dir="")) + "'>"
+                  + escape(label) + " <b>" + str(sum(1 for item in pool if item["flags"][key])) + "</b></a>")
+
+    def header(key: str, label: str, css: str = "", sub: str = "", menu: str = "") -> str:
+        active = key == sort
+        new_dir = ("asc" if descending else "desc") if active else PROD_SORTS[key]
+        words = "Sort by " + label + ", " + ("descending" if new_dir == "desc" else "ascending")
+        aria = " aria-sort='" + ("descending" if descending else "ascending") + "'" if active else ""
+        return ("<th scope='col'" + (" class='" + css + "'" if css else "") + aria + "><a class='sort' href='"
+                + escape(link(sort=key, dir=new_dir)) + "' aria-label='" + escape(words) + "'>" + escape(label) + "</a>"
+                + menu + ("<span class='sub'>" + escape(sub) + "</span>" if sub else "") + "</th>")
+
+    def menu(name: str, options: list[tuple[str, str]]) -> str:
+        current = picked[name]
+        items_html = "".join("<a" + (" class='on'" if value == current else "") + " href='" + escape(link(**{name: value}))
+                             + "'>" + escape(label) + "</a>" for value, label in [("", "All")] + options)
+        return ("<details class='hmenu'><summary aria-label='Filter " + escape(name) + "'>&#9662;</summary><div>" + items_html
+                + "</div></details>")
+
+    product_options = [(key, label) for key, label in _PRODUCT_SHORT.items()]
+    stage_options = [(stage, stage) for stage in ONBOARDING_STAGES] + [(PROD_STAGE_OTHER, "Other")]
+    check_options = list(PROD_CHECK_GROUPS)
+    head = ("<thead><tr>" + header("start", "Start") + header("days", "Days to start", sub="Salesforce approval")
+            + header("co", "Onboarding", "stick") + header("account", "Account")
+            + header("product", "Product", menu=menu("product", product_options))
+            + header("stage", "Status", sub="Salesforce stage", menu=menu("stage", stage_options))
+            + header("check", "Production checks", menu=menu("check", check_options))
+            + "<th scope='col'>Approval<span class='sub'>create · 7 days</span></th><th scope='col'>Create</th>"
+            + header("done", "Done", sub="created / updated") + header("age", "Age", "num") + "</tr></thead>")
+    body = "".join(item["tr"] for item in ordered)
+    filtered = any(picked.values())
+    clear = link(product="", stage="", check="", q="")
     if ordered:
         table = "<div class='tbl-wrap'><table class='dense'>" + head + "<tbody>" + body + "</tbody></table></div>"
+    elif items and filtered:
+        table = ("<p class='empty'>No COs match these filters. <a href='" + escape(clear) + "'>Clear filters</a></p>")
     elif items:
         table = "<p class='empty'>Nothing in this view right now. <a href='/'>Show all open (" + str(len(items)) + ")</a></p>"
     else:
         table = "<p class='empty'>No open onboardings.</p>"
+
+    def select(name: str, label: str, options: list[tuple[str, str]]) -> str:
+        return ("<label>" + escape(label) + " <select name='" + name + "'>" + "".join(
+            "<option value='" + escape(value, quote=True) + "'" + (" selected" if value == picked[name] else "") + ">"
+            + escape(text) + "</option>" for value, text in [("", "All")] + options) + "</select></label>")
+
+    keep = {name: value for name, value in view_params().items() if name in ("filter", "sort", "dir")}
+    form = ("<form class='fform' method='get' action='/'>" + "".join(
+                "<input type='hidden' name='" + name + "' value='" + escape(value, quote=True) + "'>" for name, value in keep.items())
+            + select("product", "Product", product_options) + select("stage", "Stage", stage_options)
+            + select("check", "Check", check_options)
+            + "<label>Search <input type='search' name='q' maxlength='" + str(PROD_SEARCH_MAX) + "' value='"
+            + escape(picked["q"], quote=True) + "' placeholder='CO or account'></label><button type='submit'>Apply</button>"
+            + ("<a href='" + escape(clear) + "'>Clear filters</a>" if filtered else "")
+            + "<span class='fcount'>Showing " + str(len(ordered)) + " of " + str(len(items)) + " open</span></form>")
     notes = ("<p class='note'>Subscription start dates could not be read from Salesforce, so the list is ordered by submission "
              "date and the 2-day window is not shown.</p>" if starts is None and rows else "")
     page = ("<div class='page-head'><h1>Onboarding</h1>" + _lock_chip() + "</div>" + _clone_strip()
-            + "<nav class='fbar' aria-label='Filter'><span class='fgroup'>" + chips + "</span></nav>" + notes
+            + "<nav class='fbar' aria-label='Filter'><span class='fgroup'>" + chips + "</span></nav>" + form + notes
             + "<p class='note'>Every open onboarding with its duplicate validation against the Production BackOffice clone only "
               "(Leonardo is not consulted). Approval is the 7-day create approval; the 4-hour summary approval is on the CO page. "
               "Nothing is created from this page.</p><section class='card tbl-card'>" + table + "</section>")
@@ -8322,7 +8506,8 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
     notes = {"approved": "Approval recorded.", "changed": "The CO changed since the page was shown. Review the new summary.",
              "blocked": "This summary has blockers and cannot be approved."}
     route_label = ENGINE_LABELS.get(summary["route"])
-    head = ("<a class='crumb' href='/'>&larr; Onboarding</a><div class='page-head'><h1>" + escape(ref) + "</h1>"
+    head = ("<a class='crumb' href='" + escape(_QUEUE_BACK.get()) + "'>&larr; Onboarding</a><div class='page-head'><h1>"
+            + escape(ref) + "</h1>"
             + ("<span class='acct'>" + escape(summary["account"]) + "</span>" if summary["account"] else "")
             + (_chip("chip-info", route_label) if route_label else _chip("chip-neutral", "No automated route"))
             + (_chip("chip-bad", "Blocked") if blockers else _chip("chip-ok", "Checks clear")))
@@ -10025,6 +10210,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _display_get(self) -> None:
         _display_reads.set(True)
+        _QUEUE_BACK.set(safe_back(parse_qs(urlsplit(self.path).query).get("back", ["/"])[0]))
         _display_read_times.set([])
         started = monotonic()
         try:
@@ -10032,7 +10218,8 @@ class Handler(BaseHTTPRequestHandler):
             path = parsed.path
             if path in ("/", "/onboard"):
                 query = parse_qs(parsed.query)
-                html = render_onboard_queue(query.get("filter", [""])[0], query.get("sort", [""])[0], query.get("dir", [""])[0])
+                html = render_onboard_queue(query.get("filter", [""])[0], query.get("sort", [""])[0], query.get("dir", [""])[0],
+                                            filters={name: query.get(name, [""])[0] for name in ("product", "stage", "check", "q")})
                 record_timing("page_build", "production_queue", started, True)
                 self.send_page(HTTPStatus.OK, html); return
             if path == "/dev":

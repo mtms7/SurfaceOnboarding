@@ -473,7 +473,10 @@ class VmProductionFirstPagesTests(SnapshotDashboardCase):
         for wording in ("chip-neutral'>None</span>", "Not approved yet", "No approvals recorded", "Locked</span>"):
             self.assertNotIn(wording, row)
         self.assertNotIn("<form method='post'", body)
-        self.assertNotIn("<button", re.sub(r"<form class='sidesearch'.*?</form>", "", body, flags=re.S))
+        # The side search and the queue's filter bar (owner request 2026-11-05) are GET forms that only change the view.
+        view_only = re.sub(r"<form class='(?:sidesearch|fform)'.*?</form>", "", body, flags=re.S)
+        self.assertIn("<form class='fform' method='get' action='/'>", body)
+        self.assertNotIn("<button", view_only)
 
     def test_approvals_page_is_unavailable_read_only_and_names_both_kinds(self):
         status, _, body = self.get("/prod/approvals", email=OWNER)

@@ -135,6 +135,8 @@ def text(html):
 
 
 def headers(table_html):
+    """Header texts without the per-column filter menus (owner request 2026-11-05: <details class='hmenu'>)."""
+    table_html = re.sub(r"<details class='hmenu'>.*?</details>", "", table_html, flags=re.S)
     return [text(h) for h in re.findall(r"<th[^>]*>(.*?)</th>", table_html, flags=re.S)]
 
 
@@ -149,6 +151,8 @@ def controls(page, allow=()):
     page = re.sub(r"<form class='start-form' method='post' action='/attended/production-dry-run'>.*?</form>", "", page, flags=re.S)
     # The single "Onboard in production" button (owner decision 2026-10-23) is the owner-gated control of an Approved CO.
     page = re.sub(r"<form class='start-form' method='post' action='/attended/production-create'>.*?</form>", "", page, flags=re.S)
+    # The queue's filter bar (owner request 2026-11-05) is a GET form to "/" that only changes the view.
+    page = re.sub(r"<form class='fform' method='get' action='/'>.*?</form>", "", page, flags=re.S)
     for form in re.findall(r"<form[^>]*>", page, flags=re.I):
         action = re.search(r"action='([^']*)'", form)
         if action and action.group(1) in ALLOWED_FORM_ACTIONS + tuple(allow):
@@ -295,7 +299,7 @@ class LandingTests(unittest.TestCase):
         page = self.page()
         table = page[page.index("<table"):page.index("</table>")]
         self.assertEqual(headers(table), ["Start", "Days to start Salesforce approval", "Onboarding", "Account", "Product", "Status Salesforce stage", "Production checks", "Approval create · 7 days",
-                                          "Create", "Age"])
+                                          "Create", "Done created / updated", "Age"])
         self.assertIn("<h1>Onboarding</h1>", page)
         self.assertIn("envpill prod", page)
         self.assertNotIn("envpill dev", page)
@@ -356,7 +360,7 @@ class LandingTests(unittest.TestCase):
         page = self.page()
         counts = {label: int(number) for label, number in re.findall(r"class='fchip(?: on)?' href='[^']+'>([A-Za-z ]+) <b>(\d+)</b>", page)}
         self.assertEqual(counts, {"All": 6, "Ready to onboard": 1, "Blocked": 3, "Approved": 1, "Created": 1})
-        refs = lambda html: re.findall(r"<a class='co' href='/onboard/(CO-\d+)'>", html)  # noqa: E731
+        refs = lambda html: re.findall(r"<a class='co' href='/onboard/(CO-\d+)(?:\?back=[^']*)?'>", html)  # noqa: E731
         self.assertEqual(sorted(refs(self.page("/?filter=blocked"))), ["CO-0781", "CO-0782", "CO-0784"])
         self.assertEqual(refs(self.page("/?filter=ready")), ["CO-0780"])
         self.assertEqual(refs(self.page("/?filter=approved")), ["CO-0780"])
@@ -364,9 +368,9 @@ class LandingTests(unittest.TestCase):
         self.assertEqual(len(refs(self.page("/?filter=bogus"))), 5)
 
     def test_default_order_is_the_soonest_start_first(self):
-        refs = re.findall(r"<a class='co' href='/onboard/(CO-\d+)'>", self.page())
+        refs = re.findall(r"<a class='co' href='/onboard/(CO-\d+)(?:\?back=[^']*)?'>", self.page())
         self.assertEqual(refs, ["CO-0785", "CO-0780", "CO-0784", "CO-0782", "CO-0781"])
-        by_co = re.findall(r"<a class='co' href='/onboard/(CO-\d+)'>", self.page("/?sort=co&dir=desc"))
+        by_co = re.findall(r"<a class='co' href='/onboard/(CO-\d+)(?:\?back=[^']*)?'>", self.page("/?sort=co&dir=desc"))
         self.assertEqual(by_co, ["CO-0785", "CO-0784", "CO-0782", "CO-0781", "CO-0780"])
 
     def test_days_to_start_and_next_up_only_marks_an_approved_unblocked_co(self):
