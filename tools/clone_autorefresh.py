@@ -43,22 +43,34 @@ HINTS = {
     _STILL_OLD: "Redash returned a result that is still old",
 }
 
-_lock = Lock()
-_state: dict[str, str] = {"state": "never", "at": "", "reason": ""}
-_last_failure: datetime | None = None
-_last_attempt: datetime | None = None
+class Refresher:
+    """The attempt state of one region's clone (EU: the module functions below; US: ``US``, owner request 2026-11-09)."""
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.state: dict[str, str] = {"state": "never", "at": "", "reason": ""}
+        self.last_failure: datetime | None = None
+        self.last_attempt: datetime | None = None
+
+    def reset(self) -> None:
+        self.last_failure = None
+        self.last_attempt = None
+        self.state.update({"state": "never", "at": "", "reason": ""})
+
+
+EU = Refresher()
+US = Refresher()
+_state = EU.state  # the EU state dict (kept for readers of the former module global)
 
 
 def reset() -> None:
-    """Forget every attempt (tests, and a clean start)."""
-    global _last_failure, _last_attempt
-    _last_failure = None
-    _last_attempt = None
-    _state.update({"state": "never", "at": "", "reason": ""})
+    """Forget every attempt (tests, and a clean start); both regions."""
+    EU.reset()
+    US.reset()
 
 
 def status() -> dict[str, str]:
-    return dict(_state)
+    return dict(EU.state)
 
 
 def enabled(environ: Any = None, vm: bool = False) -> bool:
@@ -87,13 +99,16 @@ def waiting_for_daily_load(now: datetime, data_age: int | None) -> bool:
 
 
 def tick(now: datetime, *, age_seconds: Callable[[], int | None], collect_once: Callable[[], dict[str, Any]],
-         force: bool = False, data_age_seconds: Callable[[], int | None] | None = None) -> str:
-    """One pass. Returns ``busy``, ``skipped_backoff``, ``skipped_fresh``, ``refreshed`` or ``failed``; never raises."""
-    global _last_failure, _last_attempt
-    if not _lock.acquire(blocking=False):
+         force: bool = False, data_age_seconds: Callable[[], int | None] | None = None,
+         refresher: Refresher | None = None) -> str:
+    """One pass. Returns ``busy``, ``skipped_backoff``, ``skipped_fresh``, ``refreshed`` or ``failed``; never raises.
+    ``refresher`` is the region's state (default EU)."""
+    box = refresher or EU
+    _state = box.state  # noqa: F841 - same name as before inside this function
+    if not box.lock.acquire(blocking=False):
         return "busy"
     try:
-        if _last_failure is not None and timedelta(0) <= now - _last_failure < RETRY_AFTER:
+        if box.last_failure is not None and timedelta(0) <= now - box.last_failure < RETRY_AFTER:
             return "skipped_backoff"
         if not force:
             try:
@@ -106,12 +121,12 @@ def tick(now: datetime, *, age_seconds: Callable[[], int | None], collect_once: 
                     catchup = waiting_for_daily_load(now, data_age_seconds())
                 except Exception:  # noqa: BLE001 - no catch-up; the 45-min rule still applies
                     catchup = False
-            due_catchup = catchup and (_last_attempt is None or not timedelta(0) <= now - _last_attempt < CATCHUP_EVERY)
+            due_catchup = catchup and (box.last_attempt is None or not timedelta(0) <= now - box.last_attempt < CATCHUP_EVERY)
             if isinstance(age, int) and not isinstance(age, bool) and 0 <= age <= REFRESH_AFTER.total_seconds()                     and not due_catchup:
                 return "skipped_fresh"
             if catchup and not due_catchup:
                 return "skipped_fresh"  # catch-up passes are at most every 15 min, whatever Redash's own result age
-        _last_attempt = now
+        box.last_attempt = now
         _state.update({"state": "running", "at": _stamp(now), "reason": ""})
         try:
             report = collect_once()
@@ -125,48 +140,51 @@ def tick(now: datetime, *, age_seconds: Callable[[], int | None], collect_once: 
         except Exception as error:  # noqa: BLE001 - only the fixed reason code of a collector error is kept
             reason = _safe_reason(getattr(error, "reason", None))
         if reason:
-            _last_failure = now
+            box.last_failure = now
             _state.update({"state": "failed", "at": _stamp(now), "reason": reason})
             return "failed"
-        _last_failure = None
+        box.last_failure = None
         _state.update({"state": "ok", "at": _stamp(now), "reason": ""})
         return "refreshed"
     finally:
-        _lock.release()
+        box.lock.release()
 
 
-def describe() -> str:
+def describe(refresher: Refresher | None = None) -> str:
     """One plain sentence for the clone strip; empty until the first attempt (and when the job is off)."""
-    state, at, reason = _state["state"], _state["at"], _state["reason"]
+    box = refresher or EU
+    name = "US clone" if box is US else "Clone"
+    state, at, reason = box.state["state"], box.state["at"], box.state["reason"]
     when = at[11:16] + " UTC" if len(at) >= 16 else ""
     if state == "running":
-        return "Clone auto-refresh is running now."
+        return name + " auto-refresh is running now."
     if state == "ok":
-        return "Clone auto-refreshed at " + when + "."
+        return name + " auto-refreshed at " + when + "."
     if state == "failed":
         hint = HINTS.get(reason)
-        return ("Clone auto-refresh failed at " + when + " (" + reason + ")" + (": " + hint if hint else "")
+        if box is US and reason == "redash_key_unavailable":
+            hint = "the Redash key for the US query is missing: run the collector with --store-key --region us"
+        return (name + " auto-refresh failed at " + when + " (" + reason + ")" + (": " + hint if hint else "")
                 + ". It retries every 5 min.")
     return ""
 
 
-def default_age_seconds() -> int | None:
-    """Age of the stored clone (when Redash last ran the query); None when it is missing or unusable."""
+def _region_status(region: str) -> dict[str, Any]:
     from integration.onboarding import production_views
     from integration.onboarding.leonardo_inventory import clone_root
 
-    info = production_views.clone_status(clone_root(), datetime.now(timezone.utc))
-    age = info.get("age_seconds")
+    return production_views.clone_status(clone_root(), datetime.now(timezone.utc), region=region)
+
+
+def default_age_seconds(region: str = "EU") -> int | None:
+    """Age of the stored clone (when Redash last ran the query); None when it is missing or unusable."""
+    age = _region_status(region).get("age_seconds")
     return age if isinstance(age, int) else None
 
 
-def default_data_age_seconds() -> int | None:
+def default_data_age_seconds(region: str = "EU") -> int | None:
     """Age of the newest change in the stored clone (the cloned database's daily load); None when unknown."""
-    from integration.onboarding import production_views
-    from integration.onboarding.leonardo_inventory import clone_root
-
-    info = production_views.clone_status(clone_root(), datetime.now(timezone.utc))
-    age = info.get("data_age_seconds")
+    age = _region_status(region).get("data_age_seconds")
     return age if isinstance(age, int) else None
 
 
@@ -178,21 +196,42 @@ def default_collect_once() -> dict[str, Any]:
     return collector.collect(collector.build_opener(), key, query_id=QUERY_ID)
 
 
+def us_enabled() -> bool:
+    """True once the US saved query is pinned (``redash_inventory.US_QUERY_ID``); before that no US job runs."""
+    from integration.onboarding import redash_inventory as redash
+
+    return redash.region_configured("US")
+
+
+def default_collect_once_us() -> dict[str, Any]:
+    """The read-only collector for the pinned US query (what ``--collect --region us`` does), in this process."""
+    from tools import redash_inventory_collector as collector
+
+    query_id = collector.resolve_query_id(None, region="US")  # fails closed when the US query is not pinned
+    key = collector.load_key(query_id=query_id)
+    return collector.collect(collector.build_opener(), key, query_id=query_id)
+
+
 def run_loop(stop: Event | None = None, *, clock: Callable[[], datetime] | None = None,
              age_seconds: Callable[[], int | None] | None = None,
              collect_once: Callable[[], dict[str, Any]] | None = None, wait_seconds: float = LOOP_SECONDS,
-             data_age_seconds: Callable[[], int | None] | None = None) -> None:
-    """Daemon loop: a forced pass at start, then a pass every ``wait_seconds`` until ``stop`` is set. Never dies."""
+             data_age_seconds: Callable[[], int | None] | None = None, region: str = "EU") -> None:
+    """Daemon loop: a forced pass at start, then a pass every ``wait_seconds`` until ``stop`` is set. Never dies.
+    ``region`` "US" uses the US refresher, the US clone's ages and the US collector."""
     stop = stop or Event()
     clock = clock or (lambda: datetime.now(timezone.utc))
-    age_seconds = age_seconds or default_age_seconds
-    collect_once = collect_once or default_collect_once
-    if data_age_seconds is None and age_seconds is default_age_seconds:
-        data_age_seconds = default_data_age_seconds  # the real clone: catch up on the daily load (tests pass their own)
+    us = region == "US"
+    refresher = US if us else EU
+    real_ages = age_seconds is None
+    age_seconds = age_seconds or (lambda: default_age_seconds(region))
+    collect_once = collect_once or (default_collect_once_us if us else default_collect_once)
+    if data_age_seconds is None and real_ages:
+        data_age_seconds = lambda: default_data_age_seconds(region)  # noqa: E731 - the real clone: catch up on the daily load
     force = True
     while True:
         try:
-            tick(clock(), age_seconds=age_seconds, collect_once=collect_once, force=force, data_age_seconds=data_age_seconds)
+            tick(clock(), age_seconds=age_seconds, collect_once=collect_once, force=force, data_age_seconds=data_age_seconds,
+                 refresher=refresher)
         except Exception:  # noqa: BLE001 - the loop never dies
             pass
         force = False

@@ -117,6 +117,11 @@ def patched(env, rows=ROWS, matches=MATCHES, starts=STARTS, unavailable=False, u
         enter(patch.object(dashboard, "production_now", return_value=env.now))
         enter(patch.object(dashboard, "_state_not_published", return_value=unavailable))
         enter(patch.object(dashboard, "sf_json", side_effect=AssertionError("no Salesforce in production dashboard tests")))
+        # 2026-11-09: the CE sheet's DealHub term (``_ce_dealhub_term``) reached the REAL Salesforce through the runner's
+        # ``production_review_inputs`` whenever ``sf`` was installed (it lives in %APPDATA%\npm, so "sf off PATH" did not hide
+        # it): CO-0780's live subscription then replaced the test's Onboarding Comments dates. No live read in these tests.
+        enter(patch.object(dashboard, "production_review_inputs",
+                           side_effect=AssertionError("no Salesforce in production dashboard tests")))
         if unlock is not UNSET:
             enter(patch.object(readiness, "production_unlock_problem", return_value=unlock))
         yield

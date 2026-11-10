@@ -76,6 +76,19 @@ def _state(fields: Mapping[str, Any]) -> str:
     return "unconfirmed"
 
 
+def matched_row(status: Any, body: Any, expected_uuid: Any) -> Mapping[str, Any] | None:
+    """The ONE raw row whose accountUuid is ``expected_uuid`` (in memory only, for the masked audit facts), else None."""
+    if status != 200 or not isinstance(body, Mapping) or not isinstance(expected_uuid, str):
+        return None
+    paged = body.get("pagination_response")
+    rows = paged.get("table_data") if isinstance(paged, Mapping) else None
+    if not isinstance(rows, list):
+        return None
+    expected = expected_uuid.strip().lower()
+    mine = [r for r in rows[:200] if isinstance(r, Mapping) and str(_flatten(r).get("accountUuid", "")).strip().lower() == expected]
+    return mine[0] if len(mine) == 1 else None
+
+
 def scan_reply(status: Any, body: Any, expected_uuid: Any) -> dict[str, Any]:
     """``{"state", "found", "fields"}`` for the tenant whose accountUuid is ``expected_uuid`` (never returned)."""
     if type(status) is not int or status == 0:

@@ -58,7 +58,11 @@ REMOTE_POLL_FILE = "remote_start_poll.json"
 RECORDS_PUSH_PRODUCER = "desktop-records-push"  # the masked production create records only, merged into the CURRENT snapshot
 PRODUCTION_RECORDS_FILE = "production_create_records.json"  # {"records": {"CO-0812-<stamp>.json": record}, "logs": {name: text}}
 PRODUCTION_APPROVALS_FILE = "production_create_approvals.json"  # the desktop file name: the dashboard reads it from the snapshot on the VM
-RECORD_LOG_NAMES = frozenset({"production-uuid-writes.jsonl", "production-stage-writes.jsonl", "case3-followup-writes.jsonl"})
+# The post-onboarding audit's masked live-read log (2026-11-06). Accepted from this release (r42) on; the PC only pushes it when
+# SURFACE_PUSH_AUDIT_LOG=1 (set after r42 is active on the VM: an older VM refuses an unknown log name, so the push would fail).
+AUDIT_LOG_NAME = "post-onboard-audits.jsonl"
+RECORD_LOG_NAMES = frozenset({"production-uuid-writes.jsonl", "production-stage-writes.jsonl", "case3-followup-writes.jsonl",
+                              AUDIT_LOG_NAME})
 MAX_LOG_BYTES = 512 * 1024
 _RECORD_FILE_NAME = re.compile(r"CO-[0-9]{3,6}-[0-9]{8}T[0-9]{6}Z(?:-[0-9]{1,3})?\.json")
 PRODUCER_VM_READER = "vm-salesforce-reader"  # the VM refreshed queue.json / co_details.json itself (docs/43 part A)

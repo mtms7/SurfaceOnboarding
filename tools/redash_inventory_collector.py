@@ -99,16 +99,40 @@ def allowed_calls(query_id: int = QUERY_ID) -> tuple[tuple[str, re.Pattern[str]]
 ALLOWED_CALLS = allowed_calls(QUERY_ID)
 
 
-def resolve_query_id(argument: int | None = None, environ: Any = None) -> int:
-    """Which saved query to read: the argument, else ``SURFACE_REDASH_QUERY_ID``, else 251. Only supported ids pass."""
+REGIONS = {"eu": "EU", "us": "US"}  # --region value -> production region (owner request 2026-11-09)
+
+
+def resolve_query_id(argument: int | None = None, environ: Any = None, region: str = "EU") -> int:
+    """Which saved query to read. EU: the argument, else ``SURFACE_REDASH_QUERY_ID``, else 251. US: only the pinned US query
+    (``redash_inventory.US_QUERY_ID``; the EU environment variable is ignored). Only supported ids pass, and the query must
+    read the selected region's clone (``redash_query_region_mismatch``); US without a pinned query fails closed."""
+    if region not in redash.REGION_ENVIRONMENTS:
+        raise CollectorError("redash_region_unsupported")
+    if region != "EU":
+        pinned = redash.region_query_id(region)
+        if pinned is None:
+            raise CollectorError("redash_us_query_not_configured")
+        if argument is not None and argument != pinned:
+            raise CollectorError("redash_query_region_mismatch")
+        return pinned
     environ = os.environ if environ is None else environ
     raw = argument if argument is not None else (environ.get(QUERY_ID_ENV, "").strip() or QUERY_ID)
     try:
         query_id = int(raw)
-        redash.profile_for(query_id)
+        profile = redash.profile_for(query_id)
     except (ValueError, TypeError, inventory.InventoryError):
         raise CollectorError("redash_query_id_unsupported") from None
+    if profile.region != region:
+        raise CollectorError("redash_query_region_mismatch")
     return query_id
+
+
+def environment_for(query_id: int) -> str:
+    """The snapshot environment of a supported query: its region's clone ("prod-clone" for EU, "prod-clone-us" for US)."""
+    try:
+        return redash.REGION_ENVIRONMENTS[redash.profile_for(query_id).region]
+    except (inventory.InventoryError, KeyError):
+        raise CollectorError("redash_query_id_unsupported") from None
 KEY_PATTERN = re.compile(r"[A-Za-z0-9]{20,64}")
 JOB_ID = re.compile(r"[A-Za-z0-9-]{8,64}")
 DEFAULT_MAX_AGE = timedelta(minutes=60)   # older cached results trigger a refresh
@@ -395,6 +419,7 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
             accept_shrink: bool = False, sleep: Callable[[float], None] = time.sleep,
             query_id: int = QUERY_ID) -> dict[str, Any]:
     redash.profile_for(query_id)
+    env_name = environment_for(query_id)  # EU queries -> prod-clone, the US query -> prod-clone-us (never mixed)
     now = now or datetime.now(timezone.utc)
     root = root or inventory.clone_root()
     outcome: dict[str, Any] = {}
@@ -406,8 +431,8 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
     assembled = inventory.assemble_rows(normalized.rows)
     if assembled.uuid_missing_count > assembled.total_count * MAX_UUID_MISSING_SHARE:
         raise CollectorError("redash_uuid_missing")
-    environment = inventory.require_environment(ENVIRONMENT)
-    directory = inventory.env_dir(root, ENVIRONMENT)
+    environment = inventory.require_environment(env_name)
+    directory = inventory.env_dir(root, env_name)
     try:
         latest = json.loads((directory / inventory.LATEST_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -433,7 +458,7 @@ def collect(opener: Any, key: str, *, root: Path | None = None, now: datetime | 
         summary["query_id"] = query_id
         summary["row_schema"] = payload.get("row_schema", redash.ROW_SCHEMA_V1)
     try:  # "unchanged" only when the stored snapshot still verifies (hash, name, counts), not just latest.json
-        stored = inventory.load_latest(root, ENVIRONMENT, max_age=timedelta(days=3650), now=now)
+        stored = inventory.load_latest(root, env_name, max_age=timedelta(days=3650), now=now)
     except inventory.InventoryError:
         stored = None
     if stored is not None and stored.get("rows_sha256") == payload["rows_sha256"] \
@@ -515,6 +540,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--collect", action="store_true", help="Refresh if needed and write the local snapshot.")
     parser.add_argument("--query-id", type=int, default=None,
                         help="Saved query to read (supported: 251, 253). Default: $SURFACE_REDASH_QUERY_ID, else 251.")
+    parser.add_argument("--region", choices=sorted(REGIONS), default="eu",
+                        help="Production clone to read: eu (default) or us (only the pinned US query; fails closed until set).")
     parser.add_argument("--max-age-minutes", type=int, default=int(DEFAULT_MAX_AGE.total_seconds() // 60))
     parser.add_argument("--no-refresh", action="store_true", help="Never ask Redash to re-run the query.")
     parser.add_argument("--cached-ok", action="store_true",
@@ -524,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
                         help="Accept a result more than 10%% smaller than the last snapshot (a deliberate clean-up).")
     args = parser.parse_args(argv)
     try:
-        query_id = resolve_query_id(args.query_id)
+        query_id = resolve_query_id(args.query_id, region=REGIONS[args.region])
         if args.store_key:
             store_key(read_key_hidden(query_id), query_id=query_id)
             print(json.dumps({"result": "key_stored", **({"query_id": query_id} if query_id != QUERY_ID else {})}))

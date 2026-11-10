@@ -108,7 +108,10 @@ class VmRunnerRegionTests(unittest.TestCase):
             return runner.production_match_for("CO-0835", "Surface", "New Product Onboarding")
 
     def test_a_us_co_is_not_clear_on_the_vm(self):
-        found = self.run_vm("US")
+        from integration.tests.test_us_clone_2026_11_09 import unpinned
+
+        with unpinned():  # the EU-only rule (US query switched off); the US clone pass: test_us_clone_2026_11_09
+            found = self.run_vm("US")
         self.assertEqual((found["status"], found["region"]), ("region_not_checked", "US"))
         self.assertEqual(views.production_check(found)["label"], "Region US: not checked")
 
@@ -210,7 +213,10 @@ class CloneStripTests(unittest.TestCase):
     INFO = {"state": "fresh", "age_seconds": 600, "data_age_seconds": 25 * 3600, "limit_seconds": 21600, "reason": ""}
 
     def test_the_strip_names_the_region_and_the_catch_up(self):
-        html = self.strip(self.INFO, waiting=True)
+        from integration.tests.test_us_clone_2026_11_09 import unpinned
+
+        with unpinned():  # US query switched off: the strip says EU only (pinned: test_us_clone_2026_11_09)
+            html = self.strip(self.INFO, waiting=True)
         self.assertIn("Covers EU (app.pentera.io) only", html)
         self.assertIn("clone load (about 00:00 UTC) is not in this data yet; the dashboard reads Redash every 15 min", html)
 

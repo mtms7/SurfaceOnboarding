@@ -454,7 +454,7 @@ def _data_age_seconds(payload: dict[str, Any], now: datetime) -> int | None:
     return max(0, int((now - newest).total_seconds()))
 
 
-def clone_status(root: Path, now: datetime) -> dict[str, Any]:
+def clone_status(root: Path, now: datetime, region: str = "EU") -> dict[str, Any]:
     """Age and trust of the production clone (Redash) for display.
 
     ``{"state": "fresh" | "stale" | "unusable", "captured_at", "age_seconds", "data_age_seconds", "limit_seconds": 21600,
@@ -462,15 +462,24 @@ def clone_status(root: Path, now: datetime) -> dict[str, Any]:
     still fresh: the gate uses ``age <= 6 h``); ``data_age_seconds`` is the age of the newest change in the cloned data
     (docs/56 step 4): the query can run hourly while the cloned database is a day old. Fresh needs BOTH; an unknown data
     age is stale (``data_age_unknown``). Any problem with the snapshot is "unusable" with the loader's reason code.
+    ``region`` "US" reads the US clone (``prod-clone-us``, owner request 2026-11-09); a snapshot of the wrong region is
+    unusable (``inventory_snapshot_wrong_region``).
     """
+    from integration.onboarding import redash_inventory as redash
+
     base = {"state": "unusable", "captured_at": "", "age_seconds": None, "data_age_seconds": None,
             "limit_seconds": CLONE_LIMIT_SECONDS, "data_limit_seconds": DATA_LIMIT_SECONDS, "reason": "", "label": ""}
+    env_name = redash.REGION_ENVIRONMENTS.get(region)
+    if env_name is None:
+        return {**base, "reason": "region_unsupported"}
     try:
-        payload = inventory.load_latest(Path(root), "prod-clone", max_age=DISPLAY_MAX_AGE, now=now)
+        payload = inventory.load_latest(Path(root), env_name, max_age=DISPLAY_MAX_AGE, now=now)
     except inventory.InventoryError as error:
         return {**base, "reason": _text(error.reason)}
     except (OSError, ValueError, TypeError):
         return {**base, "reason": "inventory_snapshot_unreadable"}
+    if redash.snapshot_region(payload) != region:
+        return {**base, "reason": "inventory_snapshot_wrong_region"}
     age = int(payload.get("age_seconds") or 0)
     data_age = _data_age_seconds(payload, now)
     reason = ""

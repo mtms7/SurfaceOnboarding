@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,6 +82,8 @@ def build(key_file: str, out: Path, parent: Path | None = None, now: datetime | 
     logs: dict[str, str] = {}
     try:
         for name in sorted(vs.RECORD_LOG_NAMES):
+            if name == vs.AUDIT_LOG_NAME and os.environ.get("SURFACE_PUSH_AUDIT_LOG") != "1":
+                continue  # only once the VM runs a release that accepts it (r42)
             log = parent / records.RECORDS_SUBDIR / name
             if log.is_file():
                 logs[name] = log.read_text(encoding="utf-8")

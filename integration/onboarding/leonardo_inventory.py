@@ -31,7 +31,7 @@ MAX_PAGES = 200
 ACQUISITION = "ui_pagination_intercept"
 REDASH_ACQUISITION = "redash_saved_query_results"
 # <prefix>-inventory-<UTC stamp>.json; the unprefixed form is the first (2026-10-04) DEV export.
-SNAPSHOT_FILE = re.compile(r"(?:(leonardo-dev|backoffice-prod|redash-prod-clone)-)?inventory-(\d{8}T\d{6}Z)\.json")
+SNAPSHOT_FILE = re.compile(r"(?:(leonardo-dev|backoffice-prod|redash-prod-clone|redash-us-clone)-)?inventory-(\d{8}T\d{6}Z)\.json")
 LATEST_FILE = "latest.json"
 _STAMP = "%Y-%m-%dT%H:%M:%SZ"
 _SAFE_KEY = re.compile(r"[A-Za-z_]\w{0,63}")
@@ -71,6 +71,12 @@ ENVIRONMENTS: dict[str, InventoryEnvironment] = {
     "prod-clone": InventoryEnvironment("prod-clone", "https://redash.pentera.io", approved=True,
                                        endpoint_path="/api/queries/251/results.json",
                                        label="PROD (cloned copy via Redash)", file_prefix="redash-prod-clone"),
+    # Owner request 2026-11-09: the US production clone (Redash data source "Prod US (Cloned) - Mgmt"), read-only through
+    # ONE saved query (``redash_inventory.US_QUERY_ID``). Own folder and file prefix: never "redash-prod-clone-us", which the
+    # VM ingest would accept as an EU file. The endpoint path is a fixed label that every US snapshot must carry.
+    "prod-clone-us": InventoryEnvironment("prod-clone-us", "https://redash.pentera.io", approved=True,
+                                          endpoint_path="/api/queries/us-clone/results.json",
+                                          label="PROD US (cloned copy via Redash)", file_prefix="redash-us-clone"),
 }
 
 

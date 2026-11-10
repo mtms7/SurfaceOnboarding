@@ -364,6 +364,44 @@ class ProgressTests(Base):
         fu._record(self.dir, CO, "ids", "write_uncertain", NOW)
         self.assertEqual(self.prog(running=False)["failed"], "write_uncertain")
 
+    def verified_create(self):
+        self.record(outcome="readback_verified", when=datetime(2026, 10, 22, 11, 10, tzinfo=timezone.utc),
+                    account_id=ACCOUNT_ID, account_uuid=UUID, tenant_name=NAME)
+
+    def test_an_ids_write_in_flight_is_active_not_stopped(self):
+        # 2026-11-10 (CO-0844): the page read the log between the intent line and the result line and froze on "Stopped".
+        self.verified_create()
+        fu._record(self.dir, CO, "ids", "write_started", NOW)
+        progress = self.prog(running=True)
+        self.assertIsNone(progress["failed"])
+        self.assertEqual(self.states(progress)[3], "active")
+        self.assertNotIn("Stopped", ui.progress_card_html(progress))
+
+    def test_a_stage_write_in_flight_is_active_not_stopped(self):
+        self.verified_create()
+        fu._record(self.dir, CO, "ids", "write_started", NOW)
+        fu._record(self.dir, CO, "ids", "written_verified", NOW)
+        fu._record(self.dir, CO, "stage", "write_started", NOW)
+        progress = self.prog(running=True)
+        self.assertEqual((self.states(progress)[3:], progress["failed"]), (["done", "active"], None))
+
+    def test_a_lone_intent_line_after_everything_ended_is_uncertain(self):
+        self.verified_create()
+        fu._record(self.dir, CO, "ids", "write_started", NOW)
+        self.assertEqual(self.prog(running=False)["failed"], "write_uncertain")
+        self.setUp()
+        self.verified_create()
+        fu._record(self.dir, CO, "ids", "written_verified", NOW)
+        fu._record(self.dir, CO, "stage", "write_started", NOW)
+        progress = self.prog(running=False)
+        self.assertEqual((self.states(progress)[3:], progress["failed"]), (["done", "failed"], "write_uncertain"))
+
+    def test_a_rejected_write_still_stops_while_running(self):
+        self.verified_create()
+        fu._record(self.dir, CO, "ids", "write_started", NOW)
+        fu._record(self.dir, CO, "ids", "write_rejected", NOW)
+        self.assertEqual(self.prog(running=True)["failed"], "write_rejected")
+
 
 if __name__ == "__main__":
     unittest.main()

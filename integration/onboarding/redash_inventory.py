@@ -140,12 +140,26 @@ class QueryProfile:
     query_id: int
     known: frozenset[str]
     row_schema: str
+    region: str = "EU"  # the production region whose clone the query reads (decides the snapshot environment)
 
+
+# Production regions with a Redash clone (owner request 2026-11-09, "implement the US tenant clone"). EU: "Prod (Cloned) -
+# Mgmt" (data source 2, queries 251 / 253). US: "Prod US (Cloned) - Mgmt" (data source 14, active since 2026-11-09: 102
+# tenants, verified read-only). Each region has its own snapshot environment and file prefix, so the two never mix.
+REGION_ENVIRONMENTS: dict[str, str] = {"EU": "prod-clone", "US": "prod-clone-us"}
+REGION_DATA_SOURCES: dict[str, str] = {"EU": "Prod (Cloned) - Mgmt", "US": "Prod US (Cloned) - Mgmt"}
+# The ONE read-only saved query on "Prod US (Cloned) - Mgmt" (same columns as 253). Created with the owner's go 2026-11-09:
+# query 257 "Surface Onboarding | Tenant inventory v2 US (read-only)", data source 14, unpublished, text identical to 253,
+# hourly Redash schedule; first run 102 rows, 62 columns equal to 253's. Set to None to switch the US clone off: every US
+# collect then fails closed (``redash_us_query_not_configured``) and US COs are "not checked" (``production_match.apply_region``).
+US_QUERY_ID: int | None = 257
 
 PROFILES: dict[int, QueryProfile] = {
     QUERY_ID: QueryProfile(QUERY_ID, KNOWN_COLUMNS, ROW_SCHEMA_V1),
     V2_QUERY_ID: QueryProfile(V2_QUERY_ID, KNOWN_COLUMNS_V2, ROW_SCHEMA_V2),
 }
+if US_QUERY_ID is not None:
+    PROFILES[US_QUERY_ID] = QueryProfile(US_QUERY_ID, KNOWN_COLUMNS_V2, ROW_SCHEMA_V2, "US")
 
 
 def profile_for(query_id: int) -> QueryProfile:
@@ -153,6 +167,37 @@ def profile_for(query_id: int) -> QueryProfile:
     if profile is None:
         raise InventoryError("redash_query_id_unsupported")
     return profile
+
+
+def region_query_id(region: str) -> int | None:
+    """The pinned saved query of a region's clone: 253 for EU, the US query for US; None when that region has none (pure)."""
+    for profile in PROFILES.values():
+        if profile.region == region and profile.row_schema == ROW_SCHEMA_V2:
+            return profile.query_id
+    return None
+
+
+def region_configured(region: str) -> bool:
+    """True when the region has a pinned query (EU always; US once ``US_QUERY_ID`` is set)."""
+    return region in REGION_ENVIRONMENTS and region_query_id(region) is not None
+
+
+def snapshot_region(payload: Any) -> str | None:
+    """The region a verified clone snapshot was collected for: the recorded source query's region, checked against the
+    snapshot environment. A legacy EU snapshot without a recorded query counts as EU. None = inconsistent (fail closed)."""
+    if not isinstance(payload, dict):
+        return None
+    environment = payload.get("environment")
+    source = payload.get("source")
+    query_id = source.get("query_id") if isinstance(source, dict) else None
+    if query_id is None:
+        region = "EU"
+    else:
+        profile = PROFILES.get(query_id) if type(query_id) is int else None
+        if profile is None:
+            return None
+        region = profile.region
+    return region if REGION_ENVIRONMENTS.get(region) == environment else None
 
 
 def _v2_value(kind: str, value: Any) -> Any:
@@ -624,7 +669,8 @@ def source_meta(normalized: NormalizedResult, collected_at: datetime, *, refresh
     """Provenance stored in the snapshot (no row data): which query, how old the data is, what drifted."""
     stamp = "%Y-%m-%dT%H:%M:%SZ"
     return {
-        "kind": "redash", "query_id": normalized.query_id, "data_source": "Prod (Cloned) - Mgmt",
+        "kind": "redash", "query_id": normalized.query_id,
+        "data_source": REGION_DATA_SOURCES.get(profile_for(normalized.query_id).region, REGION_DATA_SOURCES["EU"]),
         "retrieved_at": normalized.retrieved_at.strftime(stamp),
         "collected_at": collected_at.astimezone(timezone.utc).strftime(stamp),
         "data_latest_modified": normalized.latest_modified.strftime(stamp) if normalized.latest_modified else None,

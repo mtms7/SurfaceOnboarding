@@ -8372,9 +8372,22 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
     """
     from integration.onboarding import production_match as match
 
+    result, region_value = _production_match_in(reference, product, onboarding_type, match.CLONE_REGION)
+    # Owner request 2026-11-09: a US CO is checked against the US clone once its saved query is pinned (before that it stays
+    # "region_not_checked" from the EU pass). A missing / stale / wrong US clone is "clone_unavailable" (us_clone_*): blocks.
+    if match.region_of(region_value) == "US" and "US" in match.clone_regions():
+        result, _ = _production_match_in(reference, product, onboarding_type, "US")
+    return result
+
+
+def _production_match_in(reference: str, product: Any, onboarding_type: Any, clone_region: str) -> tuple[dict[str, Any], Any]:
+    """One match of ``reference`` against the clone of ``clone_region`` ("EU" or "US"); returns (result, the CO's region value
+    as read: None when it was not read). The body is the former ``production_match_for`` (unchanged for EU)."""
+    from integration.onboarding import production_match as match
+
     reads = MATCH_READS.get()
     expectation_of, identity_of = reads if reads is not None else (_production_expectation, _identity_for)
-    snapshot = match.load_snapshot(clone_root(), datetime.now(timezone.utc))
+    snapshot = match.load_snapshot(clone_root(), datetime.now(timezone.utc), region=clone_region)
     co_source: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     engine = None
@@ -8418,11 +8431,16 @@ def production_match_for(reference: str, product: Any = None, onboarding_type: A
         result["reason"] = "production_inputs_not_prepared"
     result["route"] = engine
     result = _apply_verified_tenant(result, reference, uuid_value)
+    region_value: Any = None
     if isinstance(identity, dict) and "region" in identity:  # the desktop read carries the region
-        result = match.apply_region(result, identity["region"])
+        region_value = identity["region"]
+        result = match.apply_region(result, region_value, clone_region)
     elif state_paths.vm_mode() and REFERENCE.fullmatch(reference):  # the VM: the region the publisher read (owner go 2026-11-05)
-        result = match.apply_region(result, _snapshot_region(reference))
-    return result
+        region_value = _snapshot_region(reference)
+        result = match.apply_region(result, region_value, clone_region)
+    if clone_region != match.CLONE_REGION:
+        result["clone_region"] = clone_region
+    return result, region_value
 
 
 def _combine_duplicate(ui: str, api: str) -> str:
@@ -10850,6 +10868,9 @@ def main() -> int:
     parser.add_argument("--production-scan-check", action="store_true",
                         help="With --co: READ-ONLY CE scan check of a tenant created by a verified production create (you sign "
                              "in with SSO and MFA; nothing is typed, clicked or written).")
+    parser.add_argument("--production-primary-user", action="store_true",
+                        help="With --co: the owner's click: create the Case 3 primary user (Salesforce Primary User contact) as "
+                             "Admin in the tenant, or confirm it exists; one guarded add at most; the tenant is given back.")
     parser.add_argument("--kept-window-only", action="store_true",
                         help="Only with --production-scan-check: use the kept, signed-in production window or stop (no launch, "
                              "no sign-in wait). The dashboard's automatic check.")
@@ -10857,6 +10878,12 @@ def main() -> int:
                         help="Only with --production-create or --production-surface-renewal: the owner's explicit go for this one "
                              "run (never implied).")
     args = parser.parse_args()
+    if args.production_primary_user:
+        if (not args.co or args.revision or args.production_create or args.production_dry_run or args.production_scan_check
+                or args.dry_run or args.confirm_write or args.kept_window_only):
+            parser.error("--production-primary-user needs --co and is a separate run")
+        print(run_production_primary_user(args.co))
+        return 0
     if args.production_scan_check:
         if (not args.co or args.revision or args.production_create or args.production_dry_run or args.production_probe
                 or args.production_readback or args.dry_run or args.confirm_write or args.owner_go):
@@ -11570,6 +11597,300 @@ def _scan_check_line(result: str) -> str:
                       separators=(",", ":"))
 
 
+# --- Case 3 primary user (owner request + HAR 2026-11-06, CO-0841) ------------------------------------------------------------
+PRIMARY_USER_RESPONSE_MS = 20_000
+PRIMARY_USER_SIGNED_IN = ("primary_user_ready",)
+
+
+class PrimaryUserGuard(production_dry_run.DryRunRequestGuard):
+    """Reads pass (dry-run rules) plus, for ONE tenant: its take-control GET, the Users table read, ONE add POST whose body
+    equals the plan exactly (while armed), and giveUpControl (only ever gives privileges back). Every other write is
+    aborted and counted; a second or different add is aborted (``add_mismatch``)."""
+
+    def __init__(self, account_id: str, user: Any) -> None:
+        super().__init__()
+        self.account_id, self.user = account_id, user
+        self.add_armed = self.add_used = False
+        self.add_mismatch = self.add_blocked = self.control_other = 0
+
+    def handle(self, route: Any) -> None:
+        from integration.onboarding import production_case3_primary_user as primary
+
+        try:
+            method, url = str(route.request.method).upper(), str(route.request.url)
+            body = getattr(route.request, "post_data", None)
+        except Exception:
+            route.abort()
+            return
+        if production_probe.url_origin(url) != production_probe.PRODUCTION_ORIGIN:
+            super().handle(route)
+            return
+        path = production_probe.url_path(url) or ""
+        target = primary.control_id(method, path)
+        if target is not None:
+            if target == self.account_id:
+                route.continue_()
+            else:
+                self.control_other += 1
+                route.abort()
+            return
+        if method == "POST" and path == primary.USERS_PATH and primary.users_list_body_ok(body):
+            route.continue_()
+            return
+        if method == "POST" and path == primary.GIVE_UP_PATH:
+            route.continue_()
+            return
+        if method == "POST" and path == primary.ADD_PATH:
+            if self.add_armed and not self.add_used and primary.body_matches(body, self.user):
+                self.add_used, self.add_armed = True, False  # disarmed before it continues: a repeat is aborted
+                route.continue_()
+            else:
+                self.add_blocked += 1
+                if self.add_armed and not primary.body_matches(body, self.user):
+                    self.add_mismatch += 1
+                route.abort()
+            return
+        super().handle(route)
+
+
+def _primary_user_line(result: str, wrote: bool = False) -> str:
+    return json.dumps({"result": result, "production_write": "performed" if wrote else "not_performed",
+                       "salesforce_writeback": "not_performed"}, separators=(",", ":"))
+
+
+def _pu_users_state(page: Any, user: Any, trigger: Any) -> str | None:
+    """Run ``trigger`` and read the Users table reply it causes (in memory only): the user's state or None."""
+    from integration.onboarding import production_case3_primary_user as primary
+
+    def is_users(r: Any) -> bool:
+        return (r.request.method.upper() == "POST" and production_probe.url_origin(r.url) == production_probe.PRODUCTION_ORIGIN
+                and production_probe.url_path(r.url) == primary.USERS_PATH)
+
+    with page.expect_response(is_users, timeout=PRIMARY_USER_RESPONSE_MS) as info:
+        trigger()
+    response = info.value
+    if response.status != 200:
+        return None
+    try:
+        return primary.user_state(response.json(), user)
+    except Exception:
+        return None
+
+
+def _pu_release(page: Any, diag: dict[str, str]) -> bool:
+    """Give the tenant back (the page's own Give up control); True when giveUpControl answered 200."""
+    from integration.onboarding import production_case3_primary_user as primary
+
+    def is_give_up(r: Any) -> bool:
+        return (r.request.method.upper() == "POST" and production_probe.url_path(r.url) == primary.GIVE_UP_PATH)
+
+    label = re.compile(r"give\s*up\s*control", re.IGNORECASE)
+    try:
+        control = page.get_by_text(label)
+        diag["release_controls"] = str(min(control.count(), 9))
+        if not control.count():
+            return False
+        with page.expect_response(is_give_up, timeout=PRIMARY_USER_RESPONSE_MS) as info:
+            control.first.click(timeout=FIELD_TIMEOUT_MS)
+            page.wait_for_timeout(800)
+            confirm = page.get_by_role("button", name=re.compile(r"^\s*(yes|ok|confirm|give\s*up(\s*control)?)\s*$", re.I))
+            if confirm.count() == 1:
+                confirm.first.click(timeout=FIELD_TIMEOUT_MS)
+        return info.value.status == 200
+    except Exception:
+        return False
+
+
+def _pu_fill_and_add(page: Any, guard: Any, user: Any, diag: dict[str, str], record: Any) -> str:
+    """Open Add user, fill the person, click the form's one submit; the guard lets only the exact planned body through."""
+    from integration.onboarding import production_case3_primary_user as primary
+
+    try:
+        page.get_by_role("button", name=re.compile(r"add\s*user", re.I)).first.click(timeout=FIELD_TIMEOUT_MS)
+        page.wait_for_timeout(800)
+        scope = page.get_by_role("dialog") if page.get_by_role("dialog").count() == 1 else page
+        for pattern, value, key in ((r"first\s*name", user.first_name, "first"), (r"last\s*name", user.last_name, "last"),
+                                    (r"e-?mail", user.email, "email")):
+            box = scope.get_by_label(re.compile(pattern, re.I))
+            if box.count() != 1:
+                box = scope.get_by_placeholder(re.compile(pattern, re.I))
+            diag["field_" + key] = str(min(box.count(), 9))
+            if box.count() != 1:
+                raise LookupError("field")
+            box.first.fill(value, timeout=FIELD_TIMEOUT_MS)
+        role = scope.get_by_label(re.compile(r"^\s*roles?\s*$", re.I))
+        diag["role_controls"] = str(min(role.count(), 9))
+        if role.count() == 1 and not re.search(r"admin", role.first.inner_text(timeout=FIELD_TIMEOUT_MS) or "", re.I):
+            role.first.click(timeout=FIELD_TIMEOUT_MS)
+            option = page.get_by_role("option", name=re.compile(r"^\s*(account\s*)?admin(istrator)?\s*$", re.I))
+            diag["role_options"] = str(min(option.count(), 9))
+            if option.count() != 1:
+                raise LookupError("role")
+            option.first.click(timeout=FIELD_TIMEOUT_MS)
+        submit = scope.get_by_role("button", name=re.compile(r"^\s*(add|add\s*user|save|create|invite)\s*$", re.I))
+        diag["submit_buttons"] = str(min(submit.count(), 9))
+        if submit.count() != 1:
+            raise LookupError("submit")
+    except Exception:
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return "add_form_unavailable"
+    try:
+        record("write_started")
+    except Exception:
+        page.keyboard.press("Escape")
+        return "primary_user_record_failed"
+
+    def is_add(r: Any) -> bool:
+        return r.request.method.upper() == "POST" and production_probe.url_path(r.url) == primary.ADD_PATH
+
+    guard.add_armed = True
+    try:
+        with page.expect_response(is_add, timeout=PRIMARY_USER_RESPONSE_MS) as info:
+            submit.first.click(timeout=FIELD_TIMEOUT_MS)
+        response = info.value
+    except Exception:
+        return "add_body_mismatch" if guard.add_mismatch else "add_no_signal"
+    finally:
+        guard.add_armed = False
+    return "add_accepted" if response.status == 200 else "add_rejected"
+
+
+def run_production_primary_user(reference: str, *, environ: Any | None = None, now: datetime | None = None,
+                                records_parent: Path | None = None, open_page: Any = None, read_co: Any = None,
+                                wait_seconds: float = MAX_WAIT_SECONDS) -> str:
+    """Owner click (CO page, owner request 2026-11-06): create the Case 3 primary user as Admin in the tenant, the way the
+    owner did by hand (HAR 2026-11-06), or confirm it is already there. ONE add at most, guarded by its exact body; the
+    tenant is always given back (Give up control). The Salesforce stage move (User Created) is the dashboard's follow-up.
+
+    Gates before any browser: desktop, a verified Case 3 create (tenant name + account id), a fresh fixed CO read (route,
+    stage Scan Completed Successfully or User Created, Primary User contact with a valid email on the CO's own domain), and
+    no earlier primary-user attempt that needs review."""
+    from integration.onboarding import case3_followup
+    from integration.onboarding import production_case3_primary_user as primary
+    from integration.onboarding import production_create_ui as create_ui
+
+    environ = dict(os.environ if environ is None else environ)
+    clock = (lambda: now) if now is not None else (lambda: datetime.now(timezone.utc))
+    if not isinstance(reference, str) or not REFERENCE.fullmatch(reference):
+        return _primary_user_line("invalid_co_reference")
+    runtime = str(environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop")).strip().casefold()
+    if _launch_os_name() != "nt" or runtime != "desktop":
+        return _primary_user_line("browser_launch_not_allowed")
+    parent = records_parent or _pdr_records_parent()
+    last = case3_followup.last_primary_user(parent, reference)
+    if last in primary.DONE_RESULTS:
+        return _primary_user_line("already_done")
+    if last is not None and last not in ("add_form_unavailable", "control_item_not_found", "control_failed",
+                                         "users_list_unavailable", "row_not_found", "session_expired", "add_rejected",
+                                         "add_body_mismatch", "user_exists_other_role"):
+        return _primary_user_line("primary_user_needs_review")  # started / unverified / no signal: never repeated
+    try:
+        history = create_ui.load_co_records(parent, reference)
+    except Exception:
+        return _primary_user_line("records_unreadable")
+    verified = [r for r in history if r.get("outcome") == "readback_verified" and r.get("route") == CASE3_ENGINE]
+    account_id = verified[-1].get("account_id") if verified else None
+    tenant = verified[-1].get("tenant_name") if verified else None
+    if (create_ui.co_status(history)["code"] != create_ui.CREATED_VERIFIED or not isinstance(account_id, str)
+            or not re.fullmatch(r"[0-9a-f]{24}", account_id) or not isinstance(tenant, str) or not tenant.strip()):
+        return _primary_user_line("no_verified_case3_create")
+    try:
+        rows = (read_co or _sf_records)("SELECT " + primary.SOQL_FIELDS + " FROM Customer_Onboarding__c WHERE Name = '"
+                                        + reference + "' LIMIT 2")
+        row = rows[0] if len(rows) == 1 and rows[0].get("Name") == reference else None
+    except Exception:
+        row = None
+    user, problem = primary.plan(row)
+    if user is None:
+        return _primary_user_line(problem)
+    stage = primary.stage_problem(row)
+    if stage is not None:
+        return _primary_user_line(stage)
+    diag: dict[str, str] = {}
+
+    def record(result: str) -> None:
+        case3_followup.record_primary_user(parent, reference, result, clock(), user.domain, diag)
+
+    result, released, in_control = "control_failed", True, False
+    opener = open_page or (_kept_browser_page if production_window_kept() else _pdr_browser_page)
+    try:
+        with opener(production_probe.probe_target(), KEPT_SIGN_IN_SECONDS if opener is _kept_browser_page else wait_seconds) as page:
+            guard = PrimaryUserGuard(account_id, user)
+            guard.install(page)
+            try:  # the verified tenant row (by name, then the exact account id)
+                reply = _pdr_reader(page, in_app=False).readback(tenant)
+                status = reply.get("status") if isinstance(reply, dict) else None
+                found = [r for r in (reply.get("rows") or []) if isinstance(r, dict) and r.get("id") == account_id] \
+                    if status == 200 else []
+                if status in (401, 403):
+                    raise LookupError("session_expired")
+                if len(found) != 1:
+                    raise LookupError("row_not_found")
+                page.locator("tr, [role='row']").filter(has_text=tenant).first.click(timeout=FIELD_TIMEOUT_MS)
+                page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
+                items = page.locator(ROW_MENU_ITEMS_SELECTOR).filter(has_text=re.compile(r"control", re.I))
+                page.wait_for_timeout(500)
+                diag["control_items"] = str(min(items.count(), 9))
+                if items.count() != 1:
+                    tokens = [t for t in page.locator(ROW_MENU_ITEMS_SELECTOR).evaluate_all(
+                        "els => els.map(e => e.getAttribute('data-am'))") if isinstance(t, str)
+                        and re.fullmatch(r"Button-Grid_[A-Za-z0-9_]{1,40}", t)]
+                    diag["menu_items"] = ",".join(tokens)[:300]
+                    page.keyboard.press("Escape")
+                    raise LookupError("control_item_not_found")
+                token = items.first.get_attribute("data-am") or ""
+                if re.search(r"(?i)delete|remove|disable|deactivate|suspend|reset|purge", token):
+                    page.keyboard.press("Escape")
+                    raise LookupError("control_item_not_found")
+                with page.expect_response(lambda r: primary.control_id(r.request.method, production_probe.url_path(r.url) or "")
+                                          == account_id, timeout=PRIMARY_USER_RESPONSE_MS) as info:
+                    items.first.click(timeout=FIELD_TIMEOUT_MS)
+                in_control = True
+                if info.value.status != 200:
+                    raise LookupError("control_failed")
+                page.wait_for_timeout(1500)
+                origin = production_probe.PRODUCTION_ORIGIN
+                state = _pu_users_state(page, user, lambda: page.goto(origin + primary.USERS_PAGE, wait_until="domcontentloaded",
+                                                                       timeout=30_000))
+                if state is None:
+                    raise LookupError("users_list_unavailable")
+                if state == "present_admin":
+                    result = primary.ALREADY
+                elif state == "present_other_role":
+                    result = "user_exists_other_role"
+                else:
+                    added = _pu_fill_and_add(page, guard, user, diag, record)
+                    if added != "add_accepted":
+                        result = added
+                    else:
+                        try:
+                            after = _pu_users_state(page, user, lambda: page.reload(wait_until="domcontentloaded",
+                                                                                    timeout=30_000))
+                        except Exception:
+                            after = None
+                        result = primary.CREATED if after == "present_admin" else "user_created_unverified"
+            except LookupError as stop:
+                result = str(stop)
+            finally:
+                if in_control:
+                    released = _pu_release(page, diag)
+    except RuntimeError as error:
+        result = {"production_dry_run_login_timeout": "production_sign_in_timeout",
+                  "production_window_signed_out": "production_window_signed_out"}.get(str(error), "primary_user_failed")
+    except Exception:
+        result = "primary_user_failed"
+    final = result if released else result + "+" + primary.CONTROL_NOT_RELEASED
+    try:
+        if result not in ("production_sign_in_timeout", "production_window_signed_out", "primary_user_failed") or in_control:
+            record(final)
+    except Exception:
+        pass
+    return _primary_user_line(final, wrote=result in (primary.CREATED, "user_created_unverified", "add_no_signal"))
+
+
 def run_production_scan_check(reference: str, *, environ: Any | None = None, now: datetime | None = None,
                               records_parent: Path | None = None, open_page: Any = None,
                               wait_seconds: float = MAX_WAIT_SECONDS, kept_only: bool = False) -> str:
@@ -11583,11 +11904,13 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
     ``kept_only`` (the dashboard's automatic check, owner request 2026-10-30): only a new tab in the kept, signed-in
     production window; no launch, no sign-in wait, nothing brought to the front; otherwise nothing is read or recorded.
     """
+    from integration.onboarding import post_onboard_audit as audit
     from integration.onboarding import production_create_ui as create_ui
     from integration.onboarding import production_scan_check as scan
 
     environ = dict(os.environ if environ is None else environ)
     now = now or datetime.now(timezone.utc)
+    audit_facts: dict[str, Any] = {}
     if not isinstance(reference, str) or not REFERENCE.fullmatch(reference):
         return _scan_check_line("invalid_co_reference")
     runtime = str(environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop")).strip().casefold()
@@ -11622,6 +11945,7 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
             else:
                 status, body = _pdr_reader(page, in_app=False).table(tenant, mode=production_probe.REWRITE_STRICT)
                 reply = scan.scan_reply(status, body, uuid)
+                audit_facts = audit.live_row_facts(scan.matched_row(status, body, uuid))  # masked: no identity leaves
                 # Live 2026-10-19: the row holds no CE result; the Duration Per Scan executions list decides.
                 if reply["found"] and isinstance(account_id, str) and account_id:
                     try:
@@ -11648,6 +11972,11 @@ def run_production_scan_check(reference: str, *, environ: Any | None = None, now
         scan.record(parent, reference, reply, now)
     except Exception:
         return _scan_check_line("scan_record_failed")
+    if reply.get("found"):  # post-onboarding audit (owner go 2026-11-06): one masked line per live read; never fails the check
+        try:
+            audit.append(parent, audit.log_line(reference, now, reply["state"], audit_facts, reply.get("executions")))
+        except Exception:
+            pass
     return _scan_check_line(reply["state"])
 
 

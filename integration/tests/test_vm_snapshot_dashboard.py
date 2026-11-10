@@ -646,6 +646,13 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         self.push_clone("Other Co", "other.example")  # the CO itself is not in this clone: EU would be "Clear"
         self.publish({"CO-0001": self.item(region="US")})
         found = self.match("CO-0001")
+        # 2026-11-09: the US CO is matched against the US clone (query 257), which this VM does not have: still blocked
+        self.assertEqual((found["status"], found["reason"], found["clone_region"]),
+                         ("clone_unavailable", "us_clone_inventory_snapshot_missing", "US"))
+        from integration.tests.test_us_clone_2026_11_09 import unpinned
+
+        with unpinned():  # US query switched off: the EU-only rule
+            found = self.match("CO-0001")
         self.assertEqual((found["status"], found["region"]), ("region_not_checked", "US"))
         self.publish({"CO-0001": {key: value for key, value in self.item().items() if key != "region"}})
         found = self.match("CO-0001")

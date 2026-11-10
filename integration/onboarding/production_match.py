@@ -61,25 +61,47 @@ def region_problem(value: Any) -> str | None:
     return None if region_of(value) == CLONE_REGION else "surface_region_not_supported"
 
 
-def apply_region(result: dict[str, Any], region_value: Any) -> dict[str, Any]:
-    """A CO outside the EU region is never cleared (or "found") by the EU clone: such a result becomes
-    ``region_not_checked`` (blocking). Results that block anyway, and ``onboarded`` (the CO's own UUID found), stay. Pure."""
+def apply_region(result: dict[str, Any], region_value: Any, clone_region: str = CLONE_REGION) -> dict[str, Any]:
+    """A CO outside the region of the clone that produced ``result`` is never cleared (or "found") by it: such a result
+    becomes ``region_not_checked`` (blocking). Results that block anyway, and ``onboarded`` (the CO's own UUID found), stay.
+    ``clone_region`` is "EU" for the EU clone and "US" for the US clone (owner request 2026-11-09). Pure."""
     region = region_of(region_value)
-    if region == CLONE_REGION or not isinstance(result, dict) or result.get("status") not in _REGION_UNDECIDED:
+    if region == clone_region or not isinstance(result, dict) or result.get("status") not in _REGION_UNDECIDED:
         return result
     origin = REGION_ORIGINS.get(region or "", "")
     label = region or "unknown"
-    reason = ("Surface Tenant Region " + label + (" (" + origin + ")" if origin else "") + ": the clone holds EU tenants only "
-              "(https://app.pentera.io), so this CO was not checked. Check BackOffice in its region.")
+    clone_origin = REGION_ORIGINS.get(clone_region, "")
+    reason = ("Surface Tenant Region " + label + (" (" + origin + ")" if origin else "") + ": the clone holds "
+              + clone_region + " tenants only" + (" (" + clone_origin + ")" if clone_origin else "")
+              + ", so this CO was not checked. Check BackOffice in its region.")
     return {**result, "status": "region_not_checked", "reason": reason, "region": label, "region_was": result.get("status")}
 
 
-def load_snapshot(root: Any, now: datetime, max_age: timedelta = PRODUCTION_GATE_MAX_AGE) -> Mapping[str, Any] | str:
-    """The verified production-clone snapshot, or the reason code it cannot be used (never raises)."""
+def clone_regions() -> tuple[str, ...]:
+    """Regions whose clone the match can use: EU always, US once its saved query is pinned (``redash_inventory``)."""
+    from integration.onboarding import redash_inventory as redash
+
+    return tuple(region for region in redash.REGION_ENVIRONMENTS if redash.region_configured(region))
+
+
+def load_snapshot(root: Any, now: datetime, max_age: timedelta = PRODUCTION_GATE_MAX_AGE,
+                  region: str = CLONE_REGION) -> Mapping[str, Any] | str:
+    """The verified production-clone snapshot of ``region`` ("EU" default, "US"), or the reason code it cannot be used (never
+    raises). A snapshot whose recorded source query belongs to another region is refused (``inventory_snapshot_wrong_region``).
+    A US problem carries the ``us_clone_`` prefix so it is never read as the EU clone's state."""
+    from integration.onboarding import redash_inventory as redash
+
+    prefix = "" if region == CLONE_REGION else region.casefold() + "_clone_"
+    env_name = redash.REGION_ENVIRONMENTS.get(region)
+    if env_name is None:
+        return prefix + "region_unsupported" if prefix else "region_unsupported"
     try:
-        return load_latest(root, "prod-clone", max_age=max_age, now=now)
+        payload = load_latest(root, env_name, max_age=max_age, now=now)
     except InventoryError as error:
-        return error.reason
+        return prefix + error.reason
+    if redash.snapshot_region(payload) != region:
+        return prefix + "inventory_snapshot_wrong_region"
+    return payload
 
 
 def _norm(value: Any) -> str:

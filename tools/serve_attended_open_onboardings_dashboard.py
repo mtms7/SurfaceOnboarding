@@ -1239,7 +1239,8 @@ _POSTS_KEEPING_DISPLAY_CACHE = frozenset({"/login/start", "/login/cancel", "/log
 # warm-up then re-read all COs one by one, ~4.5 s each). They clear only that CO and the queue lists, once the form names
 # a valid CO; a form without one clears everything as before.
 _PER_CO_POSTS = frozenset({create_ui.CREATE_PATH, create_ui.UUID_REVIEW_PATH, create_ui.UUID_CONFIRM_PATH,
-                           create_ui.SCAN_CHECK_PATH, create_ui.FOLLOWUP_REVIEW_PATH, create_ui.FOLLOWUP_CONFIRM_PATH})
+                           create_ui.SCAN_CHECK_PATH, create_ui.FOLLOWUP_REVIEW_PATH, create_ui.FOLLOWUP_CONFIRM_PATH,
+                           create_ui.PRIMARY_USER_PATH, create_ui.PRIMARY_USER_BY_HAND_PATH})
 
 
 def clear_display_cache_for(reference: str) -> None:
@@ -6392,6 +6393,10 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
                      if scanned else "<span class='muted'>never</span>")
         status_cell = ("<span class='chip " + _SCAN_CHIP.get(status.upper(), "chip-neutral") + "'>" + escape(status.title()) + "</span>"
                        if status else "<span class='muted'>—</span>")
+        live_scan = _audit_live_by_uuid().get(str(tenant.get("account_uuid") or "").strip().lower())
+        if live_scan:  # post-onboarding audit: the newer BackOffice read beside the nightly clone's word
+            status_cell += ("<span class='sub'>clone · BackOffice " + escape(str(live_scan["status"]).title()) + " "
+                            + escape(live_scan["at"][5:16].replace("T", " ")) + "Z</span>")
         interval = str(tenant.get("scanning_interval") or "—").replace("_", " ").casefold()
         spy = tenant.get("spycloud_enabled")  # informational (ON is the default); boolean only
         spy_cell = {True: "<span class='chip chip-ok'>ON</span>", False: "<span class='chip chip-warn'>OFF</span>"}.get(
@@ -6662,6 +6667,8 @@ def _prod_action(result: dict[str, Any]) -> str:
     if status in ("exists_other", "ambiguous"):
         return "Resolve duplicate"
     if status == "clone_unavailable":
+        if reason.startswith("us_clone_"):
+            return "Refresh the US clone: " + escape(US_CLONE_HINT)
         if reason.startswith("inventory_snapshot") or reason == "alternate_domains_missing":
             return PROD_ACTION_REFRESH + _collect_hint_html()
         return "Check CO source data"
@@ -7486,8 +7493,51 @@ def _clone_strip() -> str:
         note += ("<p class='note'>Today's clone load (about 00:00 UTC) is not in this data yet"
                  + ("" if vm_mode() or not clone_autorefresh.enabled() else
                     "; the dashboard reads Redash every 15 min until it arrives") + ".</p>")
+    us_chip, us_note = _us_clone_chip()
     return ("<div class='strip'>" + chip + "<span class='chip chip-neutral'>Source: Redash, personal data removed</span>"
-            "<span class='chip chip-neutral'>Covers EU (app.pentera.io) only: US / IL COs are not checked</span></div>" + note)
+            + us_chip + "</div>" + note + us_note)
+
+
+US_CLONE_HINT = "tools/redash_inventory_collector.py --collect --region us"
+
+
+def _us_clone_chip() -> tuple[str, str]:
+    """The US clone's chip for the strip (owner request 2026-11-09): "EU only" until the US query is pinned, then the US
+    clone's own age and trust. (chip html, note html); never raises."""
+    if not production_match_regions_us():
+        return ("<span class='chip chip-neutral'>Covers EU (app.pentera.io) only: US / IL COs are not checked</span>", "")
+    try:
+        info = production_views.clone_status(clone_root(), production_now(), region="US")
+    except Exception:  # noqa: BLE001 - the strip never breaks a page; an unreadable US clone is unusable
+        info = {"state": "unusable", "reason": "inventory_snapshot_unreadable"}
+    if info.get("state") == "fresh":
+        words = "US clone " + production_views.age_words(info.get("age_seconds")) + " old"
+        if isinstance(info.get("data_age_seconds"), int):
+            words += "; data " + production_views.age_words(info["data_age_seconds"]) + " old"
+        chip = "<span class='chip chip-ok'>" + escape(words) + " &middot; trusted</span>"
+    elif info.get("state") == "stale":
+        chip = _chip("chip-warn", "US clone stale, not trusted (" + str(info.get("reason") or "unknown") + ")")
+    else:
+        chip = _chip("chip-warn", "US clone unusable: " + str(info.get("reason") or "unknown"))
+    chip += "<span class='chip chip-neutral'>IL COs are not checked</span>"
+    note = ""
+    if info.get("state") != "fresh":
+        note = ("<p class='note'>US COs are blocked until the US clone is fresh. Refresh it with <code>"
+                + escape(US_CLONE_HINT) + "</code>.</p>")
+        described = clone_autorefresh.describe(clone_autorefresh.US)
+        if described:
+            note += "<p class='note'>" + escape(described) + "</p>"
+    return chip, note
+
+
+def production_match_regions_us() -> bool:
+    """True once the US clone is usable by the production match (its saved query is pinned)."""
+    try:
+        from integration.onboarding import production_match as _pm
+
+        return "US" in _pm.clone_regions()
+    except Exception:  # noqa: BLE001 - unknown means "EU only" (fail closed: US COs stay not checked)
+        return False
 
 
 def _create_approval_chip(view: dict[str, Any]) -> str:
@@ -7733,6 +7783,8 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "", fil
                 if actions:
                     create_cell += (_chip("chip-warn", "Action needed in BackOffice") + "<span class='sub'>"
                                     + escape(" ".join(actions)) + "</span>")
+            if route_for(row) in (CE_ENGINE, CASE3_ENGINE) and item["create"]["code"] in production_views.CREATED_OUTCOMES:
+                create_cell += _audit_chip(ref)
             onboarding = "<a class='co' href='" + escape(_with_back(_co_page_href(ref), back_view)) + "'>" + escape(ref) + "</a>"
         elif create_ui._row_route(row) == production_approval.SURFACE_RENEWAL_ROUTE:
             # Surface renewal (owner go 2026-11-03): no create, one Edit Account from the production CO page (the review page
@@ -8718,9 +8770,11 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
                 inputs = _card_inputs(reference, row)
                 return create_ui.progress_card_html(progress) + create_ui.create_card_html(
                     inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
-            return create_ui.progress_card_html(progress) + (scan_html if progress["done"] else "")
+            return create_ui.progress_card_html(progress) + (scan_html + _audit_card(reference) if progress["done"] else "")
         inputs = _card_inputs(reference, row)
         html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference)) + scan_html
+        if html:  # the audit card only beside a create card (a locked build shows nothing here)
+            html += _audit_card(reference) + _primary_user_card(reference)
     except Exception:  # noqa: BLE001 - fail closed: no control
         html = ""
     if html or state is None:
@@ -9167,6 +9221,7 @@ def _auto_scan_loop(stop: Any = None) -> None:
             _auto_scan_tick()
         except Exception:  # noqa: BLE001 - the loop never dies
             pass
+        _audit_move_tick()  # post-onboarding audit: Case 3 scan moves from the clone or a live read (PC only)
         AUTO_SCAN_WAKE.wait(AUTO_SCAN_INTERVAL_SECONDS)
         AUTO_SCAN_WAKE.clear()
         if stop is not None and stop.is_set():
@@ -9213,10 +9268,394 @@ def _kept_scan_tick(now: datetime | None = None) -> str | None:
     return None
 
 
+# --- Post-onboarding audit (owner request + go 2026-11-06) -----------------------------------------------------------------
+# Every verified dashboard create from the last 3 days (30 while something is still open) is audited from two sources: the
+# nightly clone (also on the VM, no PC needed) and, whenever the PC's production window is kept and signed in, a read-only
+# live read of the tenant row through the SAME --production-scan-check --kept-window-only run (one CO at a time, never during
+# a create). A Case 3 CO whose Surface and CE scans are both done moves Account Scanning -> Scan Completed Successfully
+# (case3_followup.after_scan_finished: guarded, one write, read back, never retried). Nothing is written to BackOffice.
+AUDIT_LIVE_STATE: dict[str, datetime] = {}  # per CO: the last automatic live read started by this process
+AUDIT_MOVE_HOLD: dict[str, float] = {}  # per CO: no stage-move attempt before this epoch second
+AUDIT_MOVE_HOLD_SECONDS = 24 * 3600
+_AUDIT_CACHE: dict[str, Any] = {"at": 0.0, "views": {}, "parent": None}
+AUDIT_CACHE_SECONDS = 60
+_AUDIT_CLONE_INDEX: dict[str, Any] = {"sha": None, "index": {}, "at": None}
+
+
+def _audit_clone() -> tuple[Any, datetime | None]:
+    """(lookup by Account UUID, the clone's data time) from the verified newest clone; (None, None) when unusable."""
+    try:
+        payload = _clone_payload_for_job()
+    except Exception:  # noqa: BLE001 - no clone: the live source alone
+        return None, None
+    sha = payload.get("rows_sha256") if isinstance(payload, dict) else None
+    if sha is None or sha != _AUDIT_CLONE_INDEX["sha"]:
+        index = {str(row.get("account_uuid") or "").strip().lower(): row for row in (payload or {}).get("tenants") or []
+                 if isinstance(row, dict) and row.get("account_uuid")}
+        source = (payload or {}).get("source") if isinstance(payload, dict) else None
+        stamp = (source or {}).get("data_latest_modified") if isinstance(source, dict) else None
+        when = None
+        if isinstance(stamp, str):
+            try:
+                when = datetime.strptime(stamp[:19] + "Z", "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                when = None
+        if when is None:  # an older snapshot without the data time: its capture time (never newer than the data it holds)
+            try:
+                when = datetime.strptime(str(payload.get("captured_at")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                when = None
+        _AUDIT_CLONE_INDEX.update({"sha": sha, "index": index, "at": when})
+    index = _AUDIT_CLONE_INDEX["index"]
+    return (lambda uuid: index.get(uuid)), _AUDIT_CLONE_INDEX["at"]
+
+
+def audit_views(fresh: bool = False) -> dict[str, dict[str, Any]]:
+    """The audit view of every audited CO (cached AUDIT_CACHE_SECONDS); {} on any problem."""
+    from integration.onboarding import post_onboard_audit as audit
+
+    now_s = datetime.now(timezone.utc).timestamp()
+    try:
+        parent = production_records_parent()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not fresh and _AUDIT_CACHE["parent"] == str(parent) and now_s - float(_AUDIT_CACHE["at"]) < AUDIT_CACHE_SECONDS:
+        return dict(_AUDIT_CACHE["views"])
+    try:
+        lookup, clone_at = _audit_clone()
+        creates = audit.verified_creates(parent)
+        every = audit.views_for(parent, list(creates), lookup, clone_at)
+        now = datetime.now(timezone.utc)
+        chosen = audit.candidates(parent, now, lambda co, _route: not audit.all_done(every.get(co) or {}))
+        views = {co: every[co] for co in chosen if co in every}
+    except Exception:  # noqa: BLE001 - the audit never breaks a page
+        views = {}
+    _AUDIT_CACHE.update({"at": now_s, "views": views, "parent": str(parent)})
+    return dict(views)
+
+
+def _audit_window_since() -> datetime | None:
+    from integration.onboarding import post_onboard_audit as audit
+
+    try:
+        profile_dir, _ = attended_runner.leonardo_profile(production_probe_target())
+        log = profile_dir.with_name(profile_dir.name + attended_runner.PRODUCTION_WINDOW_LOG_SUFFIX)
+        return audit.window_signed_in_since(log.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def production_probe_target() -> Any:
+    from integration.onboarding import production_probe
+
+    return production_probe.probe_target()
+
+
+def _audit_kept_tick(now: datetime | None = None) -> str | None:
+    """Start at most one live audit read (kept window only); returns the CO started, else None. Never raises."""
+    from integration.onboarding import post_onboard_audit as audit
+
+    try:
+        if vm_mode() or _production_run_active() or not attended_runner.production_window_kept():
+            return None
+        moment = now or datetime.now(timezone.utc)
+        since = _audit_window_since()
+        live = audit.latest_live(production_records_parent())
+        for reference, item in audit_views(fresh=True).items():
+            if audit.all_done(item):
+                continue
+            with _PRODUCTION_RUNS_LOCK:
+                if (PRODUCTION_SCAN_RUNS.get(reference) or {}).get("running"):
+                    continue
+            last = AUDIT_LIVE_STATE.get(reference)
+            recorded = audit._parse((live.get(reference) or {}).get("recorded_at"))  # noqa: SLF001
+            kept = (KEPT_SCAN_STATE.get(reference) or {}).get("at")
+            tried = max([t for t in (last, recorded, kept) if isinstance(t, datetime)], default=None)
+            if not audit.live_due(tried, moment, since):
+                continue
+            if create_ui.LAUNCHES.claim(lambda ref=reference: _launch_scan_check(ref, kept_only=True)):
+                AUDIT_LIVE_STATE[reference] = moment
+                return reference
+            return None
+    except Exception:  # noqa: BLE001 - the loop never dies
+        return None
+    return None
+
+
+def _audit_case3_move(reference: str) -> str | None:
+    """The guarded Case 3 scan move for ONE CO when its audit view says both scans are done (PC only); the result word."""
+    if vm_mode() or datetime.now(timezone.utc).timestamp() < AUDIT_MOVE_HOLD.get(reference, 0.0):
+        return None
+    item = audit_views(fresh=True).get(reference)
+    if not item or item.get("route") != "case3" or not item.get("finished"):
+        return None
+    parent = production_records_parent()
+    if case3_followup.last_stage(parent, reference) != case3_followup.SCAN_STAGE_FROM:
+        return None  # only from this dashboard's own verified Account Scanning move (a hand-set stage is left to the owner)
+    inputs = _create_ui_inputs(reference, None)
+    follow_inputs = case3_followup.FollowupInputs(reference=reference, records_parent=inputs.records_parent, now=inputs.now,
+                                                  vm=inputs.vm, sf_ready=inputs.sf_ready)
+
+    def run_and_forget(argv: list[str]) -> bool:
+        ok = _run_sf_argv(argv)
+        clear_display_cache_for(reference)
+        return ok
+
+    with _STAGE_MOVE_LOCK:
+        result = case3_followup.after_scan_finished(
+            follow_inputs, create_ui.load_co_records(inputs.records_parent, reference),
+            lambda: _read_case3_followup_row(reference), run_and_forget, create_ui.PINNED_SF_ALIAS, scans_done=True)
+    if result != "written_verified":
+        AUDIT_MOVE_HOLD[reference] = datetime.now(timezone.utc).timestamp() + AUDIT_MOVE_HOLD_SECONDS
+    clear_display_cache_for(reference)
+    _AUDIT_CACHE["at"] = 0.0
+    return result
+
+
+def _audit_move_tick() -> None:
+    """After a clone load or a live read: the Case 3 scan moves that the audit now allows. Never raises."""
+    try:
+        for reference, item in audit_views(fresh=True).items():
+            if item.get("route") == "case3" and item.get("finished"):
+                _audit_case3_move(reference)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_AUDIT_LIVE_UUID: dict[str, Any] = {"at": 0.0, "map": {}}
+
+
+def _audit_live_by_uuid() -> dict[str, dict[str, str]]:
+    """{verified Account UUID: {"status", "at"}} from the newest live audit line of each CO (cached 60 s; {} on problems)."""
+    from integration.onboarding import post_onboard_audit as audit
+
+    now_s = datetime.now(timezone.utc).timestamp()
+    if now_s - float(_AUDIT_LIVE_UUID["at"]) < AUDIT_CACHE_SECONDS:
+        return _AUDIT_LIVE_UUID["map"]
+    found: dict[str, dict[str, str]] = {}
+    try:
+        parent = production_records_parent()
+        for co, line in audit.latest_live(parent).items():
+            status = (line.get("facts") or {}).get("surface_status")
+            uuid = audit._verified_uuid(parent, co)  # noqa: SLF001
+            if uuid and isinstance(status, str):
+                found[uuid] = {"status": status, "at": str(line.get("recorded_at"))}
+    except Exception:  # noqa: BLE001
+        found = {}
+    _AUDIT_LIVE_UUID.update({"at": now_s, "map": found})
+    return found
+
+
+# --- Case 3 primary user (owner request + HAR 2026-11-06) --------------------------------------------------------------------
+PRIMARY_USER_RUNS: dict[str, dict[str, Any]] = {}  # per CO: {"running": bool, "stage": result word of the User Created move}
+_PRIMARY_USER_ROWS: dict[str, tuple[float, Any]] = {}
+PRIMARY_USER_ROW_SECONDS = 120
+
+
+def _read_primary_user_row(reference: str, fresh: bool = False) -> dict[str, Any] | None:
+    """The fixed primary-user CO read (production_case3_primary_user.SOQL_FIELDS), cached briefly for the page."""
+    from integration.onboarding import production_case3_primary_user as primary
+
+    if not REFERENCE.fullmatch(reference) or os.environ.get("SURFACE_SF_TARGET_ORG") not in (None, "", create_ui.PINNED_SF_ALIAS):
+        return None
+    now_s = datetime.now(timezone.utc).timestamp()
+    cached = _PRIMARY_USER_ROWS.get(reference)
+    if not fresh and cached and now_s - cached[0] < PRIMARY_USER_ROW_SECONDS:
+        return cached[1]
+    try:
+        response = sf_json(["data", "query", "--query", "SELECT " + primary.SOQL_FIELDS + " FROM Customer_Onboarding__c "
+                            "WHERE Name = '" + reference + "' LIMIT 2", "--json"])
+        records = response["result"]["records"]  # type: ignore[index]
+        row = records[0] if response["status"] == 0 and isinstance(records, list) and len(records) == 1 \
+            and records[0].get("Name") == reference else None  # type: ignore[index]
+    except (ReadUnavailable, KeyError, TypeError, AttributeError):
+        row = None
+    _PRIMARY_USER_ROWS[reference] = (now_s, row)
+    return row
+
+
+def _primary_user_stage_move(reference: str) -> str:
+    """Scan Completed Successfully -> User Created after a done primary-user result (guarded, read back, never retried)."""
+    inputs = _create_ui_inputs(reference, None)
+    follow_inputs = case3_followup.FollowupInputs(reference=reference, records_parent=inputs.records_parent, now=inputs.now,
+                                                  vm=inputs.vm, sf_ready=inputs.sf_ready)
+
+    def run_and_forget(argv: list[str]) -> bool:
+        ok = _run_sf_argv(argv)
+        clear_display_cache_for(reference)
+        return ok
+
+    with _STAGE_MOVE_LOCK:
+        result = case3_followup.after_primary_user(
+            follow_inputs, create_ui.load_co_records(inputs.records_parent, reference),
+            lambda: _read_case3_followup_row(reference), run_and_forget, create_ui.PINNED_SF_ALIAS)
+    _PRIMARY_USER_ROWS.pop(reference, None)
+    _AUDIT_CACHE["at"] = 0.0
+    clear_display_cache_for(reference)
+    return result
+
+
+def _follow_primary_user(reference: str, process: Any) -> None:
+    try:
+        process.wait()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        stage = _primary_user_stage_move(reference)
+    except Exception:  # noqa: BLE001
+        stage = "follow_up_failed"
+    with _PRODUCTION_RUNS_LOCK:
+        PRIMARY_USER_RUNS[reference] = {"running": False, "stage": stage}
+
+
+def _launch_primary_user(reference: str) -> Any:
+    if not REFERENCE.fullmatch(reference) or not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
+        return None
+    child = dict(os.environ)
+    child.pop(runner_child_log.LOG_ENV, None)
+    folder = runner_log_dir()
+    if folder is not None:
+        child[runner_child_log.LOG_ENV] = str(folder / (reference + "-primary-user-" + datetime.now(timezone.utc)
+                                                        .strftime("%Y%m%dT%H%M%SZ") + ".log"))
+    try:
+        process = subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-primary-user", "--co", reference],
+                                   env=child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+    with _PRODUCTION_RUNS_LOCK:
+        PRIMARY_USER_RUNS[reference] = {"running": True, "stage": None}
+    Thread(target=_follow_primary_user, args=(reference, process), daemon=True).start()
+    return process
+
+
+def primary_user_gate(reference: str, row: Any) -> str | None:
+    """Why the primary-user buttons cannot run now (None: they can). Pure apart from the local records."""
+    from integration.onboarding import production_case3_primary_user as primary
+
+    if vm_mode():
+        return "vm_read_only"
+    parent = production_records_parent()
+    try:
+        history = create_ui.load_co_records(parent, reference)
+    except Exception:  # noqa: BLE001
+        return "records_unreadable"
+    if not any(r.get("outcome") == "readback_verified" and r.get("route") == CASE3_ENGINE for r in history):
+        return "no_verified_case3_create"
+    with _PRODUCTION_RUNS_LOCK:
+        if (PRIMARY_USER_RUNS.get(reference) or {}).get("running"):
+            return "primary_user_running"
+    user, problem = primary.plan(row)
+    if user is None:
+        return problem
+    return primary.stage_problem(row)
+
+
+def _post_primary_user(path: str, reference: str, values: Any) -> str:
+    """The two owner buttons. "ok" or a refusal code (nothing sent)."""
+    from integration.onboarding import production_case3_primary_user as primary
+
+    row = _read_primary_user_row(reference, fresh=True)
+    gate = primary_user_gate(reference, row)
+    if gate is not None:
+        return gate
+    parent = production_records_parent()
+    last = case3_followup.last_primary_user(parent, reference)
+    if path == create_ui.PRIMARY_USER_BY_HAND_PATH:
+        if create_ui._form(values, "by_hand_confirmed") != "1":  # noqa: SLF001
+            return "authorization_missing"
+        user, _ = primary.plan(row)
+        if last not in primary.DONE_RESULTS:
+            case3_followup.record_primary_user(parent, reference, primary.BY_HAND, datetime.now(timezone.utc),
+                                               user.domain if user else "")
+        stage = _primary_user_stage_move(reference)
+        with _PRODUCTION_RUNS_LOCK:
+            PRIMARY_USER_RUNS[reference] = {"running": False, "stage": stage}
+        return "ok"
+    if last in primary.DONE_RESULTS:  # the user is there: only the stage move is left
+        stage = _primary_user_stage_move(reference)
+        with _PRODUCTION_RUNS_LOCK:
+            PRIMARY_USER_RUNS[reference] = {"running": False, "stage": stage}
+        return "ok"
+    if create_ui.LAUNCHES.busy() or not create_ui.LAUNCHES.claim(lambda: _launch_primary_user(reference)):
+        return "launch_in_progress"
+    return "ok"
+
+
+def _primary_user_card(reference: str) -> str:
+    """The Case 3 primary-user card (only for a verified Case 3 create)."""
+    from integration.onboarding import production_case3_primary_user as primary
+
+    parent = production_records_parent()
+    try:
+        history = create_ui.load_co_records(parent, reference)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not any(r.get("outcome") == "readback_verified" and r.get("route") == CASE3_ENGINE for r in history):
+        return ""
+    row = _read_primary_user_row(reference)
+    user, problem = primary.plan(row)
+    last = case3_followup.last_primary_user(parent, reference)
+    with _PRODUCTION_RUNS_LOCK:
+        run = dict(PRIMARY_USER_RUNS.get(reference) or {})
+    stage_now = (row or {}).get("Onboarding_Stage__c") if isinstance(row, dict) else None
+    who = (escape(user.first_name + " " + user.last_name) + " · Admin · email on <code>" + escape(user.domain) + "</code>"
+           if user else "<span class='muted'>" + escape(create_ui.gate_text(problem)) + "</span>")
+    lines = ("<p class='note'>Salesforce Primary User: " + who + "<br>Salesforce stage: <strong>"
+             + escape(str(stage_now or "unknown")) + "</strong></p>")
+    if last:
+        lines += "<p class='note'>Last result: " + escape(primary.text(last)) + "</p>"
+    if run.get("stage"):
+        lines += "<p class='note'>Stage move to User Created: <code>" + escape(str(run["stage"])) + "</code></p>"
+    gate = primary_user_gate(reference, row)
+    if run.get("running"):
+        body = ("<p class='note'>Running: sign in with SSO and MFA in the app.pentera.io window if asked, then leave it alone. "
+                "Refresh this page in a minute.</p>")
+    elif gate is None and stage_now == primary.STAGE_TO and last in primary.DONE_RESULTS:
+        body = "<p class='note'>Done: the primary user exists and the CO is at User Created.</p>"
+    elif gate is None:
+        label = ("Move the stage to User Created" if last in primary.DONE_RESULTS
+                 else "Create primary user in BackOffice, then User Created")
+        body = ("<form class='start-form' method='post' action='" + create_ui.PRIMARY_USER_PATH + "'>"
+                "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
+                "<button type='submit'>" + escape(label) + "</button></form>"
+                "<p class='note'>Takes control of this tenant in BackOffice (the kept window, or SSO and MFA), reads its Users "
+                "list, adds the Salesforce Primary User as Admin only when missing (one guarded request, exactly this person "
+                "and role; BackOffice may email them an invitation), gives control back, then moves the Salesforce stage from "
+                "Scan Completed Successfully to User Created and reads it back.</p>")
+        if last not in primary.DONE_RESULTS:
+            body += ("<form class='start-form' method='post' action='" + create_ui.PRIMARY_USER_BY_HAND_PATH + "'>"
+                     "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
+                     "<label><input type='checkbox' name='by_hand_confirmed' value='1' required> I created this user as Admin "
+                     "in BackOffice by hand</label> <button type='submit'>Record it and move to User Created</button></form>")
+    else:
+        body = "<p class='note'>" + escape(create_ui.gate_text(gate)) + "</p>"
+    return ("<section class='card' aria-labelledby='co-primary-user-title'><div class='card-head'><h2 id='co-primary-user-title' "
+            "class='pill'>Primary user</h2></div>" + lines + body + "</section>")
+
+
+def _audit_chip(reference: str) -> str:
+    """The queue chip of the post-onboarding audit ("" when the CO is not audited)."""
+    from integration.onboarding import post_onboard_audit as audit
+
+    item = audit_views().get(reference)
+    if not item:
+        return ""
+    css = "chip-ok" if audit.all_done(item) else "chip-warn" if item.get("open") else "chip-neutral"
+    return _chip(css, audit.summary_text(item))
+
+
+def _audit_card(reference: str) -> str:
+    from integration.onboarding import post_onboard_audit as audit
+
+    item = audit_views().get(reference)
+    return audit.card_html(item) if item else ""
+
+
 def _kept_scan_loop(stop: Any = None) -> None:
     """Daemon loop: a tick every KEPT_SCAN_POLL_SECONDS (local files and one loopback check only), or at once on sign-in."""
     while True:
-        _kept_scan_tick()
+        if _kept_scan_tick() is None:
+            _audit_kept_tick()
         KEPT_SCAN_WAKE.wait(KEPT_SCAN_POLL_SECONDS)
         KEPT_SCAN_WAKE.clear()
         if stop is not None and stop.is_set():
@@ -9373,6 +9812,14 @@ def _follow_scan_check(reference: str, process: Any) -> None:
                                                    create_ui.PINNED_SF_ALIAS, scan_state=latest.get("state"))
     except Exception:  # noqa: BLE001
         stages = ["follow_up_failed"]
+    _AUDIT_CACHE["at"] = 0.0  # the live read just appended an audit line
+    if case3_followup.last_stage(production_records_parent(), reference) == case3_followup.SCAN_STAGE_FROM:
+        try:
+            moved = _audit_case3_move(reference)
+            if moved:
+                stages = list(stages) + ["case3:" + moved]
+        except Exception:  # noqa: BLE001
+            stages = list(stages) + ["case3:follow_up_failed"]
     with _PRODUCTION_RUNS_LOCK:
         PRODUCTION_SCAN_RUNS[reference] = {"running": False, "stages": stages}
 
@@ -10523,6 +10970,12 @@ class Handler(BaseHTTPRequestHandler):
                 refuse(code); return
             self.send_redirect("/co/" + reference + "?env=prod")  # the CO page shows the progress (same dashboard)
             return
+        if path in (create_ui.PRIMARY_USER_PATH, create_ui.PRIMARY_USER_BY_HAND_PATH):
+            code = _post_primary_user(path, reference, values)
+            if code != "ok":
+                refuse(code); return
+            self.send_redirect("/co/" + reference + "?env=prod")
+            return
         if path == create_ui.SCAN_CHECK_PATH:
             if vm_mode():
                 refuse("vm_read_only"); return
@@ -11104,6 +11557,9 @@ if __name__ == "__main__":
         Thread(target=_kept_scan_loop, name="kept-scan", daemon=True).start()
         if clone_autorefresh.enabled(vm=vm_mode()):
             Thread(target=clone_autorefresh.run_loop, name="clone-autorefresh", daemon=True).start()
+            if clone_autorefresh.us_enabled():  # only once the US saved query is pinned (owner request 2026-11-09)
+                Thread(target=clone_autorefresh.run_loop, kwargs={"region": "US"}, name="clone-autorefresh-us",
+                       daemon=True).start()
     _server = ThreadingHTTPServer((listener_host, listener_port), Handler)  # a second process dies here, before it can poll
     if not vm_mode():
         start_remote_start_worker()  # None unless the owner switched remote start ON (docs/62) and production sessions are on

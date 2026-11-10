@@ -359,6 +359,149 @@ def _write_stage(inputs: FollowupInputs, read_row: Callable[[], Mapping[str, Any
     return outcome
 
 
+# --- Account Scanning -> Scan Completed Successfully (owner go 2026-11-06: automatic once the audit shows the scans done) -----
+
+SCAN_STAGE_FROM, SCAN_STAGE_TO = "Account Scanning", "Scan Completed Successfully"
+USER_STAGE_FROM, USER_STAGE_TO = "Scan Completed Successfully", "User Created"
+
+
+def _move_plan(co_row: Any, from_stage: str, to_stage: str) -> stage_wb.StagePlan:
+    if not isinstance(co_row, Mapping) or stage_wb.STAGE_FIELD not in co_row or not isinstance(co_row.get("Id"), str):
+        return stage_wb.StagePlan("blocked", "row_unreadable", "", to_stage)
+    if (co_row.get("Onboarding_Product__c") != ids_wb.CASE3_PRODUCT or co_row.get("Onboarding_Type__c") != ids_wb.CASE3_TYPE):
+        return stage_wb.StagePlan("blocked", "route_not_case3_new", "", to_stage)
+    current = co_row.get(stage_wb.STAGE_FIELD)
+    if current == to_stage:
+        return stage_wb.StagePlan("already_present", "already_present", to_stage, to_stage)
+    if current != from_stage:
+        return stage_wb.StagePlan("blocked", "stage_not_expected", "", to_stage)
+    return stage_wb.StagePlan("ready_to_write", "", from_stage, to_stage)
+
+
+def scan_stage_plan(co_row: Any) -> stage_wb.StagePlan:
+    """The Case 3 scan move: ready only from exactly ``Account Scanning`` on the Case 3 New route."""
+    return _move_plan(co_row, SCAN_STAGE_FROM, SCAN_STAGE_TO)
+
+
+def user_stage_plan(co_row: Any) -> stage_wb.StagePlan:
+    """The Case 3 user move: ready only from exactly ``Scan Completed Successfully`` on the Case 3 New route."""
+    return _move_plan(co_row, USER_STAGE_FROM, USER_STAGE_TO)
+
+
+_MOVE_STAGES = frozenset({SCAN_STAGE_TO, "User Created"})
+
+
+def _move_argv(plan: stage_wb.StagePlan, record_id: Any, target_org: str) -> list[str]:
+    """The same fixed argument list as ``stage_wb.update_argv`` (that helper only knows the CE-only flow)."""
+    if plan.status != "ready_to_write" or plan.to_stage not in _MOVE_STAGES:
+        raise ValueError("stage plan is not ready_to_write")
+    if not isinstance(record_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15}|[A-Za-z0-9]{18}", record_id):
+        raise ValueError("invalid Salesforce record id")
+    if not isinstance(target_org, str) or not re.fullmatch(r"[A-Za-z0-9_.@][A-Za-z0-9_.@-]*", target_org):
+        raise ValueError("invalid target org alias")
+    return ["sf", "data", "update", "record", "--sobject", stage_wb.SOBJECT, "--record-id", record_id,
+            "--values", f"{stage_wb.STAGE_FIELD}='{plan.to_stage}'", "--target-org", target_org]
+
+
+_scan_argv = _move_argv  # kept name (tests and callers of the scan move)
+
+
+def _guarded_move(inputs: FollowupInputs, verified_records: Any, read_row: Callable[[], Mapping[str, Any] | None],
+                  run_argv: Callable[[list[str]], bool], target_org: str, planner: Callable[[Any], stage_wb.StagePlan],
+                  to_stage: str) -> str:
+    if inputs.sf_ready is not True:
+        return "salesforce_session_not_ready"
+    if _newest_verified(verified_records, inputs.reference) is None:
+        return "tenant_not_verified"
+    if _last(inputs.records_parent, inputs.reference, "stage") not in (None, "written_verified"):
+        return "stage_write_needs_review"
+    try:
+        row = read_row()
+    except Exception:
+        row = None
+    plan = planner(row)
+    if plan.status == "already_present":
+        return "already_present"
+    if plan.status != "ready_to_write":
+        return plan.reason
+    try:
+        argv = _move_argv(plan, (row or {}).get("Id"), target_org)
+    except ValueError:
+        return "write_blocked"
+    try:
+        _record(inputs.records_parent, inputs.reference, "stage", "write_started", inputs.now, {"to_stage": to_stage})
+    except Exception:
+        return "record_write_failed"
+    try:
+        accepted = run_argv(argv)
+    except Exception:
+        accepted = None
+    if accepted is False:
+        outcome = "write_rejected"
+    elif accepted is not True:
+        outcome = "write_uncertain"
+    else:
+        try:
+            after = read_row()
+        except Exception:
+            after = None
+        outcome = "written_verified" if stage_wb.verify_after_write(after, to_stage) == "verified" else "write_uncertain"
+    try:
+        _record(inputs.records_parent, inputs.reference, "stage", outcome, inputs.now, {"to_stage": to_stage})
+    except Exception:
+        return "record_write_failed"
+    return outcome
+
+
+def after_scan_finished(inputs: FollowupInputs, verified_records: Any, read_row: Callable[[], Mapping[str, Any] | None],
+                        run_argv: Callable[[list[str]], bool], target_org: str, *, scans_done: bool) -> str:
+    """Move ONE Case 3 CO from Account Scanning to Scan Completed Successfully when the audit says both scans are done.
+
+    Gates: build lock (PC, both constants), ``scans_done`` True, Salesforce session ready, a verified Case 3 create, the
+    newest recorded stage write of this CO verified (a rejected, started or uncertain one is never followed by another),
+    the exact current stage. Intent line before the ONE write, then read-after-write and a result line. Never retried."""
+    lock = build_lock(inputs)
+    if lock is not None:
+        return lock
+    if scans_done is not True:
+        return "scan_not_finished"
+    return _guarded_move(inputs, verified_records, read_row, run_argv, target_org, scan_stage_plan, SCAN_STAGE_TO)
+
+
+def last_primary_user(parent: Path, co: str) -> str | None:
+    """The newest recorded result of the primary-user step (``production_case3_primary_user.STEP``), else None."""
+    return _last(parent, co, "primary_user")
+
+
+def after_primary_user(inputs: FollowupInputs, verified_records: Any, read_row: Callable[[], Mapping[str, Any] | None],
+                       run_argv: Callable[[list[str]], bool], target_org: str) -> str:
+    """Move ONE Case 3 CO from Scan Completed Successfully to User Created (owner request 2026-11-06), only when the newest
+    primary-user result is done (created and read back, already present, or confirmed by the owner). Same gates as the scan
+    move; never retried."""
+    from . import production_case3_primary_user as primary
+
+    lock = build_lock(inputs)
+    if lock is not None:
+        return lock
+    if last_primary_user(inputs.records_parent, inputs.reference) not in primary.DONE_RESULTS:
+        return "primary_user_not_done"
+    return _guarded_move(inputs, verified_records, read_row, run_argv, target_org, user_stage_plan, USER_STAGE_TO)
+
+
+_PU_DIAG = re.compile(r"[0-9]|Button-Grid_[A-Za-z0-9_]{1,40}(?:,Button-Grid_[A-Za-z0-9_]{1,40}){0,11}")
+
+
+def record_primary_user(parent: Path, co: str, result: str, now: datetime, domain: str = "",
+                        diag: Mapping[str, str] | None = None) -> None:
+    """One result line of the primary-user step: the email domain and fixed diagnostics (counts, grid tokens); never a
+    name or an address."""
+    detail = {"domain": domain} if isinstance(domain, str) and re.fullmatch(r"[a-z0-9.-]{1,253}", domain or "") else {}
+    for key, value in (diag or {}).items():
+        if isinstance(key, str) and re.fullmatch(r"[a-z_]{1,24}", key) and isinstance(value, str) and _PU_DIAG.fullmatch(value):
+            detail["diag_" + key] = value
+    _record(parent, co, "primary_user", result, now, detail)
+
+
 # --- the card and the progress bar (recorded evidence only) -----------------------------------------------------------------
 
 FOLLOWUP_TEXT = {
@@ -523,8 +666,17 @@ def progress(parent: Path, co: str, since: str, *, running: bool, follow: Mappin
             if refused and refused not in ("written_verified", "already_present"):
                 failed = str(refused)  # the automatic follow-up stopped before writing: shown, not an endless wait
         else:
-            failed = next(r for r in (ids, stage) if r not in ("written_verified", None))
+            pending = next(r for r in (ids, stage) if r not in ("written_verified", None))
             reached = 3 + (ids == "written_verified")
+            # 2026-11-10 (CO-0844): the intent line is written just before the Salesforce write and its result line right after,
+            # so a page read in between saw "write_started" and showed "Stopped: Not allowed: write started"; a failed bar also
+            # stops the page refresh, so it stayed that way although both writes verified seconds later. While the runner or the
+            # follow-up is still running, that line is a write in flight (active), as on the CE-only bar (CO-0811). Once both have
+            # ended, a lone intent line means no result was recorded: shown as uncertain, and still never repeated.
+            if pending == "write_started":
+                failed = None if running else "write_uncertain"
+            else:
+                failed = pending
     elif any(o in ("created_unverified", "uncertain_submit") for o in outcomes):
         reached, failed = 2, "create_not_verified"
     elif refusal is not None:

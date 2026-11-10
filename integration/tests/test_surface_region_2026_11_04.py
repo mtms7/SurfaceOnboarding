@@ -81,7 +81,10 @@ class RunnerRegionTests(unittest.TestCase):
             return runner.production_match_for(CO, PRODUCT, KIND)
 
     def test_a_us_co_is_not_checked_instead_of_clear(self):
-        found = self.run_for("US")
+        from integration.tests.test_us_clone_2026_11_09 import unpinned
+
+        with unpinned():  # the EU-only rule (US query switched off); the US clone pass: test_us_clone_2026_11_09
+            found = self.run_for("US")
         self.assertEqual((found["status"], found["region"]), ("region_not_checked", "US"))
         self.assertEqual(views.production_check(found)["label"], "Region US: not checked")
 

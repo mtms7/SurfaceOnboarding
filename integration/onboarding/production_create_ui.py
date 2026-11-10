@@ -46,8 +46,10 @@ UUID_CONFIRM_PATH = "/attended/production-uuid-confirm"
 SCAN_CHECK_PATH = "/attended/production-scan-check"  # build 3: the owner's read-only CE scan check
 FOLLOWUP_REVIEW_PATH = "/attended/production-case3-followup-review"  # Case 3 (path B step d): the owner's review ...
 FOLLOWUP_CONFIRM_PATH = "/attended/production-case3-followup-confirm"  # ... and confirmation of the ID write and stage move
+PRIMARY_USER_PATH = "/attended/production-case3-primary-user"  # owner click: create the Case 3 primary user (2026-11-06)
+PRIMARY_USER_BY_HAND_PATH = "/attended/production-case3-primary-user-by-hand"  # owner: "I created it by hand"
 POST_PATHS = frozenset({CREATE_PATH, UUID_REVIEW_PATH, UUID_CONFIRM_PATH, SCAN_CHECK_PATH, FOLLOWUP_REVIEW_PATH,
-                        FOLLOWUP_CONFIRM_PATH})
+                        FOLLOWUP_CONFIRM_PATH, PRIMARY_USER_PATH, PRIMARY_USER_BY_HAND_PATH})
 TOKEN_TTL_SECONDS = 10 * 60
 DRY_RUN_MAX_AGE = timedelta(hours=24)
 SALESFORCE_FRESH_SECONDS = 15 * 60
@@ -80,6 +82,17 @@ STATUS_TEXT = {
 
 # Reason code -> one plain sentence for the page (never free text from an exception).
 GATE_TEXT = {
+    # Case 3 primary user (2026-11-06)
+    "no_verified_case3_create": "There is no verified Case 3 create for this CO.",
+    "primary_user_running": "The primary-user step is running for this CO.",
+    "primary_user_missing": "The CO has no Primary User contact in Salesforce.",
+    "primary_user_name_invalid": "The Primary User's first or last name is missing or unusual: fix it in Salesforce.",
+    "primary_user_email_invalid": "The Primary User has no valid email in Salesforce.",
+    "primary_user_domain_not_on_co": "The Primary User's email is not on one of the CO's domains: check Salesforce.",
+    "primary_user_is_internal": "The Primary User is a Pentera address, not the customer.",
+    "scan_not_marked_finished": "The CO is still at Account Scanning: the audit moves it to Scan Completed Successfully once "
+                                "both scans are finished (sign in to BackOffice from the dashboard, or wait for the clone).",
+    "co_unreadable": "The CO could not be read from Salesforce.",
     "no_verified_create": "There is no verified production create for this CO, so there is nothing to check.",
     "uuid_not_written": "The Account UUID is not written to Salesforce yet; the CE scan check comes after it.",
     "case3_scan_manual": "Case 3 (Surface + CE): the automatic CE scan check and the later stage moves are CE-only. Check the scan in "
