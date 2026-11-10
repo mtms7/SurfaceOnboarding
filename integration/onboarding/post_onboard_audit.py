@@ -15,7 +15,9 @@ Checks (owner 2026-11-06; Case 3 "finished" = Surface COMPLETED and CE DONE):
 
 * CE-only: CE scan done; operator assigned.
 * Case 3: Surface scan completed (row COMPLETED, a recon after the create, no recon still running); CE scan done; operator
-  assigned; Maximum scan Duration 90. The primary user is not checked yet (part 2, after the owner's HAR).
+  assigned; Maximum scan Duration 90; primary user (owner request 2026-11-10: done when our own record says so OR the
+  clone's ``v2.primary_user_present`` is True; open when the clone says False and there is no done record; unknown when
+  neither knows). CE-only has no primary-user step and never gets this check.
 """
 from __future__ import annotations
 
@@ -60,7 +62,7 @@ OPEN_TEXT = {
     "ce_scan": "CE scan not finished yet.",
     "operator": "No Operator Account on the tenant: BackOffice > Edit Account > Operator.",
     "max_scan": "Maximum scan Duration is not 90: BackOffice > Edit Account.",
-    "primary_user": "No primary user recorded yet: use Create primary user on this page (after the scan).",
+    "primary_user": "No primary user in the tenant: use Create primary user on this page (after the scan).",
 }
 _CO = re.compile(r"CO-[0-9]{3,6}")
 _STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
@@ -212,6 +214,14 @@ def checks_from_live(line: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def clone_primary_user(tenant: Any) -> bool | None:
+    """The clone's ``v2.primary_user_present`` (query 253 / the US query); None when absent. The v1 ``primary_user``
+    block is not used: the Redash v1 columns carry no primaryUser, so its ``present`` is always False there."""
+    v2 = tenant.get("v2") if isinstance(tenant, Mapping) and isinstance(tenant.get("v2"), Mapping) else {}
+    value = v2.get("primary_user_present")
+    return value if isinstance(value, bool) else None
+
+
 def checks_from_clone(tenant: Any) -> dict[str, str]:
     """Check states from one minimised clone tenant row (``leonardo_inventory.minimize_row`` shape plus ``v2``)."""
     if not isinstance(tenant, Mapping):
@@ -222,9 +232,20 @@ def checks_from_clone(tenant: Any) -> dict[str, str]:
     return {
         "surface_scan": _surface(_enum(scan.get("status")), _int(scan.get("last_recon_scan_ms")), created),
         "ce_scan": {"DONE": DONE, "PENDING": OPEN}.get(v2.get("ce_status"), UNKNOWN),
-        "operator": _bool_check(tenant.get("operator_assigned")),
+        "operator": _bool_check(_clone_operator(tenant, v2)),
         "max_scan": _hours_check(tenant.get("campaigns_timeout_hours")),
     }
+
+
+def _clone_operator(tenant: Mapping[str, Any], v2: Mapping[str, Any]) -> bool | None:
+    """Operator assigned from the clone: the minimised flag (from Redash operatorCount), else a v2 ``operator_count`` if a later
+    profile stores one. 2026-11-10: operatorCount is empty in Redash for ~72% of EU tenants (incl. most CE-only creates), so
+    the check stays unknown for them: that is missing source data, not "no operator"."""
+    flag = tenant.get("operator_assigned")
+    if isinstance(flag, bool):
+        return flag
+    count = v2.get("operator_count")
+    return count > 0 if type(count) is int and count >= 0 else None
 
 
 # --- the masked live log -----------------------------------------------------------------------------------------------------
@@ -296,10 +317,17 @@ def view(route: str, live: Mapping[str, Any] | None, clone_tenant: Any, clone_at
     clone_checks = checks_from_clone(clone_tenant) if clone_at is not None else {}
     rows = []
     for key in keys:
-        if key == "primary_user":  # our own recorded step (the tenant's Users list is read only by that step)
+        if key == "primary_user":  # our own recorded step, else the clone's primaryUserPresent (owner request 2026-11-10)
             result, at = primary_user
-            rows.append({"key": key, "label": LABELS[key], "state": DONE if result in PRIMARY_DONE else OPEN,
-                         "source": "record" if result else None, "at": at.strftime(_FORMAT) if at else None})
+            present = clone_primary_user(clone_tenant) if clone_at is not None else None
+            if result in PRIMARY_DONE:
+                state, source, when = DONE, "record", at
+            elif present is not None:
+                state, source, when = (DONE if present else OPEN), "clone", clone_at
+            else:
+                state, source, when = UNKNOWN, ("record" if result else None), (at if result else None)
+            rows.append({"key": key, "label": LABELS[key], "state": state, "source": source,
+                         "at": when.strftime(_FORMAT) if when else None})
             continue
         options = [(at, checks.get(key), source) for at, checks, source in
                    ((live_at, live_checks, "live"), (clone_at, clone_checks, "clone")) if at is not None and checks.get(key)]

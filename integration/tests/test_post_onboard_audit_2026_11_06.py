@@ -102,10 +102,11 @@ class LiveFactsTests(unittest.TestCase):
         line = audit.log_line("CO-0841", NOW, "scan_completed", facts, executions)
         result = audit.view("case3", line, None, None)
         states = {c["key"]: c["state"] for c in result["checks"]}
+        # 2026-11-10: no record and no clone row = the primary user is unknown (was "open"); the clone can now say either way
         self.assertEqual(states, {"surface_scan": "done", "ce_scan": "done", "operator": "open", "max_scan": "done",
-                                  "primary_user": "open"})
+                                  "primary_user": "unknown"})
         self.assertTrue(result["finished"])
-        self.assertEqual(result["open"], 2)
+        self.assertEqual(result["open"], 1)
         done = audit.view("case3", line, None, None, ("owner_confirmed_by_hand", NOW))
         self.assertEqual({c["key"]: c["state"] for c in done["checks"]}["primary_user"], "done")
 

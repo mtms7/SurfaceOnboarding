@@ -677,7 +677,8 @@ class DashboardEnvironmentTests(unittest.TestCase):
     def test_missing_clone_snapshot_says_how_it_is_collected(self):
         page = dashboard.render_inventory(env="prod-clone")
         self.assertIn("redash_inventory_collector.py --collect", page)
-        self.assertIn("PROD (cloned copy via Redash)", page)
+        self.assertIn("Production · Redash clone", page)  # minimal layout 2026-11-10: the source is the subtitle
+        self.assertIn("EU clone unavailable: inventory_snapshot_missing", page)
         self.assertNotIn("/attended/inventory-refresh", page)  # the clone refreshes by schedule, not by a button
 
     def test_clone_page_shows_the_data_age_without_co_links_or_a_refresh_button(self):
@@ -685,10 +686,11 @@ class DashboardEnvironmentTests(unittest.TestCase):
         with patch.object(dashboard, "attended_leonardo_readbacks", side_effect=AssertionError("DEV readbacks never apply")):
             page = dashboard.render_inventory(env="prod-clone")
             sorted_page = dashboard.render_inventory(env="prod-clone", sort="scan", direction="desc", scan="COMPLETED")
-        self.assertIn("Data as of 2026-10-05T11:30:00Z", page)
+        self.assertIn("<b>EU</b> · 2 tenants · data from 2026-10-05 11:30 UTC", page)  # minimal layout 2026-11-10
+        self.assertIn("<dt>Data as of</dt><dd>2026-10-05T11:30:00Z (", page)  # the exact time and the rest under Details
         self.assertIn("newest change in the source 2026-10-04T16:49:00Z", page)
         self.assertIn("Example Tenant 1", page)
-        self.assertIn("no CO", page)
+        self.assertIn(">No CO</a>", page)
         self.assertNotIn("href='/co/", page)
         self.assertNotIn("/attended/inventory-refresh", page)
         self.assertIn("href='/prod/tenants?", sorted_page)  # sorting and filtering stay on the clone's own page

@@ -514,6 +514,15 @@ if __name__ == "__main__":
 
 
 
+def table_row_of(page, ref):
+    """The queue table row of `ref` (2026-11-10: the Recent onboardings panel above the queue links the same COs)."""
+    panel = page.find("<section class='card recent'")
+    if panel >= 0:
+        page = page[page.index("</section>", panel):]
+    start = page.index(">" + ref + "<")
+    return page[start:page.index("</tr>", start)]
+
+
 class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
     """The VM computes the per-CO match from the FRESH pushed clone (<state>/clone-inventory), never from a replayed result;
     a CO that already owns a clone tenant (its Account UUID) is Onboarded, not a duplicate (owner 2026-10-17)."""
@@ -677,7 +686,7 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         self.publish({"CO-0001": self.item()})
         self.push_clone()
         _, _, before = self.get("/", email=OWNER)
-        row = before[before.index(">CO-0001<"):before.index("</tr>", before.index(">CO-0001<"))]
+        row = table_row_of(before, "CO-0001")
         self.assertIn("Unavailable on this server", row)
         desktop = self.state.parent / "desktop-records"
         desktop.mkdir(exist_ok=True)
@@ -701,7 +710,7 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         self.assertTrue(push.ingest_records(out.read_bytes(), KEY, self.state).startswith("ingested-records "))
         dashboard.clear_display_cache()
         _, _, after = self.get("/", email=OWNER)
-        row = after[after.index(">CO-0001<"):after.index("</tr>", after.index(">CO-0001<"))]
+        row = table_row_of(after, "CO-0001")
         self.assertIn("Verified", row)
         self.assertIn("Used", row)  # the approval column: the approval was consumed by the create
         self.assertNotIn("Unavailable on this server", row)

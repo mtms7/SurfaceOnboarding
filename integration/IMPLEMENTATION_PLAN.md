@@ -2728,3 +2728,69 @@ Then, one go each: Onboarding Completed for CO-0831/0806/0813/0816/0825/0801 (go
   - US clone fresh (captured 17:27:05Z);
   - CO-0844 `created_verified`; its card reads "Onboarded: the Account ID and UUID are written ... stage is Account Scanning".
 - **Still shown on CO-0844:** "Action needed in BackOffice" (Edit Account: Operator and Maximum scan Duration 90; first scan). The owner did these by hand. The note clears by itself once the nightly EU clone shows the tenant edited and scanned.
+
+### 2026-11-10: open items after abffafa
+
+- Owner: CO-0835 vs CO-0844 checked (done); CO-0825 was already created (no region change needed). The DevOps email (ALB security group, return route, VPN phase-2 for 172.26.0.0/16) and the IT 16350 reply to Eyal were drafted in chat for the owner to send. Nothing sent by Claude.
+
+
+### 2026-11-10: US clone health and copy-frequency check (read-only, owner's Redash via Claude in Chrome)
+
+- **US clone working:**
+  - query 257 re-runs on its hourly Redash schedule (latest result 2026-11-10T18:27Z), 103 rows;
+  - US data newest `_modified` moved from 2026-11-08T10:32Z (11-09 check) to 2026-11-09T17:00Z, so the US copy refreshed once since;
+  - EU query 253: 5,473 rows, newest `_modified` 2026-11-09T23:14Z.
+  - Neither copy has data from today (11-10) yet: both look like once-a-day copies.
+- **Copy frequency from Redash: not possible.** The Redash schedule (253 and 257: every 3600 s) only re-runs the query against the already-copied database; it cannot make the copy itself run more often. The owner's account is not a Redash admin, and the data sources (2, 13, 14; MongoDB) are not editable by the owner. The copy job that refreshes "Prod (Cloned)" and "Prod US (Cloned)" runs outside Redash (Omer / Erez fixed it), so twice-a-day has to be asked of its owner.
+- **Reply-all draft** for the Redash thread (thanks, US verified, ask who owns the copy job, twice a day, and who handles the VM AWS network path from IT 16350): in chat for the owner to send.
+
+### 2026-11-10: Tenants page shows EU and US clones (UNCOMMITTED; built by a background agent, reviewed)
+
+- `/prod/tenants?region=all|eu|us` (default All).
+  - All = EU and US rows appended, never merged or de-duplicated, with a sortable Region column.
+  - Chips with counts ("All (5473 EU + 103 US)", "US (unavailable)" instead of 0); one info strip per region (data as of, newest change, tenants, deleted, no UUID, schema changes, saved query id).
+  - Footer names EU query 253 and US query 257 from the profiles.
+- **Fail closed:** a US clone that is missing, stale, wrong-region or not configured shows "US clone unavailable: <reason>" (EU rows still shown in All); the VM shows the note (it does not collect US).
+  - Stale EU still shows rows with the stale warning, as before (owner may choose to fail closed).
+- Files: `tools/serve_attended_open_onboardings_dashboard.py`, new `integration/tests/test_tenants_regions_2026_11_10.py` (21).
+- Full suite with sf hidden: 4068 OK, skipped 18.
+- Against the real local snapshots: All 5,576 rows.
+- Needs a dashboard restart to show.
+- **Dashboard restarted** with the EU+US Tenants page (no runner was active): listener PID 46648, 2026-11-10. Owner to Continue at /login and open Tenants.
+- **Owner confirmed** the Tenants page shows All / EU / US with the US tenants (2026-11-10). Uncommitted: Tenants page change + test_tenants_regions_2026_11_10.py + section 18 notes since abffafa.
+
+### 2026-11-10: Recent onboardings panel, daily scan check, minimalist Tenants page (UNCOMMITTED; two background agents, reviewed)
+
+- **Recent onboardings** (new `integration/onboarding/recent_onboardings.py`): a panel at the top of the production Onboarding page.
+  - Shows the last 10 verified dashboard creates (CE-only and Case 3).
+  - Each row: type, region and created date; "All done" or the open items with a short reason ("why") built from enum words, dates and booleans only; a "changed since yesterday" mark.
+  - The primary user check is for Case 3 only: done if our record says so, else the clone's `primaryUserPresent` (True = done, False = missing), else unknown.
+  - Each CO is looked up by its Account UUID in the EU clone, then the US clone. A missing or stale clone gives unknown, never done.
+- **Daily history:** `production-create-records/post-onboard-daily.jsonl`, at most one masked line per CO per UTC day, checked against an allow-list. Only the PC dashboard writes it (from the hourly background loop and from page views); the VM only reads.
+- **Audit:** the clone now feeds the primary user (`post_onboard_audit.view` / `clone_primary_user`). The operator check falls back to the v2 `operator_count` when the clone's operator flag is missing; before, almost every CE-only CO read "Operator not checked". The scan-move gate (`finished`) and `after_primary_user` are unchanged. The CO-page card and the gate still read the EU clone only; feeding US into the gate needs an owner decision.
+- **Tenants page redesign** (`/prod/tenants` only; the Dev `/inventory` page output is byte-identical):
+  - title "Tenants", one search box, the All / EU / US switch, one filter row;
+  - one header line per region, with the rest under Details;
+  - 6 columns: Tenant (region · licence under the name), Domain (+N), Licence end, Last scan (status dot), Primary user, CO;
+  - per-row Details for ID, quota, alternate domains, interval, SpyCloud, account state, start and duration;
+  - the fail-closed notes are kept.
+  - Real data: 5,576 rows; 9 tenants without a primary user. The page is about 5.2 MB (no pagination, as before).
+- **Tests:** new `test_recent_onboardings_2026_11_10.py` (24) and the rewritten `test_tenants_regions_2026_11_10.py` (33). The landing-page test helpers (`test_production_first_dashboard`, `test_vm_snapshot_dashboard`) now look in the queue table, because the panel links the same COs. `test_post_onboard_audit` CO-0841: primary user unknown instead of open.
+- **Full suite** with sf hidden: 4103 OK, skipped 18 (second run). The first run had 1 order-dependent error in `test_dashboard_stage_tracker` (local HTTP server); it passes alone, in its file, and on the re-run. Tests leave no stray daily log.
+- **Needs a dashboard restart** to show.
+- **Dashboard restarted** with the Recent onboardings panel and the minimalist Tenants page (no runner active): listener PID 46308, 2026-11-10. Owner to Continue and review.
+- **Recent onboardings is closed by default** (owner request 2026-11-10): the panel is a native `<details>` placed under the All / Ready / Blocked / Approved / Created chips. The one-line summary reads e.g. "last 10 · 1 all done · 1 need attention · 8 not fully checked", and a click shows the rows.
+- **Operator reason reworded** to "Redash has no operator data for this tenant": Redash `operatorCount` is empty for 3,938 of 5,473 EU tenants, so this is missing source data, not an error.
+- **Tests:** 2 added. Full suite with sf hidden: 4105 OK, skipped 18.
+- **Daily log:** the running dashboard (PID 46308) wrote its first daily lines (10 COs, 12:05 local) to `production-create-records/post-onboard-daily.jsonl`, which is gitignored.
+- **Reply-all to Omer / Erez:** tightened version given in chat (the IT request summarized, both ticket numbers named), for the owner to send.
+- **Dashboard restarted** with the closed Recent onboardings fold-out (no runner active): listener PID 29664, 2026-11-10.
+- **Onboarding page slow after login** (owner report 2026-11-10):
+  - **Measured:** the first queue load after a restart took 135 s (`page_build production_queue 135687 ms`). About 15 Salesforce reads ran one after another, 9 to 13 s each (`sf` CLI); later loads took 0.2 to 0.6 s. The new panel, audit and clone strip each build in under 0.5 s, so they are not the cause.
+  - **Fix:** the queue waits at most `QUEUE_MATCH_WAIT_SECONDS` (3 s) for the prefetched per-CO matches. A CO still being read shows "Checking…" (status not_checked: blocked, never ready, never a clearance), a note says "Still checking N COs", and the page refreshes every 10 s until all are in. Creates still run their own gates.
+  - **Still blocking:** the base list read (ListView + start dates, about 12 s cold).
+  - **Tests:** `test_queue_fast_first_load_2026_11_10.py` (4) and a landing test; the fixtures that stub the prefetch set `QUEUE_MATCH_NOWAIT` False.
+  - **Full suite:** 4110 OK, skipped 18.
+- **Flaky, open:** `test_dashboard_stage_tracker` ConfirmationStoreAndRouteTests.test_guards_are_enforced_and_the_signed_in_identity_is_recorded errored in 2 of 4 full runs today (local HTTP server POST). It passes alone, in its file, and in 2 full runs; the traceback was not captured yet.
+- **Dashboard restarted** with the fast first load (no runner active): listener PID 40040, 2026-11-10. Owner to check the first Onboarding load time.
+- **Owner confirmed** the Onboarding page opens fast after the restart (2026-11-10). Uncommitted since abffafa: the EU+US Tenants page and its redesign, Recent onboardings with the daily check, the fast first load, tests and section 18.

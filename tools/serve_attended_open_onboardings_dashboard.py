@@ -5293,6 +5293,41 @@ PENTERA_CSS = (
     ".inv-card abbr{text-decoration:none;cursor:help}.inv-card td.stick{max-width:300px}"
     ".inv-card td.dom{max-width:230px;overflow:hidden;text-overflow:ellipsis}.inv-card td .sub code{font-size:11px}"
     ".sortlink{color:inherit;font-weight:600}.sortlink:hover{color:var(--primary-dark);text-decoration:none}"
+    # Production > Tenants, minimal layout (owner request 2026-11-10): scoped to .tenants-min, no assets, no script.
+    ".tenants-min{max-width:1280px}.tenants-min .tm-head{display:flex;align-items:baseline;gap:10px;margin:10px 0 6px}"
+    ".tm-sub{color:var(--muted);font-size:13px}.tenants-min>.note{margin:0 0 8px}"
+    ".tm-line{margin:0;color:var(--heading);font-size:13px}.tm-line b{color:var(--text)}"
+    ".tm-stale{margin-left:4px;color:var(--warn);font-weight:600}"
+    "details.tm-more>summary{cursor:pointer;color:var(--muted);font-size:12px;width:max-content}"
+    "details.tm-more[open]>summary{margin-bottom:4px}"
+    ".tm-src{margin:4px 0 14px}.tm-facts{margin:4px 0 8px;font-size:12px}.tm-facts>b{display:block;margin:0 0 2px}"
+    ".tenants-min dl{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:2px 12px;margin:0;font-size:12px}"
+    ".tenants-min dt{color:var(--muted);font-size:12px}.tenants-min dd{margin:0;white-space:normal;overflow-wrap:anywhere}"
+    ".tm-bar,.tm-filters{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:0 0 10px}"
+    ".tm-search{display:flex;gap:6px;margin:0}.tm-search input{width:260px;max-width:100%;padding:6px 10px;"
+    "border:1px solid var(--line);border-radius:6px;font:inherit;background:#fff}"
+    ".tm-seg{display:inline-flex;background:var(--pill);border-radius:7px;padding:2px}"
+    ".tm-seg a{padding:3px 10px;border-radius:5px;font-size:12.5px;font-weight:500;color:var(--heading)}"
+    ".tm-seg a:hover{text-decoration:none;color:var(--text)}.tm-seg a.on{background:#fff;color:var(--text);font-weight:600;"
+    "box-shadow:0 1px 2px #10182814}.tm-seg .n{color:var(--muted);font-weight:400;margin-left:2px}"
+    ".tm-label{color:var(--muted);font-size:12px}.tm-count{margin-left:auto;color:var(--muted);font-size:12.5px}"
+    ".tm-count b{color:var(--text)}"
+    ".tm-table{background:var(--card);border:1px solid var(--line);border-radius:10px;overflow-x:auto}"
+    ".tm-table table{width:100%;border-collapse:collapse;font-size:13px}"
+    ".tm-table th{text-align:left;padding:8px 12px;color:var(--muted);font-size:12px;font-weight:600;"
+    "border-bottom:1px solid var(--line);white-space:nowrap}.tm-table th .sortlink{font-weight:600}"
+    ".tm-table td{padding:8px 12px;border-bottom:1px solid #f0f1f3;vertical-align:top}"
+    ".tm-table tbody tr:last-child td{border-bottom:0}.tm-table tbody tr:hover td{background:#fafbfc}"
+    ".tm-tenant{min-width:220px;max-width:360px}.tm-name{display:block;font-weight:600}"
+    ".tm-meta{display:block;color:var(--muted);font-size:12px}.tm-tenant details.tm-more{margin-top:2px}"
+    ".tm-tenant details.tm-more dl{margin:4px 0 2px}.tm-alt{color:var(--muted);font-weight:400}"
+    ".tm-dom{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+    ".tm-status{display:block;color:var(--muted);font-size:12px;white-space:nowrap}"
+    ".tm-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;vertical-align:1px;"
+    "background:#c4c8cf}.tm-dot.ok{background:#3f9142}.tm-dot.warn{background:#d4a017}.tm-dot.bad{background:#d14343}"
+    ".tm-ok{color:var(--ok);font-weight:600}.tm-warn{color:var(--warn);font-weight:600}"
+    ".tm-empty{margin:0;padding:14px 12px;color:var(--muted)}"
+    ".tm-foot{margin:12px 0 0;color:var(--muted);font-size:12px}"
     # Open onboardings (2026-10-05): one filter bar and one dense, sortable table.
     ".page-head>.note{margin-top:4px}.tbl-card{padding:0;overflow:hidden}.tbl-card .empty{padding:18px 20px}"
     ".fbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;margin:0 0 14px}"
@@ -6290,76 +6325,153 @@ def _inventory_sort_value(tenant: dict, key: str, co_ref: str | None) -> str:
 INVENTORY_ENVIRONMENTS = ("dev", "prod-clone")
 PROD_CLONE_MISSING_TEXT = ("No production-clone inventory has been collected yet. The collector "
                            "(tools/redash_inventory_collector.py --collect) writes it; it needs no sign-in.")
+# Production > Tenants shows the EU and the US clone (owner request 2026-11-10). A tenant is (region, account UUID): rows of
+# the two regions are never merged or de-duplicated. ``?region=`` all (default, omitted from links) | eu | us.
+TENANT_REGIONS = ("EU", "US")
+TENANT_REGION_PARAMS = {"": "", "all": "", "eu": "EU", "us": "US"}
+TENANT_REGION_REASON_TEXT = {
+    "region_not_configured": "no saved query is pinned for this region",
+    "inventory_snapshot_missing": "no snapshot has been collected",
+    "inventory_snapshot_unreadable": "the snapshot could not be read",
+    "inventory_snapshot_tampered": "the snapshot failed its integrity check",
+    "inventory_snapshot_wrong_region": "the snapshot belongs to another region",
+    "inventory_snapshot_wrong_environment": "the snapshot belongs to another environment",
+    "inventory_snapshot_schema_version": "the snapshot was written by a different version",
+    "query_stale": "the snapshot is older than 6 h",
+    "data_stale": "the cloned data is older than 36 h",
+    "data_age_unknown": "the age of the cloned data is unknown",
+}
 
 
-def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direction: str = "",
-                     scan: str = "", co: str = "", env: str = "dev", top: str = "") -> str:
-    """Server-rendered tenant table (the CSP blocks scripts); sort and filters are query parameters.
+def _tenant_region_load(region: str, now: datetime) -> tuple[dict[str, Any] | None, str, str]:
+    """(payload, "", "") for a region whose clone is shown; (None, reason code, captured_at) when it is not (fail closed).
 
-    One environment per page: "dev" is Leonardo Development > Tenants (/inventory), "prod-clone" is Production > Tenants (/prod/tenants).
-    ``top`` is extra HTML shown above the table (the Tenants tab's production-gate note).
-    """
-    now = datetime.now(timezone.utc)
-    env = env if env in INVENTORY_ENVIRONMENTS else "dev"
-    clone = env == "prod-clone"
-    environment = inventory.ENVIRONMENTS[env]
-    refresh_form = "" if clone else ("<form method='post' action='/attended/inventory-refresh'><button type='submit'>"
-                                     "Refresh inventory</button></form>")
-    base = "/prod/tenants" if clone else "/inventory"
-    active = "prod_tenants" if clone else "inventory"
-    title = "Tenants — Production (Redash clone)" if clone else "Tenants — Leonardo Development"
-    head = ("<div class='page-head'><h1>" + escape(title) + "</h1><span class='chip chip-info'>"
-            + escape(environment.label) + "</span>" + refresh_form + "</div>")
-    if clone:
-        note = ("<p class='note'>Read-only copy of the <b>production</b> tenant list through Redash (saved query 251 on the "
-                "cloned database), with personal data removed. It refreshes on a schedule and needs no sign-in. It is "
-                "the Start gate: a match stops an onboarding, a missing match never clears one, and Start also "
-                "re-checks Leonardo live. Dashboard CO links are not shown for production tenants.</p>")
-    else:
-        note = ("<p class='note'>Read-only copy of Leonardo Development's tenant list, with personal data removed (no user "
-                "names, emails, phones, or domain lists). It is informational: Start always re-checks Leonardo live for "
-                "duplicates. Refresh also re-validates every onboarded CO from the same read.</p>")
-    started = ("<div class='banner'><strong>Export started.</strong> It runs read-only in the automation browser; reload "
-               "this page in a minute.</div>" if notice == "started" and not clone else "")
+    EU keeps today's rule (any verified EU snapshot is shown, a stale one with a warning). US is shown only while it is
+    fresh by the production gate's own rule (``production_views.clone_status``): a stale US clone is "unavailable", never
+    old rows. Every region must be configured and its snapshot must be of that region (``snapshot_region``)."""
+    from integration.onboarding import redash_inventory as redash
+
     try:
-        payload = inventory.load_latest(clone_root() if env == "prod-clone" else inventory_root(), env,
-                                        max_age=INVENTORY_DISPLAY_MAX_AGE, now=now)
+        if not redash.region_configured(region):
+            return None, "region_not_configured", ""
+        env_name = redash.REGION_ENVIRONMENTS[region]
+        if region != "EU":
+            info = production_views.clone_status(clone_root(), now, region=region)
+            if info.get("state") != "fresh":
+                return None, str(info.get("reason") or "unknown"), str(info.get("captured_at") or "")
+        payload = inventory.load_latest(clone_root(), env_name, max_age=INVENTORY_DISPLAY_MAX_AGE, now=now)
+        if redash.snapshot_region(payload) != region:
+            return None, "inventory_snapshot_wrong_region", ""
+        return payload, "", ""
     except inventory.InventoryError as error:
-        text = (PROD_CLONE_MISSING_TEXT if clone and error.reason == "inventory_snapshot_missing"
-                else INVENTORY_ERROR_TEXT.get(error.reason, error.reason))
-        body = "<section class='card'><p>" + escape(text) + "</p></section>"
-        return _app_shell(title, head + top + started + body + note, active=active)
-    try:
-        readbacks = {} if clone else attended_leonardo_readbacks()
-    except ReadUnavailable:
-        readbacks = {}
-    matched = inventory.match_readbacks(payload, readbacks)
-    co_by_tenant = {tenant_id: ref for ref, tenant_id in matched["by_reference"].items()
-                    if tenant_id not in (None, "conflict")}
-    conflicts = sorted(ref for ref, tenant_id in matched["by_reference"].items() if tenant_id == "conflict")
+        return None, str(error.reason), ""
+    except Exception:  # noqa: BLE001 - an unreadable region is unavailable, never an error page
+        return None, "inventory_snapshot_unreadable", ""
+
+
+def _tenant_region_note(region: str, reason: str, captured_at: str) -> str:
+    """The honest "<region> clone unavailable: <reason>" banner: a missing region is never shown as "no tenants"."""
+    text = TENANT_REGION_REASON_TEXT.get(reason, "")
+    if region == "EU" and reason == "inventory_snapshot_missing":
+        hint = escape(PROD_CLONE_MISSING_TEXT)
+    elif vm_mode():
+        hint = "This server does not collect the " + escape(region) + " clone yet."
+    else:
+        hint = ("Collect it with <code>" + escape(US_CLONE_HINT if region == "US" else PRODUCTION_COLLECT_HINT) + "</code>.")
+    return ("<div class='banner banner-warn'><strong>" + escape(region) + " clone unavailable: " + escape(reason) + "</strong>"
+            + (" (" + escape(text) + ")" if text else "") + (" · last data as of " + escape(captured_at) if captured_at else "")
+            + ". Its tenants are not shown; this does not mean the region has no tenants. " + hint + "</div>")
+
+
+def _inventory_summary(payload: dict[str, Any], label: str, clone: bool, conflicts: list[str], region: str = "") -> str:
+    """The info strip of one snapshot (one per region on Production > Tenants)."""
     age = timedelta(seconds=int(payload.get("age_seconds", 0)))
     stale = age > INVENTORY_STALE_AFTER
     drift = payload.get("schema_drift") if isinstance(payload.get("schema_drift"), dict) else {}
     drift_count = sum(len(drift.get(key) or []) for key in ("unknown", "missing", "type_changed"))
     source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
     newest = source.get("data_latest_modified")
-    summary = ("<div class='banner" + (" banner-warn" if stale else "") + "'><strong>"
-               + escape(str(payload.get("environment_label") or environment.label))
-               + "</strong> · " + ("Data as of " if clone else "Captured ") + escape(str(payload.get("captured_at")))
-               + (" · newest change in the source " + escape(str(newest)) if clone and newest else "")
-               + " (" + str(int(age.total_seconds() // 3600)) + " h ago" + ("; stale, " + ("check that the collector is running" if clone else "refresh before relying on it") if stale else "")
-               + ") · " + escape(str(payload.get("row_count"))) + " tenants (" + escape(str(payload.get("deleted_count")))
-               + " deleted, " + escape(str(payload.get("uuid_missing_count", 0))) + " without UUID) · "
-               + str(drift_count) + " schema change(s)"
-               + (" · <strong>ID conflict for " + escape(", ".join(conflicts)) + "</strong>: re-check live" if conflicts else "")
-               + "</div>")
+    query_id = source.get("query_id")
+    return ("<div class='banner" + (" banner-warn" if stale else "") + "'>"
+            + ("<span class='chip chip-info'>" + escape(region) + "</span> " if region else "") + "<strong>"
+            + escape(str(payload.get("environment_label") or label))
+            + "</strong> · " + ("Data as of " if clone else "Captured ") + escape(str(payload.get("captured_at")))
+            + (" · newest change in the source " + escape(str(newest)) if clone and newest else "")
+            + " (" + str(int(age.total_seconds() // 3600)) + " h ago" + ("; stale, " + ("check that the collector is running" if clone else "refresh before relying on it") if stale else "")
+            + ") · " + escape(str(payload.get("row_count"))) + " tenants (" + escape(str(payload.get("deleted_count")))
+            + " deleted, " + escape(str(payload.get("uuid_missing_count", 0))) + " without UUID) · "
+            + str(drift_count) + " schema change(s)"
+            + (" · saved query " + escape(str(query_id)) if clone and query_id is not None else "")
+            + (" · <strong>ID conflict for " + escape(", ".join(conflicts)) + "</strong>: re-check live" if conflicts else "")
+            + "</div>")
+
+
+def _prod_tenants_note() -> str:
+    """The Production > Tenants footer: one muted line naming each region's configured saved query (never a hardcoded id)."""
+    from integration.onboarding import redash_inventory as redash
+
+    sources = []
+    for region in TENANT_REGIONS:
+        query_id = redash.region_query_id(region) if redash.region_configured(region) else None
+        sources.append(region + " " + ("(saved query " + str(query_id) + " on " + redash.REGION_DATA_SOURCES.get(region, "?") + ")"
+                                       if query_id is not None else "(not configured)"))
+    return ("<p class='tm-foot'>Sources: " + escape(" and ".join(sources)) + ". Read-only Redash copies of the production "
+            "databases, personal data removed; times are UTC. A tenant is its region plus its account UUID (never merged "
+            "across regions).</p>")
+
+
+def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direction: str = "",
+                     scan: str = "", co: str = "", env: str = "dev", top: str = "", region: str = "") -> str:
+    """Server-rendered tenant table (the CSP blocks scripts); sort and filters are query parameters.
+
+    One environment per page: "dev" is Leonardo Development > Tenants (/inventory), "prod-clone" is Production > Tenants
+    (/prod/tenants, ``_render_prod_tenants``), which shows the EU and US clones (``region`` "" / "all", "eu" or "us").
+    ``top`` is extra HTML shown above the table (the Tenants tab's production-gate note).
+    """
+    now = production_now()
+    env = env if env in INVENTORY_ENVIRONMENTS else "dev"
+    if env == "prod-clone":
+        return _render_prod_tenants(query, sort=sort, direction=direction, scan=scan, co=co, top=top, region=region, now=now)
+    environment = inventory.ENVIRONMENTS[env]
+    refresh_form = ("<form method='post' action='/attended/inventory-refresh'><button type='submit'>"
+                    "Refresh inventory</button></form>")
+    base = "/inventory"
+    active = "inventory"
+    title = "Tenants — Leonardo Development"
+    started = ("<div class='banner'><strong>Export started.</strong> It runs read-only in the automation browser; reload "
+               "this page in a minute.</div>" if notice == "started" else "")
+    head = ("<div class='page-head'><h1>" + escape(title) + "</h1><span class='chip chip-info'>"
+            + escape(environment.label) + "</span>" + refresh_form + "</div>")
+    note = ("<p class='note'>Read-only copy of Leonardo Development's tenant list, with personal data removed (no user "
+            "names, emails, phones, or domain lists). It is informational: Start always re-checks Leonardo live for "
+            "duplicates. Refresh also re-validates every onboarded CO from the same read.</p>")
+    try:
+        payload = inventory.load_latest(inventory_root(), env, max_age=INVENTORY_DISPLAY_MAX_AGE, now=now)
+    except inventory.InventoryError as error:
+        text = INVENTORY_ERROR_TEXT.get(error.reason, error.reason)
+        body = "<section class='card'><p>" + escape(text) + "</p></section>"
+        return _app_shell(title, head + top + started + body + note, active=active)
+    try:
+        readbacks = attended_leonardo_readbacks()
+    except ReadUnavailable:
+        readbacks = {}
+    conflicts: list[str] = []
+    co_by_tenant: dict[Any, str] = {}
+    if readbacks:
+        matched = inventory.match_readbacks(payload, readbacks)
+        co_by_tenant = {tenant_id: ref for ref, tenant_id in matched["by_reference"].items()
+                        if tenant_id not in (None, "conflict")}
+        conflicts = sorted(ref for ref, tenant_id in matched["by_reference"].items() if tenant_id == "conflict")
+    summary = _inventory_summary(payload, environment.label, False, conflicts)
     needle = " ".join(query.split()).casefold()[:80]
     sort = sort if sort in INVENTORY_SORTS else "name"
     descending = direction == "desc"
     scan = scan if scan in {value for value, _ in INVENTORY_SCAN_FILTERS} else ""
     co = co if co in {value for value, _ in INVENTORY_CO_FILTERS} else ""
     selected = []
+    total = 0
     for tenant in payload.get("tenants") or []:
+        total += 1
         name = str(tenant.get("account_name") or "")
         ref = co_by_tenant.get(tenant.get("id"))
         status = (tenant.get("scan") or {}).get("status")
@@ -6374,7 +6486,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
     filled = sorted((item for item in selected if item[2]), key=lambda item: (item[2], name_key(item)), reverse=descending)
     empty = sorted((item for item in selected if not item[2]), key=name_key)  # blanks always last
     rows_html = ""
-    mirrors = frozenset() if clone else dev_mirror_ids()
+    mirrors = dev_mirror_ids()
     for tenant, ref, _value in filled + empty:
         licence = tenant.get("license") or {}
         tenant_scan = tenant.get("scan") or {}
@@ -6385,9 +6497,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
         domain = escape(str(tenant.get("account_domain") or "—"))
         if alt:
             domain += "<span class='sub'>+" + str(len(alt)) + " alternate</span>"
-        quota = [licence.get(key) for key in ("assets_number", "domains_number", "subdomains_number")]
-        quota_cell = " / ".join("—" if value is None else str(value) for value in quota) if any(
-            value is not None for value in quota) else "—"
+        quota_cell = _inventory_quota(licence)
         scanned = str(tenant_scan.get("last_recon_scan_utc") or "")[:16].replace("T", " ")
         scan_cell = (escape(scanned) + "<span class='sub'>" + _inventory_duration(tenant_scan.get("duration_ms")) + "</span>"
                      if scanned else "<span class='muted'>never</span>")
@@ -6406,7 +6516,8 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
             + escape(str(tenant.get("id") or "")) + "</code>"
             + ("" if tenant.get("account_uuid") else " <span class='chip chip-warn'>no UUID</span>")
             + (" " + DEV_MIRROR_CHIP if tenant.get("id") in mirrors else "")
-            + "</span></td><td>" + co_cell
+            + "</span></td>"
+            + "<td>" + co_cell
             + "</td><td>" + escape(str(licence.get("type") or "—")) + "<span class='sub'>"
             + _inventory_date(licence.get("start_date")) + " → " + _inventory_date(licence.get("expiration_date"))
             + "</span></td><td class='dom' title='" + escape(str(tenant.get("account_domain") or ""), quote=True) + "'>"
@@ -6414,8 +6525,7 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
             + "</td><td>" + status_cell + "</td><td>" + escape(interval) + "</td><td>" + spy_cell + "</td><td>" + state + "</td></tr>")
 
     def link(**changes: str) -> str:
-        params = {"q": query[:80], "sort": sort, "dir": "desc" if descending else "asc", "scan": scan, "co": co,
-                  **changes}
+        params = {"q": query[:80], "sort": sort, "dir": "desc" if descending else "asc", "scan": scan, "co": co, **changes}
         return base + "?" + urlencode({key: value for key, value in params.items() if value})
 
     def header(key: str, label: str, numeric: bool = False) -> str:
@@ -6436,10 +6546,12 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
                                         ("scan", scan), ("co", co)) if value)
     search = ("<form method='get' action='" + base + "' class='filterbar'><input name='q' value='" + escape(query[:80])
               + "' placeholder='Search tenant name' aria-label='Search tenant name'>" + hidden
-              + "<button class='ghost' type='submit'>Search</button><span class='fgroup' aria-label='Scan status'>"
+              + "<button class='ghost' type='submit'>Search</button>"
+              + "<span class='fgroup' aria-label='Scan status'>"
               + chips(INVENTORY_SCAN_FILTERS, scan, "scan") + "</span><span class='fgroup' aria-label='Onboarding'>"
               + chips(INVENTORY_CO_FILTERS, co, "co") + "</span><span class='count'><b>" + str(len(selected))
-              + "</b> of " + str(len(payload.get("tenants") or [])) + " tenants</span></form>")
+              + "</b> of " + str(total) + " tenants</span></form>")
+    folders = escape(str(payload.get("environment"))) + " folder"
     table = ("<section class='card inv-card'>" + search
              + "<div class='inv'><table><thead><tr>" + header("name", "Tenant · ID").replace("<th ", "<th class='stick' ", 1)
              + header("co", "CO") + header("licence", "Licence · start → end") + header("domain", "Domain")
@@ -6448,9 +6560,248 @@ def render_inventory(query: str = "", notice: str = "", *, sort: str = "", direc
              "<th scope='col'><abbr title='SpyCloud flag of the Leaked Credentials settings; ON is the default, OFF is informational'>SpyCloud</abbr></th>"
              "<th scope='col'>Account</th></tr></thead><tbody>" + rows_html
              + "</tbody></table></div><p class='note'>Last scan times are UTC. Snapshot: "
-             + escape(str(payload.get("environment"))) + " folder under %LOCALAPPDATA%\\SurfaceOnboarding\\leonardo-inventory "
+             + folders + " under %LOCALAPPDATA%\\SurfaceOnboarding\\leonardo-inventory "
              "(CSV beside it).</p></section>")
     return _app_shell(title, head + top + started + summary + table + note, active=active, wide=True)
+
+
+def _inventory_quota(licence: dict) -> str:
+    """Assets / domains / subdomains of a licence ("—" for each unknown part; "—" when all are unknown). Not escaped."""
+    quota = [licence.get(key) for key in ("assets_number", "domains_number", "subdomains_number")]
+    return " / ".join("—" if value is None else str(value) for value in quota) if any(
+        value is not None for value in quota) else "—"
+
+
+# ---- Production > Tenants (/prod/tenants), minimal layout (owner request 2026-11-10: "too much information") ---------
+# Title + one header line per region (the rest in a native <details>), one search box, the All / EU / US switch, one
+# filter row and a 6-column table whose per-row extras sit in a native <details> (no script; the CSP blocks scripts).
+PROD_TENANT_SORTS = frozenset({"name", "region", "domain", "end", "scan", "primary", "co", "licence", "status"})
+_TM_SCAN_DOT = {"COMPLETED": "ok", "RUNNING": "warn", "INCOMPLETE": "bad", "FAILED": "bad"}
+
+
+def _tm_time(value: object) -> str:
+    """'2026-11-10T17:35:00Z' as '2026-11-10 17:35 UTC' (escaped); anything else escaped as given, "—" when empty."""
+    text = str(value or "")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}.*", text):
+        return escape(text[:10] + " " + text[11:16]) + " UTC"
+    return escape(text) if text else "—"
+
+
+def _tm_count(value: object) -> str:
+    return "{:,}".format(value) if type(value) is int else escape(str(value))
+
+
+def _tm_primary_user(tenant: dict) -> tuple[str, str]:
+    """(cell HTML, sort value) from the v2 clone's ``primary_user_present`` (Redash ``primaryUserPresent``).
+
+    Only the v2 projection carries it; a v1 row (no ``primaryUser`` column) is unknown, never "missing"."""
+    extra = tenant.get("v2") if isinstance(tenant.get("v2"), dict) else {}
+    present = extra.get("primary_user_present")
+    if present is True:
+        return "<span class='tm-ok' title='Primary user present'>✓</span>", "present"
+    if present is False:
+        return "<span class='tm-warn'>missing</span>", "missing"
+    return "<span class='muted' title='Not in this clone'>—</span>", ""
+
+
+def _tm_region_line(region: str, payload: dict[str, Any]) -> str:
+    """One short header line per region in view: "EU · 5,473 tenants · data from <time> UTC" (+ "stale")."""
+    age = timedelta(seconds=int(payload.get("age_seconds", 0) or 0))
+    stale = age > INVENTORY_STALE_AFTER
+    return ("<p class='tm-line'><b>" + escape(region) + "</b> · " + _tm_count(len(payload.get("tenants") or []))
+            + " tenants · data from " + _tm_time(payload.get("captured_at"))
+            + (" <span class='tm-stale' title='Older than " + str(int(INVENTORY_STALE_AFTER.total_seconds() // 3600))
+               + " h: check that the collector is running'>stale</span>" if stale else "") + "</p>")
+
+
+def _tm_region_details(region: str, payload: dict[str, Any], label: str) -> str:
+    """The Details facts of one region (everything the old info strip showed beyond the header line)."""
+    age = timedelta(seconds=int(payload.get("age_seconds", 0) or 0))
+    stale = age > INVENTORY_STALE_AFTER
+    drift = payload.get("schema_drift") if isinstance(payload.get("schema_drift"), dict) else {}
+    drift_count = sum(len(drift.get(key) or []) for key in ("unknown", "missing", "type_changed"))
+    source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    facts = [("Source", escape(str(payload.get("environment_label") or label))),
+             ("Data as of", escape(str(payload.get("captured_at"))) + " (" + str(int(age.total_seconds() // 3600)) + " h ago"
+              + ("; stale, check that the collector is running" if stale else "") + ")"),
+             ("Rows", escape(str(payload.get("row_count"))) + " tenants (" + escape(str(payload.get("deleted_count")))
+              + " deleted, " + escape(str(payload.get("uuid_missing_count", 0))) + " without UUID)"),
+             ("Schema changes", str(drift_count))]
+    if source.get("query_id") is not None:
+        facts.append(("Saved query", escape(str(source.get("query_id")))))
+    if source.get("data_latest_modified"):
+        facts.append(("Newest change", "newest change in the source " + escape(str(source.get("data_latest_modified")))))
+    facts.append(("Snapshot", escape(str(payload.get("environment"))) + " folder"))
+    return ("<div class='tm-facts'><b>" + escape(region) + "</b><dl>"
+            + "".join("<dt>" + name + "</dt><dd>" + value + "</dd>" for name, value in facts) + "</dl></div>")
+
+
+def _tm_row_details(tenant: dict, licence: dict, tenant_scan: dict, live_scan: dict | None) -> str:
+    """The per-row native <details>: the facts the table no longer shows (no identifiers beyond today's tenant ID)."""
+    alt = tenant.get("alternate_domains") if isinstance(tenant.get("alternate_domains"), list) else []
+    alt_text = ", ".join(str(item) for item in alt[:20]) + (" and " + str(len(alt) - 20) + " more" if len(alt) > 20 else "")
+    spy = {True: "ON", False: "<span class='tm-warn'>OFF</span>"}.get(tenant.get("spycloud_enabled"), "—")
+    state = "deleted" if tenant.get("is_deleted") else ("enabled" if tenant.get("enabled") else "disabled")
+    facts = [("Tenant ID", "<code>" + escape(str(tenant.get("id") or "")) + "</code>"
+              + ("" if tenant.get("account_uuid") else " <span class='tm-warn'>no UUID</span>")),
+             ("Quota", "<abbr title='Assets / domains / subdomains in the licence'>" + escape(_inventory_quota(licence)) + "</abbr>"),
+             ("Alternate domains", escape(alt_text) if alt else "—"),
+             ("Scan interval", escape(str(tenant.get("scanning_interval") or "—").replace("_", " ").casefold())),
+             ("SpyCloud", spy),
+             ("Account", state),
+             ("Licence start", _inventory_date(licence.get("start_date"))),
+             ("Last scan duration", _inventory_duration(tenant_scan.get("duration_ms")))]
+    if live_scan:  # post-onboarding audit: the newer BackOffice read beside the nightly clone's word
+        facts.append(("BackOffice", escape(str(live_scan.get("status") or "").title()) + " "
+                      + escape(str(live_scan.get("at") or "")[5:16].replace("T", " ")) + "Z"))
+    return ("<details class='tm-more'><summary>Details</summary><dl>"
+            + "".join("<dt>" + name + "</dt><dd>" + value + "</dd>" for name, value in facts) + "</dl></details>")
+
+
+def _render_prod_tenants(query: str, *, sort: str, direction: str, scan: str, co: str, top: str, region: str,
+                         now: datetime) -> str:
+    """Production > Tenants: the EU and US Redash clones, read-only GET page, minimal layout (owner request 2026-11-10).
+
+    A region that is not usable shows "<region> clone unavailable: <reason>" (fail closed) and is never counted as 0;
+    rows of the two regions are never merged (a tenant is region + account UUID); production rows get no CO links."""
+    from integration.onboarding import redash_inventory as redash
+
+    base, active = "/prod/tenants", "prod_tenants"
+    title = "Tenants — Production (Redash clone)"
+    region_value = TENANT_REGION_PARAMS.get(str(region).strip().casefold(), "")
+    wanted = (region_value,) if region_value else TENANT_REGIONS
+    loaded: dict[str, dict[str, Any]] = {}
+    unavailable: dict[str, tuple[str, str]] = {}
+    for name in TENANT_REGIONS:
+        payload, reason, captured = _tenant_region_load(name, now)
+        if payload is None:
+            unavailable[name] = (reason, captured)
+        else:
+            loaded[name] = payload
+    counts = {name: len(payload.get("tenants") or []) for name, payload in loaded.items()}
+    shown = [(name, loaded[name]) for name in wanted if name in loaded]
+    labels = {name: inventory.ENVIRONMENTS[redash.REGION_ENVIRONMENTS[name]].label for name in TENANT_REGIONS}
+
+    needle = " ".join(query.split()).casefold()[:80]
+    sort = sort if sort in PROD_TENANT_SORTS and (sort != "region" or not region_value) else "name"
+    descending = direction == "desc"
+    scan = scan if scan in {value for value, _ in INVENTORY_SCAN_FILTERS} else ""
+    co = co if co in {value for value, _ in INVENTORY_CO_FILTERS} else ""
+
+    def link(**changes: str) -> str:
+        params = {"q": query[:80], "sort": sort, "dir": "desc" if descending else "asc", "scan": scan, "co": co,
+                  "region": region_value.casefold(), **changes}
+        return base + "?" + urlencode({key: value for key, value in params.items() if value})
+
+    def seg(options: tuple, current: str, param: str, aria: str) -> str:
+        return ("<nav class='tm-seg' aria-label='" + aria + "'>" + "".join(
+            "<a" + (" class='on' aria-current='true'" if value == current else "") + " href='" + escape(link(**{param: value}))
+            + "'>" + label + "</a>" for value, label in options) + "</nav>")
+
+    every = all(name in counts for name in TENANT_REGIONS)
+    region_options = ((("", "All" + (" <span class='n'>" + _tm_count(sum(counts.values())) + "</span>" if every else "")),)
+                      + tuple((name.casefold(), escape(name) + " <span class='n'>"
+                               + (_tm_count(counts[name]) if name in counts else "unavailable") + "</span>")
+                              for name in TENANT_REGIONS))
+    region_seg = seg(region_options, region_value.casefold(), "region", "Region")
+
+    head = ("<div class='tm-head'><h1>Tenants</h1><span class='tm-sub'>Production · Redash clone</span></div>" + top)
+    lines = "".join(_tm_region_line(name, payload) for name, payload in shown)
+    details = ("<details class='tm-more tm-src'><summary>Details</summary>"
+               + "".join(_tm_region_details(name, payload, labels[name]) for name, payload in shown) + "</details>"
+               if shown else "")
+    notes = "".join(_tenant_region_note(name, *unavailable[name]) for name in wanted if name in unavailable)
+    foot = _prod_tenants_note()
+    if not shown:
+        return _app_shell(title, "<div class='tenants-min'>" + head + notes + "<div class='tm-bar'>" + region_seg + "</div>"
+                          + foot + "</div>", active=active, wide=True)
+
+    selected = []
+    total = 0
+    for row_region, payload in shown:
+        for tenant in payload.get("tenants") or []:
+            total += 1
+            status = (tenant.get("scan") or {}).get("status")
+            if needle and needle not in str(tenant.get("account_name") or "").casefold():
+                continue
+            if scan and (status or "NONE").upper() != scan:
+                continue
+            if co == "linked":  # production tenants never carry a dashboard CO link
+                continue
+            if sort == "region":
+                value = row_region
+            elif sort == "primary":
+                value = _tm_primary_user(tenant)[1]
+            else:
+                value = _inventory_sort_value(tenant, sort, None)
+            selected.append((tenant, value, row_region))
+    name_key = lambda item: str(item[0].get("account_name") or "").casefold()  # noqa: E731
+    filled = sorted((item for item in selected if item[1]), key=lambda item: (item[1], name_key(item)), reverse=descending)
+    empty = sorted((item for item in selected if not item[1]), key=name_key)  # blanks always last
+
+    live_by_uuid = _audit_live_by_uuid()
+    rows_html = []
+    for tenant, _value, row_region in filled + empty:
+        licence = tenant.get("license") or {}
+        tenant_scan = tenant.get("scan") or {}
+        status = str(tenant_scan.get("status") or "")
+        alt = tenant.get("alternate_domains")
+        domain = str(tenant.get("account_domain") or "")
+        domain_cell = ((escape(domain) if domain else "<span class='muted'>—</span>")
+                       + (" <span class='muted'>+" + str(len(alt)) + "</span>" if alt else ""))
+        scanned = str(tenant_scan.get("last_recon_scan_utc") or "")[:10]
+        dot = _TM_SCAN_DOT.get(status.upper(), "none")
+        scan_cell = ((escape(scanned) if scanned else "<span class='muted'>never</span>")
+                     + "<span class='tm-status'><i class='tm-dot " + dot + "' aria-hidden='true'></i>"
+                     + (escape(status.title()) if status else "no status") + "</span>")
+        live_scan = live_by_uuid.get(str(tenant.get("account_uuid") or "").strip().lower())
+        primary_cell = _tm_primary_user(tenant)[0]
+        rows_html.append(
+            "<tr><td class='tm-tenant'><span class='tm-name'>" + escape(str(tenant.get("account_name") or "")) + "</span>"
+            + "<span class='tm-meta'>" + escape(row_region) + " · " + escape(str(licence.get("type") or "no licence type"))
+            + "</span>" + _tm_row_details(tenant, licence, tenant_scan, live_scan) + "</td>"
+            + "<td class='tm-dom' title='" + escape(domain, quote=True) + "'>" + domain_cell + "</td>"
+            + "<td>" + _inventory_date(licence.get("expiration_date")) + "</td>"
+            + "<td>" + scan_cell + "</td>"
+            + "<td>" + primary_cell + "</td>"
+            + "<td><span class='muted'>—</span></td></tr>")
+
+    def sort_href(key: str) -> str:
+        return escape(link(sort=key, dir="desc" if key == sort and not descending else "asc"))
+
+    def arrow(key: str) -> str:
+        return ((" ▼" if descending else " ▲") if key == sort else "")
+
+    def th(key: str, label: str, extra: str = "") -> str:
+        aria = (" aria-sort='" + ("descending" if descending else "ascending") + "'") if key == sort else ""
+        return ("<th scope='col'" + aria + "><a class='sortlink' href='" + sort_href(key) + "'>" + escape(label) + arrow(key)
+                + "</a>" + extra + "</th>")
+
+    region_sort = (" <span class='tm-alt'>· <a class='sortlink' href='" + sort_href("region") + "'"
+                   + (" aria-sort='" + ("descending" if descending else "ascending") + "'" if sort == "region" else "")
+                   + ">Region" + arrow("region") + "</a></span>" if not region_value else "")
+    hidden = "".join("<input type='hidden' name='" + key + "' value='" + escape(value) + "'>"
+                     for key, value in (("sort", sort if sort != "name" else ""), ("dir", direction if direction == "desc" else ""),
+                                        ("scan", scan), ("co", co), ("region", region_value.casefold())) if value)
+    split = ""
+    if not region_value:
+        split = " (" + " + ".join((_tm_count(counts[name]) + " " + name) if name in counts else (name + " unavailable")
+                                  for name in TENANT_REGIONS) + ")"
+    count = ("<span class='tm-count'><b>" + _tm_count(len(selected)) + "</b> of " + _tm_count(total) + " tenants"
+             + split + "</span>")
+    bar = ("<div class='tm-bar'><form method='get' action='" + base + "' class='tm-search'><input name='q' value='"
+           + escape(query[:80]) + "' placeholder='Search tenants' aria-label='Search tenant name'>" + hidden
+           + "<button class='ghost' type='submit'>Search</button></form>" + region_seg + "</div>")
+    filters = ("<div class='tm-filters'><span class='tm-label'>Scan</span>"
+               + seg(tuple((value, escape(label)) for value, label in INVENTORY_SCAN_FILTERS), scan, "scan", "Scan status")
+               + "<span class='tm-label'>CO</span>"
+               + seg((("", "Any"), ("linked", "With CO"), ("none", "No CO")), co, "co", "Onboarding") + count + "</div>")
+    table = ("<div class='tm-table'><table><thead><tr>" + th("name", "Tenant", region_sort) + th("domain", "Domain")
+             + th("end", "Licence end") + th("scan", "Last scan") + th("primary", "Primary user") + th("co", "CO")
+             + "</tr></thead><tbody>" + "".join(rows_html) + "</tbody></table>"
+             + ("" if rows_html else "<p class='tm-empty'>No tenant matches these filters.</p>") + "</div>")
+    return _app_shell(title, "<div class='tenants-min'>" + head + lines + details + notes + bar + filters + table + foot
+                      + "</div>", active=active, wide=True)
 
 
 # ---- Two areas: "Onboarded on Dev" and Production readiness (owner decision 2026-10-07) -----------------------
@@ -6631,8 +6982,35 @@ def _forget_display(name: str, *args: Any) -> None:
         _display_cache.pop((name, *args), None)
 
 
-def _match_of(reference: str, product: str | None, onboarding_type: str | None) -> dict[str, Any]:
-    stamp = _match_stamp()
+QUEUE_MATCH_WAIT_SECONDS = 3.0  # owner 2026-11-10: a cold queue (after a restart) waited ~2 min for every CO's Salesforce reads
+QUEUE_PENDING_REFRESH_SECONDS = 10
+CHECKING_MATCH_REASON = "checking"
+QUEUE_MATCH_NOWAIT = True
+
+
+def _match_ready(reference: str, product: str, onboarding_type: str, stamp: str) -> bool:
+    """True when the cached production match for these inputs has finished (value or error), so reading it will not wait."""
+    with _display_cache_lock:
+        entry = _display_cache.get(("production_match_display", reference, product, onboarding_type, stamp))
+    return entry is not None and entry[0] > monotonic() and entry[2].done()
+
+
+def _match_of_nowait(reference: str, product: str | None, onboarding_type: str | None, stamp: str,
+                     deadline: float) -> tuple[dict[str, Any], bool]:
+    """(match, pending) for the queue. Waits for the prefetched match only until ``deadline``; past it a CO whose Salesforce
+    reads are still running shows as "Checking…" (status not_checked: blocked, never a clearance) and the page refreshes."""
+    product, onboarding_type = product or "", onboarding_type or ""
+    if not QUEUE_MATCH_NOWAIT:  # TEST hook: fixtures that stub the prefetch read every match synchronously
+        return _match_of(reference, product, onboarding_type, stamp), False
+    while not _match_ready(reference, product, onboarding_type, stamp):
+        if monotonic() >= deadline:
+            return {**_unreadable_match(CHECKING_MATCH_REASON), "status": "not_checked"}, True
+        sleep(0.1)
+    return _match_of(reference, product, onboarding_type, stamp), False
+
+
+def _match_of(reference: str, product: str | None, onboarding_type: str | None, stamp: str | None = None) -> dict[str, Any]:
+    stamp = stamp if stamp is not None else _match_stamp()
     try:
         match = production_match_display(reference, product or "", onboarding_type or "", stamp)
     except Exception:  # noqa: BLE001 - a failed read never clears a CO: it shows as unavailable
@@ -7696,12 +8074,18 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "", fil
         prefetch_display_read(production_match_display, str(row["Name"]), row.get("Onboarding_Product__c") or "",
                               row.get("Onboarding_Type__c") or "", _match_stamp())
     items = []
+    stamp = _match_stamp()
+    deadline = monotonic() + QUEUE_MATCH_WAIT_SECONDS
+    pending_checks = 0
     for row in rows:
         ref = str(row["Name"])
         route = route_for(row)
         supported = route == CE_ENGINE or route in SURFACE_ROUTES
-        match = _match_of(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"))
+        match, pending = _match_of_nowait(ref, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c"), stamp, deadline)
         check = production_views.production_check(match)
+        if pending:
+            pending_checks += 1
+            check = {**check, "label": "Checking…"}
         coverage = (production_views.renewal_coverage(match, QUEUE_END_DATES.get(ref))
                     if "renewal" in str(row.get("Onboarding_Type__c") or "").casefold() else None)
         renewed = bool(coverage and coverage["state"] == "renewed")
@@ -7934,12 +8318,20 @@ def render_onboard_queue(flt: str = "", sort: str = "", direction: str = "", fil
             + "<span class='fcount'>Showing " + str(len(ordered)) + " of " + str(len(items)) + " open</span></form>")
     notes = ("<p class='note'>Subscription start dates could not be read from Salesforce, so the list is ordered by submission "
              "date and the 2-day window is not shown.</p>" if starts is None and rows else "")
+    names = {ref_: row_.get("Account__r.Name") for ref_, row_ in ((str(r.get("Name")), r) for r in rows)}
     page = ("<div class='page-head'><h1>Onboarding</h1>" + _lock_chip() + "</div>" + _clone_strip()
-            + "<nav class='fbar' aria-label='Filter'><span class='fgroup'>" + chips + "</span></nav>" + form + notes
+            + "<nav class='fbar' aria-label='Filter'><span class='fgroup'>" + chips + "</span></nav>"
+            + _recent_panel(names)  # owner 2026-11-10: closed by default, under the filter chips; one click shows the details
+            + form + notes
             + "<p class='note'>Every open onboarding with its duplicate validation against the Production BackOffice clone only "
               "(Leonardo is not consulted). Approval is the 7-day create approval; the 4-hour summary approval is on the CO page. "
               "Nothing is created from this page.</p><section class='card tbl-card'>" + table + "</section>")
-    return _app_shell("Onboarding", page, active="prod_onboarding", wide=True)
+    refresh = ("<meta http-equiv='refresh' content='" + str(QUEUE_PENDING_REFRESH_SECONDS) + "'>" if pending_checks else "")
+    if pending_checks:
+        page = page.replace("<div class='page-head'>", "<p class='note'>Still checking " + str(pending_checks) + " CO"
+                            + ("s" if pending_checks != 1 else "") + " against Salesforce (first load after a restart); this "
+                            "page refreshes every " + str(QUEUE_PENDING_REFRESH_SECONDS) + " s.</p><div class='page-head'>", 1)
+    return _app_shell("Onboarding", page, refresh=refresh, active="prod_onboarding", wide=True)
 
 
 def _kv_grid(pairs: list[tuple[str, str]], code: frozenset[str] = frozenset()) -> str:
@@ -9222,6 +9614,7 @@ def _auto_scan_loop(stop: Any = None) -> None:
         except Exception:  # noqa: BLE001 - the loop never dies
             pass
         _audit_move_tick()  # post-onboarding audit: Case 3 scan moves from the clone or a live read (PC only)
+        _recent_onboardings(fresh=True)  # the daily history line of each recent create (once per CO per UTC day)
         AUTO_SCAN_WAKE.wait(AUTO_SCAN_INTERVAL_SECONDS)
         AUTO_SCAN_WAKE.clear()
         if stop is not None and stop.is_set():
@@ -9649,6 +10042,50 @@ def _audit_card(reference: str) -> str:
 
     item = audit_views().get(reference)
     return audit.card_html(item) if item else ""
+
+
+# --- Recent onboardings panel + daily history (owner request 2026-11-10) -----------------------------------------------------
+# The landing page's "Recent onboardings" card: the last 10 verified dashboard creates with their audit checks from the EU
+# and US clones (a stale or missing region gives unknown, never done) and the live log. Local files only, no live read.
+# The first computation of each UTC day appends one masked line per CO to post-onboard-daily.jsonl (PC only; the VM reads).
+_RECENT_CACHE: dict[str, Any] = {"at": 0.0, "items": None, "parent": None, "write": False}
+
+
+def _recent_onboardings(fresh: bool = False) -> list[dict[str, Any]] | None:
+    """The panel items (cached AUDIT_CACHE_SECONDS); None when they cannot be built. Never raises."""
+    from integration.onboarding import recent_onboardings as recent
+
+    now_s = datetime.now(timezone.utc).timestamp()
+    try:
+        parent = production_records_parent()
+        if not fresh and _RECENT_CACHE["parent"] == str(parent) and now_s - float(_RECENT_CACHE["at"]) < AUDIT_CACHE_SECONDS:
+            return _RECENT_CACHE["items"]
+        now = production_now()
+        root = clone_root()
+        clones = recent.region_clones(
+            lambda env: inventory.load_latest(root, env, max_age=INVENTORY_DISPLAY_MAX_AGE, now=now), now)
+        items: list[dict[str, Any]] | None = recent.recent(parent, clones)
+        if _RECENT_CACHE.get("write") and not vm_mode():  # the published snapshot is never written; the served PC keeps it
+            try:
+                recent.record_daily(parent, items or [], now)
+            except (OSError, ValueError):
+                pass
+    except Exception:  # noqa: BLE001 - the panel never breaks the page
+        parent, items = None, None
+    _RECENT_CACHE.update({"at": now_s, "items": items, "parent": str(parent) if parent is not None else None})
+    return items
+
+
+def _recent_panel(names: Mapping[str, Any] | None = None) -> str:
+    from integration.onboarding import recent_onboardings as recent
+
+    now = production_now()
+    try:
+        items = _recent_onboardings()
+        history = recent.daily_lines(production_records_parent()) if items else []
+        return recent.panel_html(items, now, names, history)
+    except Exception:  # noqa: BLE001
+        return recent.panel_html(None, now)
 
 
 def _kept_scan_loop(stop: Any = None) -> None:
@@ -10685,7 +11122,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.OK, render_history()); return
             params = parse_qs(parsed.query)
             kept = {key: value[0] for key, value in params.items()
-                    if key in ("q", "sort", "dir", "scan", "co") and value and value[0]}
+                    if key in ("q", "sort", "dir", "scan", "co", "region") and value and value[0]}
             if (path == "/inventory" and params.get("env", [""])[0] == "prod-clone") or path == "/tenants":
                 # The production clone moved to Production > Tenants; keep old links and bookmarks working.
                 self.send_redirect("/prod/tenants" + ("?" + urlencode(kept) if kept else "")); return
@@ -10711,7 +11148,8 @@ class Handler(BaseHTTPRequestHandler):
                     params.get("q", [""])[0], "" if clone else params.get("refresh", [""])[0],
                     sort=params.get("sort", [""])[0], direction=params.get("dir", [""])[0],
                     scan=params.get("scan", [""])[0], co=params.get("co", [""])[0],
-                    env="prod-clone" if clone else "dev", top=PRODUCTION_GATE_NOTE if clone else ""))
+                    env="prod-clone" if clone else "dev", top=PRODUCTION_GATE_NOTE if clone else "",
+                    region=params.get("region", [""])[0] if clone else ""))
                 return
             if path in ("/attended/ce-only-runner-status", "/attended/co0702-runner-status"):
                 ref = parse_qs(parsed.query).get("ref", [CO0702_REFERENCE])[0]
@@ -11550,6 +11988,7 @@ if __name__ == "__main__":
     _timing_logger.addHandler(_timing_handler)
     _timing_logger.setLevel(logging.INFO)
     if not vm_mode():
+        _RECENT_CACHE["write"] = True  # the served desktop process keeps the daily history (never imports or tests)
         Thread(target=_auto_scan_loop, name="auto-scan", daemon=True).start()
         Thread(target=_display_warm_loop, name="display-warm", daemon=True).start()
         Thread(target=close_kept_production_window, args=("start",), name="production-window-start", daemon=True).start()

@@ -346,6 +346,7 @@ class QueueLinkTests(unittest.TestCase):
         with mock.patch.object(dashboard, "queue_rows", return_value=[row]), \
                 mock.patch.object(dashboard, "queue_start_dates", return_value={"CO-0829": "2026-11-01"}), \
                 mock.patch.object(dashboard, "prefetch_display_read"), \
+                mock.patch.object(dashboard, "QUEUE_MATCH_NOWAIT", False), \
                 mock.patch.object(dashboard, "_match_of", return_value=None), \
                 mock.patch.object(dashboard.production_views, "production_check", return_value=check), \
                 mock.patch.object(dashboard, "_clone_payload_for_job", return_value=None), \
@@ -403,6 +404,7 @@ class RenewalCoverageTests(unittest.TestCase):
         with mock.patch.object(dashboard, "queue_rows", return_value=[row]), \
                 mock.patch.object(dashboard, "queue_start_dates", side_effect=starts), \
                 mock.patch.object(dashboard, "prefetch_display_read"), \
+                mock.patch.object(dashboard, "QUEUE_MATCH_NOWAIT", False), \
                 mock.patch.object(dashboard, "_match_of", return_value=self.match("2027-01-15")), \
                 mock.patch.object(dashboard, "_clone_payload_for_job", return_value=None), \
                 mock.patch.object(dashboard, "_clone_strip", return_value=""), \

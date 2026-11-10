@@ -305,6 +305,7 @@ def create_state(records: dict[str, Any], co_reference: str, *, locked: bool) ->
 # --- Production checks chip -----------------------------------------------------------------------------------------
 
 NOT_CHECKED_TEXT = {
+    "checking": "Still reading this CO from Salesforce; the page refreshes by itself. Blocked until the check is in.",
     "production_inputs_not_prepared": "The CO's production inputs (name, domains and plan) could not be built; the clone itself "
                                       "is fine.",
     "co_source_unreadable": "The CO's name or domains could not be read; the clone itself is fine.",

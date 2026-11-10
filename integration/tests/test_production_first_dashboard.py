@@ -100,13 +100,14 @@ class Env:
 
 
 @contextlib.contextmanager
-def patched(env, rows=ROWS, matches=MATCHES, starts=STARTS, unavailable=False, unlock=UNSET):
+def patched(env, rows=ROWS, matches=MATCHES, starts=STARTS, unavailable=False, unlock=UNSET, nowait=False):
     dashboard.clear_display_cache()
     with contextlib.ExitStack() as stack:
         enter = stack.enter_context
         enter(patch.object(dashboard, "queue_rows", side_effect=lambda: [dict(item) for item in rows]))
         enter(patch.object(dashboard, "queue_start_dates", return_value=dict(starts)))
         enter(patch.object(dashboard, "prefetch_display_read"))
+        enter(patch.object(dashboard, "QUEUE_MATCH_NOWAIT", nowait))  # no prefetch here: read each canned match in place
         enter(patch.object(dashboard, "UNSTAMPED_MATCH_ALLOWED", True))  # canned matches carry no computed_at
         enter(patch.object(dashboard, "production_match_for",
                            side_effect=lambda ref, product=None, kind=None: matches.get(ref, match())))
@@ -239,8 +240,33 @@ class LandingTests(unittest.TestCase):
         return html
 
     def row_of(self, page, ref):
+        # 2026-11-10: the "Recent onboardings" panel above the queue links the same COs; look in the queue table only.
+        panel = page.find("<section class='card recent'")
+        if panel >= 0:
+            page = page[page.index("</section>", panel):]
         start = page.index(">" + ref + "</a>") if ">" + ref + "</a>" in page else page.index(">" + ref + "<")
         return page[page.rindex("<tr", 0, start):page.index("</tr>", start)]
+
+    def test_a_cold_queue_shows_checking_refreshes_and_marks_nothing_ready(self):
+        # Owner report 2026-11-10: after a restart the queue waited ~2 min for every CO's Salesforce reads.
+        with patch.object(dashboard, "QUEUE_MATCH_WAIT_SECONDS", 0.0):
+            html = self.page(nowait=True)
+        self.assertIn("Checking…", html)
+        self.assertIn("http-equiv='refresh' content='10'", html)
+        self.assertIn("Still checking", html)
+        self.assertIn("Ready to onboard <b>0</b>", html)
+        self.assertNotIn("Next up", html)
+
+    def test_recent_onboardings_sits_closed_under_the_filter_chips(self):
+        # Owner 2026-11-10: the panel is a closed fold-out below All / Ready / Blocked / Approved / Created.
+        html = self.page()
+        if "<section class='card recent'" not in html:
+            self.skipTest("no Recent onboardings panel in this fixture")
+        self.assertLess(html.index("class='fbar'"), html.index("<section class='card recent'"))
+        self.assertLess(html.index("<section class='card recent'"), html.index("class='fform'"))
+        panel = html[html.index("<section class='card recent'"):]
+        self.assertTrue(panel[:panel.index("</section>")].count("<details>") >= 1)
+        self.assertNotIn("<details open", panel[:panel.index("</section>")])
 
     def test_a_co_this_dashboard_onboarded_says_onboarded_with_its_stage_not_clear(self):
         """The nightly clone does not hold a tenant created today, so the match says Clear; the recorded evidence wins."""
@@ -387,8 +413,7 @@ class LandingTests(unittest.TestCase):
                 approved(ROWS[4], "Pending"),    # CO-0784
                 approved(ROWS[5], "Approved")]   # CO-0785: already created
         html = self.page(rows=rows)
-        tr = {ref: next(chunk for chunk in html.split("<tr") if ">" + ref + "</a>" in chunk)
-              for ref in ("CO-0780", "CO-0781", "CO-0782", "CO-0784", "CO-0785")}
+        tr = {ref: self.row_of(html, ref) for ref in ("CO-0780", "CO-0781", "CO-0782", "CO-0784", "CO-0785")}
         cells = {ref: re.search(r"<td class='c-days'>(.*?)</td>", chunk, re.S).group(1) for ref, chunk in tr.items()}
         self.assertIn("<b>2</b> days", cells["CO-0780"])
         self.assertIn("Approved", cells["CO-0780"])
