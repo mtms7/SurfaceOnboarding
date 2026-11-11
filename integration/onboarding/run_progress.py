@@ -64,9 +64,14 @@ PRODUCTION_CREATE_CHECKS: tuple[tuple[str, str], ...] = (
     ("pcr_form", "Add Account form filled and every value read back"),
 )
 
+# The Case 3 primary-user run (owner request 2026-11-11): fixed step words; outcomes are fixed result/state words only
+# (never a name or an email). Mapped to the card's steps by ``primary_user_progress``.
+PRIMARY_USER_MILESTONES: tuple[str, ...] = ("pu_start", "pu_signed_in", "pu_tenant_found", "pu_control_taken", "pu_users_read",
+                                            "pu_add_sent", "pu_add_verified", "pu_control_released", "pu_result")
+
 MILESTONE_STEPS = frozenset([*(step for table in (_CREATE_STEPS, _RENEWAL_STEPS, _PRODUCTION_DRY_RUN_STEPS)
                                for _label, matchers in table for step, _outcomes in matchers),
-                             *(step for step, _label in PRODUCTION_CREATE_CHECKS)])
+                             *(step for step, _label in PRODUCTION_CREATE_CHECKS), *PRIMARY_USER_MILESTONES])
 
 PENDING, ACTIVE, DONE, FAILED = "pending", "active", "done", "failed"
 

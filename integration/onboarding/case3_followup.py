@@ -483,7 +483,7 @@ def after_primary_user(inputs: FollowupInputs, verified_records: Any, read_row: 
     lock = build_lock(inputs)
     if lock is not None:
         return lock
-    if last_primary_user(inputs.records_parent, inputs.reference) not in primary.DONE_RESULTS:
+    if not primary.is_done(last_primary_user(inputs.records_parent, inputs.reference)):
         return "primary_user_not_done"
     return _guarded_move(inputs, verified_records, read_row, run_argv, target_org, user_stage_plan, USER_STAGE_TO)
 

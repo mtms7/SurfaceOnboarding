@@ -11658,6 +11658,33 @@ def _primary_user_line(result: str, wrote: bool = False) -> str:
                        "salesforce_writeback": "not_performed"}, separators=(",", ":"))
 
 
+def _pu_note(reference: str, step: str, outcome: str, clock: Any) -> None:
+    """One milestone of the primary-user run for the dashboard bar (owner request 2026-11-11). Fixed step and result/state
+    words only, never a name or an email. Best effort: a progress file that cannot be written never changes the run."""
+    from integration.onboarding import primary_user_progress as pu_progress
+
+    try:
+        run_progress.record_milestone(PROGRESS_PATH, reference, {"t": clock().strftime(PDR_STAMP), "step": step,
+                                                                 "outcome": pu_progress.safe_word(outcome)})
+    except Exception:
+        pass
+
+
+def _pu_run_active(reference: str, moment: datetime) -> bool:
+    """True while an earlier primary-user run of this CO recorded its start but no result, less than STALE_SECONDS ago
+    (single-flight across a dashboard restart: the second click must not open a second BackOffice window)."""
+    from integration.onboarding import primary_user_progress as pu_progress
+
+    try:
+        run = pu_progress.current_run(run_progress.read_milestones(PROGRESS_PATH, reference))
+        if not run or any(e.get("step") == "pu_result" for e in run):
+            return False
+        started = datetime.strptime(str(run[0].get("t")), PDR_STAMP).replace(tzinfo=timezone.utc)
+        return 0 <= (moment - started).total_seconds() < pu_progress.STALE_SECONDS
+    except Exception:
+        return False
+
+
 def _pu_users_state(page: Any, user: Any, trigger: Any) -> str | None:
     """Run ``trigger`` and read the Users table reply it causes (in memory only): the user's state or None."""
     from integration.onboarding import production_case3_primary_user as primary
@@ -11677,6 +11704,12 @@ def _pu_users_state(page: Any, user: Any, trigger: Any) -> str | None:
         return None
 
 
+USER_MENU_SELECTOR = '[data-am="button-User_Icon"]'  # tenant app header (read 2026-11-11)
+ADD_USER_MODAL_SELECTOR = ".administration-users-add-user"  # the Add User box (no role=dialog; read 2026-11-11)
+ROLE_SELECT_SELECTOR = "select#roleNames"  # native select: Admin = "admin", Restricted Operator, Read Only
+ROLE_ADMIN_VALUE = "admin"
+
+
 def _pu_release(page: Any, diag: dict[str, str]) -> bool:
     """Give the tenant back (the page's own Give up control); True when giveUpControl answered 200."""
     from integration.onboarding import production_case3_primary_user as primary
@@ -11684,16 +11717,25 @@ def _pu_release(page: Any, diag: dict[str, str]) -> bool:
     def is_give_up(r: Any) -> bool:
         return (r.request.method.upper() == "POST" and production_probe.url_path(r.url) == primary.GIVE_UP_PATH)
 
-    label = re.compile(r"give\s*up\s*control", re.IGNORECASE)
+    # 2026-11-11 (CO-0844, read in the owner's controlled session): there is no "Give up control" button. In controlled mode
+    # the tenant app's user menu (data-am button-User_Icon) offers "User Profile" and "Log Out", and the 2026-11-06 HAR shows
+    # giveUpControl sent from /administration/users and then the BackOffice tenant list: Log Out gives control back. The click
+    # counts only when giveUpControl answers 200; any other write it might cause is aborted by the guard (fail closed).
     try:
-        control = page.get_by_text(label)
+        page.locator(USER_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
+        page.wait_for_timeout(600)
+        control = page.locator(".hover-menu-item").filter(has_text=re.compile(r"^\s*log\s*out\s*$", re.I))
         diag["release_controls"] = str(min(control.count(), 9))
-        if not control.count():
+        if control.count() != 1:
+            page.keyboard.press("Escape")
             return False
         with page.expect_response(is_give_up, timeout=PRIMARY_USER_RESPONSE_MS) as info:
             control.first.click(timeout=FIELD_TIMEOUT_MS)
+            # 2026-11-11 (CO-0844 run 22:22Z): Log Out opens a "Log out of your account" box (Cancel / Log out); without its
+            # confirm no giveUpControl is sent. Click that box's one "Log out" button only.
             page.wait_for_timeout(800)
-            confirm = page.get_by_role("button", name=re.compile(r"^\s*(yes|ok|confirm|give\s*up(\s*control)?)\s*$", re.I))
+            confirm = page.get_by_role("button", name=re.compile(r"^\s*log\s*out\s*$", re.I))
+            diag["release_confirm"] = str(min(confirm.count(), 9))
             if confirm.count() == 1:
                 confirm.first.click(timeout=FIELD_TIMEOUT_MS)
         return info.value.status == 200
@@ -11708,7 +11750,10 @@ def _pu_fill_and_add(page: Any, guard: Any, user: Any, diag: dict[str, str], rec
     try:
         page.get_by_role("button", name=re.compile(r"add\s*user", re.I)).first.click(timeout=FIELD_TIMEOUT_MS)
         page.wait_for_timeout(800)
-        scope = page.get_by_role("dialog") if page.get_by_role("dialog").count() == 1 else page
+        modal = page.locator(ADD_USER_MODAL_SELECTOR)
+        diag["modal"] = str(min(modal.count(), 9))
+        scope = modal.first if modal.count() == 1 else (page.get_by_role("dialog") if page.get_by_role("dialog").count() == 1
+                                                         else page)
         for pattern, value, key in ((r"first\s*name", user.first_name, "first"), (r"last\s*name", user.last_name, "last"),
                                     (r"e-?mail", user.email, "email")):
             box = scope.get_by_label(re.compile(pattern, re.I))
@@ -11718,18 +11763,22 @@ def _pu_fill_and_add(page: Any, guard: Any, user: Any, diag: dict[str, str], rec
             if box.count() != 1:
                 raise LookupError("field")
             box.first.fill(value, timeout=FIELD_TIMEOUT_MS)
-        role = scope.get_by_label(re.compile(r"^\s*roles?\s*$", re.I))
+        # 2026-11-11: Roles is a native <select id="roleNames"> (empty first option; Admin = "admin"); the submit is "Confirm",
+        # disabled until the form is valid. The guard still lets only the exact planned body (roleNames USER_ACCOUNT_ADMIN) out.
+        role = scope.locator(ROLE_SELECT_SELECTOR)
         diag["role_controls"] = str(min(role.count(), 9))
-        if role.count() == 1 and not re.search(r"admin", role.first.inner_text(timeout=FIELD_TIMEOUT_MS) or "", re.I):
-            role.first.click(timeout=FIELD_TIMEOUT_MS)
-            option = page.get_by_role("option", name=re.compile(r"^\s*(account\s*)?admin(istrator)?\s*$", re.I))
-            diag["role_options"] = str(min(option.count(), 9))
-            if option.count() != 1:
-                raise LookupError("role")
-            option.first.click(timeout=FIELD_TIMEOUT_MS)
-        submit = scope.get_by_role("button", name=re.compile(r"^\s*(add|add\s*user|save|create|invite)\s*$", re.I))
+        if role.count() != 1:
+            raise LookupError("role")
+        role.first.select_option(value=ROLE_ADMIN_VALUE, timeout=FIELD_TIMEOUT_MS)
+        if role.first.input_value(timeout=FIELD_TIMEOUT_MS) != ROLE_ADMIN_VALUE:
+            raise LookupError("role")
+        submit = scope.get_by_role("button", name=re.compile(r"^\s*(confirm|add|add\s*user|save|create|invite)\s*$", re.I))
         diag["submit_buttons"] = str(min(submit.count(), 9))
         if submit.count() != 1:
+            raise LookupError("submit")
+        page.wait_for_timeout(300)
+        if not submit.first.is_enabled(timeout=FIELD_TIMEOUT_MS):
+            diag["submit_disabled"] = "1"
             raise LookupError("submit")
     except Exception:
         try:
@@ -11779,24 +11828,40 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
     runtime = str(environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop")).strip().casefold()
     if _launch_os_name() != "nt" or runtime != "desktop":
         return _primary_user_line("browser_launch_not_allowed")
+    # 2026-11-11 (owner, CO-0844): one run per CO at a time, also across a dashboard restart; then the milestones of THIS run
+    # (pu_start ... pu_result) for the dashboard's progress bar and final banner.
+    if _pu_run_active(reference, clock()):
+        return _primary_user_line("primary_user_already_running")
+
+    def note(step: str, outcome: str = "ok") -> None:
+        _pu_note(reference, step, outcome, clock)
+
+    def finish(result: str, wrote: bool = False) -> str:
+        note("pu_result", result)
+        return _primary_user_line(result, wrote=wrote)
+
+    note("pu_start")
     parent = records_parent or _pdr_records_parent()
     last = case3_followup.last_primary_user(parent, reference)
-    if last in primary.DONE_RESULTS:
-        return _primary_user_line("already_done")
-    if last is not None and last not in ("add_form_unavailable", "control_item_not_found", "control_failed",
+    if primary.is_done(last):
+        return finish("already_done")
+    # A stop before any add (the "+control_not_released" suffix only says the tenant was left in control, 2026-11-11 CO-0844)
+    # may be retried: the next run takes control again and gives it back. A started / unverified / no-signal add never is.
+    base = last.split("+", 1)[0] if isinstance(last, str) else last
+    if last is not None and base not in ("add_form_unavailable", "control_item_not_found", "control_failed",
                                          "users_list_unavailable", "row_not_found", "session_expired", "add_rejected",
                                          "add_body_mismatch", "user_exists_other_role"):
-        return _primary_user_line("primary_user_needs_review")  # started / unverified / no signal: never repeated
+        return finish("primary_user_needs_review")  # started / unverified / no signal: never repeated
     try:
         history = create_ui.load_co_records(parent, reference)
     except Exception:
-        return _primary_user_line("records_unreadable")
+        return finish("records_unreadable")
     verified = [r for r in history if r.get("outcome") == "readback_verified" and r.get("route") == CASE3_ENGINE]
     account_id = verified[-1].get("account_id") if verified else None
     tenant = verified[-1].get("tenant_name") if verified else None
     if (create_ui.co_status(history)["code"] != create_ui.CREATED_VERIFIED or not isinstance(account_id, str)
             or not re.fullmatch(r"[0-9a-f]{24}", account_id) or not isinstance(tenant, str) or not tenant.strip()):
-        return _primary_user_line("no_verified_case3_create")
+        return finish("no_verified_case3_create")
     try:
         rows = (read_co or _sf_records)("SELECT " + primary.SOQL_FIELDS + " FROM Customer_Onboarding__c WHERE Name = '"
                                         + reference + "' LIMIT 2")
@@ -11805,10 +11870,10 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
         row = None
     user, problem = primary.plan(row)
     if user is None:
-        return _primary_user_line(problem)
+        return finish(problem)
     stage = primary.stage_problem(row)
     if stage is not None:
-        return _primary_user_line(stage)
+        return finish(stage)
     diag: dict[str, str] = {}
 
     def record(result: str) -> None:
@@ -11818,6 +11883,7 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
     opener = open_page or (_kept_browser_page if production_window_kept() else _pdr_browser_page)
     try:
         with opener(production_probe.probe_target(), KEPT_SIGN_IN_SECONDS if opener is _kept_browser_page else wait_seconds) as page:
+            note("pu_signed_in")
             guard = PrimaryUserGuard(account_id, user)
             guard.install(page)
             try:  # the verified tenant row (by name, then the exact account id)
@@ -11829,20 +11895,19 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
                     raise LookupError("session_expired")
                 if len(found) != 1:
                     raise LookupError("row_not_found")
+                note("pu_tenant_found")
                 page.locator("tr, [role='row']").filter(has_text=tenant).first.click(timeout=FIELD_TIMEOUT_MS)
                 page.locator(SCAN_EXEC_ROW_MENU_SELECTOR).first.click(timeout=FIELD_TIMEOUT_MS)
-                items = page.locator(ROW_MENU_ITEMS_SELECTOR).filter(has_text=re.compile(r"control", re.I))
                 page.wait_for_timeout(500)
-                diag["control_items"] = str(min(items.count(), 9))
-                if items.count() != 1:
-                    tokens = [t for t in page.locator(ROW_MENU_ITEMS_SELECTOR).evaluate_all(
-                        "els => els.map(e => e.getAttribute('data-am'))") if isinstance(t, str)
-                        and re.fullmatch(r"Button-Grid_[A-Za-z0-9_]{1,40}", t)]
+                tokens = [t for t in page.locator(ROW_MENU_ITEMS_SELECTOR).evaluate_all(
+                    "els => els.map(e => e.getAttribute('data-am'))") if isinstance(t, str)
+                    and re.fullmatch(r"Button-Grid_[A-Za-z0-9_]{1,40}", t)]
+                # 2026-11-11 (CO-0844): the take-control item is "Access" (Button-Grid_Access), not a "control" text.
+                token = primary.control_item_token(tokens)
+                items = page.locator('[data-am="' + token + '"]') if token else None
+                diag["control_items"] = str(min(items.count(), 9)) if items is not None else "0"
+                if items is None or items.count() != 1:
                     diag["menu_items"] = ",".join(tokens)[:300]
-                    page.keyboard.press("Escape")
-                    raise LookupError("control_item_not_found")
-                token = items.first.get_attribute("data-am") or ""
-                if re.search(r"(?i)delete|remove|disable|deactivate|suspend|reset|purge", token):
                     page.keyboard.press("Escape")
                     raise LookupError("control_item_not_found")
                 with page.expect_response(lambda r: primary.control_id(r.request.method, production_probe.url_path(r.url) or "")
@@ -11851,10 +11916,12 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
                 in_control = True
                 if info.value.status != 200:
                     raise LookupError("control_failed")
+                note("pu_control_taken")
                 page.wait_for_timeout(1500)
                 origin = production_probe.PRODUCTION_ORIGIN
                 state = _pu_users_state(page, user, lambda: page.goto(origin + primary.USERS_PAGE, wait_until="domcontentloaded",
                                                                        timeout=30_000))
+                note("pu_users_read", state or "unreadable")
                 if state is None:
                     raise LookupError("users_list_unavailable")
                 if state == "present_admin":
@@ -11863,6 +11930,7 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
                     result = "user_exists_other_role"
                 else:
                     added = _pu_fill_and_add(page, guard, user, diag, record)
+                    note("pu_add_sent", added)
                     if added != "add_accepted":
                         result = added
                     else:
@@ -11871,12 +11939,14 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
                                                                                     timeout=30_000))
                         except Exception:
                             after = None
+                        note("pu_add_verified", after or "unreadable")
                         result = primary.CREATED if after == "present_admin" else "user_created_unverified"
             except LookupError as stop:
                 result = str(stop)
             finally:
                 if in_control:
                     released = _pu_release(page, diag)
+                    note("pu_control_released", "ok" if released else "failed")
     except RuntimeError as error:
         result = {"production_dry_run_login_timeout": "production_sign_in_timeout",
                   "production_window_signed_out": "production_window_signed_out"}.get(str(error), "primary_user_failed")
@@ -11888,7 +11958,7 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
             record(final)
     except Exception:
         pass
-    return _primary_user_line(final, wrote=result in (primary.CREATED, "user_created_unverified", "add_no_signal"))
+    return finish(final, wrote=result in (primary.CREATED, "user_created_unverified", "add_no_signal"))
 
 
 def run_production_scan_check(reference: str, *, environ: Any | None = None, now: datetime | None = None,

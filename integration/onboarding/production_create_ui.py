@@ -84,7 +84,8 @@ STATUS_TEXT = {
 GATE_TEXT = {
     # Case 3 primary user (2026-11-06)
     "no_verified_case3_create": "There is no verified Case 3 create for this CO.",
-    "primary_user_running": "The primary-user step is running for this CO.",
+    "primary_user_running": "The primary-user step is already running for this CO: nothing new was started. Its progress "
+                            "is on the CO page (it refreshes itself).",
     "primary_user_missing": "The CO has no Primary User contact in Salesforce.",
     "primary_user_name_invalid": "The Primary User's first or last name is missing or unusual: fix it in Salesforce.",
     "primary_user_email_invalid": "The Primary User has no valid email in Salesforce.",

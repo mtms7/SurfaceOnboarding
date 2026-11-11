@@ -2794,3 +2794,69 @@ Then, one go each: Onboarding Completed for CO-0831/0806/0813/0816/0825/0801 (go
 - **Flaky, open:** `test_dashboard_stage_tracker` ConfirmationStoreAndRouteTests.test_guards_are_enforced_and_the_signed_in_identity_is_recorded errored in 2 of 4 full runs today (local HTTP server POST). It passes alone, in its file, and in 2 full runs; the traceback was not captured yet.
 - **Dashboard restarted** with the fast first load (no runner active): listener PID 40040, 2026-11-10. Owner to check the first Onboarding load time.
 - **Owner confirmed** the Onboarding page opens fast after the restart (2026-11-10). Uncommitted since abffafa: the EU+US Tenants page and its redesign, Recent onboardings with the daily check, the fast first load, tests and section 18.
+- **2026-11-10: owner sent the reply-all to Omer and Erez** (thanks for the US clone; who owns the copy job for twice a day; which DevOps contact for the VM Redash path, with the IT 16350 summary). Waiting for their answer.
+
+### 2026-11-11: CO-0844 primary user did not create; audit wrongly said "done" (UNCOMMITTED)
+
+- **Observed:** the owner clicked "Create primary user in BackOffice, then User Created" on CO-0844 and signed in. The run recorded `control_item_not_found` at 21:28:20Z, with control_items 0 and menu items Access, Scan Now, Edit, Details, Stop Scan, Delete. Nothing was changed in BackOffice or Salesforce. The CO stays at Scan Completed Successfully; the dashboard's own Case 3 scan move set that stage at 19:50:42Z.
+- **Cause 1:** the runner looked for a row-menu item whose text contains "control". BackOffice names the take-control action **Access** (`Button-Grid_Access`; docs/57 lists it). This was the first live run of the 2026-11-06 step.
+- **Fix 1:** new `production_case3_primary_user.control_item_token(tokens)` picks exactly one item: `Button-Grid_Access`, or a token naming "control". It never picks a delete, stop or scan item, and returns nothing when the choice is ambiguous. The click is still let through only as a GET of this tenant's own `/account/control/<id>`, and the add stays guarded to the exact planned body.
+- **Cause 2:** the 2026-11-10 audit rule took the primary user from Redash `primaryUserPresent`. That flag is True for every dashboard create, because the create makes the owner's attended account the tenant's primary user. So CO-0844 showed "Primary user: done (clone)" although no customer Admin existed.
+- **Fix 2:** the primary user is done only from our own record (created, already present, or confirmed by hand), else open; see `post_onboard_audit.PRIMARY_USER_NOTE`. The panel's reason now says "the customer's Admin user has not been created yet", or "last attempt: <result>".
+- **Not changed:** the Tenants page "Primary user" column still shows Redash `primaryUserPresent`, which means only "the tenant has some primary user". To relabel or remove (owner decision).
+- **Tests:** `ControlMenuItemTests` (3); the recent-onboardings primary-user tests rewritten for the record-only rule (`PrimaryUserRecordOnlyTests`); CO-0841 back to open (open count 2).
+- **No new HAR needed:** the 2026-11-06 HAR already gives the four requests (control, users list, add with `USER_ACCOUNT_ADMIN`, giveUpControl). If the next run stops after Access, a HAR of the manual steps would show the difference.
+- **Full suite** with sf hidden: 4112 OK, skipped 18 (2026-11-11). Next: restart the dashboard (owner go), then re-run Create primary user on CO-0844.
+- **Dashboard restarted** with the Access fix and the record-only primary-user audit (no runner active): listener PID 30136, 2026-11-11. Owner to re-run Create primary user on CO-0844.
+- **Second run 2026-11-11 21:46:17Z: `add_form_unavailable+control_not_released`.**
+  - Access worked (control_items 1). The Add User form opened and the first name, last name and email fields were found and filled.
+  - No Role control (role_controls 0) and no submit button (submit_buttons 0) were found, so nothing was sent and no user was created.
+  - Give up control was not found (release_controls 0): **the tenant is still under the owner's BackOffice control.**
+  - Cause: the form and release selectors were guesses (the HAR has requests, not page markup).
+  - Next: read the real Add User dialog and the Give up control button in the owner's signed-in Chrome (read only, no submit), with the owner's go.
+- **Progress bar for the primary-user run:** being built by a background agent (owner request); not deployed yet.
+- **Real form and release read in the owner's Chrome** (owner go "Yes, read it", 2026-11-11; read-only, the form was cancelled and nothing was sent):
+  - Add User opens `div.modal-style.administration-users-add-user` (no role=dialog) with First name *, Last name *, Organization email *, Job title, Phone number.
+  - Roles is a native `select#roleNames`: empty first option, Admin = `admin`, Restricted Operator, Read Only.
+  - The buttons are Cancel and **Confirm** (disabled until valid).
+  - There is no "Give up control" button: the header has a non-clickable account badge, Help, Settings (Account Settings / User Management / System Audits) and User (User Profile / **Log Out**).
+  - The 2026-11-06 HAR shows giveUpControl sent from /administration/users and then the BackOffice tenant list (getAllDetailedAccounts), so in controlled mode Log Out gives control back.
+- **Runner fix:**
+  - scope = the add-user box;
+  - `select_option("admin")`, read back;
+  - submit = Confirm, which must be enabled;
+  - release = user menu > Log Out, counted only when giveUpControl answers 200 (the guard aborts any other write);
+  - a stop before any add with `+control_not_released` may now be retried; a started, unverified or no-signal add is never retried.
+- **Tests:** `test_primary_user_form_2026_11_11.py` (5, fake page).
+- **Primary-user progress bar** (background agent, reviewed):
+  - New `integration/onboarding/primary_user_progress.py`: 7 steps (sign in and find the tenant, take control, read Users, add the Admin, read it back, give control back, stage User Created).
+  - Banners: green "Customer Admin user created and verified" / "already present" / "Confirmed by hand"; red "User NOT created: <reason>"; "User creation NOT confirmed" for unverified or no-signal results; amber "Control of the tenant was NOT given back".
+  - Runner milestones `pu_*` hold fixed words only; `pu_result` is written for every outcome.
+  - Single-flight across restarts: `primary_user_already_running`, 25-minute window.
+  - The page refreshes every 5 s only while the run is active; caches are cleared when it ends.
+  - Runner log enabled for `--production-primary-user`.
+  - The "BackOffice opened twice" was two separate clicks, 21:27Z and 21:45Z, with two dashboard restarts in between.
+  - Tests: `test_primary_user_progress_2026_11_11.py` (26).
+- **Full suite** with sf hidden: 4143 OK, skipped 18 (2026-11-11). The real progress file has no `pu_` entries from the tests.
+- **Next:** the owner gives control back (Ion Bank user menu > Log Out; this also confirms the release path), restarts the dashboard (go), then re-runs Create primary user on CO-0844.
+- **Owner confirmed** Log Out returned to the BackOffice tenant list (control given back; the release path is confirmed). **Dashboard restarted** with the form fix and the progress bar: listener PID 40580, 2026-11-11. Owner to re-run Create primary user on CO-0844.
+- **Third run 2026-11-11 22:21-22:22Z: `user_created_verified+control_not_released`.** the CO's Primary User contact was created as Admin and read back; the owner's screenshot shows him in Users. Log Out was found (release_controls 1), but BackOffice then asks "Log out of your account" (Cancel / Log out); the runner did not click that confirm, so no giveUpControl was sent.
+  - Because of the suffix, `after_primary_user` refused the User Created move (result not in DONE_RESULTS).
+  - The window that "opened again" at 22:23Z was the automatic read-only audit scan check reusing the kept window (`scan_completed`), not this run.
+- **Fixes:**
+  - `primary.is_done()` ignores the `+control_not_released` suffix and is used by the runner, the dashboard card, `case3_followup.after_primary_user` and the audit.
+  - `_pu_release` clicks the confirm box's one "Log out" button while waiting for giveUpControl.
+  - Tests: Log out confirm box (2) and `SuffixDoneTests`.
+- **CO-0844 next:** the owner clicks "Log out" in the open confirm box (give control back). After the restart, the card offers "Move the stage to User Created" (the user is done by record).
+- **Full suite** with sf hidden: 4145 OK, skipped 18 (2026-11-11). Next: restart (owner go), then on CO-0844 click Move the stage to User Created.
+- **Dashboard restarted** with is_done() and the Log out confirm (no runner active): listener PID 32760, 2026-11-11. Owner to move CO-0844 to User Created from the card.
+- **CO-0844 stage still Scan Completed Successfully** (owner, after the restart): no stage line was recorded after 22:22Z, so the "Move the stage to User Created" click never completed.
+  - **Measured:** the cold CO page took 88.6 s (`page_build co_prod 88641 ms`), then 9.2 s. Each `sf` read takes about 10 s.
+  - The stage move ran inside the click: a fresh primary-user read, the stage write and the read-back, about 30 to 40 s with no feedback.
+- **Fixes:**
+  - The stage move runs in the background (`_start_primary_user_stage_move`). The card shows "Running: Moving the Salesforce stage to User Created", the page refreshes every 5 s, and a second click is refused (`primary_user_running`). The result word is kept; a crash becomes `stage_move_failed`.
+  - `prefetch_onboard_page` also starts the Case 3 Primary user row read with the page's other reads; before, it ran last, alone, about 10 s.
+  - Tests: `test_primary_user_stage_move_async_2026_11_11.py` (3).
+- **Full suite** with sf hidden: 4148 OK, skipped 18 (2026-11-11). Next: restart (owner go), then click Move the stage to User Created on CO-0844 once.
+- **Dashboard restarted** with the background stage move and the prefetched Primary user row (no runner active): listener PID 39368, 2026-11-11. Owner to click Move the stage to User Created on CO-0844.
+- **CO-0844 at User Created (verified):** stage line written_verified (to User Created) at 22:56:25Z, and a read-only Salesforce read shows Onboarding_Stage__c = User Created, LastModifiedDate 2026-11-11T22:56:51Z. The Case 3 primary-user flow is live end to end (Access > Users > add Admin > read back > Log out confirm > stage). Uncommitted since a79f03a: the primary-user fixes, progress bar, background stage move, Primary user row prefetch, record-only primary-user audit, tests and section 18.

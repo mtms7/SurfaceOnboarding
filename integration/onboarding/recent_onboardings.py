@@ -212,13 +212,11 @@ def describe(check: Mapping[str, Any], live: Mapping[str, Any] | None, tenant: A
         if type(hours) in (int, float) and not isinstance(hours, bool):
             return word, f"Maximum scan Duration is {hours:g} h"
         return word, "Maximum scan Duration not readable"
-    if key == "primary_user":
-        if state == audit.OPEN:
-            return word, "no primary user in the tenant" + (f" (clone {clone_day})" if clone_day else "")
+    if key == "primary_user":  # our own record only (post_onboard_audit.PRIMARY_USER_NOTE)
         result = primary[0]
         if isinstance(result, str) and _RESULT.fullmatch(result):
-            return word, "last attempt: " + result.replace("_", " ") + "; not in the clone yet"
-        return word, no_data if not isinstance(tenant, Mapping) else "the clone does not say yet"
+            return word, "last attempt: " + result.replace("_", " ") + " (use Create primary user on the CO page)"
+        return word, "the customer's Admin user has not been created yet (Create primary user on the CO page)"
     return word, ""
 
 

@@ -24,6 +24,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 STEP = "primary_user"
+# 2026-11-11 (CO-0844): the BackOffice row menu names the take-control action "Access" (data-am Button-Grid_Access; docs/57
+# lists Details, Edit, Access, Scan Now, Stop Scan, Delete). The first live run looked for the word "control" and stopped.
+CONTROL_MENU_TOKEN = "Button-Grid_Access"
+_UNSAFE_MENU = re.compile(r"(?i)delete|remove|disable|deactivate|suspend|reset|purge|stop|scan")
+
+
+def control_item_token(tokens: list[str]) -> str | None:
+    """The ONE row-menu item that takes control of the tenant (``Button-Grid_Access``, or a token naming "control"), else
+    None. Never a destructive or scan item. The click is still let through only as a GET of this tenant's own control path."""
+    found = [t for t in tokens if isinstance(t, str) and re.fullmatch(r"Button-Grid_[A-Za-z0-9_]{1,40}", t)
+             and (t == CONTROL_MENU_TOKEN or re.search(r"(?i)control", t)) and not _UNSAFE_MENU.search(t)]
+    return found[0] if len(set(found)) == 1 and len(found) == 1 else None
 ROLE = "USER_ACCOUNT_ADMIN"
 CONTROL_PATH = re.compile(r"/api/v1/backoffice/account/control/([0-9a-f]{24})")
 USERS_PATH = "/api/v1/administration/users"
@@ -43,6 +55,12 @@ CREATED = "user_created_verified"
 ALREADY = "user_already_present"
 BY_HAND = "owner_confirmed_by_hand"
 DONE_RESULTS = frozenset({CREATED, ALREADY, BY_HAND})
+
+
+def is_done(result: object) -> bool:
+    """True when the customer's Admin user exists by our record. A "+control_not_released" suffix (2026-11-11 CO-0844: the
+    user was created and read back, then the Log out confirm was not clicked) does not undo that; it is reported apart."""
+    return isinstance(result, str) and result.split("+", 1)[0] in DONE_RESULTS
 RESULT_TEXT = {
     CREATED: "The primary user was created as Admin in the tenant and read back from its Users list.",
     ALREADY: "The primary user already exists as Admin in the tenant (nothing was added).",

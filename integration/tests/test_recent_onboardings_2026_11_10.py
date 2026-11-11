@@ -65,27 +65,30 @@ class RecentTestCase(unittest.TestCase):
         return recent.region_clones(_loader(payloads), NOW)
 
 
-class PrimaryUserFromCloneTests(unittest.TestCase):
+def _primary_done(parent, co):
+    from integration.onboarding import case3_followup
+    case3_followup.record_primary_user(parent, co, "user_created_verified", NOW)
+
+
+class PrimaryUserRecordOnlyTests(unittest.TestCase):
+    """2026-11-11 (CO-0844): Redash primaryUserPresent is True for every dashboard create (the owner's attended account is
+    the tenant's primary user), so it never decides the customer's Admin user: only our own record does."""
+
     def _state(self, tenant, primary=(None, None), clone_at=CLONE_AT):
         checks = {c["key"]: c for c in audit.view("case3", None, tenant, clone_at, primary)["checks"]}
         return checks["primary_user"]["state"], checks["primary_user"]["source"]
 
-    def test_done_open_unknown(self):
-        self.assertEqual(self._state(_tenant(EU_UUID)), ("done", "clone"))
+    def test_the_clone_flag_never_makes_it_done(self):
+        self.assertEqual(self._state(_tenant(EU_UUID)), ("open", None))  # primaryUserPresent True: still open
         absent = _tenant(EU_UUID, v2={"ce_status": "DONE", "primary_user_present": False})
-        self.assertEqual(self._state(absent), ("open", "clone"))
-        self.assertEqual(self._state(_tenant(EU_UUID, v2={})), ("unknown", None))
-        self.assertEqual(self._state(None, clone_at=None), ("unknown", None))
+        self.assertEqual(self._state(absent), ("open", None))
+        self.assertEqual(self._state(None, clone_at=None), ("open", None))
 
-    def test_our_done_record_wins_and_a_failed_record_alone_is_unknown(self):
-        absent = _tenant(EU_UUID, v2={"primary_user_present": False})
-        self.assertEqual(self._state(absent, ("user_created_verified", NOW)), ("done", "record"))
-        self.assertEqual(self._state(None, ("add_rejected", NOW), clone_at=None), ("unknown", "record"))
-        self.assertEqual(self._state(absent, ("add_rejected", NOW)), ("open", "clone"))
-
-    def test_v1_primary_user_block_is_not_used(self):
-        """Redash v1 rows carry no primaryUser, so minimize_row's present is always False there: never "open" from it."""
-        self.assertEqual(self._state(_tenant(EU_UUID, v2={}, primary_user={"present": False})), ("unknown", None))
+    def test_only_a_done_record_counts(self):
+        for result in ("user_created_verified", "user_already_present", "owner_confirmed_by_hand"):
+            self.assertEqual(self._state(_tenant(EU_UUID), (result, NOW)), ("done", "record"))
+        for result in ("add_rejected", "control_item_not_found", "user_created_unverified"):
+            self.assertEqual(self._state(_tenant(EU_UUID), (result, NOW)), ("open", "record"))
 
     def test_ce_only_never_gets_the_check(self):
         checks = audit.view("ce_only", None, _tenant(EU_UUID), CLONE_AT)["checks"]
@@ -99,6 +102,7 @@ class PrimaryUserFromCloneTests(unittest.TestCase):
 class RegionTests(RecentTestCase):
     def test_us_lookup_after_eu(self):
         _write_create(self.parent, "CO-0901", audit.CASE3_ROUTE, NOW - timedelta(days=1), uuid=US_UUID)
+        _primary_done(self.parent, "CO-0901")
         item = recent.recent(self.parent, self.clones(eu=[_tenant(EU_UUID)], us=[_tenant(US_UUID)]))[0]
         self.assertEqual(item["region"], "US")
         self.assertTrue(audit.all_done(item))
@@ -109,7 +113,8 @@ class RegionTests(RecentTestCase):
         stale = self.clones(eu=[_tenant(EU_UUID)], data_at=NOW - timedelta(days=3))
         item = recent.recent(self.parent, stale)[0]
         self.assertEqual(item["region"], "EU")
-        self.assertEqual({c["state"] for c in item["checks"]}, {"unknown"})
+        self.assertEqual({c["state"] for c in item["checks"] if c["key"] != "primary_user"}, {"unknown"})
+        self.assertNotIn("done", {c["state"] for c in item["checks"]})
         self.assertIn("EU clone is stale", item["checks"][0]["why"])
         old_query = self.clones(eu=[_tenant(EU_UUID)], age=7 * 3600)
         self.assertFalse(old_query[0]["fresh"])
@@ -153,7 +158,10 @@ class WhyTests(unittest.TestCase):
         none = _tenant(EU_UUID, v2={"primary_user_present": True})
         self.assertEqual(self._why("ce_only", none, key="ce_scan")[1], "no CE scan yet (clone 2026-11-09)")
         self.assertEqual(self._why("case3", pending, key="primary_user"),
-                         ("Primary user missing", "no primary user in the tenant (clone 2026-11-09)"))
+                         ("Primary user missing",
+                          "the customer's Admin user has not been created yet (Create primary user on the CO page)"))
+        self.assertEqual(self._why("case3", pending, key="primary_user", primary=("control_item_not_found", NOW))[1],
+                         "last attempt: control item not found (use Create primary user on the CO page)")
         lone = _tenant(EU_UUID, operator_assigned=False)
         self.assertEqual(self._why("ce_only", lone, key="operator")[1], "no Operator Account on the tenant")
         live = audit.log_line("CO-0901", NOW, "scan_running", {}, [{"campaign_type": audit.CE_CAMPAIGN, "status": "PENDING"}])
@@ -173,6 +181,8 @@ class PanelTests(RecentTestCase):
         for n in range(12):
             _write_create(self.parent, f"CO-09{n:02d}", audit.CE_ROUTE if n % 2 else audit.CASE3_ROUTE,
                           NOW - timedelta(days=40 - n))
+            if not n % 2:
+                _primary_done(self.parent, f"CO-09{n:02d}")
         items = recent.recent(self.parent, self.clones(eu=[_tenant(EU_UUID)]))
         self.assertEqual([i["co"] for i in items], [f"CO-09{n:02d}" for n in range(11, 1, -1)])
         html = recent.panel_html(items, NOW, {"CO-0911": "<b>Acme & Co</b>"})
@@ -192,7 +202,7 @@ class PanelTests(RecentTestCase):
         html = recent.panel_html(recent.recent(self.parent, self.clones(eu=[tenant])), NOW)
         self.assertIn("Surface scan running", html)
         self.assertIn("Primary user missing", html)
-        self.assertIn("no primary user in the tenant (clone 2026-11-09)", html)
+        self.assertIn("Admin user has not been created yet", html)
         self.assertNotIn("All done", html)
         self.assertIn("Status unavailable", recent.panel_html(None, NOW))
 
@@ -232,7 +242,7 @@ class DailyLogTests(RecentTestCase):
         self.assertEqual(recent.record_daily(self.parent, now_items, NOW), 1)
         lines = recent.daily_lines(self.parent)
         self.assertEqual([(l["co_reference"], l["day"]) for l in lines], [("CO-0901", "2026-11-09"), ("CO-0901", "2026-11-10")])
-        self.assertEqual(lines[0]["checks"]["primary_user"], {"state": "open", "source": "clone"})
+        self.assertEqual(lines[0]["checks"]["primary_user"], {"state": "open", "source": None})
         self.assertEqual(lines[1]["region"], "EU")
         self.assertEqual(lines[1]["clone_day"], "2026-11-09")
         raw = (self.parent / records.RECORDS_SUBDIR / recent.DAILY_LOG).read_text(encoding="utf-8")

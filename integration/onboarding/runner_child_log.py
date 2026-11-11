@@ -23,10 +23,11 @@ from typing import Any, Mapping, Sequence
 
 LOG_ENV = "SURFACE_ONBOARDING_RUNNER_LOG"
 WITHHELD = "[line withheld]"
-PRODUCTION_FLAGS = ("--production-create", "--production-dry-run", "--production-scan-check")
+# 2026-11-11: the primary-user run too (the CO-0844 clicks left no runner log: only the result line and codes are kept).
+PRODUCTION_FLAGS = ("--production-create", "--production-dry-run", "--production-scan-check", "--production-primary-user")
 _KEYS = ("result", "outcome", "reason", "refusal_reason", "record", "record_error", "production_write",
          "salesforce_writeback")
-_CODE = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
+_CODE = re.compile(r"[A-Za-z0-9_.:+-]{1,80}")  # "+": a primary-user result suffix (+control_not_released)
 _UUID_LIKE = re.compile(r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _OPERATOR_LINES = ("Sign in with SSO and MFA in the window titled app.pentera.io; waiting up to 15 minutes",
                    "FORM LEFT OPEN: close the Add Account window in the production browser yourself (Cancel).")

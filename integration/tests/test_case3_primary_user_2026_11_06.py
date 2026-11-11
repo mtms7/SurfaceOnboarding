@@ -184,6 +184,9 @@ class RunnerGateTests(unittest.TestCase):
         os_name = mock.patch.object(runner, "_launch_os_name", return_value="nt")
         os_name.start()
         self.addCleanup(os_name.stop)
+        progress = mock.patch.object(runner, "PROGRESS_PATH", self.parent / "progress.json")  # never the real progress file
+        progress.start()
+        self.addCleanup(progress.stop)
 
     def _run(self, **kw):
         line = self.runner.run_production_primary_user("CO-0841", environ={"SURFACE_ONBOARDING_RUNTIME": "desktop"},
@@ -218,6 +221,36 @@ class RunnerGateTests(unittest.TestCase):
                              "scan_not_marked_finished")
         self.opener.assert_not_called()
 
+
+class ControlMenuItemTests(unittest.TestCase):
+    """2026-11-11 (CO-0844): the take-control item is "Access" (Button-Grid_Access); the first live run looked for "control"."""
+
+    LIVE = ["Button-Grid_Access", "Button-Grid_Scan_Now", "Button-Grid_Edit", "Button-Grid_Details", "Button-Grid_Stop_Scan",
+            "Button-Grid_Delete"]
+
+    def test_the_live_menu_gives_access(self):
+        self.assertEqual(primary.control_item_token(self.LIVE), "Button-Grid_Access")
+
+    def test_a_control_named_item_still_works(self):
+        self.assertEqual(primary.control_item_token(["Button-Grid_Edit", "Button-Grid_Take_Control"]), "Button-Grid_Take_Control")
+
+    def test_never_destructive_scan_or_ambiguous(self):
+        self.assertIsNone(primary.control_item_token(["Button-Grid_Delete", "Button-Grid_Scan_Now", "Button-Grid_Stop_Scan"]))
+        self.assertIsNone(primary.control_item_token(["Button-Grid_Access", "Button-Grid_Take_Control"]))
+        self.assertIsNone(primary.control_item_token(["Button-Grid_Access", "Button-Grid_Access"]))
+        self.assertIsNone(primary.control_item_token(["Button-Grid_Delete_Control"]))
+        self.assertIsNone(primary.control_item_token([]))
+        self.assertIsNone(primary.control_item_token(["access", "Button-Grid_Access x"]))
+
+class SuffixDoneTests(unittest.TestCase):
+    """CO-0844 2026-11-11: created and read back, then control not given back; the user exists, so it is done."""
+
+    def test_created_with_control_not_released_is_done(self):
+        self.assertTrue(primary.is_done("user_created_verified+control_not_released"))
+        self.assertTrue(primary.is_done("user_already_present"))
+        self.assertFalse(primary.is_done("add_form_unavailable+control_not_released"))
+        self.assertFalse(primary.is_done("user_created_unverified"))
+        self.assertFalse(primary.is_done(None))
 
 if __name__ == "__main__":
     unittest.main()

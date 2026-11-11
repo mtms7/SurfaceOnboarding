@@ -15,9 +15,12 @@ Checks (owner 2026-11-06; Case 3 "finished" = Surface COMPLETED and CE DONE):
 
 * CE-only: CE scan done; operator assigned.
 * Case 3: Surface scan completed (row COMPLETED, a recon after the create, no recon still running); CE scan done; operator
-  assigned; Maximum scan Duration 90; primary user (owner request 2026-11-10: done when our own record says so OR the
-  clone's ``v2.primary_user_present`` is True; open when the clone says False and there is no done record; unknown when
-  neither knows). CE-only has no primary-user step and never gets this check.
+  assigned; Maximum scan Duration 90; primary user: done only when our own record says so (created and read back, already
+  present as Admin, or confirmed by the owner), else open. CE-only has no primary-user step and never gets this check.
+
+PRIMARY_USER_NOTE (2026-11-11, CO-0844): Redash ``primaryUserPresent`` is True for every dashboard create, because the create
+makes the owner's attended account the tenant's primary user; it says nothing about the customer's Admin, so it is NOT used
+(the 2026-11-10 clone rule showed CO-0844 "done" although no customer user existed).
 """
 from __future__ import annotations
 
@@ -317,15 +320,10 @@ def view(route: str, live: Mapping[str, Any] | None, clone_tenant: Any, clone_at
     clone_checks = checks_from_clone(clone_tenant) if clone_at is not None else {}
     rows = []
     for key in keys:
-        if key == "primary_user":  # our own recorded step, else the clone's primaryUserPresent (owner request 2026-11-10)
+        if key == "primary_user":  # our own recorded step only (see PRIMARY_USER_NOTE)
             result, at = primary_user
-            present = clone_primary_user(clone_tenant) if clone_at is not None else None
-            if result in PRIMARY_DONE:
-                state, source, when = DONE, "record", at
-            elif present is not None:
-                state, source, when = (DONE if present else OPEN), "clone", clone_at
-            else:
-                state, source, when = UNKNOWN, ("record" if result else None), (at if result else None)
+            state = DONE if isinstance(result, str) and result.split("+", 1)[0] in PRIMARY_DONE else OPEN
+            source, when = ("record" if result else None), (at if result else None)
             rows.append({"key": key, "label": LABELS[key], "state": state, "source": source,
                          "at": when.strftime(_FORMAT) if when else None})
             continue

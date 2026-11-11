@@ -5184,7 +5184,7 @@ PENTERA_CSS = (
     ".runprog-done .runprog-fill{background:var(--ok)}"
     ".runprog-steps{margin:0;padding-left:20px;font-size:13px;color:var(--muted)}"
     ".runprog-steps .s-done{color:var(--ok)}.runprog-steps .s-active{color:var(--text);font-weight:700}"
-    ".runprog-steps .s-failed{color:var(--bad);font-weight:700}"
+    ".runprog-steps .s-failed{color:var(--bad);font-weight:700}.runprog-steps .s-skipped{color:var(--muted)}"
     "code{font:12px/1.4 Consolas,'SFMono-Regular',monospace;background:var(--pill);padding:1px 5px;border-radius:4px}"
     ".readiness h2,.login-preflight h2,.manual-action h2{margin:0 0 4px;font-size:15px;color:var(--heading)}"
     ".readiness p,.login-preflight p,.manual-action p{margin:2px 0 0;color:var(--muted)}"
@@ -7256,6 +7256,8 @@ def prefetch_onboard_page(reference: str, row: dict[str, Any] | None = None) -> 
     _ROUTE_HINTS[reference] = {"Name": reference, "Onboarding_Product__c": product, "Onboarding_Type__c": kind}
     if route == CASE3_ENGINE:  # 2026-11-02 (CO-0757): preflight, values card and match each read this CO + DealHub
         prefetch_display_read(case3_source_display, reference)
+        if not state_paths.vm_mode():  # 2026-11-11 (CO-0844): the Primary user card's own read ran last, alone (~10 s)
+            _display_prefetch_pool.submit(_read_primary_user_row, reference)
     if not state_paths.vm_mode():  # the match's own CO read starts with the others (the VM never reads Salesforce)
         prefetch_display_read(production_identity_display, reference)
     if _queued_start_date(reference) is None:  # the start date card read last, one CO at a time
@@ -7740,7 +7742,8 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
                  + _production_guide_html(guide, match))
     progress = _production_run_progress(reference)
     refresh = ("<meta http-equiv='refresh' content='5'>"
-               if progress is not None and not progress["done"] and not progress["failed"] else "") or _dry_run_refresh(reference)
+               if progress is not None and not progress["done"] and not progress["failed"] else "") or _dry_run_refresh(reference) \
+        or _primary_user_refresh(reference)
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod", refresh=refresh)
 
 
@@ -8969,7 +8972,8 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
             + "<section class='card'><div class='card-head'><h2 class='pill'>Salesforce facts</h2></div>"
             + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + sheet + approval_card + record_card
             + "</details>")
-    return _app_shell("Review " + ref, main, active="prod_onboarding", refresh=_dry_run_refresh(ref))
+    return _app_shell("Review " + ref, main, active="prod_onboarding",
+                      refresh=_dry_run_refresh(ref) or _primary_user_refresh(ref))
 
 
 # "superseded" (2026-10-30): an early-activation approval replaces a live one (CO-0801); without it /prod/approvals failed.
@@ -9162,7 +9166,8 @@ def _production_create_html(reference: str, row: dict[str, str | None] | None, s
                 inputs = _card_inputs(reference, row)
                 return create_ui.progress_card_html(progress) + create_ui.create_card_html(
                     inputs, create_ui.last_uuid_write(inputs.records_parent, reference))
-            return create_ui.progress_card_html(progress) + (scan_html + _audit_card(reference) if progress["done"] else "")
+            return create_ui.progress_card_html(progress) + (scan_html + _audit_card(reference) + _primary_user_card(reference)
+                                                             if progress["done"] else "")
         inputs = _card_inputs(reference, row)
         html = create_ui.create_card_html(inputs, create_ui.last_uuid_write(inputs.records_parent, reference)) + scan_html
         if html:  # the audit card only beside a create card (a locked build shows nothing here)
@@ -9883,9 +9888,16 @@ def _primary_user_stage_move(reference: str) -> str:
             follow_inputs, create_ui.load_co_records(inputs.records_parent, reference),
             lambda: _read_case3_followup_row(reference), run_and_forget, create_ui.PINNED_SF_ALIAS)
     _PRIMARY_USER_ROWS.pop(reference, None)
-    _AUDIT_CACHE["at"] = 0.0
-    clear_display_cache_for(reference)
+    _forget_primary_user_views(reference)
     return result
+
+
+def _forget_primary_user_views(reference: str) -> None:
+    """After a primary-user run or stage move: the CO page, the audit and the Recent onboardings panel must read THIS
+    result, not a cached older one (owner report 2026-11-11, CO-0844: the page kept showing an old result)."""
+    _AUDIT_CACHE["at"] = 0.0
+    _RECENT_CACHE["at"] = 0.0
+    clear_display_cache_for(reference)
 
 
 def _follow_primary_user(reference: str, process: Any) -> None:
@@ -9893,12 +9905,15 @@ def _follow_primary_user(reference: str, process: Any) -> None:
         process.wait()
     except Exception:  # noqa: BLE001
         pass
+    _forget_primary_user_views(reference)  # the run's own result line is on disk now
     try:
         stage = _primary_user_stage_move(reference)
     except Exception:  # noqa: BLE001
         stage = "follow_up_failed"
     with _PRODUCTION_RUNS_LOCK:
-        PRIMARY_USER_RUNS[reference] = {"running": False, "stage": stage}
+        run = PRIMARY_USER_RUNS.get(reference) or {}
+        PRIMARY_USER_RUNS[reference] = {**run, "running": False, "stage": stage}
+    _forget_primary_user_views(reference)
 
 
 def _launch_primary_user(reference: str) -> Any:
@@ -9910,15 +9925,66 @@ def _launch_primary_user(reference: str) -> Any:
     if folder is not None:
         child[runner_child_log.LOG_ENV] = str(folder / (reference + "-primary-user-" + datetime.now(timezone.utc)
                                                         .strftime("%Y%m%dT%H%M%SZ") + ".log"))
+    since = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")  # milestones older than this launch never count
     try:
         process = subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-primary-user", "--co", reference],
                                    env=child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
         return None
     with _PRODUCTION_RUNS_LOCK:
-        PRIMARY_USER_RUNS[reference] = {"running": True, "stage": None}
+        PRIMARY_USER_RUNS[reference] = {"running": True, "stage": None, "since": since, "process": process}
+    _forget_primary_user_views(reference)
     Thread(target=_follow_primary_user, args=(reference, process), daemon=True).start()
     return process
+
+
+def primary_user_run_state(reference: str, now: datetime | None = None) -> dict[str, Any] | None:
+    """The newest primary-user run of ``reference`` from its milestones: ``{"since", "events", "runner_running",
+    "follow_running", "active", "stage"}``, or None (no run to show; a by-hand record or a stage-only move shows the recorded
+    result instead). A run started by THIS dashboard counts only milestones from its launch on; a run started before a
+    dashboard restart counts as running until its result or ``primary_user_progress.STALE_SECONDS``."""
+    from integration.onboarding import primary_user_progress as pu_progress
+
+    with _PRODUCTION_RUNS_LOCK:
+        run = dict(PRIMARY_USER_RUNS.get(reference) or {})
+    try:
+        events = pu_progress.current_run(run_progress.read_milestones(attended_runner.PROGRESS_PATH, reference))
+    except Exception:  # noqa: BLE001 - no milestone is shown rather than a guess
+        events = []
+    since = run.get("since")
+    if isinstance(since, str) and since:
+        if events and str(events[0].get("t") or "") < since:
+            events = []  # an older run's milestones: this launch has not written its start yet
+        try:
+            runner_running = run["process"].poll() is None
+        except Exception:  # noqa: BLE001 - an unreadable handle counts as still running (fail closed)
+            runner_running = True
+        follow_running = bool(run.get("running")) and not runner_running
+        return {"since": since, "events": events, "runner_running": runner_running, "follow_running": follow_running,
+                "active": runner_running or bool(run.get("running")), "stage": run.get("stage")}
+    if run.get("manual") or not events:
+        return None
+    started = str(events[0].get("t") or "")
+    finished = any(event.get("step") == "pu_result" for event in events)
+    try:
+        age = ((now or datetime.now(timezone.utc)) - datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ")
+               .replace(tzinfo=timezone.utc)).total_seconds()
+    except ValueError:
+        age = float(pu_progress.STALE_SECONDS)
+    running = not finished and 0 <= age < pu_progress.STALE_SECONDS
+    return {"since": started, "events": events, "runner_running": running, "follow_running": False, "active": running,
+            "stage": run.get("stage")}
+
+
+def _primary_user_refresh(reference: str) -> str:
+    """The 5-second page refresh while a primary-user run of ``reference`` (or its stage move) is running, else ''."""
+    try:
+        state = primary_user_run_state(reference)
+    except Exception:  # noqa: BLE001
+        return ""
+    with _PRODUCTION_RUNS_LOCK:
+        moving = bool((PRIMARY_USER_RUNS.get(reference) or {}).get("stage_moving"))
+    return "<meta http-equiv='refresh' content='5'>" if moving or (state is not None and state["active"]) else ""
 
 
 def primary_user_gate(reference: str, row: Any) -> str | None:
@@ -9935,12 +10001,34 @@ def primary_user_gate(reference: str, row: Any) -> str | None:
     if not any(r.get("outcome") == "readback_verified" and r.get("route") == CASE3_ENGINE for r in history):
         return "no_verified_case3_create"
     with _PRODUCTION_RUNS_LOCK:
-        if (PRIMARY_USER_RUNS.get(reference) or {}).get("running"):
+        if (PRIMARY_USER_RUNS.get(reference) or {}).get("running") or (PRIMARY_USER_RUNS.get(reference) or {}).get("stage_moving"):
             return "primary_user_running"
+    state = primary_user_run_state(reference)
+    if state is not None and state["active"]:  # also a run started before a dashboard restart (single-flight)
+        return "primary_user_running"
     user, problem = primary.plan(row)
     if user is None:
         return problem
     return primary.stage_problem(row)
+
+
+def _start_primary_user_stage_move(reference: str) -> None:
+    """The User Created move in the background (owner report 2026-11-11, CO-0844: the click waited ~30-40 s on three Salesforce
+    calls and looked like nothing happened). The card shows "Moving the stage..." and the page refreshes until it ends."""
+    with _PRODUCTION_RUNS_LOCK:
+        PRIMARY_USER_RUNS[reference] = {"running": False, "stage": None, "manual": True, "stage_moving": True}
+
+    def work() -> None:
+        try:
+            stage = _primary_user_stage_move(reference)
+        except Exception:  # noqa: BLE001 - recorded as a word, never raised in the worker
+            stage = "stage_move_failed"
+        with _PRODUCTION_RUNS_LOCK:
+            PRIMARY_USER_RUNS[reference] = {"running": False, "stage": stage, "manual": True}
+        _PRIMARY_USER_ROWS.pop(reference, None)
+        clear_display_cache_for(reference)
+
+    Thread(target=work, name="primary-user-stage-" + reference, daemon=True).start()
 
 
 def _post_primary_user(path: str, reference: str, values: Any) -> str:
@@ -9957,21 +10045,44 @@ def _post_primary_user(path: str, reference: str, values: Any) -> str:
         if create_ui._form(values, "by_hand_confirmed") != "1":  # noqa: SLF001
             return "authorization_missing"
         user, _ = primary.plan(row)
-        if last not in primary.DONE_RESULTS:
+        if not primary.is_done(last):
             case3_followup.record_primary_user(parent, reference, primary.BY_HAND, datetime.now(timezone.utc),
                                                user.domain if user else "")
-        stage = _primary_user_stage_move(reference)
-        with _PRODUCTION_RUNS_LOCK:
-            PRIMARY_USER_RUNS[reference] = {"running": False, "stage": stage}
+        _start_primary_user_stage_move(reference)
         return "ok"
-    if last in primary.DONE_RESULTS:  # the user is there: only the stage move is left
-        stage = _primary_user_stage_move(reference)
-        with _PRODUCTION_RUNS_LOCK:
-            PRIMARY_USER_RUNS[reference] = {"running": False, "stage": stage}
+    if primary.is_done(last):  # the user is there: only the stage move is left
+        _start_primary_user_stage_move(reference)
         return "ok"
     if create_ui.LAUNCHES.busy() or not create_ui.LAUNCHES.claim(lambda: _launch_primary_user(reference)):
+        with _PRODUCTION_RUNS_LOCK:  # a second click while this CO's run starts or runs: "already running", never a 2nd window
+            if (PRIMARY_USER_RUNS.get(reference) or {}).get("running"):
+                return "primary_user_running"
         return "launch_in_progress"
     return "ok"
+
+
+def primary_user_result_html(state: dict[str, Any] | None, last: str | None, stage: str | None, parent: Path,
+                             reference: str) -> str:
+    """The progress bar of the newest run (and, once it ended, its banner: user created or NOT, and why; control not given
+    back; the stage move), else the banner of the newest recorded result. Fixed words and texts only."""
+    from integration.onboarding import post_onboard_audit as audit
+    from integration.onboarding import primary_user_progress as pu_progress
+
+    if state is None:
+        if not last:
+            return ""
+        return "<p class='note'>Last recorded result:</p>" + pu_progress.banner_html(last, stage)
+    view = pu_progress.progress(state["events"], running=state["runner_running"], stage=state["stage"],
+                                follow_running=state["follow_running"])
+    if view["result"] == "runner_ended_without_a_result":
+        # The runner wrote no final milestone (it stopped early): its own result line counts when it is from THIS run.
+        try:
+            recorded, at = audit.primary_user_result(parent, reference)
+            if recorded and at is not None and at.strftime("%Y-%m-%dT%H:%M:%SZ") >= str(state["since"]):
+                view["result"] = pu_progress.safe_word(recorded)
+        except Exception:  # noqa: BLE001 - the honest "no result" stays
+            pass
+    return pu_progress.card_html(view, state["stage"])
 
 
 def _primary_user_card(reference: str) -> str:
@@ -9995,18 +10106,19 @@ def _primary_user_card(reference: str) -> str:
            if user else "<span class='muted'>" + escape(create_ui.gate_text(problem)) + "</span>")
     lines = ("<p class='note'>Salesforce Primary User: " + who + "<br>Salesforce stage: <strong>"
              + escape(str(stage_now or "unknown")) + "</strong></p>")
-    if last:
-        lines += "<p class='note'>Last result: " + escape(primary.text(last)) + "</p>"
-    if run.get("stage"):
-        lines += "<p class='note'>Stage move to User Created: <code>" + escape(str(run["stage"])) + "</code></p>"
+    state = primary_user_run_state(reference)
+    lines += primary_user_result_html(state, last, run.get("stage"), parent, reference)
     gate = primary_user_gate(reference, row)
-    if run.get("running"):
+    if run.get("stage_moving"):
+        body = ("<p class='note'><span class='chip chip-warn'>Running</span> Moving the Salesforce stage to User Created and "
+                "reading it back. This page refreshes itself every 5 seconds.</p>")
+    elif (state is not None and state["active"]) or run.get("running"):
         body = ("<p class='note'>Running: sign in with SSO and MFA in the app.pentera.io window if asked, then leave it alone. "
-                "Refresh this page in a minute.</p>")
-    elif gate is None and stage_now == primary.STAGE_TO and last in primary.DONE_RESULTS:
+                "This page refreshes itself every 5 seconds until the run ends.</p>")
+    elif gate is None and stage_now == primary.STAGE_TO and primary.is_done(last):
         body = "<p class='note'>Done: the primary user exists and the CO is at User Created.</p>"
     elif gate is None:
-        label = ("Move the stage to User Created" if last in primary.DONE_RESULTS
+        label = ("Move the stage to User Created" if primary.is_done(last)
                  else "Create primary user in BackOffice, then User Created")
         body = ("<form class='start-form' method='post' action='" + create_ui.PRIMARY_USER_PATH + "'>"
                 "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
@@ -10015,7 +10127,7 @@ def _primary_user_card(reference: str) -> str:
                 "list, adds the Salesforce Primary User as Admin only when missing (one guarded request, exactly this person "
                 "and role; BackOffice may email them an invitation), gives control back, then moves the Salesforce stage from "
                 "Scan Completed Successfully to User Created and reads it back.</p>")
-        if last not in primary.DONE_RESULTS:
+        if not primary.is_done(last):
             body += ("<form class='start-form' method='post' action='" + create_ui.PRIMARY_USER_BY_HAND_PATH + "'>"
                      "<input type='hidden' name='reference' value='" + escape(reference) + "'>"
                      "<label><input type='checkbox' name='by_hand_confirmed' value='1' required> I created this user as Admin "
