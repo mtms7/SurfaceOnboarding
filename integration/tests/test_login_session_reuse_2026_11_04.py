@@ -89,7 +89,8 @@ class ContinueWithActiveSessionTests(LoginFlowTests):
 
     def test_the_launcher_reports_both_sessions(self):
         text = LAUNCHER.read_text(encoding="utf-8")
-        self.assertIn("select Continue at", text)
+        # 2026-11-12 local accounts: the dashboard sign-in is the username form; the launcher still reports the Salesforce session.
+        self.assertIn("session is still active (checked again after sign-in)", text)
         self.assertIn("backoffice-production-automation", text)
         self.assertNotIn("Copy-Item", text)  # nothing is copied between profiles
 

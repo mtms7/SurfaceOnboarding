@@ -190,7 +190,7 @@ class CacheTests(ReadSpeedCase):
     def test_refresh_query_and_every_post_clear_the_cache(self):
         self.assertIn('"refresh"', inspect.getsource(dashboard.Handler.do_GET))
         self.assertIn("clear_display_cache()", inspect.getsource(dashboard.Handler.do_GET))
-        post = inspect.getsource(dashboard.Handler.do_POST)
+        post = inspect.getsource(dashboard.Handler._do_post)  # do_POST wraps it with the audit log (2026-11-12)
         self.assertLess(post.index("clear_display_cache()"), post.index("login_required()"))
 
     def test_write_and_confirmation_paths_never_read_through_the_cache(self):

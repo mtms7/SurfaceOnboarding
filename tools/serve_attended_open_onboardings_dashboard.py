@@ -57,6 +57,7 @@ from integration.onboarding import review_approval
 from integration.onboarding import runner_child_log
 from integration.onboarding import run_progress
 from integration.onboarding import users_file
+from integration.onboarding import accounts
 from integration.onboarding import vm_snapshot
 from integration.onboarding.state_paths import state_file
 from integration.onboarding.dev_onboarded import dev_onboarded_evidence, dev_status
@@ -449,9 +450,26 @@ def probe_salesforce_readiness() -> SessionStatus:
                 org_id = None
         status = readiness.classify_salesforce_probe(done.returncode, org_id,
                                                      os.environ.get("SURFACE_SF_EXPECTED_ORG_ID"), now)
+    status = salesforce_data_user_status(status, now)
     set_session_status("salesforce", status)
     if status.state is SessionState.READY:
         request_auto_scan()
+    return status
+
+
+def salesforce_data_user_status(status: SessionStatus, now: datetime) -> SessionStatus:
+    """2026-11-12: with SURFACE_SF_EXPECTED_DATA_USER set, a ready Salesforce session must belong to that user (the owner's
+    user until the integration user exists). Anyone else's session is signed out and Salesforce work stays blocked."""
+    expected = os.environ.get("SURFACE_SF_EXPECTED_DATA_USER", "").strip().casefold()
+    if not expected or status.state is not SessionState.READY:
+        return status
+    info = salesforce_userinfo()
+    if not isinstance(info, dict):
+        return SessionStatus(SessionState.BLOCKED, "salesforce_user_unverified", now)
+    names = {str(info.get(key) or "").strip().casefold() for key in ("email", "preferred_username")}
+    if expected not in names:
+        _sf_quiet("org", "logout", "--target-org", salesforce_target_org(), "--no-prompt")
+        return SessionStatus(SessionState.BLOCKED, "salesforce_wrong_user", now)
     return status
 
 
@@ -561,6 +579,10 @@ SESSION_REASON_TEXT = {
     "salesforce_login_not_allowed": "A browser sign-in can only be started from the desktop dashboard.",
     "salesforce_org_not_pinned": "The expected Salesforce org Id is not configured (SURFACE_SF_EXPECTED_ORG_ID). Nothing runs until it is.",
     "salesforce_wrong_org": "The CLI session belongs to a different Salesforce org than the pinned one.",
+    "salesforce_wrong_user": "That Salesforce sign-in is not the account this dashboard uses for Salesforce work. It was "
+                             "signed out. Sign in to Salesforce with the expected account (shown on this page).",
+    "salesforce_user_unverified": "Salesforce did not report which user is signed in, so Salesforce work stays blocked. "
+                                  "Re-check, or sign in to Salesforce again.",
     "salesforce_timeout": "Salesforce did not answer in time. Check the network or VPN, then re-check.",
     "salesforce_cli_missing": "The Salesforce CLI could not be started on this desktop.",
     "salesforce_schema": "Salesforce returned an unexpected answer.",
@@ -2977,6 +2999,11 @@ def post_form(handler: BaseHTTPRequestHandler) -> dict[str, list[str]] | None:
         parsed = parse_qs(handler.rfile.read(length).decode("utf-8"), keep_blank_values=True, strict_parsing=True)
     except (UnicodeDecodeError, ValueError):
         parsed = None
+    try:  # the audit log records only which CO an action concerned, never other form contents
+        reference = exact_form_value(parsed, "reference") or ""
+        handler._audit_reference = reference if REFERENCE.fullmatch(reference) else ""  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
     if getattr(handler, "display_clear_pending", False):  # a per-CO production POST: its clear waits for the form
         handler.display_clear_pending = False
         reference = exact_form_value(parsed, "reference")
@@ -5272,6 +5299,23 @@ PENTERA_CSS = (
     ".sessions th{width:190px}.trouble{margin-top:14px}.trouble summary{cursor:pointer;color:var(--muted);font-size:13px}"
     ".banner{background:var(--info-bg);color:var(--text);border-radius:6px;padding:10px 14px;margin:0 0 14px}"
     ".operator{margin:14px 0 0;font-size:12px;color:#c9d1e0;word-break:break-all}.operator form{margin-top:6px}"
+    # 2026-11-12 accounts: signed-in block on separate lines, Users as a nav item under Sign out, forms and login page.
+    ".operator .op-label,.operator .op-name,.operator .op-role{display:block}.operator .op-name{color:#fff;font-size:13px}"
+    ".operator .op-role{margin:4px 0 2px}.side-admin{margin-top:10px;display:flex;flex-direction:column;gap:2px}"
+    ".form-grid{display:flex;flex-wrap:wrap;align-items:flex-end;gap:10px 14px;margin:0 0 10px}"
+    ".form-grid label,.stack-form label{display:flex;flex-direction:column;gap:4px;color:var(--heading);font-size:12.5px;"
+    "font-weight:600}.stack-form{display:grid;gap:14px;max-width:380px;margin:6px 0 12px}.stack-form button{justify-self:start}"
+    ".form-grid input,.form-grid select,.stack-form input{font:inherit;color:var(--text);background:#fff;"
+    "border:1px solid #cfd4dc;border-radius:6px;padding:7px 10px;min-width:180px}"
+    ".form-grid input:focus,.form-grid select:focus,.stack-form input:focus{outline:2px solid var(--primary);outline-offset:1px}"
+    ".users-tiles{grid-template-columns:repeat(5,minmax(0,1fr))}.ut{table-layout:auto}.ut th{width:auto!important}"
+    ".card-head h2{margin:0;font-size:16px;color:var(--heading)}.manage summary{cursor:pointer;color:var(--primary);"
+    "font-weight:600}.manage-body{display:grid;gap:8px;margin:10px 0 4px;padding:12px;border:1px solid var(--line);"
+    "border-radius:8px;background:#f8fafc}button.danger{color:var(--bad);border-color:var(--bad)}"
+    "button.danger:hover{background:#fff3f2}.login-main{max-width:440px;margin:64px auto;padding:0 16px}"
+    ".login-brand{text-align:center;margin:0 0 18px}.login-brand .brand{margin:0}.login-sub{color:var(--muted);"
+    "font-size:13px;margin-top:6px}.login-main h1{margin:0 0 12px}"
+    "@media(max-width:760px){.users-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}}"
     ".banner-bad{background:var(--bad-bg)}.banner-warn{background:var(--warn-bg)}.inv{overflow-x:auto}.inv th,.inv td{text-align:left!important;white-space:nowrap}"
     ".inv td:first-child{white-space:normal;min-width:160px}"
     # Wide pages (2026-10-05): full-width main, filter bar, scrolling table with sticky header and first column.
@@ -5541,7 +5585,7 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
         "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + (SNAPSHOT_BANNER_CSS if vm_mode() else "") + "</style></head><body>"
         "<div class='envbar " + env + "' aria-hidden='true'></div><div class='shell'>"
         "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
-        + SEARCH_FORM + groups + ("" if vm_mode() else _session_chip()) + _operator_block() +
+        + SEARCH_FORM + groups + ("" if vm_mode() else _session_chip()) + _operator_block(active) +
         "<div class='side-foot'>" + ("Read-only copy · published from the desktop" if vm_mode() else "Attended · localhost only") + "</div></aside>"
         "<main" + (" class='wide'" if wide else "") + "><div class='envrow'><span class='envpill " + env + "'>"
         + escape(ENV_PILLS[env]) + "</span></div>" + (snapshot_banner() + vm_strip_actions(main_html) if vm_mode() else main_html)
@@ -5549,7 +5593,7 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
     )
 
 
-def _operator_block() -> str:
+def _operator_block(active: str = "") -> str:
     operator = _current_operator.get()
     if not operator:
         return ""
@@ -5561,14 +5605,21 @@ def _operator_block() -> str:
                     "<br><span class='muted'>read-only, through your SSH tunnel</span></div>")
         return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
                 "<br><a href='" + VM_SIGN_OUT_PATH + "'>Sign out</a></div>")
-    role = desktop_role(operator) if desktop_users() is not None else None
-    extra = ""
-    if role:
-        extra = "<br><span class='muted'>" + escape(role) + "</span>"
-        if role == users_file.ROLE_ADMIN:
-            extra += " · <a href='" + ADMIN_USERS_PATH + "'>Users</a>"
-    return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>" + extra +
-            "<form method='post' action='/logout'><button class='ghost' type='submit'>Sign out</button></form></div>")
+    role = desktop_role(operator) if (local_accounts_mode() or desktop_users() is not None) else None
+    role_line = "<span class='op-role'>" + _role_chip(role) + "</span>" if role else ""
+    # Owner request 2026-11-12: name and role on their own lines; Users is a nav item under Sign out (admins only).
+    links = []
+    if local_accounts_mode():
+        links.append((ACCOUNT_PASSWORD_PATH, "Change password", "account_password"))
+    if is_admin_role(role):
+        links.append((ADMIN_USERS_PATH, "Users", "admin_users"))
+    admin_nav = ("<nav class='side-admin' aria-label='Account'>" + "".join(
+        "<a href='" + href + "'" + (" class='active'" if key == active else "") + ">" + label + "</a>"
+        for href, label, key in links) + "</nav>") if links else ""
+    return ("<div class='operator'><span class='op-label'>Signed in as</span><strong class='op-name'>" + escape(operator)
+            + "</strong>" + role_line +
+            "<form method='post' action='/logout'><button class='ghost' type='submit'>Sign out</button></form></div>"
+            + admin_nav)
 
 
 def _onboarding_chip(reference: str) -> str:
@@ -10749,7 +10800,7 @@ def vm_role(email: str | None) -> str | None:
 # operator keeps full access, as before.
 ADMIN_USERS_PATH = "/admin/users"
 ADMIN_USERS_CHANGE_PATH = "/admin/users/change"
-VIEWER_POSTS = frozenset({"/logout"})
+VIEWER_POSTS = frozenset({"/logout", "/account/password"})
 _users_change_lock = Lock()
 
 
@@ -10776,10 +10827,122 @@ def desktop_role(operator: str | None) -> str | None:
     """The signed-in operator's role, or None (not signed in, or no longer listed). Without a users file: admin."""
     if operator is None:
         return None
+    if local_accounts_mode():
+        account = local_account(operator)
+        return None if account is None or account.get("disabled") else account.get("role")
     users = desktop_users()
     if users is None:
         return users_file.ROLE_ADMIN
     return users.get(operator.strip().casefold())
+
+
+def is_admin_role(role: str | None) -> bool:
+    return role in (users_file.ROLE_ADMIN, accounts.ROLE_SUPERADMIN)
+
+
+def role_may_operate(role: str | None) -> bool:
+    return users_file.may_operate(role) or accounts.may_operate(role)
+
+
+# --- Local dashboard accounts (owner decisions 2026-11-12, phase 1b) ---
+# With SURFACE_DASHBOARD_ACCOUNTS_DIR set (the launcher sets it), people sign in to the dashboard with a local username and
+# password from the encrypted store (integration/onboarding/secure_store.py, accounts.py): one super admin (created only by
+# tools/dashboard_accounts.py init-superadmin), operators and viewers created on the Users page. Salesforce is no longer part
+# of the dashboard sign-in: the Salesforce data session is signed in separately (Sessions page) and must belong to
+# SURFACE_SF_EXPECTED_DATA_USER (the owner's user until the integration user exists). Every sign-in, sign-out, account
+# change and action is written to the encrypted, chained audit log.
+ACCOUNTS_DIR_ENV = "SURFACE_DASHBOARD_ACCOUNTS_DIR"
+ACCOUNTS_KEY_ENV = "SURFACE_DASHBOARD_ACCOUNTS_KEY"
+EXPECTED_DATA_USER_ENV = "SURFACE_SF_EXPECTED_DATA_USER"
+LOCAL_LOGIN_PATH = "/login/password"
+ACCOUNT_PASSWORD_PATH = "/account/password"
+_SELF_AUDITED_POSTS = frozenset({LOCAL_LOGIN_PATH, ACCOUNT_PASSWORD_PATH, ADMIN_USERS_CHANGE_PATH, "/logout"})
+_store_cache: dict[tuple[str, str], Any] = {}
+_accounts_lock = Lock()
+_account_change_lock = Lock()  # serialises read-modify-write of the accounts document
+
+
+def local_accounts_mode() -> bool:
+    return not vm_mode() and bool(os.environ.get(ACCOUNTS_DIR_ENV, "").strip())
+
+
+def _secure_store_module() -> Any:
+    # Imported on first use: it needs the `cryptography` package, which a dashboard without local accounts does not.
+    from integration.onboarding import secure_store
+    return secure_store
+
+
+def account_store() -> Any:
+    """The SecureStore for the configured folder, or None (no folder configured, or `cryptography` missing)."""
+    folder = os.environ.get(ACCOUNTS_DIR_ENV, "").strip()
+    if not folder:
+        return None
+    key = os.environ.get(ACCOUNTS_KEY_ENV, "").strip()
+    with _accounts_lock:
+        store = _store_cache.get((folder, key))
+        if store is None:
+            try:
+                module = _secure_store_module()
+            except ImportError:
+                return None
+            store = _store_cache[(folder, key)] = module.SecureStore(folder, key or None)
+    return store
+
+
+def load_account_document() -> dict[str, Any] | None:
+    """The decrypted accounts document, or None when the store is missing, tampered with, or the key is wrong."""
+    store = account_store()
+    if store is None:
+        return None
+    try:
+        return store.load_accounts()
+    except (RuntimeError, OSError):  # secure_store.StoreError is a RuntimeError
+        return None
+
+
+def save_account_document(document: dict[str, Any]) -> bool:
+    store = account_store()
+    if store is None:
+        return False
+    try:
+        store.save_accounts(document)
+        return True
+    except (RuntimeError, OSError):
+        return False
+
+
+def local_account(username: str | None) -> dict[str, Any] | None:
+    document = load_account_document()
+    if document is None or not username:
+        return None
+    return document["accounts"].get(username.strip().casefold())
+
+
+def audit(kind: str, user: str = "", role: str = "", action: str = "", target: str = "", result: str = "") -> None:
+    """Best effort: an audit write failure never blocks the dashboard, but it is reported on the Users page."""
+    store = account_store()
+    if store is None:
+        return
+    try:
+        store.append_audit(kind, user, role, action, target, result)
+    except (RuntimeError, OSError, ValueError):
+        _audit_failures.append(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+_audit_failures: list[str] = []
+
+
+def _audit_post(handler: Any) -> None:
+    """After every POST in local-accounts mode: who, which action, which CO, which HTTP result."""
+    if not local_accounts_mode():
+        return
+    path = urlsplit(getattr(handler, "path", "") or "").path
+    if path in _SELF_AUDITED_POSTS or path in ("/login/start", "/login/cancel", "/login/continue"):
+        return
+    headers = getattr(handler, "headers", None)
+    operator = dashboard_operator(headers.get("Cookie") if headers is not None else None)
+    audit("action", operator or "(not signed in)", desktop_role(operator) or "", path,
+          getattr(handler, "_audit_reference", "") or "", str(getattr(handler, "_audit_status", "") or ""))
 
 
 def configured_public_origin() -> tuple[str | None, bool]:
@@ -10976,6 +11139,15 @@ def end_dashboard_session(cookie_header: str | None) -> str | None:
     if any_run_in_progress():
         return "run_in_progress"
     token = _cookie(cookie_header, SESSION_COOKIE)
+    if local_accounts_mode():
+        # Local accounts: only the dashboard session ends. The Salesforce data session is shared and is not this person's
+        # sign-in, so it stays (the Sessions page signs it in or out); the BackOffice window is closed by the caller.
+        operator = dashboard_operator(cookie_header)
+        with _login_lock:
+            if token:
+                _dashboard_sessions.pop(token, None)
+        audit("sign_out", operator or "", desktop_role(operator) or "", "/logout", "", "ok")
+        return None
     with _login_lock:
         if token:
             _dashboard_sessions.pop(token, None)
@@ -11134,6 +11306,212 @@ def page_admin_users(result: str = "") -> str:
             + "<p class='note'>Users file: <code>" + escape(path) + "</code></p></section>"
             "<section class='card'><h2>Latest changes</h2>" + log + "</section>")
     return _app_shell("Users", body)
+
+
+# --- Local accounts pages (2026-11-12, phase 1b) ---
+LOCAL_LOGIN_TEXT = {
+    "invalid": "Wrong username or password.",
+    "locked": "Too many wrong passwords: this account is locked for 15 minutes. Ask the super admin if you need it sooner.",
+    "disabled": "This account is disabled. Ask the super admin.",
+    "no_accounts": "No dashboard account exists yet. The owner runs the super-admin setup command first.",
+    "store_unavailable": "The encrypted account store could not be read on this machine, so nobody can sign in. Nothing "
+                         "was changed.",
+}
+ACCOUNT_RESULT_TEXT = {
+    "password_mismatch": "The two new passwords are different.",
+    "current_password_wrong": "The current password is wrong.",
+    "password_too_short": "The new password needs at least 12 characters.",
+    "password_too_long": "The new password is longer than 128 characters.",
+    "password_edge_spaces": "The new password cannot start or end with a space.",
+    "password_contains_username": "The new password cannot contain your username.",
+    "password_unchanged": "The new password must be different from the current one.",
+    "store_unavailable": "The encrypted account store could not be written. Nothing was changed.",
+}
+LOCAL_USERS_RESULT_TEXT = {
+    "saved": ("ok", "Saved. The change applies on the person's next click."),
+    "already_exists": ("warn", "That username already exists."),
+    "not_found": ("warn", "That account does not exist (the page may be out of date)."),
+    "invalid_username": ("warn", "Usernames are 3-32 characters: lower-case letters, digits, dot, dash or underscore, "
+                                 "starting with a letter."),
+    "invalid_role": ("warn", "Choose operator or viewer."),
+    "no_change": ("warn", "Nothing to change."),
+    "superadmin_protected": ("warn", "The super admin account cannot be changed from this page."),
+    "too_many_accounts": ("warn", "The account list is full."),
+    "unknown_action": ("warn", "Unknown change. Nothing was changed."),
+    "store_unavailable": ("warn", "The encrypted account store could not be read or written. Nothing was changed."),
+    **{code: ("warn", "Temporary password: " + text[0].lower() + text[1:]) for code, text in ACCOUNT_RESULT_TEXT.items()
+       if code.startswith("password_too") or code in ("password_edge_spaces", "password_contains_username")},
+}
+ROLE_CHIP = {accounts.ROLE_SUPERADMIN: ("chip-info", "Super admin"), accounts.ROLE_OPERATOR: ("chip-ok", "Operator"),
+             accounts.ROLE_VIEWER: ("chip-neutral", "Viewer"), users_file.ROLE_ADMIN: ("chip-info", "Admin")}
+AUDIT_KIND_LABEL = {"sign_in": ("chip-ok", "Sign-in"), "sign_in_failed": ("chip-bad", "Sign-in failed"),
+                    "sign_out": ("chip-neutral", "Sign-out"), "account": ("chip-info", "Account"),
+                    "action": ("chip-warn", "Action")}
+
+
+def _role_chip(role: str | None) -> str:
+    css, label = ROLE_CHIP.get(role or "", ("chip-neutral", role or "unknown"))
+    return "<span class='chip " + css + "'>" + escape(label) + "</span>"
+
+
+def _end_sessions_of(username: str) -> None:
+    name = (username or "").strip().casefold()
+    with _login_lock:
+        for token in [token for token, (_expiry, who) in _dashboard_sessions.items() if who == name]:
+            _dashboard_sessions.pop(token, None)
+
+
+def _login_shell(title: str, body: str) -> str:
+    return ("<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,"
+            "initial-scale=1'><title>" + escape(title) + "</title><style>" + PENTERA_CSS + "</style></head><body>"
+            "<main class='login-main'><div class='login-brand'><span class='brand'>PENTERA.</span>"
+            "<div class='login-sub'>Surface Onboarding</div></div>" + body + "</main></body></html>")
+
+
+def page_local_login(reason: str = "") -> str:
+    banner = ("<div class='banner banner-warn'>" + escape(LOCAL_LOGIN_TEXT[reason]) + "</div>") if reason else ""
+    body = ("<section class='card'><h1>Sign in</h1>" + banner +
+            "<form method='post' action='" + LOCAL_LOGIN_PATH + "' class='stack-form'>"
+            "<label>Username<input type='text' name='username' required maxlength='32' autocomplete='username' autofocus>"
+            "</label><label>Password<input type='password' name='password' required maxlength='128' "
+            "autocomplete='current-password'></label><button type='submit'>Sign in</button></form>"
+            "<p class='note'>Your dashboard account is created by the super admin. Salesforce is signed in separately on "
+            "the Sessions page when Salesforce work needs it; BackOffice asks for your own account when a run needs it.</p>"
+            "</section>")
+    return _login_shell("Sign in", body)
+
+
+def page_account_password(result: str = "", must_change: bool = False) -> str:
+    banner = ""
+    if result in ACCOUNT_RESULT_TEXT:
+        banner = "<div class='banner banner-warn'>" + escape(ACCOUNT_RESULT_TEXT[result]) + "</div>"
+    elif must_change:
+        banner = ("<div class='banner'>Choose your own password before you continue (the one you received was "
+                  "temporary).</div>")
+    body = ("<div class='page-head'><h1>Change password</h1></div><section class='card'>" + banner +
+            "<form method='post' action='" + ACCOUNT_PASSWORD_PATH + "' class='stack-form'>"
+            "<label>Current password<input type='password' name='current' required maxlength='128' "
+            "autocomplete='current-password'></label>"
+            "<label>New password<input type='password' name='new' required minlength='12' maxlength='128' "
+            "autocomplete='new-password'></label>"
+            "<label>New password again<input type='password' name='confirm' required minlength='12' maxlength='128' "
+            "autocomplete='new-password'></label><button type='submit'>Save password</button></form>"
+            "<p class='note'>At least 12 characters, not containing your username. The dashboard keeps only a salted "
+            "hash in its encrypted store.</p></section>")
+    return _app_shell("Change password", body, active="account_password")
+
+
+def _ts(value: float | int | None) -> str:
+    if not value:
+        return ""
+    return datetime.fromtimestamp(float(value), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def page_local_users(result: str = "", user_filter: str = "", kind_filter: str = "") -> str:
+    """Super-admin Users page: accounts, add a user, and the encrypted activity log (onboarding page style)."""
+    banner = ""
+    if result in LOCAL_USERS_RESULT_TEXT:
+        tone, text = LOCAL_USERS_RESULT_TEXT[result]
+        banner = ("<div class='outcome outcome-" + ("success" if tone == "ok" else "info") + "'><span class='outcome-icon'>"
+                  + ("&#10003;" if tone == "ok" else "!") + "</span><div><strong>" + escape(text) + "</strong></div></div>")
+    document = load_account_document()
+    store = account_store()
+    if document is None or store is None:
+        body = ("<div class='page-head'><h1>Users</h1></div>" + banner + "<section class='card'><p>"
+                + escape(LOCAL_LOGIN_TEXT["store_unavailable"]) + "</p></section>")
+        return _app_shell("Users", body, active="admin_users")
+    rows = accounts.public_view(document)
+    check = store.verify_audit()
+    counts = {role: sum(1 for row in rows if row["role"] == role) for role in accounts.ROLES}
+    attention = sum(1 for row in rows if row["locked"] or row["disabled"] or row["must_change"])
+    tiles = ("<div class='tiles users-tiles'>"
+             "<div class='tile'><b>" + str(len(rows)) + "</b><span>Accounts</span><small>who can sign in</small></div>"
+             "<div class='tile'><b>" + str(counts[accounts.ROLE_OPERATOR]) + "</b><span>Operators</span>"
+             "<small>run onboardings</small></div>"
+             "<div class='tile'><b>" + str(counts[accounts.ROLE_VIEWER]) + "</b><span>Viewers</span><small>read only</small>"
+             "</div><div class='tile" + (" alert" if attention else " zero") + "'><b>" + str(attention) + "</b>"
+             "<span>Need attention</span><small>locked, disabled or new</small></div>"
+             "<div class='tile" + ("" if check.ok else " alert") + "'><b>" + str(check.entries) + "</b><span>Audit entries"
+             "</span><small>" + ("chain verified" if check.ok else "CHAIN BROKEN at line " + str(check.broken_at))
+             + "</small></div></div>")
+
+    def manage(row: dict[str, Any]) -> str:
+        name = escape(row["username"])
+        if row["role"] == accounts.ROLE_SUPERADMIN:
+            return "<span class='note'>Protected (setup command only)</span>"
+        hidden = "<input type='hidden' name='username' value='" + name + "'>"
+        role_options = "".join("<option value='" + role + "'" + (" selected" if role == row["role"] else "") + ">"
+                               + role + "</option>" for role in accounts.ASSIGNABLE_ROLES)
+        toggle = "enable" if row["disabled"] else "disable"
+        return ("<details class='manage'><summary>Manage</summary><div class='manage-body'>"
+                "<form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "' class='form-grid'>" + hidden +
+                "<input type='hidden' name='action' value='role'><label>Role<select name='role'>" + role_options +
+                "</select></label><button class='ghost' type='submit'>Change role</button></form>"
+                "<form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "' class='form-grid'>" + hidden +
+                "<input type='hidden' name='action' value='reset'><label>New temporary password<input type='password' "
+                "name='temporary_password' required minlength='12' maxlength='128' autocomplete='new-password'></label>"
+                "<button class='ghost' type='submit'>Reset password</button></form>"
+                "<div class='actions'><form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "'>" + hidden +
+                "<input type='hidden' name='action' value='" + toggle + "'><button class='ghost' type='submit'>"
+                + toggle.capitalize() + "</button></form><form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "'>"
+                + hidden + "<input type='hidden' name='action' value='remove'><button class='ghost danger' type='submit'>"
+                "Remove</button></form></div></div></details>")
+
+    def status(row: dict[str, Any]) -> str:
+        chips = []
+        if row["disabled"]:
+            chips.append("<span class='chip chip-bad'>Disabled</span>")
+        if row["locked"]:
+            chips.append("<span class='chip chip-bad'>Locked</span>")
+        if row["must_change"]:
+            chips.append("<span class='chip chip-warn'>Must change password</span>")
+        return " ".join(chips) or "<span class='chip chip-ok'>Active</span>"
+
+    table = ("<table class='q ut'><thead><tr><th>Username</th><th>Role</th><th>Status</th><th>Last change</th><th></th>"
+             "</tr></thead><tbody>" + "".join(
+                 "<tr><td><span class='co'>" + escape(row["username"]) + "</span></td><td>" + _role_chip(row["role"])
+                 + "</td><td>" + status(row) + "</td><td>" + escape(_ts(row["changed"])) + "</td><td>" + manage(row)
+                 + "</td></tr>" for row in rows) + "</tbody></table>")
+    add = ("<form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "' class='form-grid'>"
+           "<input type='hidden' name='action' value='add'>"
+           "<label>Username<input type='text' name='username' required maxlength='32' pattern='[a-z][a-z0-9._\\-]{2,31}' "
+           "autocomplete='off' placeholder='e.g. jostrander'></label>"
+           "<label>Role<select name='role'><option value='operator' selected>operator</option>"
+           "<option value='viewer'>viewer</option></select></label>"
+           "<label>Temporary password<input type='password' name='temporary_password' required minlength='12' "
+           "maxlength='128' autocomplete='new-password'></label><button type='submit'>Add user</button></form>"
+           "<p class='note'>Give the temporary password to the person directly (not by e-mail). They must choose their own "
+           "password at first sign-in. Usernames: 3-32 lower-case letters, digits, dot, dash or underscore.</p>")
+    entries = store.read_audit(100, user=user_filter, kind=kind_filter)
+    users = sorted({row["username"] for row in rows})
+    filters = ("<form method='get' action='" + ADMIN_USERS_PATH + "' class='form-grid'><label>User<select name='user'>"
+               "<option value=''>All</option>" + "".join("<option value='" + escape(name) + "'"
+                                                        + (" selected" if name == user_filter else "") + ">"
+                                                        + escape(name) + "</option>" for name in users)
+               + "</select></label><label>Event<select name='kind'><option value=''>All</option>" + "".join(
+                   "<option value='" + kind + "'" + (" selected" if kind == kind_filter else "") + ">" + label
+                   + "</option>" for kind, (_css, label) in AUDIT_KIND_LABEL.items())
+               + "</select></label><button class='ghost' type='submit'>Filter</button></form>")
+    log_rows = "".join(
+        "<tr><td>" + escape(entry.get("at", "").replace("T", " ").replace("Z", " UTC")) + "</td><td>"
+        + escape(entry.get("user", "")) + "</td><td><span class='chip " + AUDIT_KIND_LABEL.get(entry.get("kind", ""),
+                                                                                               ("chip-neutral", ""))[0]
+        + "'>" + escape(AUDIT_KIND_LABEL.get(entry.get("kind", ""), ("", entry.get("kind", "")))[1]) + "</span></td><td>"
+        + escape(entry.get("action", "")) + "</td><td>" + escape(entry.get("target", "")) + "</td><td>"
+        + escape(entry.get("result", "")) + "</td></tr>" for entry in entries)
+    log = ("<table class='q ut'><thead><tr><th>When</th><th>User</th><th>Event</th><th>Action</th><th>CO / account</th>"
+           "<th>Result</th></tr></thead><tbody>" + (log_rows or "<tr><td colspan='6' class='empty'>No entries.</td></tr>")
+           + "</tbody></table>")
+    failures = ("<div class='outcome outcome-failed'><span class='outcome-icon'>!</span><div><strong>Audit writes failed "
+                + str(len(_audit_failures)) + " time(s) since the dashboard started</strong><p>Check the store folder and "
+                "its key.</p></div></div>") if _audit_failures else ""
+    body = ("<div class='page-head'><h1>Users</h1><span class='chip chip-info'>Super admin only</span></div>" + banner
+            + failures + tiles +
+            "<section class='card queue-card'><div class='card-head'><h2>Accounts</h2></div>" + table + "</section>"
+            "<section class='card'><div class='card-head'><h2>Add a user</h2></div>" + add + "</section>"
+            "<section class='card queue-card'><div class='card-head'><h2>Activity</h2><span class='note'>Newest first, last "
+            "100. Encrypted on disk; each entry is chained to the previous one.</span></div>" + filters + log + "</section>")
+    return _app_shell("Users", body, active="admin_users")
 
 
 # Routes that launch the runner: "start" creates a tenant, "read" is read-only.
@@ -11312,6 +11690,10 @@ class Handler(BaseHTTPRequestHandler):
         cookie_header = self.headers.get("Cookie")
         if dashboard_operator(cookie_header):
             self.send_redirect("/"); return
+        if local_accounts_mode():
+            reason = parse_qs(urlsplit(self.path).query).get("reason", [""])[0]
+            self.send_page(HTTPStatus.OK, page_local_login(reason if reason in LOCAL_LOGIN_TEXT else ""))
+            return
         state, value = finish_dashboard_login(_cookie(cookie_header, ATTEMPT_COOKIE))
         clear_attempt = ATTEMPT_COOKIE + "=; Path=/" + cookie_attributes() + "; Max-Age=0"
         if state == "signed_in":
@@ -11341,10 +11723,24 @@ class Handler(BaseHTTPRequestHandler):
             if operator is None:
                 self.send_redirect("/login"); return
             _current_operator.set(operator)
+            query = parse_qs(urlsplit(self.path).query)
+            if local_accounts_mode() and operator:
+                account = local_account(operator) or {}
+                if path == ACCOUNT_PASSWORD_PATH:
+                    self.send_page(HTTPStatus.OK, page_account_password(query.get("result", [""])[0],
+                                                                        bool(account.get("must_change"))))
+                    return
+                if account.get("must_change"):
+                    self.send_redirect(ACCOUNT_PASSWORD_PATH); return
             if path == ADMIN_USERS_PATH:
-                if login_required() and desktop_role(operator) != users_file.ROLE_ADMIN:
+                if login_required() and not is_admin_role(desktop_role(operator)):
                     self.send_page(HTTPStatus.FORBIDDEN, page_admin_only()); return
-                self.send_page(HTTPStatus.OK, page_admin_users(parse_qs(urlsplit(self.path).query).get("result", [""])[0]))
+                result = query.get("result", [""])[0]
+                if local_accounts_mode():
+                    self.send_page(HTTPStatus.OK, page_local_users(result, query.get("user", [""])[0],
+                                                                   query.get("kind", [""])[0]))
+                else:
+                    self.send_page(HTTPStatus.OK, page_admin_users(result))
                 return
         # Display reads may use the short in-memory cache; ?refresh=1 drops it.
         if parse_qs(urlsplit(self.path).query).get("refresh", [""])[0] == "1":
@@ -11479,6 +11875,86 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_vm_unavailable()); return
             set_session_status("salesforce", SessionStatus(SessionState.EXPIRED, "salesforce_read_failed", readiness_now()))
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable())
+
+    def _post_local_login(self, form: Any) -> None:
+        """Username + password against the encrypted store. Failures are counted (lockout) and audited."""
+        username = exact_form_value(form, "username") or ""
+        password = exact_form_value(form, "password") or ""
+        shown = username.strip().lower() if accounts.USERNAME.fullmatch(username.strip().lower()) else "(invalid name)"
+        with _account_change_lock:
+            document = load_account_document()
+            if document is None:
+                audit("sign_in_failed", shown, "", LOCAL_LOGIN_PATH, "", "store_unavailable")
+                self.send_redirect("/login?reason=store_unavailable"); return
+            if accounts.superadmin_name(document) is None:
+                self.send_redirect("/login?reason=no_accounts"); return
+            name, reason = accounts.authenticate(document, username, password)
+            saved = save_account_document(document)
+        if name is None or not saved:
+            audit("sign_in_failed", shown, "", LOCAL_LOGIN_PATH, "", reason if saved else "store_unavailable")
+            self.send_redirect("/login?reason=" + (reason if saved else "store_unavailable")); return
+        account = document["accounts"][name]
+        session = token_urlsafe(32)
+        with _login_lock:
+            _dashboard_sessions[session] = (monotonic() + DASHBOARD_SESSION_SECONDS, name)
+        audit("sign_in", name, account.get("role", ""), LOCAL_LOGIN_PATH, "", "ok")
+        if session_statuses(include_runs=False)["salesforce"].state is not SessionState.READY:
+            Thread(target=probe_salesforce_readiness, daemon=True).start()  # Salesforce stays separate: only a check
+        self.send_redirect_with_cookies(ACCOUNT_PASSWORD_PATH if account.get("must_change") else "/", [
+            SESSION_COOKIE + "=" + session + "; Path=/" + cookie_attributes() + "; Max-Age=" + str(DASHBOARD_SESSION_SECONDS)])
+
+    def _post_account_password(self, operator: str, form: Any) -> None:
+        current = exact_form_value(form, "current") or ""
+        new = exact_form_value(form, "new") or ""
+        if new != (exact_form_value(form, "confirm") or ""):
+            self.send_redirect(ACCOUNT_PASSWORD_PATH + "?result=password_mismatch"); return
+        with _account_change_lock:
+            document = load_account_document()
+            if document is None:
+                self.send_redirect(ACCOUNT_PASSWORD_PATH + "?result=store_unavailable"); return
+            try:
+                accounts.change_own_password(document, operator, current, new)
+                result = "saved" if save_account_document(document) else "store_unavailable"
+            except accounts.AccountError as error:
+                result = str(error)
+        audit("account", operator, desktop_role(operator) or "", "change_own_password", operator, result)
+        self.send_redirect("/" if result == "saved" else ACCOUNT_PASSWORD_PATH + "?result=" + result)
+
+    def _post_local_users_change(self, form: Any) -> None:
+        """Super admin only (checked in _do_post): add, role, reset password, disable, enable, remove. Audited."""
+        by = dashboard_operator(self.headers.get("Cookie")) or ""
+        action = exact_form_value(form, "action") or ""
+        username = exact_form_value(form, "username") or ""
+        role = exact_form_value(form, "role") or ""
+        temporary = exact_form_value(form, "temporary_password") or ""
+        shown = username.strip().lower() if accounts.USERNAME.fullmatch(username.strip().lower()) else "(invalid name)"
+        with _account_change_lock:
+            document = load_account_document()
+            if document is None:
+                result = "store_unavailable"
+            else:
+                try:
+                    if action == "add":
+                        accounts.add_account(document, username, role, temporary)
+                    elif action == "role":
+                        accounts.set_role(document, username, role)
+                    elif action == "reset":
+                        accounts.reset_password(document, username, temporary)
+                    elif action in ("disable", "enable"):
+                        accounts.set_disabled(document, username, action == "disable")
+                        if action == "disable":
+                            _end_sessions_of(username)
+                    elif action == "remove":
+                        accounts.remove_account(document, username)
+                        _end_sessions_of(username)
+                    else:
+                        raise accounts.AccountError("unknown_action")
+                    result = "saved" if save_account_document(document) else "store_unavailable"
+                except accounts.AccountError as error:
+                    result = str(error)
+        audit("account", by, desktop_role(by) or "", action or "(none)", shown,
+              (result + (" role=" + role if action in ("add", "role") and role in accounts.ROLES else "")))
+        self.send_redirect(ADMIN_USERS_PATH + "?result=" + (result if result in LOCAL_USERS_RESULT_TEXT else "unknown_action"))
 
     def _post_admin_users_change(self, form: Any) -> None:
         """Admin only (checked in do_POST): one add / role change / removal, saved atomically and logged."""
@@ -11776,7 +12252,18 @@ class Handler(BaseHTTPRequestHandler):
             refuse(str(result.get("reason") or "write_blocked")); return
         self.send_redirect("/co/" + reference + "?env=prod")  # the create card shows the recorded result
 
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._audit_status = int(code)  # for the activity audit log
+        super().send_response(code, message)
+
     def do_POST(self) -> None:
+        # 2026-11-12: every POST is recorded in the encrypted audit log (local accounts only): who, what, which CO, result.
+        try:
+            Handler._do_post(self)
+        finally:
+            _audit_post(self)
+
+    def _do_post(self) -> None:
         # Any action may change Salesforce or local state; later pages read fresh. Sign-in and session checks change no CO
         # data, so they keep the cache (owner request 2026-10-28: every Re-check made all pages cold).
         path = urlsplit(self.path).path
@@ -11798,21 +12285,34 @@ class Handler(BaseHTTPRequestHandler):
                 self._vm_refuse(HTTPStatus.FORBIDDEN, "Not available on the VM",
                                 "The VM dashboard is read-only in phase 1: runs start from the owner's Windows desktop. "
                                 "Nothing was started or changed."); return
-        if path in ("/login/start", "/login/cancel", "/login/continue"):
+        if path == LOCAL_LOGIN_PATH and local_accounts_mode():
+            self._post_local_login(post_form(self)); return
+        if path in ("/login/start", "/login/cancel", "/login/continue", LOCAL_LOGIN_PATH):
+            if local_accounts_mode() or path == LOCAL_LOGIN_PATH:
+                # Local accounts: the dashboard sign-in is the username form; Salesforce signs in on the Sessions page.
+                self._discard_unread_body()
+                self.send_redirect("/login"); return
             self._post_login(path); return
         if login_required() and dashboard_operator(self.headers.get("Cookie")) is None:
             # Not signed in: no form parse, Salesforce read, or launch (the unread body is only discarded).
             self._discard_unread_body()
             self.send_page(HTTPStatus.FORBIDDEN, "<!doctype html><title>Sign in required</title><p>"
-                           "<a href='/login'>Sign in with Salesforce</a> first. Nothing was started.</p>")
+                           "<a href='/login'>Sign in</a> first. Nothing was started.</p>")
             return
         if login_required() and not vm_mode():
-            role = desktop_role(dashboard_operator(self.headers.get("Cookie")))
-            if path.startswith("/admin/") and role != users_file.ROLE_ADMIN:
+            operator = dashboard_operator(self.headers.get("Cookie"))
+            role = desktop_role(operator)
+            if local_accounts_mode():
+                if path == ACCOUNT_PASSWORD_PATH:
+                    self._post_account_password(operator or "", post_form(self)); return
+                if (local_account(operator) or {}).get("must_change") and path != "/logout":
+                    self._discard_unread_body()
+                    self.send_redirect(ACCOUNT_PASSWORD_PATH); return
+            if path.startswith("/admin/") and not is_admin_role(role):
                 self._discard_unread_body()
                 self.send_page(HTTPStatus.FORBIDDEN, page_admin_only())
                 return
-            if not users_file.may_operate(role) and path not in VIEWER_POSTS:
+            if not role_may_operate(role) and path not in VIEWER_POSTS:
                 # Viewers read only: no form parse, Salesforce read, or launch.
                 self._discard_unread_body()
                 self.send_page(HTTPStatus.FORBIDDEN, "<!doctype html><title>Read-only access</title><p>Your role is "
@@ -11835,6 +12335,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == REMOTE_START_PATH:
             self._post_remote_start(post_form(self)); return
         if path == ADMIN_USERS_CHANGE_PATH:
+            if local_accounts_mode():
+                self._post_local_users_change(post_form(self)); return
             self._post_admin_users_change(post_form(self)); return
         if path == "/attended/prepare-sessions":
             environment = exact_form_value(post_form(self), "environment") or readiness.LEONARDO_DEVELOPMENT

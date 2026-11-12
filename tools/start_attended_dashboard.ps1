@@ -50,7 +50,11 @@ param(
     [string]$PythonPath = '',
     # 2026-11-12 desktop users and roles: who may sign in and with which role (admin, operator, viewer). Created on the
     # first start with -AllowedUser as the only admin; later changes come from the dashboard's Users page (admin only).
-    [string]$UsersFile = ''
+    [string]$UsersFile = '',
+    # 2026-11-12 phase 1b: local dashboard accounts (username + password) in an encrypted store. The super admin is created
+    # once with tools/dashboard_accounts.py init-superadmin; Salesforce is then signed in separately (Sessions page) and must
+    # be -AllowedUser's account until the Salesforce integration user exists.
+    [string]$AccountsDir = ''
 )
 
 Set-StrictMode -Version Latest
@@ -198,6 +202,18 @@ if (-not (Test-Path -LiteralPath $UsersFile)) {
     Write-Host "Users file created with $firstAdmin as the first admin: $UsersFile"
 }
 $env:SURFACE_ONBOARDING_USERS_FILE = $UsersFile
+if (-not $AccountsDir) {
+    $AccountsDir = Join-Path $env:LOCALAPPDATA 'SurfaceOnboarding\accounts'
+}
+$env:SURFACE_DASHBOARD_ACCOUNTS_DIR = $AccountsDir
+Remove-Item Env:SURFACE_DASHBOARD_ACCOUNTS_KEY -ErrorAction SilentlyContinue
+# Salesforce work must use this account's session (the integration user replaces it later).
+$env:SURFACE_SF_EXPECTED_DATA_USER = $AllowedUser.Trim().ToLowerInvariant()
+$accountsReady = Test-Path -LiteralPath (Join-Path $AccountsDir 'accounts.enc')
+if (-not $accountsReady) {
+    Write-Warning ("No dashboard account exists yet. Create the super admin once (hidden password prompt): " +
+                   "& '$PythonPath' tools/dashboard_accounts.py init-superadmin --username <name>")
+}
 $env:SURFACE_PASSWORD_RESET_URL = $PasswordResetUrl
 if ($ProductionSessions) {
     $env:SURFACE_ONBOARDING_PRODUCTION_SESSIONS = '1'
@@ -262,8 +278,13 @@ if (-not $NoBrowser) {
         Start-Process "http://127.0.0.1:$Port/login"
     }
 }
-if ($salesforceSessionActive) {
-    Write-Host "Next: the Salesforce session is still active; select Continue at http://127.0.0.1:$Port/login (no new SSO/MFA)."
+if (-not $accountsReady) {
+    Write-Host "Next: create the super admin (see the warning above), then sign in at http://127.0.0.1:$Port/login."
 } else {
-    Write-Host "Next: select Sign in with Salesforce (OneLogin SSO and MFA) at http://127.0.0.1:$Port/login."
+    Write-Host "Next: sign in with your dashboard username and password at http://127.0.0.1:$Port/login."
+}
+if ($salesforceSessionActive) {
+    Write-Host "Salesforce: the $AllowedUser session is still active (checked again after sign-in)."
+} else {
+    Write-Host "Salesforce: sign in as $AllowedUser on the Sessions page when Salesforce work needs it (SSO and MFA)."
 }

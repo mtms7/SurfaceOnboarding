@@ -1324,7 +1324,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         # Guards POST_ROUTES against drift: each routed path must be listed.
         import inspect
         import re as _re
-        source = inspect.getsource(dashboard.Handler.do_POST)
+        source = inspect.getsource(dashboard.Handler._do_post)  # do_POST only adds the audit log (2026-11-12)
         routed = set(_re.findall(r'"(/attended/[a-z0-9-]+)"', source))
         # The guarded production create routes (docs/53) are dispatched as a set (create_ui.POST_PATHS), not by literal.
         from integration.onboarding import production_create_ui as _create_ui

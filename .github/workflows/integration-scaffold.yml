@@ -16,6 +16,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      # Encrypted dashboard accounts and audit log (2026-11-12, phase 1b): AES-256-GCM.
+      - run: python -m pip install --disable-pip-version-check "cryptography==46.0.7"
       - run: python -m unittest discover -s integration/tests -t . -v
       - run: python tools/check_integration_artifacts.py
       - run: python tools/check_integration_offline_boundary.py
