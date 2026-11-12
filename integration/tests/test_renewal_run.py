@@ -384,6 +384,9 @@ class FakeRequest:
     def _claim_and_launch(self, reference, revision, launch, **fields):
         return dashboard.Handler._claim_and_launch(self, reference, revision, launch, **fields)
 
+    def _discard_unread_body(self):
+        return dashboard.Handler._discard_unread_body(self)
+
 
 class StartRenewalRouteTests(RunnerSandbox):
     def setUp(self):

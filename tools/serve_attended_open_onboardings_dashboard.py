@@ -11100,16 +11100,23 @@ class Handler(BaseHTTPRequestHandler):
                                list(self.headers.get_all(PROXY_SECRET_HEADER) or []))
         return email, vm_role(email)
 
-    def _vm_refuse(self, status: HTTPStatus, title: str, message: str) -> None:
-        # Consume a small unread request body first so the refusal is not lost to a connection reset.
+    def _discard_unread_body(self) -> None:
+        """Consume a small unread request body (never parsed) so a refusal is not lost to a connection reset.
+
+        Without this, Windows may reset the connection when it closes with unread bytes, and the client sees
+        WinError 10053/10054 instead of the refusal page. A missing, bad or oversize length closes the connection.
+        """
         try:
             unread = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
+        except (TypeError, ValueError):
             unread = 0
         if 0 < unread <= 65536:
             self.rfile.read(unread)
         else:
             self.close_connection = True
+
+    def _vm_refuse(self, status: HTTPStatus, title: str, message: str) -> None:
+        self._discard_unread_body()
         self.send_page(status, "<!doctype html><title>" + escape(title) + "</title><p>" + escape(message) + "</p>")
 
     def _vm_identity_refusal(self, email: str | None) -> None:
@@ -11131,6 +11138,8 @@ class Handler(BaseHTTPRequestHandler):
                                          self.headers.get("Sec-Fetch-Site"), self.server.server_address[1],
                                          self.headers.get("Referer"))
         if problem is not None:
+            if self.command == "POST":
+                self._discard_unread_body()
             self.send_error(HTTPStatus.FORBIDDEN, "Request refused")
             return False
         return True
@@ -11628,7 +11637,8 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/login/start", "/login/cancel", "/login/continue"):
             self._post_login(path); return
         if login_required() and dashboard_operator(self.headers.get("Cookie")) is None:
-            # Not signed in: no form parse, Salesforce read, or launch.
+            # Not signed in: no form parse, Salesforce read, or launch (the unread body is only discarded).
+            self._discard_unread_body()
             self.send_page(HTTPStatus.FORBIDDEN, "<!doctype html><title>Sign in required</title><p>"
                            "<a href='/login'>Sign in with Salesforce</a> first. Nothing was started.</p>")
             return
