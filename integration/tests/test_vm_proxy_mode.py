@@ -447,7 +447,7 @@ class UsersFileParserTests(unittest.TestCase):
             users_file.parse_users(f"{OWNER}\n{OWNER} operator\n")
 
     def test_malformed_lines_are_refused_without_echoing_the_content(self):
-        bad_lines = ["not-an-email", f"{OWNER} admin", f"{OWNER} operator extra", f"{OWNER}, {VIEWER}", "a@b",
+        bad_lines = ["not-an-email", f"{OWNER} owner", f"{OWNER} operator extra", f"{OWNER}, {VIEWER}", "a@b",
                      "<x>@pentera.io operator", f"{OWNER}\toperator\tviewer", "operator"]
         for bad in bad_lines:
             with self.assertRaises(users_file.UsersFileError) as caught:
@@ -574,7 +574,7 @@ class RenderAllowedEmailsTests(unittest.TestCase):
             users = Path(folder) / "users.txt"
             out = Path(folder) / "allowed.txt"
             out.write_text("previous@pentera.io\n", encoding="utf-8")
-            for text in (f"{OWNER}\nnot-an-email\n", f"{OWNER} admin\n", f"{OWNER}\n{OWNER} operator\n", "# nobody\n"):
+            for text in (f"{OWNER}\nnot-an-email\n", f"{OWNER} owner\n", f"{OWNER}\n{OWNER} operator\n", "# nobody\n"):
                 users.write_text(text, encoding="utf-8")
                 done = self.run_script(str(users), str(out))
                 self.assertEqual(done.returncode, 1, text)

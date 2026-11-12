@@ -11,7 +11,9 @@ Use -Restart only when you explicitly want to stop the loopback process that
 currently owns this dashboard port.
 
 The dashboard login is the operator's Salesforce SSO (no dashboard
-password): only the -AllowedUser address(es) may sign in.
+password): only the people in the users file may sign in (-UsersFile, default
+%LOCALAPPDATA%\SurfaceOnboarding\dashboard-users.txt; created on the first start with
+-AllowedUser as the only admin; the admin adds teammates on the Users page).
 Every Salesforce read is pinned to the -TargetOrg alias and must belong to
 the org Id in -ExpectedOrgId (or the first line of
 %LOCALAPPDATA%\SurfaceOnboarding\salesforce-expected-org-id.txt). The org Id
@@ -45,7 +47,10 @@ param(
     [string]$ExpectedOrgId = '',
     [string]$AllowedUser = 'milton.stevenson@pentera.io',
     [string]$PasswordResetUrl = '',
-    [string]$PythonPath = ''
+    [string]$PythonPath = '',
+    # 2026-11-12 desktop users and roles: who may sign in and with which role (admin, operator, viewer). Created on the
+    # first start with -AllowedUser as the only admin; later changes come from the dashboard's Users page (admin only).
+    [string]$UsersFile = ''
 )
 
 Set-StrictMode -Version Latest
@@ -176,6 +181,23 @@ $quotedDashboard = '"' + $dashboard + '"'
 $env:SURFACE_SF_TARGET_ORG = $TargetOrg
 $env:SURFACE_SF_EXPECTED_ORG_ID = $ExpectedOrgId
 $env:SURFACE_DASHBOARD_ALLOWED_USERS = $AllowedUser
+if (-not $UsersFile) {
+    $UsersFile = Join-Path $env:LOCALAPPDATA 'SurfaceOnboarding\dashboard-users.txt'
+}
+if (-not (Test-Path -LiteralPath $UsersFile)) {
+    $firstAdmin = $AllowedUser.Trim().ToLowerInvariant()
+    if ($firstAdmin -notmatch "^[a-z0-9._%+'-]{1,64}@[a-z0-9-]+(\.[a-z0-9-]+)*\.[a-z]{2,24}$") {
+        throw 'The users file does not exist and -AllowedUser is not one valid e-mail address, so no first admin can be created.'
+    }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $UsersFile) | Out-Null
+    $usersText = "# Surface onboarding dashboard users: one 'email role' per line (role: admin, operator or viewer).`n" +
+                 "# Managed from the dashboard's Users page (admin only); every change is logged next to this file.`n" +
+                 "$firstAdmin admin`n"
+    # UTF-8 without a byte-order mark: the dashboard rejects a file whose first line is not a clean e-mail.
+    [System.IO.File]::WriteAllText($UsersFile, $usersText, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "Users file created with $firstAdmin as the first admin: $UsersFile"
+}
+$env:SURFACE_ONBOARDING_USERS_FILE = $UsersFile
 $env:SURFACE_PASSWORD_RESET_URL = $PasswordResetUrl
 if ($ProductionSessions) {
     $env:SURFACE_ONBOARDING_PRODUCTION_SESSIONS = '1'

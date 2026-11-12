@@ -1232,7 +1232,7 @@ def clear_display_cache() -> None:
 
 _QUEUE_WIDE_READS = frozenset({"queue_source_rows", "queue_start_dates", "closed_history"})
 _POSTS_KEEPING_DISPLAY_CACHE = frozenset({"/login/start", "/login/cancel", "/login/continue", "/logout", "/attended/prepare-sessions",
-                                          "/attended/session-recheck", "/attended/salesforce-login"})
+                                          "/attended/session-recheck", "/attended/salesforce-login", "/admin/users/change"})
 
 
 # Production buttons of ONE CO (owner request 2026-10-29: each "Onboard in production" click made every page cold, and the
@@ -5561,7 +5561,13 @@ def _operator_block() -> str:
                     "<br><span class='muted'>read-only, through your SSH tunnel</span></div>")
         return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
                 "<br><a href='" + VM_SIGN_OUT_PATH + "'>Sign out</a></div>")
-    return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
+    role = desktop_role(operator) if desktop_users() is not None else None
+    extra = ""
+    if role:
+        extra = "<br><span class='muted'>" + escape(role) + "</span>"
+        if role == users_file.ROLE_ADMIN:
+            extra += " · <a href='" + ADMIN_USERS_PATH + "'>Users</a>"
+    return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>" + extra +
             "<form method='post' action='/logout'><button class='ghost' type='submit'>Sign out</button></form></div>")
 
 
@@ -10731,8 +10737,49 @@ def vm_role(email: str | None) -> str | None:
     if _list_configured(OPERATORS_ENV, OPERATORS_FILE_ENV):
         operators = _email_set(OPERATORS_ENV, OPERATORS_FILE_ENV)
     else:
-        operators = frozenset(item for item, role in roles.items() if role == ROLE_OPERATOR)
+        operators = frozenset(item for item, role in roles.items() if users_file.may_operate(role))
     return ROLE_OPERATOR if email in operators else ROLE_VIEWER
+
+
+# --- Desktop users and roles (owner request 2026-11-12, phase 1) ---
+# With SURFACE_ONBOARDING_USERS_FILE set (the launcher always sets it), the desktop allow-list and roles come from that
+# file: admin (everything plus the Users page), operator (runs and actions), viewer (read only). The file is re-read on
+# every request, so a removed user is signed out at once and a role change applies on the next click. A malformed file
+# admits nobody. Without the variable (a direct start, tests) the old single allow-list applies and every signed-in
+# operator keeps full access, as before.
+ADMIN_USERS_PATH = "/admin/users"
+ADMIN_USERS_CHANGE_PATH = "/admin/users/change"
+VIEWER_POSTS = frozenset({"/logout"})
+_users_change_lock = Lock()
+
+
+def desktop_users() -> dict[str, str] | None:
+    """``{email: role}`` from the users file (``{}`` when unreadable or malformed), or None when no file is configured."""
+    path = os.environ.get(USERS_FILE_ENV, "").strip()
+    if not path:
+        return None
+    try:
+        return users_file.load_users_file(path)
+    except users_file.UsersFileError:
+        return {}
+
+
+def desktop_allowed_operators() -> frozenset[str]:
+    """Who may sign in on the desktop: every user in the users file, else the old SURFACE_DASHBOARD_ALLOWED_USERS list."""
+    users = desktop_users()
+    if users is None:
+        return readiness.allowed_operators(os.environ.get("SURFACE_DASHBOARD_ALLOWED_USERS"))
+    return frozenset(users)
+
+
+def desktop_role(operator: str | None) -> str | None:
+    """The signed-in operator's role, or None (not signed in, or no longer listed). Without a users file: admin."""
+    if operator is None:
+        return None
+    users = desktop_users()
+    if users is None:
+        return users_file.ROLE_ADMIN
+    return users.get(operator.strip().casefold())
 
 
 def configured_public_origin() -> tuple[str | None, bool]:
@@ -10769,7 +10816,13 @@ def dashboard_operator(cookie_header: str | None, *, now: float | None = None) -
         if session is None or now >= session[0]:
             _dashboard_sessions.pop(token, None)
             return None
-        return session[1]
+        operator = session[1]
+    if not vm_mode() and desktop_role(operator) is None:
+        # Removed from the users file (or the file became unreadable): the session ends at once.
+        with _login_lock:
+            _dashboard_sessions.pop(token, None)
+        return None
+    return operator
 
 
 def _sf_quiet(*arguments: str, timeout: int = 30) -> int | None:
@@ -10854,7 +10907,7 @@ def finish_dashboard_login(attempt_token: str | None) -> tuple[str, str | None]:
     if returncode != 0:
         set_session_status("salesforce", SessionStatus(SessionState.EXPIRED, "salesforce_sign_in_required", readiness_now()))
         return "failed", "login_cancelled_or_failed"
-    allowed = readiness.allowed_operators(os.environ.get("SURFACE_DASHBOARD_ALLOWED_USERS"))
+    allowed = desktop_allowed_operators()
     userinfo = salesforce_userinfo()
     problem = readiness.identity_problem(userinfo, allowed, os.environ.get("SURFACE_SF_EXPECTED_ORG_ID"))
     if problem is not None:
@@ -10886,7 +10939,7 @@ def active_salesforce_operator(*, fresh: bool = False) -> str | None:
     with _login_lock:
         if not fresh and _active_session_cache and now - _active_session_cache["at"] < ACTIVE_SESSION_CACHE_SECONDS:
             return _active_session_cache["operator"]
-    allowed = readiness.allowed_operators(os.environ.get("SURFACE_DASHBOARD_ALLOWED_USERS"))
+    allowed = desktop_allowed_operators()
     userinfo = salesforce_userinfo()
     operator = None
     if userinfo is not None and readiness.identity_problem(userinfo, allowed,
@@ -11003,6 +11056,86 @@ def page_login(state: str = "", reason: str | None = None, active_operator: str 
             + "</main></body></html>")
 
 
+ADMIN_USERS_RESULT_TEXT = {
+    "saved": ("ok", "Saved. The change applies on the person's next click."),
+    "already_listed": ("warn", "That e-mail is already listed. Change its role in the table instead."),
+    "not_listed": ("warn", "That e-mail is not listed (the page may be out of date). Nothing was changed."),
+    "invalid_email": ("warn", "Not a valid e-mail address. Nothing was changed."),
+    "invalid_role": ("warn", "Choose admin, operator or viewer. Nothing was changed."),
+    "no_change": ("warn", "That user already has this role. Nothing was changed."),
+    "last_admin": ("warn", "Refused: the dashboard must keep at least one admin. Nothing was changed."),
+    "too_many_users": ("warn", "Refused: the users list is full. Nothing was changed."),
+    "unknown_action": ("warn", "Unknown change. Nothing was changed."),
+    "users_file_unavailable": ("warn", "The users file could not be read or written. Nothing was changed; check the file."),
+    "no_users_file": ("warn", "No users file is configured: start the dashboard with tools/start_attended_dashboard.ps1."),
+    "saved_log_failed": ("warn", "Saved, but the change could not be written to the change log. Check the log file."),
+}
+ROLE_TEXT = {users_file.ROLE_ADMIN: "Admin: everything, plus this Users page",
+             users_file.ROLE_OPERATOR: "Operator: onboardings, renewals, scan checks, own BackOffice sign-in",
+             users_file.ROLE_VIEWER: "Viewer: read only"}
+
+
+def page_admin_only() -> str:
+    return ("<!doctype html><title>Admin only</title><p>Only a dashboard admin can open or change the Users page. "
+            "Nothing was changed.</p><p><a href='/'>Return</a></p>")
+
+
+def _role_select(name: str, selected: str) -> str:
+    return ("<select name='" + name + "'>" + "".join(
+        "<option value='" + role + "'" + (" selected" if role == selected else "") + ">" + role + "</option>"
+        for role in users_file.ROLES) + "</select>")
+
+
+def page_admin_users(result: str = "") -> str:
+    """Admin-only Users page: who may sign in, with which role; add, change, remove; the latest changes."""
+    path = os.environ.get(USERS_FILE_ENV, "").strip()
+    banner = ""
+    if result in ADMIN_USERS_RESULT_TEXT:
+        tone, text = ADMIN_USERS_RESULT_TEXT[result]
+        banner = "<div class='banner" + (" banner-warn" if tone == "warn" else "") + "'>" + escape(text) + "</div>"
+    if not path:
+        body = ("<div class='page-head'><h1>Users</h1></div><section class='card'>" + banner + "<p>"
+                + escape(ADMIN_USERS_RESULT_TEXT["no_users_file"][1]) + " Until then the single allow-list of the "
+                "launcher applies and every signed-in person has full access.</p></section>")
+        return _app_shell("Users", body)
+    try:
+        users = users_file.load_users_file(path)
+        problem = ""
+    except users_file.UsersFileError as error:
+        users, problem = {}, str(error)
+    rows = "".join(
+        "<tr><td>" + escape(email) + "</td><td>"
+        "<form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "' class='inline'>"
+        "<input type='hidden' name='action' value='set'><input type='hidden' name='email' value='" + escape(email) + "'>"
+        + _role_select("role", role) + " <button class='ghost' type='submit'>Change role</button></form></td><td>"
+        "<form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "' class='inline'>"
+        "<input type='hidden' name='action' value='remove'><input type='hidden' name='email' value='" + escape(email) + "'>"
+        "<button class='ghost' type='submit'>Remove</button></form></td></tr>"
+        for email, role in sorted(users.items()))
+    table = ("<table><thead><tr><th>E-mail (Salesforce sign-in)</th><th>Role</th><th></th></tr></thead><tbody>"
+             + (rows or "<tr><td colspan='3'>Nobody is listed.</td></tr>") + "</tbody></table>")
+    add = ("<form method='post' action='" + ADMIN_USERS_CHANGE_PATH + "'><input type='hidden' name='action' value='add'>"
+           "<label>E-mail <input type='email' name='email' required maxlength='254' autocomplete='off'></label> "
+           "<label>Role " + _role_select("role", users_file.ROLE_OPERATOR) + "</label> "
+           "<button type='submit'>Add user</button></form>")
+    changes = users_file.recent_changes(path)
+    log = ("<table><thead><tr><th>When (UTC)</th><th>By</th><th>Change</th><th>E-mail</th><th>Role</th></tr></thead><tbody>"
+           + "".join("<tr><td>" + escape(entry["at"]) + "</td><td>" + escape(entry["by"]) + "</td><td>"
+                     + escape(entry["action"]) + "</td><td>" + escape(entry["email"]) + "</td><td>"
+                     + escape(entry.get("role", "")) + "</td></tr>" for entry in changes)
+           + "</tbody></table>") if changes else "<p class='note'>No changes recorded yet.</p>"
+    roles = "<ul>" + "".join("<li>" + escape(text) + "</li>" for text in ROLE_TEXT.values()) + "</ul>"
+    body = ("<div class='page-head'><h1>Users</h1></div><section class='card'>" + banner
+            + ("<div class='banner banner-warn'>The users file is invalid (" + escape(problem) + "): nobody can sign in "
+               "until it is fixed. Saving from this page rewrites it.</div>" if problem else "")
+            + "<p>People sign in with their own Salesforce account (SSO and MFA); the dashboard keeps no passwords. Only "
+              "the e-mails below can sign in. A change applies on the person's next click; a removed person is signed "
+              "out at once. The last admin cannot be removed.</p>" + roles + table + "<h2>Add a user</h2>" + add
+            + "<p class='note'>Users file: <code>" + escape(path) + "</code></p></section>"
+            "<section class='card'><h2>Latest changes</h2>" + log + "</section>")
+    return _app_shell("Users", body)
+
+
 # Routes that launch the runner: "start" creates a tenant, "read" is read-only.
 SESSION_GATED_ROUTES = {
     "/attended/start-ce-only-runner": "start", "/attended/start-co0702-ce-only-runner": "start",
@@ -11027,6 +11160,7 @@ POST_ROUTES = frozenset({
     "/attended/validate", "/attended/validate-all", "/attended/verify-uncertain", "/attended/spycloud-check",
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
     "/attended/review-approve", "/attended/tenant-name-confirm", dry_ui.DRY_RUN_PATH, REMOTE_START_PATH,
+    ADMIN_USERS_CHANGE_PATH,
     *sorted(create_ui.POST_PATHS),
 })
 
@@ -11207,6 +11341,11 @@ class Handler(BaseHTTPRequestHandler):
             if operator is None:
                 self.send_redirect("/login"); return
             _current_operator.set(operator)
+            if path == ADMIN_USERS_PATH:
+                if login_required() and desktop_role(operator) != users_file.ROLE_ADMIN:
+                    self.send_page(HTTPStatus.FORBIDDEN, page_admin_only()); return
+                self.send_page(HTTPStatus.OK, page_admin_users(parse_qs(urlsplit(self.path).query).get("result", [""])[0]))
+                return
         # Display reads may use the short in-memory cache; ?refresh=1 drops it.
         if parse_qs(urlsplit(self.path).query).get("refresh", [""])[0] == "1":
             clear_display_cache()
@@ -11340,6 +11479,31 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_vm_unavailable()); return
             set_session_status("salesforce", SessionStatus(SessionState.EXPIRED, "salesforce_read_failed", readiness_now()))
             self.send_page(HTTPStatus.SERVICE_UNAVAILABLE, page_salesforce_unavailable())
+
+    def _post_admin_users_change(self, form: Any) -> None:
+        """Admin only (checked in do_POST): one add / role change / removal, saved atomically and logged."""
+        path = os.environ.get(USERS_FILE_ENV, "").strip()
+        if not path:
+            self.send_redirect(ADMIN_USERS_PATH + "?result=no_users_file"); return
+        action = exact_form_value(form, "action") or ""
+        email = exact_form_value(form, "email") or ""
+        role = None if action == "remove" else exact_form_value(form, "role")
+        by = dashboard_operator(self.headers.get("Cookie")) or "admin"
+        with _users_change_lock:
+            try:
+                updated = users_file.apply_change(users_file.load_users_file(path), action, email, role)
+                users_file.save_users_file(path, updated)
+            except users_file.UserChangeError as error:
+                result = str(error)
+            except (users_file.UsersFileError, OSError):
+                result = "users_file_unavailable"
+            else:
+                try:
+                    users_file.append_change(path, by, action, email, role)
+                    result = "saved"
+                except OSError:
+                    result = "saved_log_failed"
+        self.send_redirect(ADMIN_USERS_PATH + "?result=" + (result if result in ADMIN_USERS_RESULT_TEXT else "unknown_action"))
 
     def _post_login(self, path: str) -> None:
         cookie_header = self.headers.get("Cookie")
@@ -11642,6 +11806,19 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page(HTTPStatus.FORBIDDEN, "<!doctype html><title>Sign in required</title><p>"
                            "<a href='/login'>Sign in with Salesforce</a> first. Nothing was started.</p>")
             return
+        if login_required() and not vm_mode():
+            role = desktop_role(dashboard_operator(self.headers.get("Cookie")))
+            if path.startswith("/admin/") and role != users_file.ROLE_ADMIN:
+                self._discard_unread_body()
+                self.send_page(HTTPStatus.FORBIDDEN, page_admin_only())
+                return
+            if not users_file.may_operate(role) and path not in VIEWER_POSTS:
+                # Viewers read only: no form parse, Salesforce read, or launch.
+                self._discard_unread_body()
+                self.send_page(HTTPStatus.FORBIDDEN, "<!doctype html><title>Read-only access</title><p>Your role is "
+                               "viewer: you can read every page but not start or change anything. Nothing was started. "
+                               "Ask the dashboard admin for the operator role.</p><p><a href='/'>Return</a></p>")
+                return
         if path == "/logout":
             problem = end_dashboard_session(self.headers.get("Cookie"))
             if problem is not None:
@@ -11657,6 +11834,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == REMOTE_START_PATH:
             self._post_remote_start(post_form(self)); return
+        if path == ADMIN_USERS_CHANGE_PATH:
+            self._post_admin_users_change(post_form(self)); return
         if path == "/attended/prepare-sessions":
             environment = exact_form_value(post_form(self), "environment") or readiness.LEONARDO_DEVELOPMENT
             problem = prepare_sessions_problem(environment)
