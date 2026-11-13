@@ -137,8 +137,12 @@ class GuardTests(unittest.TestCase):
 
 
 class Locator:
-    def __init__(self, count=1, enabled=True, value=""):
+    def __init__(self, count=1, enabled=True, value="", labels=None):
         self._count, self.enabled, self.value, self.clicks = count, enabled, value, 0
+        self.labels = labels or []
+
+    def all_inner_texts(self):
+        return list(self.labels)
 
     @property
     def first(self):
@@ -168,7 +172,10 @@ class FakeEditPage:
 
     def __init__(self, guard, *, options=1, reply_id=ACCOUNT_ID, status=200, scan_sticks=True):
         self.guard, self.reply_id, self.status = guard, reply_id, status
-        self.confirm, self.operator_input, self.option = Locator(), Locator(), Locator(count=options)
+        # 2026-11-13: the picker lists the options and picks the one that is the same person (accents etc. ignored).
+        labels = {0: [], 1: [OPERATOR], 2: [OPERATOR, OPERATOR.replace(" Operator", " - Operator")]}[options]
+        self.confirm, self.operator_input = Locator(), Locator()
+        self.option = Locator(count=1, labels=labels)
         self.scan = Locator(value="24")
         if not scan_sticks:
             self.scan.fill = lambda value, **_kw: None
@@ -227,7 +234,8 @@ class EditRunnerTests(unittest.TestCase):
     def test_the_edit_sets_both_values_confirms_once_and_verifies(self):
         page = FakeEditPage(self.guard)
         self.assertEqual(self.run_edit(page), edit.VERIFIED)
-        self.assertEqual(page.operator_input.value, OPERATOR)
+        self.assertEqual(page.operator_input.value, edit.search_text(OPERATOR))  # typed: the name without "Operator"
+        self.assertEqual(page.option.clicks, 1)
         self.assertEqual(page.scan.value, "90")
         self.assertEqual((page.confirm.clicks, page.sent), (1, ["continue"]))
         self.assertEqual(self.recorded, ["write_started"])
@@ -239,16 +247,24 @@ class EditRunnerTests(unittest.TestCase):
         self.assertEqual(self.run_edit(page), edit.ALREADY_SET)
         self.assertEqual(page.confirm.clicks, 0)
 
-    def test_a_missing_or_ambiguous_operator_cancels_before_confirm(self):
-        for count, code in ((0, "edit_operator_not_found"), (2, "edit_operator_ambiguous")):
+    def test_a_missing_or_ambiguous_operator_still_saves_the_hours(self):
+        # Owner decision 2026-11-13: no single matching operator never blocks the rest; the hours are saved, the select stays
+        # empty and the run reports it (the step turns it into edit_operator_unmatched: assign the operator by hand).
+        for count in (0, 2):
             with self.subTest(options=count):
-                self.replies = [reply(row()), reply(row(90, [OPERATOR]))]
-                page = FakeEditPage(self.guard, options=count)
-                self.assertEqual(self.run_edit(page), code)
-                self.assertEqual(page.confirm.clicks, 0)
+                self.guard = live.LiveRequestGuard()
+                self.guard.create_used = True
+                self.replies = [reply(row()), reply(row(90, []))]
+                self.recorded = []
+                page, diag = FakeEditPage(self.guard, options=count), {}
+                result = runner._pcr_case3_edit(page, self.guard, INTENDED, EXPECTED, ACCOUNT_ID, OPERATOR,
+                                                self.recorded.append, diag)
+                self.assertEqual(result, edit.VERIFIED)
+                self.assertEqual(diag.get("operator"), "unmatched")
+                self.assertEqual(page.option.clicks, 0)
                 self.assertEqual(page.operator_input.value, "")  # cleared, never left typed
-        self.assertEqual(self.cancelled, 2)
-        self.assertEqual(self.recorded, [])
+                self.assertEqual((page.confirm.clicks, page.scan.value), (1, "90"))
+        self.assertEqual(self.cancelled, 0)
 
     def test_a_value_that_does_not_stick_cancels(self):
         page = FakeEditPage(self.guard, scan_sticks=False)

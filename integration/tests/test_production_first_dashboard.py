@@ -191,10 +191,10 @@ class NavigationTests(unittest.TestCase):
 
     def test_groups_order_and_labels(self):
         aside = self.aside()
-        links = re.findall(r"<a href='([^']+)'(?: class='active')?>([^<]+)</a>", aside)
+        links = re.findall(r"<a href='([^']+)'(?: class='active' aria-current='page')?>(?:<svg.*?</svg>)?<span>([^<]+)</span></a>", aside)
         self.assertEqual(links, self.PRODUCTION + self.TOOLS + self.DEV)
         heads = [re.sub(r"<[^>]+>", "", head) for head in re.findall(r"<div class='navhead'>(.*?)</div>", aside)]
-        self.assertEqual(heads, ["PRODUCTIONread-only", "TOOLS"])
+        self.assertEqual(heads, ["Administration"])  # 2026-11-13: no PRODUCTION box in the menu (the page pill says it)
         self.assertNotIn("LEONARDO", aside)
         self.assertLess(aside.index("navgroup prod"), aside.index("navgroup tools"))
 
@@ -642,7 +642,10 @@ class CoPageTests(unittest.TestCase):
         for state in ({}, {"unlock": "production_runner_not_supported"}, {"unavailable": True}):
             for summary in (summary_for(), summary_for(blockers=["production_exists_matches"])):
                 page = self.page(summary, **state)
-                self.assertEqual(controls(page, allow=("/attended/review-approve", "Approve this summary")), [], state)
+                self.assertEqual(controls(page, allow=("/attended/review-approve", "Approve this summary",
+                                                       "/attended/production-operator-confirm",
+                                                   "Mark Operator Account assigned",
+                                                   "/attended/production-operator-edit", "Set Operator from Technical Advisor")), [], state)
                 self.assertNotRegex(page, r"(?i)<(button|a)[^>]*>[^<]*(create in production|start onboarding|confirm)")
 
     def test_an_unlocked_flag_alone_adds_no_control(self):
@@ -742,7 +745,10 @@ class CoPageTests(unittest.TestCase):
         self.assertNotIn("UUID writeback to Salesforce", verified)
         create = verified[verified.index("<h2 id='co-create-title'"):]
         self.assertIn("Created and verified", create[:create.index("</section>")])
-        self.assertEqual(controls(verified, allow=("/attended/review-approve", "Approve this summary")), [])
+        self.assertEqual(controls(verified, allow=("/attended/review-approve", "Approve this summary",
+                                                   "/attended/production-operator-confirm",
+                                                   "Mark Operator Account assigned",
+                                                   "/attended/production-operator-edit", "Set Operator from Technical Advisor")), [])
 
     def test_values_are_escaped(self):
         hostile = "<img src=x onerror=alert(1)>"
@@ -916,7 +922,7 @@ class LegacyUrlsAndSafetyTests(unittest.TestCase):
             for page in (dashboard.render_prod_readiness("", True), dashboard.render_prod_matches(True)):
                 self.assertEqual(areas_module.forms(page), [])
                 self.assertIn("envpill prod", page)
-                self.assertIn("class='active'>Onboarding</a>", page)
+                self.assertRegex(page, r"class='active' aria-current='page'><svg[^>]*>.*?</svg><span>Onboarding</span></a>")
 
     @locked_create_build  # unlock window 2026-10-22: runs as the locked build
     def test_the_co_production_view_carries_the_lock_footer(self):

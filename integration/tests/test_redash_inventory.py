@@ -775,12 +775,13 @@ class TenantsTabTests(unittest.TestCase):
         # 2026-10-16: the Dev entry is labelled "Dev tenants" inside the collapsed last group.
         for active, own in (("prod_tenants", "/prod/tenants"), ("inventory", "/inventory")):
             shell = dashboard._app_shell("t", "", active=active)
-            self.assertIn("<a href='/prod/tenants'" + (" class='active'" if own == "/prod/tenants" else "") + ">Tenants</a>", shell)
+            self.assertRegex(shell, "<a href='/prod/tenants'" + (" class='active' aria-current='page'" if own == "/prod/tenants"
+                                                                 else "") + "><svg[^>]*>.*?</svg><span>Tenants</span></a>")
             self.assertNotIn("Dev tenants", shell)  # owner decision 2026-10-19: no Leonardo (Dev) menu
             self.assertEqual(shell.count("class='active'"), 1 if own == "/prod/tenants" else 0)
         self.assertNotIn("DevOps", dashboard._app_shell("t", "", active="inventory"))
         self._collect()
-        self.assertIn("<a href='/prod/tenants' class='active'>", dashboard.render_inventory(env="prod-clone"))
+        self.assertIn("<a href='/prod/tenants' class='active' aria-current='page'>", dashboard.render_inventory(env="prod-clone"))
         self.assertNotIn("Dev tenants", dashboard.render_inventory(env="dev"))  # no Dev menu entry any more (2026-10-19)
 
     def test_tenants_tab_has_the_gate_note_and_no_manual_check_or_refresh_while_devops_keeps_refresh(self):

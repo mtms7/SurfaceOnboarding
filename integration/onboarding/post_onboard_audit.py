@@ -158,7 +158,10 @@ def live_row_facts(row: Any) -> dict[str, Any]:
         "surface_status": _enum(row.get("lastScanStatusEnum")),
         "last_recon_ms": _int(row.get("lastReconScan")),
         "created_ms": _int(row.get("_created")),
-        "operator_assigned": bool(operators) if isinstance(operators, list) else None,
+        # 2026-11-13 (CO-0845 HAR): the row carries ``operatorAccounts: null`` when NO operator is assigned (a list once one
+        # is), so a present null is "no operator"; only a missing key or another shape stays unknown.
+        "operator_assigned": (bool(operators) if isinstance(operators, list)
+                              else False if "operatorAccounts" in row and operators is None else None),
         "max_scan_hours": hours if type(hours) in (int, float) and not isinstance(hours, bool) else None,
         "primary_user_present": isinstance(primary, Mapping) if "primaryUser" in row else None,
         "enabled": row.get("enabled") if isinstance(row.get("enabled"), bool) else None,
@@ -308,12 +311,86 @@ def latest_live(parent: Path) -> dict[str, dict[str, Any]]:
 
 # --- the view ----------------------------------------------------------------------------------------------------------------
 
+# --- the operator confirmed by hand (owner request 2026-11-13, CO-0845) ----------------------------------------------------
+# For CE-only tenants neither source carries the operator: the live BackOffice row has no ``operatorAccounts`` and Redash's
+# operatorCount is empty. A signed-in operator who checked the tenant in BackOffice confirms it once; the line records only
+# the CO, the dashboard user and the time. It counts ONLY while both sources are unknown: a known value (for example
+# "no operator" read live) always wins, so a confirmation never hides a real "no".
+OPERATOR_CONFIRMATIONS = "operator-confirmations.jsonl"
+_BY = re.compile(r"[a-z0-9][a-z0-9._%+'@-]{1,99}")
+
+
+def operator_confirmation(parent: Path, co: str) -> tuple[str | None, datetime | None]:
+    """(who, when) of the newest valid confirmation of ``co``; (None, None) when there is none or the log is unreadable."""
+    try:
+        lines = (Path(parent) / records.RECORDS_SUBDIR / OPERATOR_CONFIRMATIONS).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None, None
+    best: tuple[str | None, datetime | None] = (None, None)
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        when = _parse(item.get("recorded_at")) if isinstance(item, dict) else None
+        by = item.get("confirmed_by") if isinstance(item, dict) else None
+        if (when is None or item.get("co_reference") != co or not isinstance(by, str) or not _BY.fullmatch(by)
+                or item.get("check") != "operator"):
+            continue
+        if best[1] is None or when >= best[1]:
+            best = (by, when)
+    return best
+
+
+def record_operator_confirmation(parent: Path, co: str, by: str, now: datetime) -> None:
+    """Append one confirmation line (never rewritten). Raises ValueError on a bad CO or user, OSError on a write failure."""
+    by = (by or "").strip().casefold()
+    if not isinstance(co, str) or not _CO.fullmatch(co) or not _BY.fullmatch(by):
+        raise ValueError("operator_confirmation_invalid")
+    folder = Path(parent) / records.RECORDS_SUBDIR
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    line = json.dumps({"co_reference": co, "check": "operator", "confirmed_by": by,
+                       "recorded_at": now.astimezone(timezone.utc).strftime(_FORMAT)}, sort_keys=True)
+    fd = os.open(folder / OPERATOR_CONFIRMATIONS, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def operator_edit_at(parent: Path, co: str) -> datetime | None:
+    """When this dashboard's own Edit Account last set AND read back the Technical Advisor's operator (owner decision
+    2026-11-13), from the follow-up log: the newest ``bo_edit`` line with a done result and ``operator: named``; else None."""
+    try:
+        lines = (Path(parent) / records.RECORDS_SUBDIR / "case3-followup-writes.jsonl").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    newest = None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict) or item.get("co_reference") != co or item.get("step") != "bo_edit":
+            continue
+        when = _parse(item.get("recorded_at"))
+        if when is None:
+            continue
+        done = item.get("result") in ("edit_verified", "edit_already_set") and item.get("operator") == "named"
+        if newest is None or when >= newest[0]:
+            newest = (when, done)
+    return newest[0] if newest is not None and newest[1] else None
+
+
 def view(route: str, live: Mapping[str, Any] | None, clone_tenant: Any, clone_at: datetime | None,
-         primary_user: tuple[str | None, datetime | None] = (None, None)) -> dict[str, Any]:
+         primary_user: tuple[str | None, datetime | None] = (None, None),
+         operator_confirmed: tuple[str | None, datetime | None] = (None, None),
+         operator_edited_at: datetime | None = None) -> dict[str, Any]:
     """``{"route", "checks": [{"key", "label", "state", "source", "at"}], "open", "unknown", "finished", "note"}``.
 
     Per check the newer source with a known value wins; a known value always beats an unknown one. ``finished`` (the
-    scan move rule) is True only when every scan check of the route is done."""
+    scan move rule) is True only when every scan check of the route is done. ``operator_confirmed`` (who, when) makes an
+    otherwise UNKNOWN operator check done (source "confirmed"); it never overrides a known value."""
     keys = CHECKS.get(route, ())
     live_at = _parse(live.get("recorded_at")) if isinstance(live, Mapping) else None
     live_checks = checks_from_live(live) if live_at is not None else {}
@@ -331,6 +408,16 @@ def view(route: str, live: Mapping[str, Any] | None, clone_tenant: Any, clone_at
                    ((live_at, live_checks, "live"), (clone_at, clone_checks, "clone")) if at is not None and checks.get(key)]
         known = [o for o in options if o[1] != UNKNOWN]
         pick = max(known or options, key=lambda o: o[0]) if options else None
+        if key == "operator" and isinstance(operator_edited_at, datetime) and (pick is None or pick[0] <= operator_edited_at):
+            # Our own verified Edit Account is newer than the last BackOffice / clone reading (owner decision 2026-11-13).
+            rows.append({"key": key, "label": LABELS[key], "state": DONE, "source": "record",
+                         "at": operator_edited_at.strftime(_FORMAT)})
+            continue
+        by, confirmed_at = operator_confirmed if isinstance(operator_confirmed, tuple) else (None, None)
+        if key == "operator" and not known and isinstance(by, str) and isinstance(confirmed_at, datetime):
+            rows.append({"key": key, "label": LABELS[key], "state": DONE, "source": "confirmed",
+                         "at": confirmed_at.strftime(_FORMAT), "by": by})
+            continue
         rows.append({"key": key, "label": LABELS[key], "state": pick[1] if pick else UNKNOWN,
                      "source": pick[2] if pick else None, "at": pick[0].strftime(_FORMAT) if pick else None})
     states = {r["key"]: r["state"] for r in rows}
@@ -378,19 +465,56 @@ def summary_text(item: Mapping[str, Any]) -> str:
     return " · ".join(parts)
 
 
-def card_html(item: Mapping[str, Any]) -> str:
-    """The CO page card (escaped; no script)."""
+OPERATOR_CONFIRM_PATH = "/attended/production-operator-confirm"
+OPERATOR_EDIT_PATH = "/attended/production-operator-edit"  # owner decision 2026-11-13: set the Technical Advisor's operator
+
+
+def operator_missing(item: Mapping[str, Any] | None) -> bool:
+    """True when the operator check is open (no operator) or unknown: the "Set Operator" button applies."""
+    for check in (item or {}).get("checks") or ():
+        if check.get("key") == "operator":
+            return check.get("state") in (OPEN, UNKNOWN)
+    return False
+
+
+def operator_unknown(item: Mapping[str, Any] | None) -> bool:
+    """True when the item's operator check is unknown (the only time a confirmation by hand is offered or accepted)."""
+    for check in (item or {}).get("checks") or ():
+        if check.get("key") == "operator":
+            return check.get("state") == UNKNOWN
+    return False
+
+
+def card_html(item: Mapping[str, Any], reference: str | None = None, may_confirm: bool = False) -> str:
+    """The CO page card (escaped; no script). With ``reference`` and ``may_confirm``, an unknown operator check offers the
+    "Confirm Operator Account assigned" button (a local record only)."""
     from html import escape
 
     icon = {DONE: "&#10003;", OPEN: "&#9679;", UNKNOWN: "?"}
     rows = []
     for check in item.get("checks") or ():
         source = {"live": "BackOffice", "clone": "clone", "record": "dashboard record"}.get(check.get("source"), "no data")
+        if check.get("source") == "confirmed":
+            source = "confirmed by " + str(check.get("by") or "an operator")
         when = (check.get("at") or "")[:16].replace("T", " ")
         extra = "" if check["state"] != OPEN else " <span class='muted'>" + escape(OPEN_TEXT[check["key"]]) + "</span>"
         rows.append(f"<li>{icon.get(check['state'], '?')} {escape(check['label'])}: <strong>{escape(check['state'])}</strong>"
                     f" <span class='muted'>({escape(source)}{' ' + escape(when) + 'Z' if when else ''})</span>{extra}</li>")
     note = f"<p class='muted'>{escape(item['note'])}</p>" if item.get("note") else ""
+    if reference and may_confirm and operator_missing(item) and _CO.fullmatch(reference):
+        note += ("<form method='post' action='" + OPERATOR_EDIT_PATH + "' class='actions'>"
+                 "<input type='hidden' name='reference' value='" + escape(reference, quote=True) + "'>"
+                 "<button type='submit'>Set Operator from Technical Advisor</button>"
+                 "<span class='muted'> Opens BackOffice (SSO and MFA), then ONE Edit Account of this tenant: the Salesforce "
+                 "Account's Technical Advisor as Operator and Maximum scan Duration (CE-only 24 h, Case 3 90 h). An operator "
+                 "that is someone else is never replaced.</span></form>")
+    if reference and may_confirm and operator_unknown(item) and _CO.fullmatch(reference):
+        note += ("<form method='post' action='" + OPERATOR_CONFIRM_PATH + "' class='actions'>"
+                 "<input type='hidden' name='reference' value='" + escape(reference, quote=True) + "'>"
+                 "<button type='submit' class='ghost'>Mark Operator Account assigned</button>"
+                 "<span class='muted'> BackOffice and Redash carry no operator data for this tenant. Mark it only after you "
+                 "checked it in BackOffice (Edit Account &gt; Operator). Recorded locally with your name; nothing is sent.</span>"
+                 "</form>")
     chip = ("<span class='chip chip-ok'>All done</span>" if all_done(item)
             else "<span class='chip chip-warn'>" + escape(summary_text(item)) + "</span>")
     return ("<section class='card' aria-labelledby='co-audit-title'><div class='card-head'>"
@@ -415,7 +539,8 @@ def views_for(parent: Path, cos: Iterable[str], clone_rows_by_uuid: Callable[[st
             uuid = _verified_uuid(parent, co)
             tenant = clone_rows_by_uuid(uuid) if uuid else None
         out[co] = view(item["route"], live.get(co), tenant, clone_at if tenant is not None else None,
-                       primary_user_result(parent, co) if item["route"] == "case3" else (None, None))
+                       primary_user_result(parent, co) if item["route"] == "case3" else (None, None),
+                       operator_confirmation(parent, co), operator_edit_at(parent, co))
     return out
 
 

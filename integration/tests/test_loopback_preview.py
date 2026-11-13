@@ -47,7 +47,7 @@ class LoopbackPreviewTests(unittest.TestCase):
                 self.assertEqual(status, 200)
                 text = body.decode("utf-8")
                 self.assertIn("Read-only design preview · synthetic data · Not deployed.", text)
-                self.assertIn("PENTERA.", text)  # the current Pentera shell
+                self.assertIn("<span class='brand'><b>PENTERA</b>", text)  # the current Pentera shell
                 self.assertEqual(re.findall(r"<button(?![^>]*\bdisabled\b)", text), [])
                 self.assertNotIn("Read from Salesforce at", text)
         self.assertEqual((dashboard.sf_json, dashboard.load_runner_state, runner._sf_records), originals)

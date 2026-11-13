@@ -305,7 +305,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("id='history'", page)
         self.assertIn("<svg viewBox='0 0 880 200'", page)
         self.assertIn("Read from Salesforce at 20:40 · updates every 10 min", page)  # the cached read time
-        self.assertIn("<a href='/history' class='active'>History</a>", page)
+        self.assertRegex(page, r"<a href='/history' class='active' aria-current='page'><svg[^>]*>.*?</svg><span>History</span></a>")
         self.assertNotIn("<script", page)
         with patch.object(dashboard, "closed_history", side_effect=dashboard.ReadUnavailable()):
             failed = dashboard.render_history()
@@ -385,7 +385,7 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         self.assertIn("class='side'", page)  # the shared Pentera shell
         self.assertIn("<nav class='fbar' aria-label='Queues and history'>", page)
         self.assertIn("<main class='wide'>", page)  # the full-width layout
-        self.assertIn("<a href='/history'>History</a>", page)  # the History tab in the top navigation
+        self.assertRegex(page, r"<a href='/history'><svg[^>]*>.*?</svg><span>History</span></a>")  # the History menu item
         self.assertIn("aria-current='page'", page)  # "All open" tile is current
         self.assertIn("<table class='dense'>", page)
         self.assertIn("Start onboarding", page)
@@ -1315,8 +1315,8 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
                 patch.object(dashboard, "attended_leonardo_readbacks", return_value={}):
             page = page_detail("CO-0999", row)
         self.assertIn("class='side'", page)
-        self.assertIn("PENTERA.", page)
-        self.assertIn("--nav:#0f1626", page)
+        self.assertIn("<span class='brand'><b>PENTERA</b>", page)  # Pentera Core look (2026-11-13)
+        self.assertIn("--nav:#05050f", page)
         self.assertIn("&larr; Open Onboardings", page)
         self.assertNotIn("\u00e2\u2020", page)  # no mojibake arrow
 
@@ -1333,7 +1333,9 @@ class AttendedOpenOnboardingsDashboardTests(unittest.TestCase):
         # The VM-started run request (owner decision 2026-10-27, docs/62) is dispatched by its constant; locked unless the VM is switched on.
         # The admin Users page change (2026-11-12, desktop roles) is dispatched by its constant too.
         self.assertEqual(routed | set(_create_ui.POST_PATHS) | {_dry_ui.DRY_RUN_PATH, dashboard.REMOTE_START_PATH,
-                                                               dashboard.ADMIN_USERS_CHANGE_PATH},
+                                                               dashboard.ADMIN_USERS_CHANGE_PATH,
+                                                               # 2026-11-13: dispatched by their constants as well
+                                                               dashboard.OPERATOR_CONFIRM_PATH, dashboard.OPERATOR_EDIT_PATH},
                          set(dashboard.POST_ROUTES))
         self.assertIn("create_ui.POST_PATHS", source)
         self.assertIn("dry_ui.DRY_RUN_PATH", source)

@@ -138,7 +138,8 @@ class LayoutOrderTests(unittest.TestCase):
 
     def test_tracker_note_is_only_the_ahead_chip(self):
         page = render(row_for(SURFACE), readback=READBACK, runner=VERIFIED_RUN)
-        tracker = page[page.index("<nav class='tracker'"):page.index("</nav>")]
+        start = page.index("<nav class='tracker'")
+        tracker = page[start:page.index("</nav>", start)]  # 2026-11-13: the menu is a <nav> too
         self.assertIn("Salesforce still shows: New", tracker)
         self.assertNotIn("<form", tracker)
         self.assertNotIn("matches", tracker)

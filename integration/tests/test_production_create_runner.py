@@ -231,8 +231,16 @@ class Harness(dry.Harness):
             self.mint(revision, operator, ticket_when)
         env = dict(dry.UNLOCK)
         out = io.StringIO()
+        self.edit_steps = []  # 2026-11-13: the CE-only post-create Edit Account (own tests: test_operator_from_technical_advisor)
+
+        def edit_step(*args, **kw):
+            self.edit_steps.append({"reference": args[3], "scan_hours": kw.get("scan_hours"),
+                                    "technical_advisor": kw.get("technical_advisor")})
+            return "edit_already_set"
         with mock.patch.object(session_readiness, "PRODUCTION_RUNNER_SUPPORTED", runner_flag), \
-                mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", dry_flag), contextlib.redirect_stdout(out):
+                mock.patch.object(session_readiness, "PRODUCTION_DRY_RUN_SUPPORTED", dry_flag), contextlib.redirect_stdout(out), \
+                mock.patch.object(runner, "_pcr_case3_edit_step", edit_step), \
+                mock.patch.object(runner, "_pcr_technical_advisor", lambda _ref: "Alejandro Espinosa Álvarez"):
             line = runner.run_production_create(
                 CO, revision, owner_go=go, environ=env, now=NOW, records_parent=self.records,
                 approval_path=self.approval_path, load_source=(lambda _r: source) if source else self.load_source,
@@ -487,6 +495,9 @@ class CreateTests(Base):
         result = h.go()
         self.assertEqual(result["result"], "created_verified")
         self.assertEqual((h.page.confirm_clicks, h.page.readback_calls), (1, 1))
+        # 2026-11-13: after the verified CE-only create, ONE Edit Account step with the Technical Advisor and 24 h
+        self.assertEqual(h.edit_steps, [{"reference": CO, "scan_hours": 24,
+                                         "technical_advisor": "Alejandro Espinosa Álvarez"}])
         self.assertEqual(h.outcomes().count("attempt_started"), 1)
         self.assertEqual(sorted(h.outcomes()), sorted(["dry_run_passed", "attempt_started", "readback_verified"]))
         self.assertEqual(h.approval_unused(), "approval_consumed")

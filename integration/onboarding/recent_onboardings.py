@@ -35,7 +35,7 @@ REGION_ORDER = ("EU", "US")
 CLONE_LIMIT_SECONDS = 6 * 3600  # production_views.CLONE_LIMIT_SECONDS
 DATA_LIMIT_SECONDS = 36 * 3600  # production_views.DATA_LIMIT_SECONDS
 ROUTE_CHIP = {"ce_only": "CE-only", "case3": "Case 3"}
-SOURCES = frozenset({"live", "clone", "record"})
+SOURCES = frozenset({"live", "clone", "record", "confirmed"})
 STATES = frozenset({audit.DONE, audit.OPEN, audit.UNKNOWN})
 _DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 _RESULT = re.compile(r"[a-z_]{1,40}")
@@ -230,7 +230,8 @@ def co_status(parent: Path, co: str, route: str, live: Mapping[str, Any] | None,
     trusted = tenant if region is not None and region.get("fresh") else None
     clone_at = region.get("at") if trusted is not None else None
     primary = audit.primary_user_result(parent, co) if route == "case3" else (None, None)
-    item = audit.view(route, live, trusted, clone_at, primary)
+    item = audit.view(route, live, trusted, clone_at, primary, audit.operator_confirmation(parent, co),
+                      audit.operator_edit_at(parent, co))
     no_data = _no_data_why(region, clones, uuid)
     for check in item["checks"]:
         check["word"], check["why"] = describe(check, live, trusted, clone_at, primary, no_data)

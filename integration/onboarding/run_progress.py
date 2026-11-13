@@ -69,9 +69,14 @@ PRODUCTION_CREATE_CHECKS: tuple[tuple[str, str], ...] = (
 PRIMARY_USER_MILESTONES: tuple[str, ...] = ("pu_start", "pu_signed_in", "pu_tenant_found", "pu_control_taken", "pu_users_read",
                                             "pu_add_sent", "pu_add_verified", "pu_control_released", "pu_result")
 
+# Owner request 2026-11-13 (CO-0843): the operator Edit Account (button run and the edit after a create).
+OPERATOR_EDIT_MILESTONES: tuple[str, ...] = ("op_start", "op_signed_in", "op_tenant_found", "op_form_open", "op_operator",
+                                             "op_scan", "op_saved", "op_verified", "op_result")
+
 MILESTONE_STEPS = frozenset([*(step for table in (_CREATE_STEPS, _RENEWAL_STEPS, _PRODUCTION_DRY_RUN_STEPS)
                                for _label, matchers in table for step, _outcomes in matchers),
-                             *(step for step, _label in PRODUCTION_CREATE_CHECKS), *PRIMARY_USER_MILESTONES])
+                             *(step for step, _label in PRODUCTION_CREATE_CHECKS), *PRIMARY_USER_MILESTONES,
+                             *OPERATOR_EDIT_MILESTONES])
 
 PENDING, ACTIVE, DONE, FAILED = "pending", "active", "done", "failed"
 

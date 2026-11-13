@@ -1253,14 +1253,28 @@ def clear_display_cache() -> None:
 
 
 _QUEUE_WIDE_READS = frozenset({"queue_source_rows", "queue_start_dates", "closed_history"})
+# "/login/password" and "/account/password" (local accounts, phase 1b) change no CO data either (owner report 2026-11-13: every
+# username sign-in made all pages cold, so the first page after sign-in waited minutes on the `sf` reads).
 _POSTS_KEEPING_DISPLAY_CACHE = frozenset({"/login/start", "/login/cancel", "/login/continue", "/logout", "/attended/prepare-sessions",
-                                          "/attended/session-recheck", "/attended/salesforce-login", "/admin/users/change"})
+                                          "/attended/session-recheck", "/attended/salesforce-login", "/admin/users/change",
+                                          "/login/password", "/account/password"})
 
 
 # Production buttons of ONE CO (owner request 2026-10-29: each "Onboard in production" click made every page cold, and the
 # warm-up then re-read all COs one by one, ~4.5 s each). They clear only that CO and the queue lists, once the form names
 # a valid CO; a form without one clears everything as before.
-_PER_CO_POSTS = frozenset({create_ui.CREATE_PATH, create_ui.UUID_REVIEW_PATH, create_ui.UUID_CONFIRM_PATH,
+OPERATOR_CONFIRM_PATH = "/attended/production-operator-confirm"  # post_onboard_audit.OPERATOR_CONFIRM_PATH (local record)
+OPERATOR_EDIT_PATH = "/attended/production-operator-edit"  # post_onboard_audit.OPERATOR_EDIT_PATH (one BackOffice edit)
+OPERATOR_CONFIRM_TEXT = {
+    "vm_read_only": "The VM dashboard is read-only.",
+    "dashboard_not_signed_in": "Sign in to the dashboard first.",
+    "no_verified_create": "This dashboard has no verified production create for this CO.",
+    "operator_not_unknown": "The Operator Account is already known from BackOffice or the clone; that value stands.",
+    "records_unavailable": "The local records could not be read or written.",
+    "launch_in_progress": "Another production run is in progress; wait until it ends.",
+    "operator_edit_not_started": "The BackOffice window could not be started on this desktop.",
+}
+_PER_CO_POSTS = frozenset({OPERATOR_CONFIRM_PATH, OPERATOR_EDIT_PATH, create_ui.CREATE_PATH, create_ui.UUID_REVIEW_PATH, create_ui.UUID_CONFIRM_PATH,
                            create_ui.SCAN_CHECK_PATH, create_ui.FOLLOWUP_REVIEW_PATH, create_ui.FOLLOWUP_CONFIRM_PATH,
                            create_ui.PRIMARY_USER_PATH, create_ui.PRIMARY_USER_BY_HAND_PATH})
 
@@ -1345,6 +1359,42 @@ def refresh_changed_cos(min_interval: float, now: datetime | None = None) -> lis
         return changed
     finally:
         _change_lock.release()
+
+
+# Change-check heartbeat (owner report 2026-11-13: every CO page waited 5-7 s on its own change check, a `sf` CLI process).
+# While someone used a page in the last CHANGE_HEARTBEAT_ACTIVE_SECONDS, a background thread runs the same check every
+# CHANGE_HEARTBEAT_SECONDS, so the CO page's check (CHANGE_CHECK_PAGE_SECONDS) is already fresh and returns at once. The page
+# still never shows Salesforce state older than about CHANGE_CHECK_PAGE_SECONDS; creates and writes re-read Salesforce
+# themselves (unchanged). Idle: only the warm-up loop's once-a-minute check runs. Desktop only.
+CHANGE_HEARTBEAT_SECONDS = 10.0
+CHANGE_HEARTBEAT_ACTIVE_SECONDS = 600.0
+CHANGE_HEARTBEAT_POLL_SECONDS = 2.0
+_last_page_activity = {"at": None}  # monotonic time of the last page GET; never who or what
+
+
+def note_page_activity(now: float | None = None) -> None:
+    _last_page_activity["at"] = monotonic() if now is None else now
+
+
+def change_heartbeat_tick(now: float | None = None) -> bool:
+    """Run the change check when a page was used recently; True when it was attempted. Never raises."""
+    if vm_mode():
+        return False
+    at = _last_page_activity["at"]
+    now = monotonic() if now is None else now
+    if at is None or now - at > CHANGE_HEARTBEAT_ACTIVE_SECONDS:
+        return False
+    try:
+        refresh_changed_cos(CHANGE_HEARTBEAT_SECONDS)
+    except Exception:  # noqa: BLE001 - the heartbeat never dies; the page's own check still applies
+        pass
+    return True
+
+
+def _change_heartbeat_loop(stop: Any = None) -> None:
+    halt = stop or Event()
+    while not halt.wait(CHANGE_HEARTBEAT_POLL_SECONDS):
+        change_heartbeat_tick()
 
 
 def _store_display_value(key: tuple[object, ...], value: Any, generation: int) -> None:
@@ -2304,16 +2354,69 @@ def update_co0741_comment_after_confirmation(evaluation: CommentUpdateEvaluation
         return False
 
 
+VIEW_ID_FILE_NAME = "open_onboardings_view_id.txt"
+# Only the served desktop process keeps the list-view id on disk (set at startup; tests and imports never read or write it).
+_VIEW_ID_PERSIST = {"enabled": False, "loaded_from_disk": False}
+_VIEW_ID_PATTERN = re.compile(r"[A-Za-z0-9]{15,18}")
+
+
+def _view_id_path() -> Path:
+    return state_file(Path(__file__).resolve().parents[1] / "integration" / VIEW_ID_FILE_NAME)
+
+
+def _load_persisted_view_id() -> str | None:
+    """The list-view id kept by an earlier run (owner report 2026-11-13: the first page after a restart paid ~5 s for it)."""
+    if not _VIEW_ID_PERSIST["enabled"] or vm_mode():
+        return None
+    try:
+        value = _view_id_path().read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return value if _VIEW_ID_PATTERN.fullmatch(value) else None
+
+
+def _persist_view_id(view_id: str) -> None:
+    if not _VIEW_ID_PERSIST["enabled"] or vm_mode():
+        return
+    try:
+        path = _view_id_path()
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_text(view_id + "\n", encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError:
+        pass  # best effort: the next restart simply looks it up again
+
+
+def forget_open_onboardings_view_id() -> None:
+    """Drop the kept id (memory and disk), so the next call resolves it from Salesforce again."""
+    global _open_onboardings_view_id
+    with _view_id_lock:
+        _open_onboardings_view_id = None
+        _VIEW_ID_PERSIST["loaded_from_disk"] = False
+        if _VIEW_ID_PERSIST["enabled"] and not vm_mode():
+            try:
+                _view_id_path().unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def open_onboardings_view_id() -> str:
     """Resolve and retain only the static Salesforce list-view identifier.
 
     This avoids one Salesforce CLI process on every refresh. It never caches a
     Customer Onboarding row, subscription value, or browser/session material.
+    The served desktop process also keeps the id on disk across restarts; a list
+    read that fails with a kept id forgets it and resolves it again once.
     """
     global _open_onboardings_view_id
     with _view_id_lock:
         if _open_onboardings_view_id is not None:
             return _open_onboardings_view_id
+        persisted = _load_persisted_view_id()
+        if persisted is not None:
+            _open_onboardings_view_id = persisted
+            _VIEW_ID_PERSIST["loaded_from_disk"] = True
+            return persisted
         view = sf_json(["data", "query", "--query", VIEW_QUERY, "--json"])
         try:
             records = view["result"]["records"]  # type: ignore[index]
@@ -2322,6 +2425,8 @@ def open_onboardings_view_id() -> str:
                     or not isinstance(view_id, str) or not re.fullmatch(r"[A-Za-z0-9]{15,18}", view_id)):
                 raise ReadUnavailable()
             _open_onboardings_view_id = view_id
+            _VIEW_ID_PERSIST["loaded_from_disk"] = False
+            _persist_view_id(view_id)
             return view_id
         except (KeyError, TypeError, IndexError):
             raise ReadUnavailable() from None
@@ -2464,7 +2569,14 @@ def queue_source_rows() -> list[dict[str, str | None]]:
         return snapshot_queue_rows()
     try:
         view_id = open_onboardings_view_id()
-        result = sf_json(["api", "request", "rest", f"/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/{view_id}/results", "--method", "GET"])
+        try:
+            result = sf_json(["api", "request", "rest", f"/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/{view_id}/results", "--method", "GET"])
+        except ReadUnavailable:
+            if not _VIEW_ID_PERSIST["loaded_from_disk"]:
+                raise
+            forget_open_onboardings_view_id()  # a kept id that no longer works: look it up again, once
+            view_id = open_onboardings_view_id()
+            result = sf_json(["api", "request", "rest", f"/services/data/v67.0/sobjects/Customer_Onboarding__c/listviews/{view_id}/results", "--method", "GET"])
         rows: list[dict[str, str | None]] = []
         for record in result["records"]:  # type: ignore[index]
             values = {column["fieldNameOrPath"]: column["value"] for column in record["columns"]}
@@ -4860,7 +4972,8 @@ def _session_chip() -> str:
     now = readiness_now()
     state = readiness.effective(statuses["salesforce"], now, readiness.READ_TTL).state  # Leonardo is no longer shown
     css, text = SESSION_CHIPS[state]
-    return "<a class='session-chip' href='/connection'><span class='chip " + css + "'>Sessions: " + text + "</span></a>"
+    return ("<a class='session-chip' href='/connection' title='Sessions: " + text + "'><span class='sdot " + css + "'></span>"
+            "<span class='stext'>Sessions: " + text + "</span></a>")
 
 
 def page_salesforce_login_opened() -> str:
@@ -5539,6 +5652,67 @@ PENTERA_CSS = (
     "@media(max-width:760px){.sidesearch{flex-direction:row;flex:1 1 100%;margin:0 0 8px}.sidesearch input{flex:1}}"
     "@media(max-width:760px){.navgroup{flex-direction:row;flex-wrap:wrap;align-items:center;margin:0 8px 0 0}"
     ".navhead{display:none}.envrow{margin:-8px 0 6px}}"
+    # Pentera Core look (owner request 2026-11-13), last so it wins over the rules above.
+    ":root{--nav:#05050f;--nav-hover:#1b1d29;--nav-active:#2b2e3b;--nav-text:#e9ebf2;--nav-muted:#8a8fa3;"
+    "--primary:#0a84f0;--primary-dark:#0a6cc8;--cond:'Bahnschrift SemiCondensed','Bahnschrift','Arial Narrow',sans-serif}"
+    ".side{flex:0 0 224px;width:224px;background:var(--nav);padding:24px 14px 16px;gap:0;position:sticky;top:0;height:100vh;"
+    "overflow-y:auto}"
+    ".side a.brand-block{display:flex;flex-direction:column;align-items:center;gap:6px;margin:0 0 22px;padding:0;"
+    "background:none}"
+    ".side a.brand-block:hover{text-decoration:none;background:none}"
+    ".brand{display:inline-flex;align-items:flex-end;gap:3px;background:none;padding:0;margin:0;color:#fff;font:inherit}"
+    ".brand b{background:#fff;color:#000;font:700 25px/1 var(--cond);letter-spacing:.4px;padding:5px 8px 4px}"
+    ".brand i{width:6px;height:6px;border-radius:50%;background:#fff;margin-bottom:2px}"
+    ".brand-sub{color:var(--nav-muted);font:600 11.5px/1 var(--cond);letter-spacing:1px;text-transform:uppercase;margin:0}"
+    ".sidesearch{position:relative;flex-direction:row;margin:0 2px 16px}"
+    ".sidesearch svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);pointer-events:none}"
+    ".sidesearch input{background:#13141f;border:1px solid #262838;border-radius:8px;color:var(--nav-text);"
+    "padding:9px 10px 9px 32px;font-size:13px}.sidesearch input::placeholder{color:var(--nav-muted)}"
+    ".sidesearch input:focus{border-color:var(--primary);outline:none}"
+    ".visually-hidden{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;"
+    "clip:rect(0 0 0 0);white-space:nowrap;border:0}"
+    ".navgroup{gap:2px;margin:0 0 6px}.navgroup a::before{display:none}"
+    ".side .navgroup a{display:flex;align-items:center;gap:11px;color:var(--nav-text);font:600 16px/1 var(--cond);"
+    "letter-spacing:.2px;padding:12px 12px;border-radius:6px;margin:1px 0}"
+    ".side .navgroup a:hover{background:var(--nav-hover);text-decoration:none}"
+    ".side .navgroup a.active{background:var(--nav-active);color:#fff}"
+    ".side .navgroup a svg{flex:0 0 18px;opacity:.85}"
+    ".navgroup .navhead,.navgroup.prod .navhead{background:none;color:var(--nav-muted);font:600 11px/1 var(--cond);"
+    "letter-spacing:1.4px;text-transform:uppercase;padding:0;margin:16px 12px 6px}"
+    ".side-spacer{flex:1 1 auto;min-height:16px}"
+    ".side a.session-chip{display:flex;align-items:center;gap:8px;margin:0 0 6px;padding:8px 12px;border-radius:6px;"
+    "color:var(--nav-muted);font:500 12px 'Segoe UI',sans-serif}"
+    ".side a.session-chip:hover{background:var(--nav-hover);text-decoration:none}"
+    ".sdot{width:8px;height:8px;border-radius:50%;flex:0 0 8px;background:#9aa1ad}"
+    ".sdot.chip-ok{background:#53d22d;box-shadow:0 0 0 3px #53d22d2e}.sdot.chip-warn{background:#f5b301;box-shadow:0 0 0 3px #f5b3012e}"
+    ".account{position:relative;border-top:1px solid #1d1f2c;padding-top:8px;margin:0;font-size:inherit;color:inherit;"
+    "word-break:normal}"
+    ".account>summary{list-style:none;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:5px;"
+    "padding:10px 6px 6px;border-radius:8px;color:var(--nav-text)}"
+    ".account>summary::-webkit-details-marker{display:none}.account>summary:hover,.account[open]>summary{background:var(--nav-hover)}"
+    ".avatar{width:52px;height:52px;border-radius:50%;background:var(--primary);display:grid;place-items:center}"
+    ".account .acct-name{display:block;color:#fff;font:600 15px/1.1 var(--cond);letter-spacing:.3px;word-break:break-all;"
+    "text-align:center}"
+    ".account .acct-role{display:block;margin:0;font:600 11px 'Segoe UI',sans-serif;color:#9fd0ff}"
+    ".account-panel{position:fixed;left:232px;bottom:16px;width:310px;z-index:20;background:#fff;color:var(--text);"
+    "border-radius:10px;box-shadow:0 12px 32px #00000040;padding:18px 18px 16px}"
+    ".account-panel h2{margin:0 0 10px;font:600 21px/1.1 var(--cond);color:var(--text)}"
+    ".acct-row{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-top:1px solid var(--line);font-size:13px}"
+    ".acct-row span{color:var(--muted)}.acct-row b{text-align:right;word-break:break-all}"
+    ".acct-actions{display:flex;gap:10px;margin-top:14px}.acct-actions>*{flex:1 1 0;min-width:0;margin:0}"
+    ".side .acct-actions a.btn,.acct-actions button{display:block;width:100%;text-align:center;border-radius:999px;"
+    "padding:9px 0;font:700 13.5px 'Segoe UI',sans-serif;margin:0}"
+    ".side .acct-actions a.btn{border:1.5px solid var(--primary);color:var(--primary);background:#fff}"
+    ".side .acct-actions a.btn:hover{background:#f0f7ff;text-decoration:none}"
+    ".account-panel .side-foot{margin:12px 0 0;padding:0;color:var(--muted)}"
+    "button{border-radius:999px}"
+    "h1{font:600 30px/1.15 var(--cond);letter-spacing:.2px}"
+    "@media(max-width:760px){.side{position:static;width:auto;height:auto;flex-direction:row;flex-wrap:wrap;align-items:center;"
+    "gap:6px;padding:10px 12px}.side a.brand-block{flex-direction:row;margin:0 8px 0 0}.brand-sub{display:none}"
+    ".side-spacer{display:none}.side a.session-chip .stext{display:none}.account{border:0;padding:0;margin-left:auto}"
+    ".account>summary{flex-direction:row;padding:4px}.avatar{width:32px;height:32px}.account .acct-name,.account .acct-role{display:none}"
+    ".account-panel{left:12px;right:12px;width:auto;top:64px;bottom:auto}"
+    ".side .navgroup a{padding:8px 10px;font-size:15px}.navgroup .navhead{display:none}}"
 )
 
 
@@ -5548,7 +5722,7 @@ PENTERA_CSS = (
 NAV_GROUPS = (
     ("prod", "PRODUCTION", "read-only", (("/", "Onboarding", "prod_onboarding"), ("/prod/tenants", "Tenants", "prod_tenants"),
                                          ("/history", "History", "history"), ("/prod/approvals", "Approvals", "prod_approvals"))),
-    ("tools", "TOOLS", "", (("/connection", "Sessions", "connection"),)),
+    ("tools", "Administration", "", (("/connection", "Sessions", "connection"),)),
 )
 DEV_NAV_HEAD = "DEV - LEONARDO"
 DEV_NAV_LINKS = (("/dev", "Onboardings", "onboardings"), ("/dev/onboarded", "Onboarded on Dev", "dev_onboarded"),
@@ -5559,9 +5733,30 @@ ENV_BY_ACTIVE = {"prod_onboarding": "prod", "prod_tenants": "prod", "history": "
 ENV_PILLS = {"dev": "DEV · Leonardo", "prod": "PRODUCTION · read-only", "tools": "TOOLS"}
 
 
-SEARCH_FORM = ("<form class='sidesearch' method='get' action='/search' role='search'><input type='text' name='q' maxlength='80' "
+SEARCH_FORM = ("<form class='sidesearch' method='get' action='/search' role='search'>"
+               "<svg width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='#8a8fa3' stroke-width='2.4' aria-hidden='true'>"
+               "<circle cx='11' cy='11' r='7'/><path d='m20 20-3.5-3.5'/></svg><input type='text' name='q' maxlength='80' "
                "placeholder='Search CO or account' aria-label='Search CO or account' autocomplete='off'>"
-               "<button class='ghost' type='submit'>Search</button></form>")
+               "<button class='ghost visually-hidden' type='submit'>Search</button></form>")
+
+# Line icons of the sidebar (owner request 2026-11-13, Pentera Core look); inline SVG, no external file or font.
+_ICON_PATHS = {
+    "prod_onboarding": "<path d='M4 12h16M4 6h16M4 18h10'/>",
+    "prod_tenants": "<rect x='3' y='4' width='18' height='6' rx='1.5'/><rect x='3' y='14' width='18' height='6' rx='1.5'/>",
+    "history": "<circle cx='12' cy='12' r='8.5'/><path d='M12 7.5V12l3 2'/>",
+    "prod_approvals": "<path d='M5 12.5 10 17l9-10'/>",
+    "connection": "<path d='M8 7h8M8 12h8M8 17h5'/><rect x='4' y='3' width='16' height='18' rx='2'/>",
+    "admin_users": "<circle cx='9' cy='8' r='3.5'/><path d='M2.5 20c.8-3.6 3.4-5.5 6.5-5.5s5.7 1.9 6.5 5.5M16 4.5a3.5 3.5 0 0 1 0 "
+                   "7M18 14.8c2 .7 3.2 2.5 3.6 5.2'/>",
+}
+
+
+def _nav_icon(key: str) -> str:
+    path = _ICON_PATHS.get(key)
+    if not path:
+        return ""
+    return ("<svg width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' "
+            "stroke-linecap='round' stroke-linejoin='round' aria-hidden='true'>" + path + "</svg>")
 
 
 def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", wide: bool = False,
@@ -5570,13 +5765,17 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
     env = env if env in ("dev", "prod") else ENV_BY_ACTIVE.get(active, "tools")
 
     def nav(href: str, label: str, key: str) -> str:
-        return "<a href='" + href + "'" + (" class='active'" if key == active else "") + ">" + label + "</a>"
+        return ("<a href='" + href + "'" + (" class='active' aria-current='page'" if key == active else "") + ">"
+                + _nav_icon(key) + "<span>" + label + "</span></a>")
 
+    # Owner request 2026-11-13 (Pentera Core look): no PRODUCTION box in the menu (the page pill says it), plain items with
+    # icons; Sessions and, for admins, Users under "Administration".
+    admin_links = _admin_nav_links()
     groups = "".join(
-        "<div class='navgroup " + key + "'><div class='navhead'>" + head
-        + ("<span class='ro'>" + note + "</span>" if note else "") + "</div>"
-        + "".join(nav(*link) for link in links) + "</div>" for key, head, note, links in NAV_GROUPS
-        if not (vm_mode() and key == "tools"))
+        "<nav class='navgroup " + key + "' aria-label='" + escape(head.title(), quote=True) + "'>"
+        + ("" if key == "prod" else "<div class='navhead'>" + escape(head) + "</div>")
+        + "".join(nav(*link) for link in (links + (admin_links if key == "tools" else ()))) + "</nav>"
+        for key, head, note, links in NAV_GROUPS if not (vm_mode() and key == "tools"))
     # Owner decision 2026-10-19: production is live, so the Leonardo (Dev) group is not shown. Its pages stay reachable only
     # by typing the URL; nothing links to them.
     return (
@@ -5584,42 +5783,62 @@ def _app_shell(title: str, main_html: str, refresh: str = "", active: str = "", 
         "<meta name='viewport' content='width=device-width,initial-scale=1'>" + refresh +
         "<title>" + escape(title) + "</title><style>" + PENTERA_CSS + (SNAPSHOT_BANNER_CSS if vm_mode() else "") + "</style></head><body>"
         "<div class='envbar " + env + "' aria-hidden='true'></div><div class='shell'>"
-        "<aside class='side'><span class='brand'>PENTERA.</span><div class='brand-sub'>Surface Onboarding</div>"
-        + SEARCH_FORM + groups + ("" if vm_mode() else _session_chip()) + _operator_block(active) +
-        "<div class='side-foot'>" + ("Read-only copy · published from the desktop" if vm_mode() else "Attended · localhost only") + "</div></aside>"
+        "<aside class='side'><a class='brand-block' href='/' aria-label='Pentera Surface Onboarding home'>"
+        "<span class='brand'><b>PENTERA</b><i></i></span><span class='brand-sub'>Surface Onboarding</span></a>"
+        + SEARCH_FORM + groups + "<div class='side-spacer'></div>" + ("" if vm_mode() else _session_chip())
+        + (_operator_block(active) or "<div class='side-foot'>" + ("Read-only copy · published from the desktop" if vm_mode()
+                                                                   else "Attended · localhost only") + "</div>") + "</aside>"
         "<main" + (" class='wide'" if wide else "") + "><div class='envrow'><span class='envpill " + env + "'>"
         + escape(ENV_PILLS[env]) + "</span></div>" + (snapshot_banner() + vm_strip_actions(main_html) if vm_mode() else main_html)
         + "</main></div></body></html>"
     )
 
 
+def _admin_nav_links() -> tuple[tuple[str, str, str], ...]:
+    """Users (admins only) under Administration; desktop only."""
+    if vm_mode():
+        return ()
+    operator = _current_operator.get()
+    role = desktop_role(operator) if operator and (local_accounts_mode() or desktop_users() is not None) else None
+    return ((ADMIN_USERS_PATH, "Users", "admin_users"),) if is_admin_role(role) else ()
+
+
+_AVATAR = ("<span class='avatar' aria-hidden='true'><svg width='28' height='28' viewBox='0 0 24 24' fill='#fff'>"
+           "<circle cx='12' cy='8' r='4.2'/><path d='M3.8 21c.9-4.4 4.1-6.6 8.2-6.6s7.3 2.2 8.2 6.6z'/></svg></span>")
+
+
 def _operator_block(active: str = "") -> str:
+    """The account at the bottom of the menu (owner request 2026-11-13, Pentera Core look): avatar, name and role; a click
+    opens the account panel (native ``<details>``, no script) with Change password and Sign out."""
     operator = _current_operator.get()
     if not operator:
         return ""
     if vm_mode():
+        foot = "Read-only copy · published from the desktop"
         if os.environ.get(VM_SIGN_OUT_ENV) != "1":
             # The interim tunnel VM has one fixed identity set by nginx and no oauth2-proxy, so /oauth2/sign_out does not exist
             # there (owner 2026-10-27: the link did nothing). Access ends when the owner closes the SSH tunnel.
-            return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
-                    "<br><span class='muted'>read-only, through your SSH tunnel</span></div>")
-        return ("<div class='operator'>Signed in as<br><strong>" + escape(operator) + "</strong>"
-                "<br><a href='" + VM_SIGN_OUT_PATH + "'>Sign out</a></div>")
-    role = desktop_role(operator) if (local_accounts_mode() or desktop_users() is not None) else None
-    role_line = "<span class='op-role'>" + _role_chip(role) + "</span>" if role else ""
-    # Owner request 2026-11-12: name and role on their own lines; Users is a nav item under Sign out (admins only).
-    links = []
-    if local_accounts_mode():
-        links.append((ACCOUNT_PASSWORD_PATH, "Change password", "account_password"))
-    if is_admin_role(role):
-        links.append((ADMIN_USERS_PATH, "Users", "admin_users"))
-    admin_nav = ("<nav class='side-admin' aria-label='Account'>" + "".join(
-        "<a href='" + href + "'" + (" class='active'" if key == active else "") + ">" + label + "</a>"
-        for href, label, key in links) + "</nav>") if links else ""
-    return ("<div class='operator'><span class='op-label'>Signed in as</span><strong class='op-name'>" + escape(operator)
-            + "</strong>" + role_line +
-            "<form method='post' action='/logout'><button class='ghost' type='submit'>Sign out</button></form></div>"
-            + admin_nav)
+            actions = "<p class='muted'>read-only, through your SSH tunnel</p>"
+        else:
+            actions = "<div class='acct-actions'><a class='btn' href='" + VM_SIGN_OUT_PATH + "'>Sign out</a></div>"
+        role_text = ""
+    else:
+        foot = "Attended · localhost only"
+        role = desktop_role(operator) if (local_accounts_mode() or desktop_users() is not None) else None
+        role_text = ROLE_CHIP.get(role or "", ("", role or ""))[1] if role else ""
+        change = ("<a class='btn' href='" + ACCOUNT_PASSWORD_PATH + "'" + (" aria-current='page'" if active == "account_password"
+                  else "") + ">Change password</a>") if local_accounts_mode() else ""
+        actions = ("<div class='acct-actions'>" + change + "<form method='post' action='/logout'><button type='submit'>"
+                   "Sign out</button></form></div>")
+    rows = "<div class='acct-row'><span>Signed in as</span><b>" + escape(operator) + "</b></div>"
+    if role_text:
+        rows += "<div class='acct-row'><span>Role</span><b>" + escape(role_text) + "</b></div>"
+    return ("<details class='account operator'" + (" open" if active == "account_password" else "") + "><summary>"
+            + _AVATAR + "<span class='acct-name op-name'>" + escape(operator) + "</span>"
+            + ("<span class='acct-role op-role'>" + escape(role_text) + "</span>" if role_text else "")
+            + "<span class='visually-hidden'>Account menu</span></summary><div class='account-panel' role='group' "
+            "aria-label='Your account'><h2>Your account</h2>" + rows + actions + "<div class='side-foot'>" + escape(foot)
+            + "</div></div></details>")
 
 
 def _onboarding_chip(reference: str) -> str:
@@ -7800,7 +8019,7 @@ def page_detail_production(reference: str, row: dict[str, str | None], match: di
     progress = _production_run_progress(reference)
     refresh = ("<meta http-equiv='refresh' content='5'>"
                if progress is not None and not progress["done"] and not progress["failed"] else "") or _dry_run_refresh(reference) \
-        or _primary_user_refresh(reference)
+        or _primary_user_refresh(reference) or _operator_edit_refresh(reference)
     return _app_shell(reference + " production", main_html, active="prod_onboarding", env="prod", refresh=refresh)
 
 
@@ -9030,7 +9249,7 @@ def page_onboard_review(summary: dict[str, Any], extras: dict[str, Any], notice:
             + _kv_grid(facts, frozenset({"Source revision"})) + "</section>" + checks_card + sheet + approval_card + record_card
             + "</details>")
     return _app_shell("Review " + ref, main, active="prod_onboarding",
-                      refresh=_dry_run_refresh(ref) or _primary_user_refresh(ref))
+                      refresh=_dry_run_refresh(ref) or _primary_user_refresh(ref) or _operator_edit_refresh(ref))
 
 
 # "superseded" (2026-10-30): an early-activation approval replaces a live one (CO-0801); without it /prod/approvals failed.
@@ -9171,12 +9390,32 @@ def _case3_tenant_name(reference: str, row: dict[str, str | None] | None) -> str
     return None if resolved.unavailable or resolved.needs_confirmation else resolved.name
 
 
+def approval_identity(operator: str | None) -> str | None:
+    """The identity the approval, owner and launch-ticket checks compare (2026-11-13, CO-0845 ``approval_not_issued``).
+
+    Those checks name the owner by e-mail (issuer list, ``issued_by``, ticket operator). With local accounts (phase 1b) the
+    dashboard sign-in is a username, so ONLY the enabled super admin maps to the one owner e-mail of the issuer list; every
+    other account keeps its username and stays refused (owner only, D1). An ambiguous or empty issuer list maps nothing.
+    Without local accounts, or for an operator that is already an e-mail (remote start), the value is unchanged."""
+    if not operator or not local_accounts_mode() or "@" in operator:
+        return operator
+    account = local_account(operator)
+    if account is None or account.get("disabled") or account.get("role") != accounts.ROLE_SUPERADMIN:
+        return operator
+    from tools import issue_production_approval as issuer_tool
+    try:
+        allowed = issuer_tool.issuer_allow_list(os.environ)
+    except issuer_tool.Refuse:
+        return operator
+    return next(iter(allowed)) if len(allowed) == 1 else operator
+
+
 def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operator: str | None = None) -> create_ui.Inputs:
     """The plain facts for the create gate. A POST passes a row read inside that very request; a page shows the display read."""
     sf_ready = _salesforce_ready_for_create()
     return create_ui.Inputs(
         reference=reference, row=row, now=production_now(), environ=os.environ,
-        operator=operator if operator is not None else (_current_operator.get() or None), vm=vm_mode(),
+        operator=approval_identity(operator if operator is not None else (_current_operator.get() or None)), vm=vm_mode(),
         approvals_path=approvals_read_path(), records_parent=production_records_parent(), clone=_clone_status(),
         sf_ready=sf_ready, row_fresh=bool(row), tenant_names_path=attended_runner.TENANT_NAMES_PATH,
         case3_tenant_name=_case3_tenant_name(reference, row))
@@ -10210,7 +10449,140 @@ def _audit_card(reference: str) -> str:
     from integration.onboarding import post_onboard_audit as audit
 
     item = audit_views().get(reference)
-    return audit.card_html(item) if item else ""
+    if not item:
+        return ""
+    operator = _current_operator.get()
+    may = not vm_mode() and (not login_required() or role_may_operate(desktop_role(operator)))
+    html = audit.card_html(item, reference, may_confirm=may)
+    progress = _operator_edit_card(reference, item.get("route"))
+    if progress:  # owner request 2026-11-13: the run's own progress bar right under the card title
+        html = html.replace("</div><ul>", "</div>" + progress + "<ul>", 1)
+    if item.get("route") == "ce_only":  # owner decision 2026-11-13: the CE-only post-create Edit Account result
+        try:
+            note = case3_followup.ce_edit_note(production_records_parent(), reference)
+        except Exception:  # noqa: BLE001 - the note never breaks the page
+            note = None
+        if note:
+            html = html.replace("</ul>", "</ul><p class='note'><b>Operator / Maximum scan:</b> " + escape(note) + "</p>", 1)
+    return html
+
+
+def operator_edit_state(reference: str, now: datetime | None = None) -> dict[str, Any] | None:
+    """``{"events", "running"}`` of the newest operator Edit Account of ``reference`` (button or after a create), else None.
+    Running = no result yet and younger than ``operator_edit_progress.STALE_SECONDS``."""
+    from integration.onboarding import operator_edit_progress as op_progress
+
+    try:
+        events = op_progress.current_run(run_progress.read_milestones(attended_runner.PROGRESS_PATH, reference))
+    except Exception:  # noqa: BLE001
+        return None
+    if not events:
+        return None
+    finished = any(event.get("step") == "op_result" for event in events)
+    try:
+        age = ((now or datetime.now(timezone.utc)) - datetime.strptime(str(events[0].get("t") or ""), "%Y-%m-%dT%H:%M:%SZ")
+               .replace(tzinfo=timezone.utc)).total_seconds()
+    except ValueError:
+        age = float(op_progress.STALE_SECONDS)
+    return {"events": events, "running": not finished and 0 <= age < op_progress.STALE_SECONDS}
+
+
+def _operator_edit_card(reference: str, route: str | None) -> str:
+    """The progress bar of the newest operator edit (owner request 2026-11-13), or ''."""
+    from integration.onboarding import operator_edit_progress as op_progress
+    from integration.onboarding import production_case3_edit as edit
+
+    state = operator_edit_state(reference)
+    if state is None:
+        return ""
+    hours = edit.CE_ONLY_SCAN_HOURS if route == "ce_only" else edit.SCAN_HOURS
+    return op_progress.card_html(op_progress.progress(state["events"], running=state["running"]), hours)
+
+
+def _operator_edit_refresh(reference: str) -> str:
+    try:
+        state = operator_edit_state(reference)
+    except Exception:  # noqa: BLE001
+        return ""
+    return "<meta http-equiv='refresh' content='5'>" if state is not None and state["running"] else ""
+
+
+def _post_operator_edit(reference: str) -> str:
+    """"ok" (the run started) or a refusal code. Owner decision 2026-11-13: the "Set Operator from Technical Advisor" click
+    starts the runner's ONE guarded Edit Account for a CO this dashboard onboarded; the runner re-checks every gate (verified
+    create, Technical Advisor, the tenant row and its current operator) and records the result."""
+    from integration.onboarding import post_onboard_audit as audit
+
+    if vm_mode():
+        return "vm_read_only"
+    try:
+        if reference not in audit.verified_creates(production_records_parent()):
+            return "no_verified_create"
+    except (OSError, ValueError):
+        return "records_unavailable"
+    if create_ui.LAUNCHES.busy():
+        return "launch_in_progress"
+    if not create_ui.LAUNCHES.claim(lambda: _launch_operator_edit(reference)):
+        return "operator_edit_not_started"
+    return "ok"
+
+
+def _launch_operator_edit(reference: str) -> Any:
+    """Start the runner's ``--production-operator-edit`` for one CO (desktop only); the audit cache drops when it ends."""
+    if not REFERENCE.fullmatch(reference) or not local_browser_launch_allowed() or not ATTENDED_CE_ONLY_RUNNER.is_file():
+        return None
+    child = dict(os.environ)
+    child.pop(runner_child_log.LOG_ENV, None)
+    folder = runner_log_dir()
+    if folder is not None:
+        child[runner_child_log.LOG_ENV] = str(folder / (reference + "-operator-" + datetime.now(timezone.utc)
+                                                        .strftime("%Y%m%dT%H%M%SZ") + ".log"))
+    try:
+        process = subprocess.Popen([sys.executable, str(ATTENDED_CE_ONLY_RUNNER), "--production-operator-edit", "--co", reference],
+                                   env=child, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return None
+
+    def follow() -> None:
+        try:
+            process.wait()
+        except Exception:  # noqa: BLE001
+            pass
+        _AUDIT_CACHE["at"] = 0.0
+        _RECENT_CACHE["at"] = 0.0
+        clear_display_cache_for(reference)
+
+    Thread(target=follow, daemon=True).start()
+    return process
+
+
+def _post_operator_confirm(reference: str, operator: str | None) -> str:
+    """"ok" or a refusal code. Owner request 2026-11-13 (CO-0845): records that the signed-in operator checked the Operator
+    Account in BackOffice. Only for a CO this dashboard onboarded (verified create) whose operator check is unknown in both
+    sources; a known value is never overridden. A local line only: nothing is sent to BackOffice or Salesforce."""
+    from integration.onboarding import post_onboard_audit as audit
+
+    if vm_mode():
+        return "vm_read_only"
+    who = (operator or "").strip()
+    if not who:
+        return "dashboard_not_signed_in"
+    try:
+        parent = production_records_parent()
+        if reference not in audit.verified_creates(parent):
+            return "no_verified_create"
+        item = audit_views(fresh=True).get(reference)
+        if item is None:  # not among the audited COs any more: build its view directly
+            lookup, clone_at = _audit_clone()
+            item = audit.views_for(parent, [reference], lookup, clone_at).get(reference)
+        if not audit.operator_unknown(item):
+            return "operator_not_unknown"
+        audit.record_operator_confirmation(parent, reference, who, datetime.now(timezone.utc))
+    except (OSError, ValueError):
+        return "records_unavailable"
+    _AUDIT_CACHE["at"] = 0.0
+    _RECENT_CACHE["at"] = 0.0
+    return "ok"
 
 
 # --- Recent onboardings panel + daily history (owner request 2026-11-10) -----------------------------------------------------
@@ -11539,6 +11911,7 @@ POST_ROUTES = frozenset({
     "/attended/salesforce-id-writeback-review", "/attended/salesforce-id-writeback-confirm",
     "/attended/review-approve", "/attended/tenant-name-confirm", dry_ui.DRY_RUN_PATH, REMOTE_START_PATH,
     ADMIN_USERS_CHANGE_PATH,
+    OPERATOR_CONFIRM_PATH, OPERATOR_EDIT_PATH,  # 2026-11-13 (owner, CO-0845): operator mark and Set Operator from TA
     *sorted(create_ui.POST_PATHS),
 })
 
@@ -11749,6 +12122,7 @@ class Handler(BaseHTTPRequestHandler):
         context.run(Handler._display_get, self)
 
     def _display_get(self) -> None:
+        note_page_activity()
         _display_reads.set(True)
         _QUEUE_BACK.set(safe_back(parse_qs(urlsplit(self.path).query).get("back", ["/"])[0]))
         _display_read_times.set([])
@@ -12438,6 +12812,18 @@ class Handler(BaseHTTPRequestHandler):
             self._post_tenant_name_confirm(reference, form); return
         if path == dry_ui.DRY_RUN_PATH:
             self._post_production_dry_run(reference, form); return
+        if path in (OPERATOR_CONFIRM_PATH, OPERATOR_EDIT_PATH):
+            code = (_post_operator_confirm(reference, self.request_operator()) if path == OPERATOR_CONFIRM_PATH
+                    else _post_operator_edit(reference))
+            if code != "ok":
+                self.send_page(HTTPStatus.CONFLICT, _app_shell(reference + " not done", "<section class='card'><div class='banner "
+                               "banner-warn'><span class='chip chip-warn'>Not done</span> " + escape(OPERATOR_CONFIRM_TEXT.get(
+                                   code, "The confirmation could not be recorded.")) + " Nothing was recorded.</div><p class='note'>"
+                               "Code: <code>" + escape(code) + "</code></p><p><a href='/co/" + escape(reference) + "?env=prod'>"
+                               "Return to " + escape(reference) + "</a></p></section>", active="prod_onboarding", env="prod"))
+                return
+            self.send_redirect("/co/" + reference + "?env=prod")
+            return
         if path in create_ui.POST_PATHS:
             self._post_production_create(path, reference, form); return
         gated_action = SESSION_GATED_ROUTES.get(path)
@@ -12793,7 +13179,9 @@ if __name__ == "__main__":
     if not vm_mode():
         _RECENT_CACHE["write"] = True  # the served desktop process keeps the daily history (never imports or tests)
         Thread(target=_auto_scan_loop, name="auto-scan", daemon=True).start()
+        _VIEW_ID_PERSIST["enabled"] = True  # the served process keeps the list-view id across restarts (before the warm-up)
         Thread(target=_display_warm_loop, name="display-warm", daemon=True).start()
+        Thread(target=_change_heartbeat_loop, name="change-heartbeat", daemon=True).start()
         Thread(target=close_kept_production_window, args=("start",), name="production-window-start", daemon=True).start()
         Thread(target=_production_window_loop, name="production-window", daemon=True).start()
         Thread(target=_kept_scan_loop, name="kept-scan", daemon=True).start()

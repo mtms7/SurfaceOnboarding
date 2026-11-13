@@ -1318,6 +1318,31 @@ def case3_scope_summary(source: Case3FillSource, run_day: date | None = None) ->
     return scope
 
 
+def _op_note(reference: str, step: str, outcome: str, clock: Any) -> None:
+    """One operator-edit milestone for the dashboard bar (owner request 2026-11-13); fixed words only; never raises."""
+    from integration.onboarding import operator_edit_progress as op_progress
+
+    try:
+        run_progress.record_milestone(PROGRESS_PATH, reference, {"t": clock().strftime(PDR_STAMP), "step": step,
+                                                                 "outcome": op_progress.safe_word(outcome)})
+    except Exception:
+        pass
+
+
+def _pcr_technical_advisor(reference: str) -> str:
+    """The CO Account's Technical Advisor name by one fixed read-only query ("" when absent, odd or unreadable; never a guess)."""
+    if not REFERENCE.fullmatch(reference):
+        return ""
+    try:
+        rows = _sf_records("SELECT Name, Account__r.Delivery_Engineer__r.Name FROM Customer_Onboarding__c WHERE Name = '"
+                           + reference + "' LIMIT 2")
+    except Exception:
+        return ""
+    if len(rows) != 1 or not isinstance(rows[0], dict) or rows[0].get("Name") != reference:
+        return ""
+    return _person_name(rows[0])
+
+
 def _person_name(row: dict[str, Any]) -> str:
     """The Account's Technical Advisor name from a CO row ("" unless it is one short single-line text)."""
     account = row.get("Account__r")
@@ -10871,6 +10896,9 @@ def main() -> int:
     parser.add_argument("--production-primary-user", action="store_true",
                         help="With --co: the owner's click: create the Case 3 primary user (Salesforce Primary User contact) as "
                              "Admin in the tenant, or confirm it exists; one guarded add at most; the tenant is given back.")
+    parser.add_argument("--production-operator-edit", action="store_true",
+                        help="With --co: the owner's click: ONE Edit Account of the verified tenant that sets the Account "
+                             "Technical Advisor's operator and Maximum scan Duration (CE-only 24 h, Case 3 90 h).")
     parser.add_argument("--kept-window-only", action="store_true",
                         help="Only with --production-scan-check: use the kept, signed-in production window or stop (no launch, "
                              "no sign-in wait). The dashboard's automatic check.")
@@ -10883,6 +10911,12 @@ def main() -> int:
                 or args.dry_run or args.confirm_write or args.kept_window_only):
             parser.error("--production-primary-user needs --co and is a separate run")
         print(run_production_primary_user(args.co))
+        return 0
+    if args.production_operator_edit:
+        if (not args.co or args.revision or args.production_create or args.production_dry_run or args.production_scan_check
+                or args.production_primary_user or args.dry_run or args.confirm_write or args.kept_window_only):
+            parser.error("--production-operator-edit needs --co and is a separate run")
+        print(run_production_operator_edit(args.co))
         return 0
     if args.production_scan_check:
         if (not args.co or args.revision or args.production_create or args.production_dry_run or args.production_probe
@@ -11282,40 +11316,105 @@ def _pcr_selected_operators(page: Any) -> list[str] | None:
     return [" ".join(str(label).split()) for label in labels] if isinstance(labels, list) else None
 
 
-def _pcr_pick_operator(page: Any, operator: str) -> str | None:
-    """Select exactly the one option named ``operator`` in the empty Operator Account select; None when it is the only chip."""
+def _pcr_option_labels(page: Any) -> list[str]:
+    """The labels of the Operator Account options currently listed (react-select ``role=option``); [] when none load."""
+    options = page.get_by_role("option")
+    labels: list[str] = []
+    for _ in range(PCR_EDIT_OPTION_POLLS):
+        try:
+            labels = [" ".join(str(text).split()) for text in options.all_inner_texts()]
+        except Exception:
+            labels = []
+        if labels:
+            break
+        page.wait_for_timeout(500)
+    return labels
+
+
+def _pcr_candidate_labels(page: Any, candidates: list[str]) -> list[str]:
+    """The candidate labels shown exactly once on the page while the list is open (polled while the options load)."""
+    found: list[str] = []
+    for _ in range(PCR_EDIT_OPTION_POLLS):
+        found = []
+        for label in candidates:
+            try:
+                if page.get_by_text(label, exact=True).count() == 1:
+                    found.append(label)
+            except Exception:
+                continue
+        if found:
+            break
+        page.wait_for_timeout(500)
+    return found
+
+
+def _pcr_pick_operator(page: Any, operator: str, diag: dict[str, str] | None = None) -> tuple[str | None, str | None]:
+    """Select the one option that is the same person as ``operator`` (the Technical Advisor, owner decision 2026-11-13: accents,
+    case, punctuation and the word "Operator" ignored) in the empty Operator Account select.
+
+    ``(picked label, None)`` when selected; ``(None, code)`` otherwise. ``edit_operator_not_found`` / ``edit_operator_ambiguous``
+    leave the select empty (the caller may still save the other value); any other code stops the edit."""
+    from integration.onboarding import production_case3_edit as edit
+
     control = page.locator(OPERATOR_ACCOUNT_INPUT_SELECTOR)
     try:
         if control.count() != 1:
-            return "edit_operator_control_absent"
+            return None, "edit_operator_control_absent"
     except Exception:
-        return "edit_operator_control_absent"
+        return None, "edit_operator_control_absent"
     if _verify_operator_account_empty(page) is not None:
-        return "edit_operator_not_empty"
+        return None, "edit_operator_not_empty"
+    def close_menu() -> None:
+        # Tab moves the focus out and closes the list (never Escape: it could close the Edit form). CO-0843 2026-11-13: a list
+        # left open covered Cancel, so a stopped edit left the form open.
+        try:
+            control.first.press("Tab", timeout=FIELD_TIMEOUT_MS)
+        except Exception:
+            pass
+
     try:
         control.first.click(timeout=FIELD_TIMEOUT_MS)
-        control.first.fill(operator, timeout=FIELD_TIMEOUT_MS)
-        options = page.get_by_role("option", name=operator, exact=True)
-        count = 0
-        for _ in range(PCR_EDIT_OPTION_POLLS):
-            count = options.count()
-            if count:
+        label, code, by_role = None, "edit_operator_not_found", True
+        typed = edit.search_text(operator)
+        for term in dict.fromkeys((typed, typed.split(" ")[0] if typed else "")):  # full name, then the first name only
+            if not term:
+                continue
+            control.first.fill(term, timeout=FIELD_TIMEOUT_MS)
+            listed = _pcr_option_labels(page)
+            if diag is not None:
+                diag["option_items"] = str(min(len(listed), 99))
+            by_role = bool(listed)
+            if not listed:  # no role=option items (a checkbox list): the exact candidate labels that are on the page
+                listed = _pcr_candidate_labels(page, edit.label_candidates(operator))
+                if diag is not None:
+                    diag["candidate_labels"] = str(len(listed))
+            label, code = edit.pick_operator(listed, operator)
+            if label is not None or code == "edit_operator_ambiguous":
                 break
-            page.wait_for_timeout(500)
-        if count != 1:
-            control.first.fill("", timeout=FIELD_TIMEOUT_MS)  # never Escape here: it could close the Edit form
-            return "edit_operator_not_found" if count == 0 else "edit_operator_ambiguous"
+        if label is None:
+            control.first.fill("", timeout=FIELD_TIMEOUT_MS)
+            close_menu()
+            return None, code
+        options = (page.get_by_role("option", name=label, exact=True) if by_role
+                   else page.get_by_text(label, exact=True))
+        if options.count() != 1:
+            control.first.fill("", timeout=FIELD_TIMEOUT_MS)
+            close_menu()
+            return None, "edit_operator_ambiguous"
         options.first.click(timeout=FIELD_TIMEOUT_MS)
+        close_menu()
     except Exception:
-        return "edit_operator_select_failed"
+        close_menu()
+        return None, "edit_operator_select_failed"
     chips = _pcr_selected_operators(page)
-    if chips is not None and chips != [operator]:
-        return "edit_operator_select_failed"  # unreadable chips are left to the row re-read after the save
-    return None
+    if chips is not None and chips != [label]:
+        return None, "edit_operator_select_failed"  # unreadable chips are left to the row re-read after the save
+    return label, None
 
 
 def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_row: dict[str, Any], account_id: str,
-                    operator: str | None, record: Any, diag: dict[str, str] | None = None) -> str:
+                    operator: str | None, record: Any, diag: dict[str, str] | None = None,
+                    scan_hours: int | None = None, note: Any = None) -> str:
     """The one Edit Account after a verified Case 3 create (owner go 2026-11-02): Operator "<Technical Advisor> Operator" and
     Maximum scan Duration 90, then ONE Confirm and a row re-read (``production_case3_edit``).
 
@@ -11326,12 +11425,20 @@ def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_ro
     from integration.onboarding import production_create_live as live
 
     name = intended["tenant_name"]
+    hours = edit.SCAN_HOURS if scan_hours is None else scan_hours  # owner 2026-11-13: CE-only 24, with Surface 90
+
+    def mark(step: str, outcome: str = "ok") -> None:  # progress bar milestones (owner request 2026-11-13); never raises
+        if note is not None:
+            try:
+                note(step, outcome)
+            except Exception:
+                pass
 
     def read() -> Any:
         return _pdr_reader(page, in_app=False).readback(name)
 
     try:
-        before = edit.before_edit(read(), intended, account_id, operator)
+        before = edit.before_edit(read(), intended, account_id, operator, hours)
     except Exception:
         before = "edit_row_unavailable"
     if before != "ok":
@@ -11361,9 +11468,19 @@ def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_ro
             return stop("edit_form_unavailable")
     except Exception:
         return stop("edit_form_unavailable")
+    mark("op_form_open")
+    picked = None
+    if not operator:
+        mark("op_operator", "none")
     if operator:
-        problem = _pcr_pick_operator(page, operator)
-        if problem:
+        picked, problem = _pcr_pick_operator(page, operator, diag)
+        mark("op_operator", "picked" if picked else "unmatched" if problem in ("edit_operator_not_found",
+                                                                               "edit_operator_ambiguous") else "failed")
+        if problem in ("edit_operator_not_found", "edit_operator_ambiguous"):
+            # Owner decision 2026-11-13: no single matching operator never blocks the rest; the owner assigns it by hand.
+            if diag is not None:
+                diag["operator"] = "unmatched"
+        elif problem:
             return stop(problem)
     label = production_dry_run.MAX_SCAN_DURATION_LABEL
     try:
@@ -11375,11 +11492,21 @@ def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_ro
                 control = _pdr_advanced_text(page, label)
                 if control is not None:
                     break
-        if control is None or not control.first.is_enabled():
+        if control is None and hours == edit.CE_ONLY_SCAN_HOURS:
+            # CO-0843 2026-11-13: the CE-only Edit form shows no Maximum scan Duration; the owner's CO-0845 edit still sent
+            # campaignsTimeoutInHours 24 (the form's own value). Nothing to type; the re-read after the save must show 24.
+            if diag is not None:
+                diag["scan_control"] = "absent_form_default"
+            mark("op_scan", "form_default")
+        elif control is None or not control.first.is_enabled():
+            mark("op_scan", "absent")
             return stop("edit_scan_control_absent")
-        control.first.fill(edit.SCAN_HOURS_TEXT, timeout=FIELD_TIMEOUT_MS)
-        if control.first.input_value() != edit.SCAN_HOURS_TEXT:
-            return stop("edit_fill_mismatch")
+        else:
+            control.first.fill(str(hours), timeout=FIELD_TIMEOUT_MS)
+            if control.first.input_value() != str(hours):
+                mark("op_scan", "mismatch")
+                return stop("edit_fill_mismatch")
+            mark("op_scan", "set")
         if confirm.count() != 1 or not confirm.first.is_enabled():
             return stop("edit_confirm_unavailable")
     except Exception:
@@ -11400,28 +11527,33 @@ def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_ro
         guard.disarm_edit()
     problem = edit.edit_response_problem(response.request.method, live.edit_request_id(response.request.method, response.url),
                                          response.status, account_id)
+    mark("op_saved", "ok" if not problem else problem)
     if problem:
         return problem
     verdict = "edit_saved_unverified"
     for _ in range(PCR_EDIT_REREADS):
         page.wait_for_timeout(2_000)
         try:
-            verdict = edit.after_edit(read(), intended, expected_row, account_id, operator)
+            verdict = edit.after_edit(read(), intended, expected_row, account_id, picked, hours)
         except Exception:
             verdict = "edit_saved_unverified"
         if verdict not in ("edit_saved_unverified", "edit_values_not_kept"):
             break
+    mark("op_verified", verdict)
     return verdict
 
 
 def _pcr_case3_edit_step(page: Any, guard: Any, parent: Path, reference: str, intended: dict[str, Any],
-                         strict_state: dict[str, Any], source: Any, stamp: Any) -> str:
-    """Run ``_pcr_case3_edit`` once after a verified Case 3 create and record its result (never raises; never repeated:
-    the run ends after it, and a new run needs a new approval and an uncreated CO)."""
+                         strict_state: dict[str, Any], source: Any, stamp: Any, scan_hours: int | None = None,
+                         technical_advisor: str | None = None) -> str:
+    """Run ``_pcr_case3_edit`` once after a verified create and record its result (never raises; never repeated: the run ends
+    after it, and a new run needs a new approval and an uncreated CO). Case 3: 90 h; CE-only (owner 2026-11-13): 24 h with
+    ``technical_advisor`` read by ``_pcr_technical_advisor``."""
     from integration.onboarding import case3_followup
     from integration.onboarding import production_case3_edit as edit
 
-    operator = edit.operator_name(getattr(source, "technical_advisor", ""))
+    advisor = technical_advisor if technical_advisor is not None else getattr(source, "technical_advisor", "")
+    operator = edit.operator_name(advisor)
     detail = {"operator": "named" if operator else "unknown"}
 
     def record(result: str) -> None:
@@ -11432,17 +11564,24 @@ def _pcr_case3_edit_step(page: Any, guard: Any, parent: Path, reference: str, in
         result = "edit_account_id_unknown"
     else:
         diag: dict[str, str] = {}
+        clock = stamp if callable(stamp) else (lambda: datetime.now(timezone.utc))
+        _op_note(reference, "op_start", "after_create", clock)
+        _op_note(reference, "op_tenant_found", "ok", clock)
         try:
-            result = _pcr_case3_edit(page, guard, intended, strict_state["expected"], account_id, operator, record, diag)
+            result = _pcr_case3_edit(page, guard, intended, strict_state["expected"], account_id, operator, record, diag,
+                                     scan_hours, lambda step, outcome: _op_note(reference, step, outcome, clock))
         except Exception:
             result = "edit_failed"
         detail.update(diag)
     if result == edit.VERIFIED and operator is None:
-        result = "edit_operator_unknown"  # 90 is set; the operator is left for the Technical Advisor
+        result = "edit_operator_unknown"  # the hours are set; the operator is left for the Technical Advisor
+    elif result == edit.VERIFIED and detail.get("operator") == "unmatched":
+        result = edit.UNMATCHED  # the hours are set; no single BackOffice operator matched: assign it by hand
     try:
         record(result)
     except Exception:
         pass
+    _op_note(reference, "op_result", result, lambda: datetime.now(timezone.utc))
     return result
 
 
@@ -11961,6 +12100,117 @@ def run_production_primary_user(reference: str, *, environ: Any | None = None, n
     return finish(final, wrote=result in (primary.CREATED, "user_created_unverified", "add_no_signal"))
 
 
+OPERATOR_EDIT_STABLE_FIELDS = ("accountName", "accountDomain", "accountType", "scanningInterval",
+                               "leakedCredentialsScanningInterval", "accountLicense.expirationDate", "accountLicense.startDate",
+                               "accountLicense.licenseType", "accountLicense.enabled", "enabled")
+# A previous run whose Confirm may have been sent without a known result: never repeated automatically.
+OPERATOR_EDIT_REVIEW = frozenset({"write_started", "edit_save_no_signal", "edit_saved_unverified", "edit_id_mismatch",
+                                  "write_uncertain"})
+
+
+def run_production_operator_edit(reference: str, *, environ: Any | None = None, now: datetime | None = None,
+                                 records_parent: Path | None = None, open_page: Any = None, advisor: Any = None,
+                                 wait_seconds: float = MAX_WAIT_SECONDS) -> str:
+    """Owner click "Set Operator from Technical Advisor" (owner decision 2026-11-13, CO-0845 HAR) on a CO this dashboard
+    onboarded: ONE Edit Account of exactly the verified tenant that picks the Account Technical Advisor's operator (accents,
+    case and the word "Operator" ignored; exactly one option) and sets Maximum scan Duration (CE-only 24 h, Case 3 90 h).
+
+    Gates before any browser: desktop, a verified CE-only or Case 3 create (tenant name + account id), a Technical Advisor on
+    the Account (fresh fixed read), no earlier run that needs review. In the browser: the row by name and the exact id; an
+    operator already on the tenant that is someone else is never replaced; a missing match saves only the hours. The guard
+    lets exactly one ``POST /account/{that id}/edit`` through and never a create. The result is recorded (step ``bo_edit``)."""
+    from integration.onboarding import case3_followup
+    from integration.onboarding import production_case3_edit as edit
+    from integration.onboarding import production_contract
+    from integration.onboarding import production_create_live as live
+    from integration.onboarding import production_create_ui as create_ui
+
+    environ = dict(os.environ if environ is None else environ)
+    clock = (lambda: now) if now is not None else (lambda: datetime.now(timezone.utc))
+
+    def note(step: str, outcome: str = "ok") -> None:
+        _op_note(reference, step, outcome, clock)
+
+    def line(result: str, wrote: bool = False) -> str:
+        note("op_result", result)
+        return json.dumps({"result": result, "production_write": "performed" if wrote else "not_performed",
+                           "salesforce_writeback": "not_performed"}, separators=(",", ":"))
+
+    if not isinstance(reference, str) or not REFERENCE.fullmatch(reference):
+        return json.dumps({"result": "invalid_co_reference", "production_write": "not_performed",
+                           "salesforce_writeback": "not_performed"}, separators=(",", ":"))
+    note("op_start", "button")
+    runtime = str(environ.get("SURFACE_ONBOARDING_RUNTIME", "desktop")).strip().casefold()
+    if _launch_os_name() != "nt" or runtime != "desktop":
+        return line("browser_launch_not_allowed")
+    parent = records_parent or _pdr_records_parent()
+    last = case3_followup._last(parent, reference, edit.STEP)  # noqa: SLF001
+    if last in OPERATOR_EDIT_REVIEW:
+        return line("operator_edit_needs_review")
+    try:
+        history = create_ui.load_co_records(parent, reference)
+    except Exception:
+        return line("records_unreadable")
+    verified = [r for r in history if r.get("outcome") == "readback_verified" and r.get("route") in edit.ROUTE_SCAN_HOURS]
+    account_id = verified[-1].get("account_id") if verified else None
+    tenant = verified[-1].get("tenant_name") if verified else None
+    if (create_ui.co_status(history)["code"] != create_ui.CREATED_VERIFIED or not isinstance(account_id, str)
+            or not re.fullmatch(r"[0-9a-f]{24}", account_id) or not isinstance(tenant, str) or not tenant.strip()):
+        return line("no_verified_create")
+    hours = edit.ROUTE_SCAN_HOURS[verified[-1]["route"]]
+    name = advisor(reference) if callable(advisor) else _pcr_technical_advisor(reference)
+    operator = edit.operator_name(name)
+    if operator is None:
+        return line("technical_advisor_missing")
+    detail = {"operator": "named", "trigger": "owner_button"}
+
+    def record(result: str) -> None:
+        case3_followup._record(parent, reference, edit.STEP, result, clock(), detail)  # noqa: SLF001
+
+    result = "operator_edit_failed"
+    opener = open_page or (_kept_browser_page if production_window_kept() else _pdr_browser_page)
+    try:
+        with opener(production_probe.probe_target(),
+                    KEPT_SIGN_IN_SECONDS if opener is _kept_browser_page else wait_seconds) as page:
+            note("op_signed_in")
+            guard = live.RenewalEditGuard()
+            guard.install(page)
+            reply = _pdr_reader(page, in_app=False).readback(tenant)
+            status = reply.get("status") if isinstance(reply, dict) else None
+            rows = reply.get("rows") if isinstance(reply, dict) and isinstance(reply.get("rows"), list) else []
+            found = [r for r in rows if isinstance(r, dict) and r.get("id") == account_id] if status == 200 else []
+            if status in (401, 403):
+                result = "edit_session_expired"
+            elif len(found) != 1:
+                result = "edit_row_not_found"
+            else:
+                row = found[0]
+                note("op_tenant_found")
+                intended = {"tenant_name": tenant, "primary_domain": str(row.get("accountDomain") or "")}
+                # The fields this edit must not change, as they are now (compared again after the save).
+                expected = {}
+                for field_name in OPERATOR_EDIT_STABLE_FIELDS:
+                    value = production_contract._lookup(row, field_name)  # noqa: SLF001
+                    if value is not None:
+                        expected[field_name] = value
+                diag: dict[str, str] = {}
+                result = _pcr_case3_edit(page, guard, intended, expected, account_id, operator, record, diag, hours, note)
+                detail.update(diag)
+                if result == edit.VERIFIED and detail.get("operator") == "unmatched":
+                    result = edit.UNMATCHED
+    except RuntimeError as error:
+        result = {"production_dry_run_login_timeout": "production_sign_in_timeout",
+                  "production_window_signed_out": "production_window_signed_out"}.get(str(error), "operator_edit_failed")
+    except Exception:
+        result = "operator_edit_failed"
+    try:
+        if result not in ("production_sign_in_timeout", "production_window_signed_out"):
+            record(result)
+    except Exception:
+        pass
+    return line(result, wrote=result in edit.WRITE_OUTCOMES)
+
+
 def run_production_scan_check(reference: str, *, environ: Any | None = None, now: datetime | None = None,
                               records_parent: Path | None = None, open_page: Any = None,
                               wait_seconds: float = MAX_WAIT_SECONDS, kept_only: bool = False) -> str:
@@ -12352,6 +12602,13 @@ def run_production_create(reference: str, acknowledged_revision: str, *, owner_g
                 return found
 
             result = run_live(final, fill, click, read, duplicate_check, form_recheck)
+            if not case3 and result.outcome == production_create.OUTCOME_VERIFIED:
+                # Owner decision 2026-11-13 (CO-0845): the CE-only tenant also gets the Technical Advisor's operator, with
+                # Maximum scan Duration 24 h, by the same one Edit Account (a missing or unmatched operator never blocks).
+                from integration.onboarding import production_case3_edit as _edit
+                _pcr_case3_edit_step(page, guard, parent, reference, contract_intended, strict_state, None, stamp,
+                                     scan_hours=_edit.CE_ONLY_SCAN_HOURS,
+                                     technical_advisor=_pcr_technical_advisor(reference))
             if case3 and result.outcome == production_create.OUTCOME_VERIFIED:
                 edit_result = _pcr_case3_edit_step(page, guard, parent, reference, contract_intended, strict_state, source,
                                                    stamp)

@@ -178,6 +178,11 @@ class ClearTests(unittest.TestCase):
         for path in ("/attended/production-create", "/attended/production-scan-check", "/attended/onboard-approve"):
             self.assertNotIn(path, dashboard._POSTS_KEEPING_DISPLAY_CACHE)
 
+    def test_local_sign_in_and_password_change_keep_the_cache(self):
+        # 2026-11-13: the username sign-in cleared every cached read, so the first page after sign-in took minutes.
+        self.assertTrue({dashboard.LOCAL_LOGIN_PATH, dashboard.ACCOUNT_PASSWORD_PATH, dashboard.ADMIN_USERS_CHANGE_PATH}
+                        <= dashboard._POSTS_KEEPING_DISPLAY_CACHE)
+
 
 class WarmUpTests(unittest.TestCase):
     ROWS = [{"Name": "CO-0001", "Onboarding_Product__c": "Credential Exposure", "Onboarding_Type__c": "New Product Onboarding"},

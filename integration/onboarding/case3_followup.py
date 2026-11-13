@@ -536,6 +536,23 @@ def edit_note(parent: Path, co: str) -> str:
 EDIT_DONE = frozenset({"edit_verified", "edit_already_set"})
 
 
+def ce_edit_note(parent: Path, co: str) -> str | None:
+    """CE-only (owner decision 2026-11-13): the recorded post-create Edit Account result (Technical Advisor operator, Maximum
+    scan Duration 24 h) as one sentence; None when the CO has no such line (creates before 2026-11-13)."""
+    from . import production_case3_edit as edit
+
+    result = _last(parent, co, edit.STEP)
+    if result is None:
+        return None
+    text = edit.result_text(result, edit.CE_ONLY_SCAN_HOURS)
+    if text:
+        return text
+    if result in ("write_started", "write_uncertain"):
+        result = "edit_save_no_signal"
+    return ("The automatic Edit Account did not finish (" + result + "): in BackOffice, Edit Account: pick the Technical "
+            "Advisor's operator and check Maximum scan Duration (hours) is 24. It is not repeated automatically.")
+
+
 def clone_tenant(parent: Path, co: str) -> Mapping[str, Any] | None:
     """The production clone row of this CO's verified tenant (matched by the recorded Account UUID), or None: not in the
     clone yet (it is a nightly copy), no verified create, or anything unreadable. Read-only, local files only."""

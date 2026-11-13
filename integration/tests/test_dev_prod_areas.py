@@ -149,14 +149,13 @@ class NavigationTests(unittest.TestCase):
     def test_groups_labels_and_order(self):
         shell = dashboard._app_shell("t", "", active="prod_onboarding")
         aside = shell[shell.index("<aside"):shell.index("</aside>")]
-        links = re.findall(r"<a href='([^']+)'(?: class='active')?>([^<]+)</a>", aside)
+        links = re.findall(r"<a href='([^']+)'(?: class='active' aria-current='page')?>(?:<svg.*?</svg>)?<span>([^<]+)</span></a>", aside)
         self.assertEqual(links, self.ORDER)
         heads = re.findall(r"<div class='navhead'>(.*?)</div>", aside)
-        self.assertEqual([re.sub(r"<[^>]+>", "", head) for head in heads], ["PRODUCTIONread-only", "TOOLS"])
-        self.assertIn("<span class='ro'>read-only</span>", aside)
+        self.assertEqual([re.sub(r"<[^>]+>", "", head) for head in heads], ["Administration"])  # 2026-11-13 Core look
         self.assertNotIn("LEONARDO", aside)
         self.assertLess(aside.index("navgroup prod"), aside.index("navgroup tools"))
-        for icon in ("<svg", "<img", "&#x1f", "emoji"):
+        for icon in ("<img", "&#x1f", "emoji"):  # 2026-11-13 (owner, Pentera Core look): inline line icons only
             self.assertNotIn(icon, aside)
         self.assertIn(".navgroup.dev a::before{background", dashboard.PENTERA_CSS)  # solid dot
         self.assertIn(".navgroup.prod a::before{background:transparent", dashboard.PENTERA_CSS)  # hollow dot

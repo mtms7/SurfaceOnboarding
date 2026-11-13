@@ -56,6 +56,8 @@ integration/attended_ce_only_progress.json
 integration/attended_ce_only_check_state.json
 integration/attended_scan_reminders.json
 integration/attended_user_created_confirmations.json
+integration/open_onboardings_view_id.txt
+integration/open_onboardings_view_id.txt.tmp
 # Locally built release archives and checksums
 release/
 integration/attended_scan_status.json

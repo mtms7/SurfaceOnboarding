@@ -493,7 +493,7 @@ class VmProductionFirstPagesTests(SnapshotDashboardCase):
         self.assertEqual(status, 200)
         self.assertIn("CO-0001", body)
         aside = body[body.index("<aside"):body.index("</aside>")]
-        self.assertIn("PRODUCTION", aside)
+        self.assertIn("aria-label='Production'", aside)  # 2026-11-13: the production group, without a PRODUCTION box
         self.assertNotIn("LEONARDO", aside)  # owner decision 2026-10-19: no Leonardo menu
         self.assertNotIn(">Sessions<", aside)  # no Sessions link on the VM
         self.assertEqual(self.calls, [])

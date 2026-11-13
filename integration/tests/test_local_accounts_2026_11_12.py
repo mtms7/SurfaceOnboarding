@@ -254,6 +254,21 @@ class LocalLoginTests(LocalModeSandbox):
         for path in self.folder.iterdir():
             self.assertNotIn(GOOD.encode(), path.read_bytes())
 
+    def test_sign_in_and_password_change_keep_the_cached_salesforce_reads(self):
+        # 2026-11-13: every username sign-in cleared the display cache, so the first page after it waited minutes on `sf`.
+        dashboard.clear_display_cache()
+        self.addCleanup(dashboard.clear_display_cache)
+        dashboard._store_display_value(("detail_row", "CO-1"), {"v": 1}, dashboard._display_generation)
+        wrong = self.request("POST", "/login/password", body=b"username=mmachados&password=wrong-password-xx")
+        right = self.request("POST", "/login/password", body=("username=mmachados&password=" + GOOD).encode())
+        self.assertEqual((self.location(wrong), self.location(right)), ("/login?reason=invalid", "/"))
+        self.assertIsNotNone(dashboard.peek_display_cache("detail_row", "CO-1"))
+        self.request("POST", "/account/password", self.session(SUPER),
+                     ("current=" + GOOD + "&new=another-good-pass-1&confirm=another-good-pass-1").encode())
+        self.assertIsNotNone(dashboard.peek_display_cache("detail_row", "CO-1"))
+        self.request("POST", "/attended/production-scan-check", self.session(SUPER), b"x=1")  # any other action still clears
+        self.assertIsNone(dashboard.peek_display_cache("detail_row", "CO-1"))
+
     def test_salesforce_sign_in_routes_no_longer_sign_anyone_in(self):
         with patch.object(dashboard, "start_dashboard_login") as start:
             response = self.request("POST", "/login/start")
@@ -343,6 +358,55 @@ class LocalRolesAndAuditTests(LocalModeSandbox):
         self.assertIsNone(dashboard.dashboard_operator(self.session(SUPER)))
         response = self.request("POST", "/login/password", body=("username=mmachados&password=" + GOOD).encode())
         self.assertEqual(self.location(response), "/login?reason=store_unavailable")
+
+
+class ApprovalIdentityTests(unittest.TestCase):
+    """2026-11-13 CO-0845 ``approval_not_issued``: the local super admin is the owner e-mail for approval checks only."""
+    OWNER = "owner@example.com"
+    ACCOUNTS = {SUPER: {"role": accounts.ROLE_SUPERADMIN}, OPERATOR: {"role": accounts.ROLE_OPERATOR},
+                VIEWER: {"role": accounts.ROLE_VIEWER}, "oldboss": {"role": accounts.ROLE_SUPERADMIN, "disabled": True}}
+
+    def identity(self, operator, local=True, env=None):
+        env = {"SURFACE_DASHBOARD_ALLOWED_USERS": self.OWNER} if env is None else env
+        with patch.dict(os.environ, env, clear=False), \
+                patch.object(dashboard, "local_accounts_mode", return_value=local), \
+                patch.object(dashboard, "local_account", side_effect=lambda name: self.ACCOUNTS.get(name)):
+            if "SURFACE_ONBOARDING_APPROVAL_ISSUERS" not in env:
+                os.environ.pop("SURFACE_ONBOARDING_APPROVAL_ISSUERS", None)
+            return dashboard.approval_identity(operator)
+
+    def test_the_super_admin_maps_to_the_one_owner_email(self):
+        self.assertEqual(self.identity(SUPER), self.OWNER)
+        self.assertEqual(self.identity(SUPER, env={"SURFACE_DASHBOARD_ALLOWED_USERS": "",
+                                                   "SURFACE_ONBOARDING_APPROVAL_ISSUERS": self.OWNER}), self.OWNER)
+
+    def test_other_accounts_keep_their_username_and_stay_refused(self):
+        for name in (OPERATOR, VIEWER, "oldboss", "unknown"):
+            self.assertEqual(self.identity(name), name, name)
+
+    def test_an_ambiguous_or_empty_issuer_list_maps_nothing(self):
+        self.assertEqual(self.identity(SUPER, env={"SURFACE_DASHBOARD_ALLOWED_USERS": "a@example.com,b@example.com"}), SUPER)
+        self.assertEqual(self.identity(SUPER, env={"SURFACE_DASHBOARD_ALLOWED_USERS": ""}), SUPER)
+        self.assertEqual(self.identity(SUPER, env={"SURFACE_DASHBOARD_ALLOWED_USERS": "",
+                                                   "SURFACE_ONBOARDING_APPROVAL_ISSUERS": "a@example.com,b@example.com"}),
+                         SUPER)
+
+    def test_without_local_accounts_or_for_an_email_nothing_changes(self):
+        self.assertEqual(self.identity(SUPER, local=False), SUPER)
+        self.assertEqual(self.identity("Owner@Example.com"), "Owner@Example.com")
+        self.assertIsNone(self.identity(None))
+        self.assertEqual(self.identity(""), "")
+
+    def test_the_create_gate_inputs_carry_the_mapped_identity(self):
+        with patch.dict(os.environ, {"SURFACE_DASHBOARD_ALLOWED_USERS": self.OWNER}, clear=False), \
+                patch.object(dashboard, "local_accounts_mode", return_value=True), \
+                patch.object(dashboard, "local_account", side_effect=lambda name: self.ACCOUNTS.get(name)), \
+                patch.object(dashboard, "_salesforce_ready_for_create", return_value=True), \
+                patch.object(dashboard, "_clone_status", return_value=None), \
+                patch.object(dashboard, "_case3_tenant_name", return_value=None):
+            os.environ.pop("SURFACE_ONBOARDING_APPROVAL_ISSUERS", None)
+            self.assertEqual(dashboard._create_ui_inputs("CO-0845", None, SUPER).operator, self.OWNER)
+            self.assertEqual(dashboard._create_ui_inputs("CO-0845", None, OPERATOR).operator, OPERATOR)
 
 
 class SalesforceDataUserTests(unittest.TestCase):
