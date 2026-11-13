@@ -152,7 +152,7 @@ def expected_create_payload(intended: Mapping[str, Any]) -> dict[str, Any]:
         "mfaRequired": True,
         "alternateDomains": [], "subDomains": [], "additionalNetworks": None, "userEmailDomains": [email_domain],
         "operatorAccountNames": [],
-        "scanningInterval": SCANNING_INTERVAL, "scanNow": False,
+        "scanningInterval": SCANNING_INTERVAL, "scanNow": True,  # owner 2026-11-13: CE-only scans at create
         "leakedCredentialsScanningInterval": LC_INTERVAL, "leakedCredentialsScannedDomains": _leaked_domains(intended, domain),
         "campaignsTimeoutInHours": CAMPAIGN_TIMEOUT_HOURS,
         "license.assetsNumber": LICENSE_COUNT_TEXT, "license.domainsNumber": LICENSE_COUNT_TEXT,

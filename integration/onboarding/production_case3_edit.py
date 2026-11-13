@@ -162,7 +162,8 @@ def after_edit(reply: Any, intended: Mapping[str, Any], expected_row: Mapping[st
         return "edit_other_fields_changed"
     names = operator_names(row)
     if (row.get("campaignsTimeoutInHours") != scan_hours or names is None
-            or (operator and not (len(names) == 1 and same_person(names[0], operator)))):
+            or (operator and not (len(names) == 1 and same_person(names[0], operator)))
+            or (not operator and names)):  # 2026-11-13: no operator chosen = none may appear (never a wrong one saved)
         return "edit_values_not_kept"
     return VERIFIED
 

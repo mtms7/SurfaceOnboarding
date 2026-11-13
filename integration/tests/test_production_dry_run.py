@@ -556,7 +556,7 @@ class MappingTests(unittest.TestCase):
         self.assertEqual({n for n, _t in intended.toggles}, set(pdr.TOGGLE_NAMES))
         self.assertEqual(dict(intended.advanced_targets), {n: False for n in pdr.ADVANCED_NAMES})
         self.assertEqual(dict(intended.toggles)["leakedCredentialsAllowed"], True)
-        self.assertEqual(intended.scan_now, False)
+        self.assertEqual(intended.scan_now, True)  # owner 2026-11-13: CE-only scans at create
         self.assertEqual([k for k, _ in intended.dates], ["license_start", "license_end"])
         self.assertEqual(len(pdr.field_keys(intended)), len(set(pdr.field_keys(intended))))
 
@@ -582,7 +582,7 @@ class CompareTests(unittest.TestCase):
     def reads(self):
         return {"texts": dict(self.intended.texts), "blanks": {label: "" for label in self.intended.blanks},
                 "selects": {n: o for n, o, _e in self.intended.selects}, "toggles": dict(self.intended.toggles),
-                "dates": {"license_start": True, "license_end": True}, "operator_empty": True, "scan_now": False}
+                "dates": {"license_start": True, "license_end": True}, "operator_empty": True, "scan_now": True}
 
     def test_all_pass_and_each_mismatch_fails_only_its_key(self):
         self.assertEqual(set(pdr.compare_reads(self.intended, self.reads()).values()), {"pass"})
@@ -592,7 +592,7 @@ class CompareTests(unittest.TestCase):
                           (lambda r: r["toggles"].update({"mfaRequired": False}), "toggle.mfaRequired"),
                           (lambda r: r["dates"].update({"license_end": False}), "date.license_end"),
                           (lambda r: r.update({"operator_empty": False}), "operator_account_empty"),
-                          (lambda r: r.update({"scan_now": True}), "toggle.scan_now"),
+                          (lambda r: r.update({"scan_now": False}), "toggle.scan_now"),
                           (lambda r: r["texts"].pop("Company name"), "text.company_name")):
             reads = self.reads()
             edit(reads)

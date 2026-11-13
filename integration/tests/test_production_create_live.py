@@ -459,7 +459,7 @@ class CreatePayloadCaptureTests(unittest.TestCase):
             self.assertNotIn(secret, kept)
 
     def test_deviations_are_reported_by_field_name_only(self):
-        for key, value, name in (("scanNow", True, "scanNow"), ("license__assetsNumber", 1, "license.assetsNumber"),
+        for key, value, name in (("scanNow", False, "scanNow"), ("license__assetsNumber", 1, "license.assetsNumber"),
                                  ("license__subDomainsNumber", "1", "license.subDomainsNumber"),
                                  ("mfaRequired", False, "mfaRequired"), ("additionalNetworks", [], "additionalNetworks"),
                                  ("campaignsTimeoutInHours", 48, "campaignsTimeoutInHours"),

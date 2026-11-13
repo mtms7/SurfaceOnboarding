@@ -45,7 +45,7 @@ def create_flat():
         "accountName": NAME, "accountDomain": DOMAIN, "accountType": "customer", "accountCountryCode": "CL",
         "organizationEmail": "test.user+acme@" + INTERNAL, "firstName": "Test", "lastName": "User", "mfaRequired": True,
         "alternateDomains": [], "subDomains": [], "additionalNetworks": None, "userEmailDomains": [INTERNAL],
-        "operatorAccountNames": [], "scanningInterval": "NO_SCHEDULE", "scanNow": False,
+        "operatorAccountNames": [], "scanningInterval": "NO_SCHEDULE", "scanNow": True,
         "leakedCredentialsScanningInterval": "WEEKLY", "leakedCredentialsScannedDomains": [DOMAIN],
         "campaignsTimeoutInHours": 24,
         "license.assetsNumber": "1", "license.domainsNumber": "1", "license.subDomainsNumber": 1,

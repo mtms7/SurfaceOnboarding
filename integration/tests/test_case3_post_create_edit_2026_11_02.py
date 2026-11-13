@@ -223,7 +223,9 @@ class EditRunnerTests(unittest.TestCase):
                       mock.patch.object(runner, "_open_row_action", lambda *_a: None),
                       mock.patch.object(runner, "_spycloud_cancel", cancel),
                       mock.patch.object(runner, "_verify_operator_account_empty", lambda _p: None),
-                      mock.patch.object(runner, "_pcr_selected_operators", lambda _p: [OPERATOR]),
+                      # the chips are what was actually clicked (2026-11-13: an unchosen chip stops before Confirm)
+                      mock.patch.object(runner, "_pcr_selected_operators",
+                                        lambda p: [OPERATOR] if getattr(getattr(p, "option", None), "clicks", 0) else []),
                       mock.patch.object(runner, "_pdr_advanced_text", lambda page, _label: page.scan)):
             patch.start()
             self.addCleanup(patch.stop)

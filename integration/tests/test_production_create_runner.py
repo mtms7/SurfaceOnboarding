@@ -638,7 +638,7 @@ class CreateBodyTests(Base):
         self.assertEqual(record.get("payload_mismatches"), [])
 
     def test_a_deviating_body_is_created_mismatch_with_names_only_and_never_a_pre_send_abort(self):
-        body = good_create_body(scanNow=True, license__assetsNumber=1, brandNewFlag="customer-secret-value",
+        body = good_create_body(scanNow=False, license__assetsNumber=1, brandNewFlag="customer-secret-value",
                                 accountDomain="other-customer.example")
         h, result = self.verdict(body=body)
         self.assertEqual(result, "created_mismatch")

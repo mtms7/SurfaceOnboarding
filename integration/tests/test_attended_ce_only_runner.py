@@ -644,7 +644,7 @@ class BuildCeOnlyFillTests(unittest.TestCase):
         plan = build_ce_only_fill(self._source())
         self.assertEqual(plan["checkboxes"], {
             "mfaRequired": True,
-            "scan_now": False,
+            "scan_now": True,  # owner 2026-11-13: CE-only scans at create
             "notificationsAllowed": False,
             "multipleUsersAllowed": False,
             "apiAccessAllowed": False,
@@ -3572,7 +3572,7 @@ CE_GOLDEN_PLAN = {
         "Type": "Prepaid annual subscription",
     },
     "checkboxes": {
-        "mfaRequired": True, "scan_now": False,
+        "mfaRequired": True, "scan_now": True,
         "automatedDiscoveryEnabled": False, "subDomainsReconEnabled": False,
         "webDictionaryBruteForceEnabled": False, "webDorkingEnabled": False,
         "fullNucleiScanEnabled": False, "authenticatedTestingEnabled": False,

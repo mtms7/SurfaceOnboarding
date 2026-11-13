@@ -282,10 +282,11 @@ class CheckboxListPickerTests(unittest.TestCase):
         guard = c3.live.LiveRequestGuard()
         guard.create_used = True
         page = c3.FakeEditPage(guard, options=0, reply_id=ACCOUNT_ID)  # the edit reply is for THIS tenant
-        texts = {label: c3.Locator(count=1) for label in on_page}
+        texts = {label: c3.Locator(count=1) for label in [*on_page, runner.PCR_EDIT_TITLE_TEXT]}
         page.get_by_text = lambda text, exact=False: texts.get(text, c3.Locator(count=0))
         presses = []
         page.operator_input.press = lambda key, **_kw: presses.append(key)
+        self.chips = None  # what the chip reader sees; None = unreadable
         return guard, page, texts, presses, c3
 
     def run_edit(self, page, guard, c3, hours, replies, diag):
@@ -294,7 +295,7 @@ class CheckboxListPickerTests(unittest.TestCase):
                 mock.patch.object(runner, "_open_row_action", lambda *_a: None), \
                 mock.patch.object(runner, "_spycloud_cancel", lambda _p: True), \
                 mock.patch.object(runner, "_verify_operator_account_empty", lambda _p: None), \
-                mock.patch.object(runner, "_pcr_selected_operators", lambda _p: None), \
+                mock.patch.object(runner, "_pcr_selected_operators", lambda _p: self.chips), \
                 mock.patch.object(runner, "_pdr_advanced_text", lambda _page, _label: None):
             return runner._pcr_case3_edit(page, guard, INTENDED, {}, ACCOUNT_ID, edit.operator_name(TA), lambda _r: None,
                                           diag, hours)
@@ -308,15 +309,37 @@ class CheckboxListPickerTests(unittest.TestCase):
         self.assertEqual((diag.get("option_items"), diag.get("candidate_labels"), diag.get("scan_control")),
                          ("0", "1", "absent_form_default"))
         self.assertEqual(page.confirm.clicks, 1)
-        self.assertIn("Tab", presses)  # the list is closed after the pick
+        self.assertEqual(presses, [])  # never Tab: it can select the focused option (CO-0839)
+        self.assertGreaterEqual(texts[runner.PCR_EDIT_TITLE_TEXT].clicks, 1)  # the list is closed by the dialog title
 
     def test_no_label_saves_the_hours_and_closes_the_list(self):
-        guard, page, _texts, presses, c3 = self.make_page([])
+        guard, page, texts, presses, c3 = self.make_page([])
         diag = {}
         result = self.run_edit(page, guard, c3, 24, [reply(None, None), reply(24, [])], diag)
         self.assertEqual((result, diag.get("operator")), (edit.VERIFIED, "unmatched"))
-        self.assertIn("Tab", presses)
+        self.assertEqual(presses, [])
+        self.assertGreaterEqual(texts[runner.PCR_EDIT_TITLE_TEXT].clicks, 1)
         self.assertEqual(page.operator_input.value, "")
+
+    def test_an_operator_chip_we_did_not_choose_stops_before_confirm(self):
+        guard, page, _texts, _presses, c3 = self.make_page([])
+        self.chips = ["Brandon Cathey Operator"]  # e.g. selected by a key press, never by us
+        diag = {}
+        result = self.run_edit(page, guard, c3, 24, [reply(None, None)], diag)
+        self.assertEqual((result, diag.get("chips_before_confirm")), ("edit_operator_unexpected", "1"))
+        self.assertEqual(page.confirm.clicks, 0)
+
+    def test_after_the_save_no_operator_may_appear_when_none_was_chosen(self):
+        self.assertEqual(edit.after_edit(reply(24, ["Brandon Cathey Operator"]), INTENDED, {}, ACCOUNT_ID, None, 24),
+                         "edit_values_not_kept")
+
+    def test_hidden_non_operator_options_do_not_hide_the_candidate_fallback(self):
+        guard, page, texts, _presses, c3 = self.make_page([LABEL])
+        page.option.labels = ["Spain", "United States of America"] * 60  # another select's options, as on CO-0839
+        diag = {}
+        result = self.run_edit(page, guard, c3, 24, [reply(None, None), reply(24, [LABEL])], diag)
+        self.assertEqual((result, diag.get("option_items"), diag.get("candidate_labels")), (edit.VERIFIED, "0", "1"))
+        self.assertEqual(texts[LABEL].clicks, 1)
 
     def test_case3_still_stops_without_the_scan_control(self):
         guard, page, _texts, _presses, c3 = self.make_page([LABEL])

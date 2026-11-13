@@ -693,7 +693,9 @@ def build_ce_only_fill(source: CeFillSource, run_day: date | None = None) -> dic
         },
         "checkboxes": {
             "mfaRequired": True,
-            "scan_now": False,
+            # Owner decision 2026-11-13 (CO-0839): CE-only starts its scan when the tenant is created ("Scan now" ON; the control
+            # exists because Scanning interval is None).
+            "scan_now": True,
             **{key: False for key in ADVANCED_TOGGLES_OFF},
             "notificationsAllowed": False,
             "multipleUsersAllowed": False,
@@ -11292,6 +11294,7 @@ def case3_live_intended(source: Case3FillSource, plan: dict[str, Any], run_day: 
 
 
 PCR_EDIT_RESPONSE_MS = 30_000
+PCR_EDIT_TITLE_TEXT = "EDIT ACCOUNT"  # the Edit dialog's static title (owner screenshots 2026-11-13)
 PCR_EDIT_OPTION_POLLS = 10  # x 500 ms: the operator options load after typing
 PCR_EDIT_REREADS = 3        # x 2 s: the row re-read after the edit reply
 
@@ -11365,10 +11368,12 @@ def _pcr_pick_operator(page: Any, operator: str, diag: dict[str, str] | None = N
     if _verify_operator_account_empty(page) is not None:
         return None, "edit_operator_not_empty"
     def close_menu() -> None:
-        # Tab moves the focus out and closes the list (never Escape: it could close the Edit form). CO-0843 2026-11-13: a list
-        # left open covered Cancel, so a stopped edit left the form open.
+        # CO-0839 2026-11-13: never Tab (it can SELECT the focused option) and never Escape (it could close the form). A click
+        # on the dialog's own static title closes the list without choosing anything (CO-0843: an open list covered Cancel).
         try:
-            control.first.press("Tab", timeout=FIELD_TIMEOUT_MS)
+            title = page.get_by_text(PCR_EDIT_TITLE_TEXT, exact=True)
+            if title.count() == 1:
+                title.first.click(timeout=FIELD_TIMEOUT_MS)
         except Exception:
             pass
 
@@ -11380,15 +11385,18 @@ def _pcr_pick_operator(page: Any, operator: str, diag: dict[str, str] | None = N
             if not term:
                 continue
             control.first.fill(term, timeout=FIELD_TIMEOUT_MS)
-            listed = _pcr_option_labels(page)
+            # CO-0839 2026-11-13: 99+ role=option items that were not the operator list (another select's hidden options):
+            # only labels that name an operator count, and the exact candidate labels are tried when they do not match.
+            listed = [text for text in _pcr_option_labels(page) if "operator" in text.casefold()]
             if diag is not None:
                 diag["option_items"] = str(min(len(listed), 99))
-            by_role = bool(listed)
-            if not listed:  # no role=option items (a checkbox list): the exact candidate labels that are on the page
-                listed = _pcr_candidate_labels(page, edit.label_candidates(operator))
-                if diag is not None:
-                    diag["candidate_labels"] = str(len(listed))
             label, code = edit.pick_operator(listed, operator)
+            by_role = label is not None
+            if label is None and code != "edit_operator_ambiguous":
+                shown = _pcr_candidate_labels(page, edit.label_candidates(operator))
+                if diag is not None:
+                    diag["candidate_labels"] = str(len(shown))
+                label, code = edit.pick_operator(shown, operator)
             if label is not None or code == "edit_operator_ambiguous":
                 break
         if label is None:
@@ -11507,7 +11515,21 @@ def _pcr_case3_edit(page: Any, guard: Any, intended: dict[str, Any], expected_ro
                 mark("op_scan", "mismatch")
                 return stop("edit_fill_mismatch")
             mark("op_scan", "set")
+        chips = _pcr_selected_operators(page)
+        # A chip reader that sees nothing ([] / None) is not proven on this form, so it never blocks; any chip that is not
+        # exactly ours does. The re-read after the save is strict both ways (production_case3_edit.after_edit).
+        if chips and chips != ([picked] if picked else []):
+            # CO-0839 2026-11-13: never save an operator we did not choose (or any operator when none matched).
+            if diag is not None:
+                diag["chips_before_confirm"] = "unreadable" if chips is None else str(len(chips))
+            return stop("edit_operator_unexpected")
         if confirm.count() != 1 or not confirm.first.is_enabled():
+            if diag is not None:
+                try:
+                    diag.update(confirm_buttons=str(confirm.count()),
+                                confirm_enabled=str(bool(confirm.count() == 1 and confirm.first.is_enabled())).lower())
+                except Exception:
+                    pass
             return stop("edit_confirm_unavailable")
     except Exception:
         return stop("edit_scan_control_absent")
