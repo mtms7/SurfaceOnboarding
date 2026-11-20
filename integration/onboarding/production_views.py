@@ -341,9 +341,10 @@ UUID_NOTE = "UUID check runs on the VM dashboard."
 
 
 def _all_inactive(candidates: list[dict[str, Any]]) -> bool:
-    """True when every match candidate has NO_SCHEDULE (or no) scanning interval — signals a deprecated tenant."""
+    """True when every match candidate explicitly carries NO_SCHEDULE scanning interval — signals a deprecated tenant.
+    A missing or None interval is not treated as inactive: positive evidence is required."""
     return bool(candidates) and all(
-        str(item.get("scanning_interval") or "NO_SCHEDULE").upper() == "NO_SCHEDULE" for item in candidates
+        str(item.get("scanning_interval") or "").upper() == "NO_SCHEDULE" for item in candidates
     )
 
 
