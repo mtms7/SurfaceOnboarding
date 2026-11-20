@@ -392,14 +392,14 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
             return {**base, "code": "live_paid", "css": "chip-bad", "label": "Live paid x " + str(live)}
         if status == "ambiguous":  # e.g. two tenants carry the CO's UUID, but fewer than two are live and paid
             return {**base, "code": "ambiguous", "css": "chip-bad", "label": "Ambiguous"}
-        if status == "exists_other":
-            return {**base, "code": "other_tenants", "css": "chip-bad", "label": "Other tenants only"}
-        if _all_inactive(candidates):
+        if _all_inactive(candidates):  # inactive check applies to exists_other too (domain-only match, all NO_SCHEDULE)
             return {**base, "code": "duplicate_inactive", "css": "chip-warn",
                     "label": "Duplicate – inactive",
                     "reason": (reason + " " if reason else "") +
                                "All matching tenants have NO_SCHEDULE scanning. "
                                "Rename the old tenant (e.g. append ' – deprecated') before onboarding."}
+        if status == "exists_other":
+            return {**base, "code": "other_tenants", "css": "chip-bad", "label": "Other tenants only"}
         return {**base, "code": "duplicate", "css": "chip-bad", "label": "Duplicate"}
     return unusable
 
