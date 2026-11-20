@@ -9277,31 +9277,80 @@ def _onboard_link(reference: str) -> str:
     return "<a class='co' href='" + escape(_co_page_href(reference)) + "'>" + escape(reference) + "</a>"
 
 
-def render_prod_approvals() -> str:
-    """``/prod/approvals``: the 7-day create approvals and the 4-hour summary approvals, read-only and labelled apart."""
+APPROVALS_NAME_UNKNOWN = "Not recorded"
+
+
+def _approval_customer_cell(name: str) -> str:
+    return escape(name) if name else "<span class='muted' title='No local create record names this customer'>" + APPROVALS_NAME_UNKNOWN + "</span>"
+
+
+def _approval_matches(needle: str, *fields: str) -> bool:
+    return not needle or any(needle in field.casefold() for field in fields if field)
+
+
+def render_prod_approvals(query: str = "") -> str:
+    """``/prod/approvals``: the 7-day create approvals and the 4-hour summary approvals, read-only and labelled apart.
+
+    Display only (owner request 2026-11-19): each row shows the customer name from the local create records (no Salesforce
+    read; "Not recorded" otherwise), and ``q`` filters both tables by CO, customer, approval ID, route or issuer. The page
+    CSP allows no script, so the filter is a plain GET form. Approval states and records are unchanged."""
     now, published = production_now(), _state_not_published()
     create = production_views.list_approvals(approvals_read_path(), now, missing_is_unavailable=published)
     summary = production_views.list_summary_approvals(REVIEW_APPROVAL_PATH, now, missing_is_unavailable=published)
+    names = production_views.customer_names_by_co(production_records_parent())
+    q = " ".join(str(query or "").split())[:PROD_SEARCH_MAX]
+    q = q if REFERENCE_SEARCH.fullmatch(q) else ""
+    needle = q.casefold()
+
+    def route_words(route: str) -> tuple[str, str]:
+        return route, ENGINE_LABELS.get(route, route)
+
+    create_items = [item for item in create["items"] if _approval_matches(
+        needle, item["co_reference"], names.get(item["co_reference"], ""), item["approval_ref"], *route_words(item["route"]),
+        item["issued_by"])]
+    summary_items = [item for item in summary["items"] if _approval_matches(
+        needle, item["co_reference"], names.get(item["co_reference"], ""), *route_words(item["route"]), item["operator"])]
     create_rows = "".join(
         "<tr><td><code>" + escape(item["approval_ref"]) + "</code></td><td>" + _onboard_link(item["co_reference"]) + "</td><td>"
+        + _approval_customer_cell(names.get(item["co_reference"], "")) + "</td><td>"
         + escape(ENGINE_LABELS.get(item["route"], item["route"])) + "</td><td>" + escape(item["issued_by"]) + "</td><td>"
         + _stamp_words(item["issued_at"]) + "</td><td>" + _stamp_words(item["expires_at"]) + "</td><td>"
-        + _chip(*_APPROVAL_STATE_CHIPS[item["state"]]) + "</td></tr>" for item in create["items"])
+        + _chip(*_APPROVAL_STATE_CHIPS[item["state"]]) + "</td></tr>" for item in create_items)
     summary_rows = "".join(
-        "<tr><td>" + _onboard_link(item["co_reference"]) + "</td><td>" + escape(item["operator"]) + "</td><td>"
+        "<tr><td>" + _onboard_link(item["co_reference"]) + "</td><td>" + _approval_customer_cell(names.get(item["co_reference"], ""))
+        + "</td><td>" + escape(item["operator"]) + "</td><td>"
         + escape(ENGINE_LABELS.get(item["route"], item["route"])) + "</td><td>" + _stamp_words(item["approved_at"]) + "</td><td>"
         + _stamp_words(item["expires_at"]) + "</td><td>" + _chip(*_APPROVAL_STATE_CHIPS[item["state"]]) + "</td></tr>"
-        for item in summary["items"])
+        for item in summary_items)
+
+    def table(listing: dict[str, Any], kept: list[dict[str, Any]], columns: tuple[str, ...], rows_html: str, noun: str,
+              singular: str) -> str:
+        if needle and listing["state"] == "ok" and listing["items"] and not kept:
+            return "<p class='empty'>No approvals match this search.</p>"
+        return _approval_table(listing, columns, rows_html, noun, singular)
+
+    def count(listing: dict[str, Any], kept: list[dict[str, Any]]) -> str:
+        return str(len(kept)) + " of " + str(len(listing["items"])) if listing["state"] == "ok" else "—"
+
+    form = ("<form class='fform' method='get' action='/prod/approvals' role='search'>"
+            "<label>Search <input type='search' name='q' maxlength='" + str(PROD_SEARCH_MAX) + "' value='"
+            + escape(q, quote=True) + "' placeholder='CO, customer, approval ID, route or issuer'></label>"
+            "<button type='submit'>Search</button>"
+            + ("<a href='/prod/approvals'>Clear</a>" if q else "")
+            + "<span class='fcount'>Create " + count(create, create_items) + " · Summary " + count(summary, summary_items)
+            + "</span></form>")
     page = ("<div class='page-head'><h1>Approvals</h1>" + _lock_chip() + "</div>" + _clone_strip()
             + "<p class='note'>Read-only. A summary approval (4 hours, one use) records that one CO summary was reviewed. A create "
               "approval (7 days, one use) is a separate record issued outside this page; only it can be consumed by a production "
-              "create.</p>"
+              "create. The customer name comes from this desktop's create records (\"" + APPROVALS_NAME_UNKNOWN + "\" when none "
+              "names it).</p>"
+            + form +
             "<section class='card tbl-card'><div class='card-head'><h2 class='pill'>Create approvals (7 days, one use)</h2></div>"
-            + _approval_table(create, ("Approval", "CO", "Route", "Issued by", "Issued", "Expires", "Status"), create_rows,
-                              "Create approvals", "create approval") + "</section>"
+            + table(create, create_items, ("Approval", "CO", "Customer", "Route", "Issued by", "Issued", "Expires", "Status"),
+                    create_rows, "Create approvals", "create approval") + "</section>"
             "<section class='card tbl-card'><div class='card-head'><h2 class='pill'>Summary approvals (4 hours)</h2></div>"
-            + _approval_table(summary, ("CO", "Approved by", "Route", "Approved", "Expires", "Status"), summary_rows,
-                              "Summary approvals", "summary approval") + "</section>")
+            + table(summary, summary_items, ("CO", "Customer", "Approved by", "Route", "Approved", "Expires", "Status"),
+                    summary_rows, "Summary approvals", "summary approval") + "</section>")
     return _app_shell("Approvals", page, active="prod_approvals", wide=True)
 
 
@@ -12166,7 +12215,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_page(HTTPStatus.OK, page)
                 return
             if path == "/prod/approvals":
-                self.send_page(HTTPStatus.OK, render_prod_approvals()); return
+                self.send_page(HTTPStatus.OK, render_prod_approvals(params.get("q", [""])[0])); return
             if path == "/prod":
                 self.send_page(HTTPStatus.OK, render_prod_readiness(params.get("filter", [""])[0],
                                                                     params.get("all", [""])[0] == "1")); return

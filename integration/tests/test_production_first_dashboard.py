@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 import json
 from pathlib import Path
+from urllib.parse import urlencode
 import re
 import tempfile
 import unittest
@@ -52,7 +53,7 @@ def match(status="not_in_production", reason="", candidates=(), **extra):
 
 
 LIVE = {"id": "t1", "name": "Two Live Paid", "domain": "live.example", "live_paid": True, "deleted": False, "enabled": True,
-        "license_type": "PREPAID_ANNUAL"}
+        "license_type": "PREPAID_ANNUAL", "scanning_interval": "MONTHLY"}
 MATCHES = {
     "CO-0780": match(), "CO-0785": match(),
     "CO-0781": match("exists_matches", candidates=[{**LIVE, "name": "Demo Logistics"}]),
@@ -799,7 +800,7 @@ class ApprovalsPageTests(unittest.TestCase):
         self.assertIn("Summary approvals (4 hours)", page)
         create = page[page.index("Create approvals (7 days"):page.index("Summary approvals (4 hours)")]
         self.assertEqual(headers(create[create.index("<table"):create.index("</table>")]),
-                         ["Approval", "CO", "Route", "Issued by", "Issued", "Expires", "Status"])
+                         ["Approval", "CO", "Customer", "Route", "Issued by", "Issued", "Expires", "Status"])
         for shown in ("PROD-CE-0780-1", "PROD-CE-0790-1", "PROD-CE-0791-1", "owner@example.test", "2026-10-23",
                       "chip-ok'>Valid</span>", "chip-warn'>Expired</span>", "chip-neutral'>Used</span>"):
             self.assertIn(shown, create)
@@ -808,7 +809,88 @@ class ApprovalsPageTests(unittest.TestCase):
         self.assertIn("chip-ok'>Valid</span>", summary)
         for hidden in ("SECRET-REVISION-9", "a" * 64, "summary_hash", "source_revision"):
             self.assertNotIn(hidden, page)
-        self.assertEqual(controls(page), [])
+        # The only control is the GET search form back to this page (view only).
+        self.assertEqual(controls(page, allow=("/prod/approvals",)), [])
+        self.assertIn("<form class='fform' method='get' action='/prod/approvals' role='search'>", page)
+
+    # Owner request 2026-11-19: customer name per approval and a search over both tables (display only).
+    def _two_customers(self):
+        self.env.write_approvals(
+            approval(), approval("CO-0790", "PROD-CE-0790-1", issued="2026-10-01T09:00:00Z", expires="2026-10-08T09:00:00Z"),
+            approval("CO-0791", "PROD-CE-0791-1", issued_by="other@example.test"))
+        self.env.summary_approvals.write_text(json.dumps({
+            "CO-0780": {"operator": "desktop-operator", "approved_at": "2026-10-16T10:00:00Z", "expires_at": "2026-10-16T14:00:00Z",
+                        "route": "case_2_new_ce_only", "source_revision": "R", "summary_hash": "a" * 64},
+            "CO-0791": {"operator": "desktop-operator", "approved_at": "2026-10-16T09:00:00Z", "expires_at": "2026-10-16T13:00:00Z",
+                        "route": "case_2_new_ce_only", "source_revision": "R", "summary_hash": "b" * 64}}), encoding="utf-8")
+        self.env.write_record(record("CO-0780", "refused", tenant_name="Early Name - CE Only"), moment=NOW - timedelta(hours=2))
+        self.env.write_record(record("CO-0780", "readback_verified", tenant_name="Intersport Slovenija - CE Only"),
+                              moment=NOW - timedelta(hours=1))
+        self.env.write_record(record("CO-0780", "refused", tenant_name=None), moment=NOW)  # newest carries no name
+        self.env.write_record(record("CO-0790", "readback_verified", route="case_3_combined_baseline",
+                                     tenant_name="Ion Bank"), moment=NOW)
+
+    def test_both_tables_show_the_customer_name_from_the_create_records(self):
+        self._two_customers()
+        page = self.page()
+        create = page[page.index("Create approvals (7 days"):page.index("Summary approvals (4 hours)")]
+        summary = page[page.index("Summary approvals (4 hours)"):]
+        self.assertEqual(headers(summary[summary.index("<table"):summary.index("</table>")]),
+                         ["CO", "Customer", "Approved by", "Route", "Approved", "Expires", "Status"])
+        row_0780 = re.search(r"<tr><td><code>PROD-CE-0780-1</code>.*?</tr>", create, flags=re.S).group(0)
+        self.assertIn("<td>Intersport Slovenija</td>", row_0780)   # newest NAMED record, CE-only suffix dropped
+        self.assertNotIn("Early Name", page)
+        self.assertIn("<td>Ion Bank</td>", create)
+        row_0791 = re.search(r"<tr><td><code>PROD-CE-0791-1</code>.*?</tr>", create, flags=re.S).group(0)
+        self.assertIn(dashboard.APPROVALS_NAME_UNKNOWN, row_0791)   # no create record: a clear fallback
+        self.assertIn("Intersport Slovenija", summary)
+        self.assertIn(dashboard.APPROVALS_NAME_UNKNOWN, summary)
+
+    def test_search_filters_both_tables_by_co_customer_approval_route_or_issuer(self):
+        self._two_customers()
+        cases = {"intersport": ({"PROD-CE-0780-1"}, {"CO-0780"}), "0790": ({"PROD-CE-0790-1"}, set()),
+                 "PROD-CE-0791": ({"PROD-CE-0791-1"}, set()), "other@example": ({"PROD-CE-0791-1"}, set()),
+                 "desktop-operator": (set(), {"CO-0780", "CO-0791"}), "ion bank": ({"PROD-CE-0790-1"}, set())}
+        for query, (create_refs, summary_refs) in cases.items():
+            with self.subTest(query=query):
+                page = self.page_q(query)
+                create = page[page.index("Create approvals (7 days"):page.index("Summary approvals (4 hours)")]
+                summary = page[page.index("Summary approvals (4 hours)"):]
+                self.assertEqual(set(re.findall(r"<code>(PROD-CE-\d+-1)</code>", create)), create_refs)
+                self.assertEqual(set(re.findall(r"<tr><td><a class='co'[^>]*>(CO-\d+)</a>", summary)), summary_refs)
+                if not create_refs:
+                    self.assertIn("No approvals match this search.", create)
+        # Route: the approval's own route (all three test approvals are CE-only), by label or engine value.
+        for query in (dashboard.ENGINE_LABELS[pa.ALLOWED_ROUTE], pa.ALLOWED_ROUTE):
+            self.assertIn("Create 3 of 3 · Summary 2 of 2", self.page_q(query))
+        self.assertIn("Create 0 of 3 · Summary 0 of 2", self.page_q(dashboard.ENGINE_LABELS["case_3_combined_baseline"]))
+        everything = self.page_q("")
+        self.assertIn("Create 3 of 3 · Summary 2 of 2", everything)
+        self.assertNotIn(">Clear</a>", everything)
+        self.assertIn(">Clear</a>", self.page_q("ion"))
+
+    def test_search_text_is_escaped_and_markup_is_dropped(self):
+        self._two_customers()
+        page = self.page_q("<script>alert(1)</script>")
+        self.assertNotIn("<script>alert", page)
+        self.assertIn("Create 3 of 3", page)   # a query with markup is ignored, not echoed
+        self.env.write_record(record("CO-0791", tenant_name="<img src=x onerror=alert(1)>"), moment=NOW)
+        page = self.page()
+        self.assertNotIn("<img src=x", page)
+        self.assertIn("&lt;img src=x", page)
+
+    def test_an_unreadable_record_only_loses_the_names(self):
+        self._two_customers()
+        (self.env.parent / pcr.RECORDS_SUBDIR / "CO-0999-bad.json").write_text("garbage", encoding="utf-8")
+        page = self.page()
+        self.assertIn("PROD-CE-0780-1", page)
+        self.assertNotIn("Intersport Slovenija", page)
+        self.assertIn(dashboard.APPROVALS_NAME_UNKNOWN, page)
+
+    def page_q(self, query):
+        status, html = page_of("/prod/approvals?" + urlencode({"q": query}), self.env)
+        self.assertEqual(status, 200)
+        return html
 
     def test_no_file_is_no_approvals_recorded_on_the_desktop_and_unavailable_on_the_server(self):
         page = self.page()

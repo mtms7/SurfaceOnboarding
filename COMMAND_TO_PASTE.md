@@ -1,3 +1,58 @@
+# VM access for Elad, step 1: read-only VM check (PC tab, PowerShell; 2026-11-19)
+
+Pentera VPN on. Open a NEW PC PowerShell tab. Password prompts = the `workato` password, then the sudo password, typed in your own window (never paste them to Claude).
+Changes nothing. Shows: active release, services, who may sign in (emails only, no hashes), which networks are allowed, which client addresses reached the site, and when the VM last refreshed its data.
+
+    ssh -t workato@172.26.37.20 "readlink /opt/surface-onboarding/app; systemctl is-active surface-onboarding-dashboard nginx surface-onboarding-sf-refresh.timer; echo '--users.txt'; sudo grep -v '^#' /etc/surface-onboarding/users.txt; echo '--htpasswd'; sudo cut -d: -f1 /etc/nginx/surface-onboarding/htpasswd; echo '--lan-allow'; sudo cat /etc/nginx/surface-onboarding/lan-allow.conf; echo '--clients'; sudo awk '{print `$1}' /var/log/nginx/access.log | sort | uniq -c; echo '--data'; ls -l --time-style=+%F_%T /var/lib/surface-onboarding/snapshots/ | tail -3; systemctl list-timers --no-pager | grep surface"
+
+Paste the output lines to Claude.
+
+
+# VM access for Elad, step 2: add elad.mendel@pentera.io as a viewer (PC tab, PowerShell; 2026-11-19)
+
+Pentera VPN on. Run each line in a NEW PC PowerShell tab (not an already open ssh window). Passwords: `workato`, then sudo, typed by you.
+
+## 2a (PC): upload the password helper to the VM
+
+    scp "C:/Users/Milton Stevenson/Documents/Surface/Workato/integration/deployment/vm_pilot/_step16a_vm_lan_users.sh" workato@172.26.37.20:/tmp/
+
+Expect a "100%" line.
+
+## 2b (runs on the VM): list Elad as a viewer (read-only), then show the file
+
+    ssh -t workato@172.26.37.20 "sudo sed -i '`$a elad.mendel@pentera.io viewer' /etc/surface-onboarding/users.txt; sudo grep -v '^#' /etc/surface-onboarding/users.txt; sudo ls -l /etc/surface-onboarding/users.txt"
+
+Expect two lines: `milton.stevenson@pentera.io operator` (or your existing line) and `elad.mendel@pentera.io viewer`, file still root-owned. Run it ONCE.
+
+## 2c (runs on the VM): set Elad's VM password (hidden prompt, twice, 14+ characters)
+
+    ssh -t workato@172.26.37.20 "sudo sh /tmp/_step16a_vm_lan_users.sh add elad.mendel@pentera.io; sudo sh /tmp/_step16a_vm_lan_users.sh list"
+
+Expect: "stored a bcrypt hash for elad.mendel@pentera.io" and both emails listed. Give Elad the password directly (call or in person), not by e-mail or chat.
+
+Undo (if ever needed): `sudo sh /tmp/_step16a_vm_lan_users.sh remove elad.mendel@pentera.io` and delete his line from users.txt.
+
+## Step 3 (runs on the VM, read-only): which VPN addresses the site refused
+
+Done 2a-2c on 2026-11-19. A test from this PC (VPN address 10.213.213.17) got 403 before any login: the network allow-list
+(10.213.213.1 and .2 only) refuses it. This shows the addresses nginx refused, with counts. Ideally Elad tries the page once first.
+
+    ssh -t workato@172.26.37.20 "sudo grep 'access forbidden' /var/log/nginx/error.log | tail -50 | sed 's/.*client: \([0-9.]*\).*/\1/' | sort | uniq -c"
+
+Paste the output to Claude. Changes nothing.
+
+Result 2026-11-19: `3 10.213.213.17` (this PC, from Claude's test). The VPN no longer hides people behind .1/.2.
+
+## Step 4 (runs on the VM, ONLY with the owner's go): allow the Pentera VPN range 10.213.213.0/24
+
+Keeps a dated backup, checks nginx before reloading, restores the backup if the check fails. Does not restart the dashboard.
+Login (email + password) and users.txt still apply on top.
+
+    ssh -t workato@172.26.37.20 "sudo cp -p /etc/nginx/surface-onboarding/lan-allow.conf /etc/nginx/surface-onboarding/lan-allow.conf.bak-20261119 && sudo sed -i 's|^deny all;|allow 10.213.213.0/24;\ndeny all;|' /etc/nginx/surface-onboarding/lan-allow.conf && sudo cat /etc/nginx/surface-onboarding/lan-allow.conf && { sudo nginx -t && sudo systemctl reload nginx && echo RELOADED || { sudo cp -p /etc/nginx/surface-onboarding/lan-allow.conf.bak-20261119 /etc/nginx/surface-onboarding/lan-allow.conf; echo RESTORED; }; }"
+
+Expect the file with `allow 10.213.213.0/24;` before `deny all;`, "syntax is ok", RELOADED. Undo: copy the .bak-20261119 file back and `sudo systemctl reload nginx`.
+
+
 # Production onboarding from the dashboard: PC tab, PowerShell, repo root (2026-10-23)
 
 CE-only and Surface & Credential Exposure (Case 3) New Product Onboarding. One button, no dry run, no typed CO.
