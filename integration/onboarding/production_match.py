@@ -403,12 +403,10 @@ def identity_match(identity: Mapping[str, Any] | None, snapshot: Mapping[str, An
                    differs=["plan_not_compared"], candidates=listed, target=_summary(exact[0]), **base)
 
 
-def _all_retired(listed: list[dict[str, Any]]) -> bool:
-    """True when every match candidate is explicitly disabled or deleted.
-    Trial/POV/Evaluation tenants that are still enabled keep the red chip; disabled/deleted can be renamed."""
-    return bool(listed) and all(
-        item.get("deleted") is True or item.get("enabled") is False for item in listed
-    )
+def _all_non_live(listed: list[dict[str, Any]]) -> bool:
+    """True when every match candidate is non-live-paid (Trial, POV, Evaluation, disabled, or deleted).
+    A live-paid tenant matching by domain with a different name keeps the red chip; all-non-live can be renamed."""
+    return bool(listed) and all(item.get("live_paid") is not True for item in listed)
 
 
 def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any] | None,
@@ -459,7 +457,7 @@ def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any
     listed = [_summary(tenant) for tenant in candidates]
     exact = [tenant for tenant in candidates if is_live_paid_tenant(tenant) and _name_key(tenant.get("account_name")) in keys]
     if not exact:
-        if _all_retired(listed):
+        if _all_non_live(listed):
             return _result("duplicate_inactive",
                            "All matching tenants have NO_SCHEDULE scanning. "
                            "Rename the old tenant (e.g. append ' – deprecated') before onboarding.",

@@ -72,19 +72,14 @@ class StateMachineTests(unittest.TestCase):
         by_primary = match(tenant("Different", "ACME.example.", ("e.example",), kind="Trial"))
         by_alternate = match(tenant("Different", "elsewhere.example", ("alt.acme.example",), kind="Trial"))
         for found in (by_name, by_primary, by_alternate):
-            self.assertEqual(found["status"], "exists_other")
+            self.assertEqual(found["status"], "duplicate_inactive")
             self.assertEqual(len(found["candidates"]), 1)
 
-    def test_only_trial_pov_disabled_or_deleted_tenants_is_exists_other_or_duplicate_inactive_and_blocks(self):
+    def test_non_live_only_candidates_are_duplicate_inactive_and_block(self):
+        # All-non-live-paid candidates (Trial, POV, Evaluation, disabled, deleted, or any mix) → duplicate_inactive.
         for others in ([tenant(kind="Trial")], [tenant(kind="POV")], [tenant(kind="Evaluation")],
+                       [tenant(enabled=False)], [tenant(deleted=True)],
                        [tenant(kind="Trial"), tenant(enabled=False), tenant(deleted=True)]):
-            with self.subTest(others=[(t["license"]["type"], t["enabled"], t["is_deleted"]) for t in others]):
-                found = match(*others)
-                self.assertEqual(found["status"], "exists_other")
-                self.assertIn("blocked", found["reason"])
-                self.assertIsNone(found["target"])
-        # Disabled or deleted-only matches are "duplicate_inactive": safe to rename before onboarding.
-        for others in ([tenant(enabled=False)], [tenant(deleted=True)]):
             with self.subTest(others=[(t["license"]["type"], t["enabled"], t["is_deleted"]) for t in others]):
                 found = match(*others)
                 self.assertEqual(found["status"], "duplicate_inactive")
@@ -149,8 +144,8 @@ class StateMachineTests(unittest.TestCase):
                 self.assertEqual(found["status"], "exists_differs")
                 self.assertEqual(found["differs"], [code])
                 self.assertEqual({r["code"]: r["result"] for r in found["fields"]}[code], "unknown")
-        # A tenant without a licence type is not "live, paid", so it can never be the target (exists_other).
-        self.assertEqual(match({**tenant(**GOOD), "license": {"type": None, "expiration_date": END_MS}})["status"], "exists_other")
+        # A tenant without a licence type is not "live, paid", so it triggers duplicate_inactive (all-non-live path).
+        self.assertEqual(match({**tenant(**GOOD), "license": {"type": None, "expiration_date": END_MS}})["status"], "duplicate_inactive")
         missing_plan = match(tenant(**GOOD), plan={**PLAN, "license_end": None})
         self.assertEqual((missing_plan["status"], missing_plan["differs"]), ("exists_differs", ["license_end"]))
 

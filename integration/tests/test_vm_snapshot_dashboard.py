@@ -729,7 +729,7 @@ class VmMatchFromPushedCloneTests(SnapshotDashboardCase):
         self.push_clone(**{"enabled": False})
         _, _, body = self.get("/", email=OWNER)
         row = body[body.index(">CO-0001<"):body.index("</tr>", body.index(">CO-0001<"))]
-        self.assertIn("Other tenants only", row)
+        self.assertIn("Duplicate", row)
 
     def test_cache_is_bounded_and_a_new_stamp_supersedes_the_old_entry(self):
         token = dashboard._display_reads.set(True)
