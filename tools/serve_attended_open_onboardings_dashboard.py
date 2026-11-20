@@ -7086,18 +7086,19 @@ def _render_prod_tenants(query: str, *, sort: str, direction: str, scan: str, co
 PROD_ACTION_REFRESH = "Refresh clone: "
 MATCH_CHIPS = {"exists_matches": ("chip-ok", "Matches"), "exists_differs": ("chip-warn", "Differs"),
                "not_in_production": ("chip-neutral", "Not in production"), "exists_other": ("chip-bad", "Other tenants only"),
+               "duplicate_inactive": ("chip-warn", "Duplicate – inactive"),
                "ambiguous": ("chip-bad", "Ambiguous"), "clone_unavailable": ("chip-warn", "Clone unavailable"),
                "onboarded": ("chip-ok", "Onboarded"), "uuid_not_in_clone": ("chip-warn", "UUID set, not in clone"),
                "tenant_found": ("chip-ok", "In production"), "tenant_missing": ("chip-warn", "Not in production"),
                "not_checked": ("chip-neutral", "Not checked")}
 MATCH_FILTERS = {"matches": ("exists_matches",), "onboarded": ("onboarded",), "differs": ("exists_differs",), "not_in_production": ("not_in_production",),
-                 "blocked": ("exists_other", "ambiguous"), "uuid_not_in_clone": ("uuid_not_in_clone",),
+                 "blocked": ("exists_other", "ambiguous", "duplicate_inactive"), "uuid_not_in_clone": ("uuid_not_in_clone",),
                  "not_checked": ("not_checked",), "clone_unavailable": ("clone_unavailable",)}
 MATCH_FILTER_LABELS = (("matches", "Matches"), ("onboarded", "Onboarded"), ("differs", "Differs"), ("not_in_production", "Not in production"),
                        ("blocked", "Blocked"), ("uuid_not_in_clone", "UUID not in clone"), ("not_checked", "Not checked"),
                        ("clone_unavailable", "Clone unavailable"))
-MATCH_STATUS_ORDER = ("exists_other", "ambiguous", "exists_differs", "clone_unavailable", "uuid_not_in_clone", "not_checked",
-                      "not_in_production", "exists_matches", "onboarded")
+MATCH_STATUS_ORDER = ("exists_other", "duplicate_inactive", "ambiguous", "exists_differs", "clone_unavailable", "uuid_not_in_clone",
+                      "not_checked", "not_in_production", "exists_matches", "onboarded")
 FIELD_RESULT_CHIPS = {"match": ("chip-ok", "Match"), "differs": ("chip-warn", "Differs"), "unknown": ("chip-warn", "Unknown"),
                       "info": ("chip-neutral", "Info"), "na": ("chip-neutral", "Not required"),
                       "not_checked": ("chip-neutral", "Not checked")}
@@ -7318,7 +7319,7 @@ def _prod_action(result: dict[str, Any]) -> str:
         return "Check CO source data"
     if status == "exists_differs":
         return "Review fields"
-    if status in ("exists_other", "ambiguous"):
+    if status in ("exists_other", "ambiguous", "duplicate_inactive"):
         return "Resolve duplicate"
     if status == "clone_unavailable":
         if reason.startswith("us_clone_"):

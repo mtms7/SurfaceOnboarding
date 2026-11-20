@@ -403,6 +403,14 @@ def identity_match(identity: Mapping[str, Any] | None, snapshot: Mapping[str, An
                    differs=["plan_not_compared"], candidates=listed, target=_summary(exact[0]), **base)
 
 
+def _all_inactive_summaries(listed: list[dict[str, Any]]) -> bool:
+    """True when every match candidate summary explicitly carries NO_SCHEDULE scanning interval.
+    A missing or None interval is not treated as inactive: positive evidence is required."""
+    return bool(listed) and all(
+        str(item.get("scanning_interval") or "").upper() == "NO_SCHEDULE" for item in listed
+    )
+
+
 def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any] | None,
                      snapshot: Mapping[str, Any] | str | None, *, account_uuid: Any = None, ce_only: bool = False,
                      today: date | None = None) -> dict[str, Any]:
@@ -451,6 +459,11 @@ def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any
     listed = [_summary(tenant) for tenant in candidates]
     exact = [tenant for tenant in candidates if is_live_paid_tenant(tenant) and _name_key(tenant.get("account_name")) in keys]
     if not exact:
+        if _all_inactive_summaries(listed):
+            return _result("duplicate_inactive",
+                           "All matching tenants have NO_SCHEDULE scanning. "
+                           "Rename the old tenant (e.g. append ' – deprecated') before onboarding.",
+                           candidates=listed, **base)
         return _result("exists_other", "Only trial, evaluation, POV, disabled or deleted tenants match; migration is blocked "
                        "until the owner resolves it.", candidates=listed, **base)
     if len(exact) > 1:

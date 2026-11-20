@@ -387,17 +387,22 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
     if status == "region_not_checked":  # owner 2026-11-04: a US / IL CO is never cleared by the EU clone
         return {**base, "code": "region_not_checked", "css": "chip-warn",
                 "label": "Region " + _text(match.get("region") or "unknown") + ": not checked"}
+    if status == "duplicate_inactive":
+        return {**base, "code": "duplicate_inactive", "css": "chip-warn",
+                "label": "Duplicate – inactive",
+                "reason": reason or ("All matching tenants have NO_SCHEDULE scanning. "
+                                     "Rename the old tenant (e.g. append ‘ – deprecated’) before onboarding.")}
     if status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
         if live > 1:
             return {**base, "code": "live_paid", "css": "chip-bad", "label": "Live paid x " + str(live)}
         if status == "ambiguous":  # e.g. two tenants carry the CO's UUID, but fewer than two are live and paid
             return {**base, "code": "ambiguous", "css": "chip-bad", "label": "Ambiguous"}
-        if _all_inactive(candidates):  # inactive check applies to exists_other too (domain-only match, all NO_SCHEDULE)
+        if _all_inactive(candidates):  # synthetic match dicts (unit tests); real data already has status "duplicate_inactive"
             return {**base, "code": "duplicate_inactive", "css": "chip-warn",
                     "label": "Duplicate – inactive",
                     "reason": (reason + " " if reason else "") +
                                "All matching tenants have NO_SCHEDULE scanning. "
-                               "Rename the old tenant (e.g. append ' – deprecated') before onboarding."}
+                               "Rename the old tenant (e.g. append ‘ – deprecated’) before onboarding."}
         if status == "exists_other":
             return {**base, "code": "other_tenants", "css": "chip-bad", "label": "Other tenants only"}
         return {**base, "code": "duplicate", "css": "chip-bad", "label": "Duplicate"}
