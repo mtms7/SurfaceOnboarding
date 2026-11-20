@@ -403,11 +403,11 @@ def identity_match(identity: Mapping[str, Any] | None, snapshot: Mapping[str, An
                    differs=["plan_not_compared"], candidates=listed, target=_summary(exact[0]), **base)
 
 
-def _all_inactive_summaries(listed: list[dict[str, Any]]) -> bool:
-    """True when every match candidate summary explicitly carries NO_SCHEDULE scanning interval.
-    A missing or None interval is not treated as inactive: positive evidence is required."""
+def _all_retired(listed: list[dict[str, Any]]) -> bool:
+    """True when every match candidate is explicitly disabled or deleted.
+    Trial/POV/Evaluation tenants that are still enabled keep the red chip; disabled/deleted can be renamed."""
     return bool(listed) and all(
-        str(item.get("scanning_interval") or "").upper() == "NO_SCHEDULE" for item in listed
+        item.get("deleted") is True or item.get("enabled") is False for item in listed
     )
 
 
@@ -459,7 +459,7 @@ def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any
     listed = [_summary(tenant) for tenant in candidates]
     exact = [tenant for tenant in candidates if is_live_paid_tenant(tenant) and _name_key(tenant.get("account_name")) in keys]
     if not exact:
-        if _all_inactive_summaries(listed):
+        if _all_retired(listed):
             return _result("duplicate_inactive",
                            "All matching tenants have NO_SCHEDULE scanning. "
                            "Rename the old tenant (e.g. append ' – deprecated') before onboarding.",

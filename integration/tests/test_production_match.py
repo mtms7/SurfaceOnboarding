@@ -75,14 +75,19 @@ class StateMachineTests(unittest.TestCase):
             self.assertEqual(found["status"], "exists_other")
             self.assertEqual(len(found["candidates"]), 1)
 
-    def test_only_trial_pov_disabled_or_deleted_tenants_is_exists_other_and_blocks(self):
+    def test_only_trial_pov_disabled_or_deleted_tenants_is_exists_other_or_duplicate_inactive_and_blocks(self):
         for others in ([tenant(kind="Trial")], [tenant(kind="POV")], [tenant(kind="Evaluation")],
-                       [tenant(enabled=False)], [tenant(deleted=True)],
                        [tenant(kind="Trial"), tenant(enabled=False), tenant(deleted=True)]):
             with self.subTest(others=[(t["license"]["type"], t["enabled"], t["is_deleted"]) for t in others]):
                 found = match(*others)
                 self.assertEqual(found["status"], "exists_other")
                 self.assertIn("blocked", found["reason"])
+                self.assertIsNone(found["target"])
+        # Disabled or deleted-only matches are "duplicate_inactive": safe to rename before onboarding.
+        for others in ([tenant(enabled=False)], [tenant(deleted=True)]):
+            with self.subTest(others=[(t["license"]["type"], t["enabled"], t["is_deleted"]) for t in others]):
+                found = match(*others)
+                self.assertEqual(found["status"], "duplicate_inactive")
                 self.assertIsNone(found["target"])
         deleted = match(tenant(deleted=True))["candidates"][0]
         self.assertTrue(deleted["deleted"])  # deleted tenants are listed, but flagged
