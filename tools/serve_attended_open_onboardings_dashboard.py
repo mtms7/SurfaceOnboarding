@@ -9463,12 +9463,14 @@ def approval_identity(operator: str | None) -> str | None:
 def _create_ui_inputs(reference: str, row: dict[str, str | None] | None, operator: str | None = None) -> create_ui.Inputs:
     """The plain facts for the create gate. A POST passes a row read inside that very request; a page shows the display read."""
     sf_ready = _salesforce_ready_for_create()
+    # The same production match the page's duplicate row shows, so "Create ready" never contradicts it (2026-11-23, CO-0857).
+    match = _match_of(reference, row.get("Onboarding_Product__c"), row.get("Onboarding_Type__c")) if row else None
     return create_ui.Inputs(
         reference=reference, row=row, now=production_now(), environ=os.environ,
         operator=approval_identity(operator if operator is not None else (_current_operator.get() or None)), vm=vm_mode(),
         approvals_path=approvals_read_path(), records_parent=production_records_parent(), clone=_clone_status(),
         sf_ready=sf_ready, row_fresh=bool(row), tenant_names_path=attended_runner.TENANT_NAMES_PATH,
-        case3_tenant_name=_case3_tenant_name(reference, row))
+        case3_tenant_name=_case3_tenant_name(reference, row), match=match)
 
 
 def _production_page_state(reference: str, row: dict[str, str | None] | None) -> dict[str, Any]:

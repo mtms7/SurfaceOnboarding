@@ -121,6 +121,10 @@ GATE_TEXT = {
     "salesforce_session_not_ready": "The Salesforce session is not ready: sign in again.",
     "salesforce_prior_uuid_present": "The CO already has an Account UUID.",
     "clone_stale": "The Redash clone is older than 6 hours or unusable: refresh it.",
+    "duplicate_in_production": ("The production clone holds a tenant with this name, or a live tenant on its domain that is not "
+                                "retired (renamed with deprecated, Trial, POV, Evaluation, disabled or deleted): see the production "
+                                "match. A BackOffice rename shows here once the clone's daily data copy includes it."),
+    "duplicate_check_unavailable": "The production duplicate check has no usable answer for this CO yet: nothing is allowed.",
     "dry_run_required": "No passing production dry run is recorded for this CO and approval.",
     "dry_run_old": "The passing dry run is older than 24 hours: run it again.",
     "prior_attempt_needs_review": "An earlier create attempt on this CO waits for the owner's review.",
@@ -362,6 +366,9 @@ class Inputs:
     # Owner request 2026-10-30: the early-activation box is only for a CO whose Start-minus-2-days window is NOT open yet.
     # False only when the page knows the window is already open; a closed or undetermined window still offers it.
     early_offer: bool = True
+    # The CO's production match (the same one the page's "No duplicate in production" row shows). None = the caller did not
+    # supply it (the run's own clone and live checks still decide); supplied, only Clear or retired-only matches pass.
+    match: Mapping[str, Any] | None = None
 
 
 def _owner_ok(operator: str | None, record: Mapping[str, Any]) -> bool:
@@ -380,6 +387,7 @@ def locked() -> bool:
 
 
 BUILD_LOCK_CODES = ("vm_read_only", "production_runner_not_supported", "production_dry_run_not_supported")
+DUPLICATE_CODES = frozenset({"duplicate", "live_paid", "other_tenants", "ambiguous", "onboarded"})  # production_check codes
 
 
 def build_lock(vm: bool) -> str | None:
@@ -492,6 +500,12 @@ def gate(inputs: Inputs) -> tuple[str | None, dict[str, Any]]:
         return "surface_account_id_present", ctx
     if not _clone_fresh(inputs.clone):
         return "clone_stale", ctx
+    if inputs.match is not None:
+        code = production_views.production_check(inputs.match)["code"]
+        if code in DUPLICATE_CODES:
+            return "duplicate_in_production", ctx
+        if code not in ("clear", "duplicate_inactive"):
+            return "duplicate_check_unavailable", ctx
     try:
         history = load_co_records(inputs.records_parent, inputs.reference)
     except Exception:

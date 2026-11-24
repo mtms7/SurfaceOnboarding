@@ -168,6 +168,23 @@ class GateTests(Base):
         self.refuses("production_locked", environ={})
         self.refuses("approval_expired", now=NOW + timedelta(days=8))
 
+    def test_the_production_match_must_be_clear_or_retired_only(self):
+        # 2026-11-23 (CO-0857): the page showed "Create ready" beside a blocked duplicate row; the gate now reads the same match.
+        def match(status, **extra):
+            return {"status": status, "reason": "", "candidates": [], **extra}
+        self.assertIsNone(ui.gate(self.inputs(match=match("not_in_production")))[0])
+        self.assertIsNone(ui.gate(self.inputs(match=match("duplicate_inactive")))[0])  # only retired tenants on the domain
+        for status, extra in (("exists_other", {}), ("exists_matches", {}), ("exists_differs", {}), ("ambiguous", {}),
+                              ("exists_other", {"candidates": [{"live_paid": True}, {"live_paid": True}]})):
+            with self.subTest(status=status, extra=extra):
+                self.refuses("duplicate_in_production", match=match(status, **extra))
+        for status in ("clone_unavailable", "not_checked", "region_not_checked", "uuid_not_in_clone", "surprise"):
+            with self.subTest(status=status):
+                self.refuses("duplicate_check_unavailable", match=match(status))
+        self.refuses("duplicate_check_unavailable", match={"status": None})
+        self.assertIsNone(ui.gate(self.inputs())[0])  # no match supplied: the run's own clone and live checks decide
+        self.assertEqual(ui.page_state(self.inputs(match=match("exists_other")))["phase"], "blocked")
+
     def test_account_uuid_field_not_read_is_not_treated_as_empty(self):
         data = row()
         del data["Account_UUID__c"]
