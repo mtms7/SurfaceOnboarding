@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from integration.onboarding import leonardo_inventory as inventory
 from integration.onboarding import production_match as pm
+from integration.onboarding.production_views import production_check
 from integration.tests.test_redash_inventory import FAKE_KEY, GET, NOW, FakeOpener, result, row
 import tools.attended_ce_only_playwright as runner
 import tools.redash_inventory_collector as collector
@@ -71,26 +72,51 @@ class StateMachineTests(unittest.TestCase):
         by_name = match(tenant("  ACME  ", "elsewhere.example", ("e.example",), kind="Trial"))
         by_primary = match(tenant("Different", "ACME.example.", ("e.example",), kind="Trial"))
         by_alternate = match(tenant("Different", "elsewhere.example", ("alt.acme.example",), kind="Trial"))
+        self.assertEqual(by_name["status"], "exists_other")  # a same-name tenant always blocks
         for found in (by_name, by_primary, by_alternate):
-            self.assertEqual(found["status"], "duplicate_inactive")
             self.assertEqual(len(found["candidates"]), 1)
+        for found in (by_primary, by_alternate):  # a Trial on the domain under another name is retired
+            self.assertEqual(found["status"], "duplicate_inactive")
 
-    def test_non_live_only_candidates_are_duplicate_inactive_and_block(self):
-        # All-non-live-paid candidates (Trial, POV, Evaluation, disabled, deleted, or any mix) → duplicate_inactive.
+    def test_same_name_non_live_tenants_still_block(self):
         for others in ([tenant(kind="Trial")], [tenant(kind="POV")], [tenant(kind="Evaluation")],
                        [tenant(enabled=False)], [tenant(deleted=True)],
                        [tenant(kind="Trial"), tenant(enabled=False), tenant(deleted=True)]):
             with self.subTest(others=[(t["license"]["type"], t["enabled"], t["is_deleted"]) for t in others]):
                 found = match(*others)
-                self.assertEqual(found["status"], "duplicate_inactive")
+                self.assertEqual(found["status"], "exists_other")
                 self.assertIsNone(found["target"])
         deleted = match(tenant(deleted=True))["candidates"][0]
         self.assertTrue(deleted["deleted"])  # deleted tenants are listed, but flagged
 
+    def test_retired_tenants_matching_only_by_domain_do_not_block(self):
+        # Owner decision 2026-11-23 (CO-0857): renamed "deprecated", Trial / POV / Evaluation, disabled or deleted.
+        for retired in (tenant("Acme - deprecated", "acme.example"), tenant("Acme - POV", "acme.example", kind="POV"),
+                        tenant("Acme Trial", "acme.example", kind="Trial"), tenant("Acme Eval", "acme.example", kind="Evaluation"),
+                        tenant("Acme Old", "acme.example", enabled=False), tenant("Acme Gone", "acme.example", deleted=True)):
+            with self.subTest(name=retired["account_name"]):
+                found = match(retired)
+                self.assertEqual(found["status"], "duplicate_inactive")
+                self.assertIsNone(found["target"])
+                self.assertFalse(production_check(found)["blocked"])
+
+    def test_the_co_0857_shape_is_released_once_the_paid_tenant_is_renamed(self):
+        co = {"tenant_names": ("Chefs' Warehouse",), "domains": ("chefswarehouse.com",)}
+        plan = {**PLAN, "primary_domain": "chefswarehouse.com", "alternate_domains": ()}
+        before = pm.production_match(co, plan, snapshot(tenant("Chef's Warehouse", "chefswarehouse.com"),
+                                                        tenant("Chefs Warehouse - POV", "chefswarehouse.com", kind="Trial")))
+        self.assertEqual(before["status"], "exists_other")  # the paid tenant was not yet renamed
+        after = pm.production_match(co, plan, snapshot(tenant("Chef's Warehouse - deprecated", "chefswarehouse.com"),
+                                                       tenant("Chefs Warehouse - POV", "chefswarehouse.com", kind="Trial")))
+        self.assertEqual(after["status"], "duplicate_inactive")
+        self.assertEqual(len(after["candidates"]), 2)
+
     def test_a_live_paid_tenant_with_another_name_does_not_count_as_the_target(self):
         found = match(tenant("Acme Holdings", "acme.example", ("alt.acme.example",)))  # same domain, different name
-        # Domain-only live-paid match → duplicate_inactive (yellow); a different name is not an exact duplicate.
-        self.assertEqual(found["status"], "duplicate_inactive")
+        self.assertEqual(found["status"], "exists_other")  # live, paid and not renamed "deprecated": still blocks
+        self.assertIsNone(found["target"])
+        unknown = match(tenant("Acme Holdings", "acme.example", kind=None))  # an unknown licence is never retired
+        self.assertEqual(unknown["status"], "exists_other")
 
     def test_two_live_paid_tenants_with_the_exact_name_is_ambiguous(self):
         found = match(tenant(ident="one", **GOOD), tenant(ident="two", **GOOD))
@@ -145,8 +171,8 @@ class StateMachineTests(unittest.TestCase):
                 self.assertEqual(found["status"], "exists_differs")
                 self.assertEqual(found["differs"], [code])
                 self.assertEqual({r["code"]: r["result"] for r in found["fields"]}[code], "unknown")
-        # A tenant without a licence type is not "live, paid", so it triggers duplicate_inactive (all-non-live path).
-        self.assertEqual(match({**tenant(**GOOD), "license": {"type": None, "expiration_date": END_MS}})["status"], "duplicate_inactive")
+        # A same-name tenant without a licence type is not "live, paid", so it can never be the target; it still blocks.
+        self.assertEqual(match({**tenant(**GOOD), "license": {"type": None, "expiration_date": END_MS}})["status"], "exists_other")
         missing_plan = match(tenant(**GOOD), plan={**PLAN, "license_end": None})
         self.assertEqual((missing_plan["status"], missing_plan["differs"]), ("exists_differs", ["license_end"]))
 

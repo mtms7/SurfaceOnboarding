@@ -12,6 +12,8 @@ never writes, and a "no tenant found" is never a clearance. First hit wins:
                      be older than the create)
   not_in_production  no candidate (same name key, or a primary / alternate domain equal to a CO domain)
   exists_other       candidates exist, but none is a live, paid tenant with the CO's EXACT name (BLOCKS migration)
+  duplicate_inactive like exists_other, but every candidate matches only by domain and is retired (renamed "deprecated",
+                     Trial / POV / Evaluation, disabled or deleted; owner decision 2026-11-23): does NOT block
   ambiguous          more than one live, paid tenant with the exact name
   exists_matches     exactly one such tenant and every REQUIRED field agrees
   exists_differs     exactly one such tenant; a required field differs or is unknown (field codes listed)
@@ -30,9 +32,10 @@ from typing import Any
 from integration.onboarding.production_contract import LICENSE_COUNT, LICENSE_TYPE, NAME_SUFFIX
 from integration.onboarding.leonardo_inventory import (
     PRODUCTION_GATE_MAX_AGE, InventoryError, _name_key, canonical_domain, duplicate_precheck, is_live_paid_tenant,
-    load_latest)
+    load_latest, retired_clone_tenant)
 
-STATUSES = ("clone_unavailable", "not_checked", "onboarded", "uuid_not_in_clone", "not_in_production", "exists_other", "ambiguous", "exists_matches", "exists_differs",
+STATUSES = ("clone_unavailable", "not_checked", "onboarded", "uuid_not_in_clone", "not_in_production", "exists_other",
+            "duplicate_inactive", "ambiguous", "exists_matches", "exists_differs",
             "tenant_found", "tenant_missing", "region_not_checked")
 REQUIRED_FIELDS = ("tenant_name", "primary_domain", "alternate_domains", "license_type", "license_end")
 NOT_A_CLEARANCE = "No tenant found. This is not a clearance: the clone can lag up to a day."
@@ -403,10 +406,8 @@ def identity_match(identity: Mapping[str, Any] | None, snapshot: Mapping[str, An
                    differs=["plan_not_compared"], candidates=listed, target=_summary(exact[0]), **base)
 
 
-def _all_non_live(listed: list[dict[str, Any]]) -> bool:
-    """True when every match candidate is non-live-paid (Trial, POV, Evaluation, disabled, or deleted).
-    A live-paid tenant matching by domain with a different name keeps the red chip; all-non-live can be renamed."""
-    return bool(listed) and all(item.get("live_paid") is not True for item in listed)
+RETIRED_ONLY_TEXT = ("Only retired tenants match, by domain (renamed \"deprecated\", Trial, POV, Evaluation, disabled or "
+                     "deleted); they do not block the create. The live BackOffice check applies the same rule.")
 
 
 def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any] | None,
@@ -457,13 +458,13 @@ def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any
     listed = [_summary(tenant) for tenant in candidates]
     exact = [tenant for tenant in candidates if is_live_paid_tenant(tenant) and _name_key(tenant.get("account_name")) in keys]
     if not exact:
-        if _all_non_live(listed):
-            reason = ("All matching tenants are non-live-paid (Trial, POV, Evaluation, disabled or deleted). "
-                      "Rename the old tenant (e.g. append ‘ – deprecated’) before onboarding.")
-        else:
-            reason = ("A live, paid tenant matches by domain under a different name. "
-                      "Confirm it has been renamed or disabled before onboarding.")
-        return _result("duplicate_inactive", reason, candidates=listed, **base)
+        blocking = [tenant for tenant in candidates
+                    if _name_key(tenant.get("account_name")) in keys or not retired_clone_tenant(tenant)]
+        if not blocking:
+            return _result("duplicate_inactive", RETIRED_ONLY_TEXT, candidates=listed, **base)
+        return _result("exists_other", "A tenant with this name, or a live tenant on this domain that is not renamed "
+                       "\"deprecated\", is in production; migration is blocked until the owner resolves it.",
+                       candidates=listed, **base)
     if len(exact) > 1:
         return _result("ambiguous", str(len(exact)) + " live, paid tenants have the exact name.", candidates=listed, **base)
     fields = compare_fields(exact[0], plan, names)

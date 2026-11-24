@@ -340,14 +340,6 @@ REVIEW_LABEL_WARNINGS = frozenset({"identity_mismatch", "tenant_deleted", "tenan
 UUID_NOTE = "UUID check runs on the VM dashboard."
 
 
-def _all_inactive(candidates: list[dict[str, Any]]) -> bool:
-    """True when every match candidate explicitly carries NO_SCHEDULE scanning interval — signals a deprecated tenant.
-    A missing or None interval is not treated as inactive: positive evidence is required."""
-    return bool(candidates) and all(
-        str(item.get("scanning_interval") or "").upper() == "NO_SCHEDULE" for item in candidates
-    )
-
-
 def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
     """One chip for a per-CO production match: Clear, Duplicate, Live paid x N, Clone stale or Clone unavailable.
 
@@ -387,23 +379,14 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
     if status == "region_not_checked":  # owner 2026-11-04: a US / IL CO is never cleared by the EU clone
         return {**base, "code": "region_not_checked", "css": "chip-warn",
                 "label": "Region " + _text(match.get("region") or "unknown") + ": not checked"}
-    if status == "duplicate_inactive":
-        return {**base, "code": "duplicate_inactive", "css": "chip-warn",
-                "label": "Duplicate – inactive",
-                "blocked": False,
-                "reason": reason or ("Matching tenants are non-live-paid or domain-only matches. "
-                                     "Rename the old tenant (e.g. append ‘ – deprecated’) before onboarding.")}
+    if status == "duplicate_inactive":  # only retired tenants match by domain (owner decision 2026-11-23): not a block
+        return {**base, "code": "duplicate_inactive", "css": "chip-warn", "label": "Duplicate – inactive",
+                "blocked": False, "reason": reason}
     if status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
         if live > 1:
             return {**base, "code": "live_paid", "css": "chip-bad", "label": "Live paid x " + str(live)}
         if status == "ambiguous":  # e.g. two tenants carry the CO's UUID, but fewer than two are live and paid
             return {**base, "code": "ambiguous", "css": "chip-bad", "label": "Ambiguous"}
-        if _all_inactive(candidates):  # synthetic match dicts (unit tests); real data already has status "duplicate_inactive"
-            return {**base, "code": "duplicate_inactive", "css": "chip-warn",
-                    "label": "Duplicate – inactive",
-                    "reason": (reason + " " if reason else "") +
-                               "All matching tenants have NO_SCHEDULE scanning. "
-                               "Rename the old tenant (e.g. append ‘ – deprecated’) before onboarding."}
         if status == "exists_other":
             return {**base, "code": "other_tenants", "css": "chip-bad", "label": "Other tenants only"}
         return {**base, "code": "duplicate", "css": "chip-bad", "label": "Duplicate"}
@@ -718,8 +701,6 @@ SHEET_REFUSALS = {
     "account_name_unavailable": "The account name could not be read, so the tenant name cannot be derived.",
     "approval_not_approved": "Salesforce does not show this CO as Approved.",
     "duplicate_in_production": "The production clone already holds a tenant that matches this name or domain.",
-    "duplicate_inactive_in_production": "The production clone holds a matching tenant with no active scanning (NO_SCHEDULE). "
-                                        "Rename it (e.g. append ' – deprecated') before onboarding.",
     "live_paid_in_production": "The production clone shows more than one live paid tenant for this CO.",
     "already_onboarded": "Already onboarded: tenant found in production (the UUID matches the CO). Do not create another.",
     "uuid_not_in_clone": "UUID set but tenant not found in clone (the clone may be older than the create). Do not create another.",
@@ -866,7 +847,6 @@ def onboarding_sheet(co: dict[str, Any], *, rules: dict[str, Any], today: date, 
               else "uuid_not_in_clone" if check_code == "uuid_not_in_clone"
               else "match_not_checked" if check_code == "not_checked"
               else "live_paid_in_production" if check_code == "live_paid"
-              else "duplicate_inactive_in_production" if check_code == "duplicate_inactive"
               else "duplicate_in_production" if check_code in ("duplicate", "other_tenants", "ambiguous")
               else "one_email_domain_required" if not tokens or ("domains_of" not in rules and len(tokens) != 1)
               else "email_domain_invalid" if domain is None

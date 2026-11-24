@@ -32,6 +32,9 @@ RETRIEVED_STALE = "2026-10-05T08:00:00"  # 4 hours old
 RETRIEVED_ANCIENT = "2026-10-03T08:00:00"  # more than 36 hours old
 
 
+PAID = {"accountLicense.licenseType": "Prepaid annual subscription"}
+
+
 def row(index: int, **overrides):
     values = {
         "_id": f"68c9{index:020x}", "_created": "2026-08-11 13:57:03", "_modified": "2026-10-04T16:49:00.123000",
@@ -613,7 +616,7 @@ class ProductionGateTests(unittest.TestCase):
 
     def test_a_name_primary_or_alternate_domain_match_blocks(self):
         self.collect(row(1, accountName="Example Customer", accountDomain="customer.example.com",
-                         alternateDomains=["alt.customer.example.com"]), row(2))
+                         alternateDomains=["alt.customer.example.com"], **PAID), row(2))
         for name, domains, reasons in (
                 ("  example   CUSTOMER ", ("x.example.org",), ["tenant_name"]),
                 ("Someone Else", ("CUSTOMER.example.com.",), ["primary_domain"]),
@@ -622,6 +625,21 @@ class ProductionGateTests(unittest.TestCase):
                 gate = self.gate(name, domains)
                 self.assertEqual((gate["result"], gate["blocks"]), ("duplicate_production_clone_match", True))
                 self.assertEqual(gate["matches"][0]["reasons"], reasons)
+
+    def test_retired_tenants_matching_only_by_domain_do_not_block(self):
+        # Owner decision 2026-11-23 (CO-0857): renamed "deprecated", Trial / POV / Evaluation, disabled or deleted.
+        self.collect(row(1, accountName="Chef's Warehouse - deprecated", accountDomain="chefswarehouse.com", **PAID),
+                     row(2, accountName="Chefs Warehouse - POV", accountDomain="chefswarehouse.com"),
+                     row(3, accountName="Old Chefs", accountDomain="chefswarehouse.com", enabled=False, **PAID),
+                     row(4, accountName="Gone Chefs", accountDomain="chefswarehouse.com", isDeleted=True, **PAID), row(5))
+        gate = self.gate("Chefs' Warehouse", ("chefswarehouse.com",))
+        self.assertEqual((gate["result"], gate["blocks"], gate["matches"]), ("production_clone_no_match", False, []))
+        self.root = Path(tempfile.mkdtemp())
+        self.collect(row(1, accountName="Chef's Warehouse", accountDomain="chefswarehouse.com", **PAID), row(5))
+        self.assertTrue(self.gate("Chefs' Warehouse", ("chefswarehouse.com",))["blocks"])  # a live paid one still blocks
+        self.root = Path(tempfile.mkdtemp())
+        self.collect(row(1, accountName="Chefs' Warehouse - deprecated", accountDomain="other.example", **PAID), row(5))
+        self.assertEqual(self.gate("Chefs' Warehouse - deprecated", ("x.example",))["matches"][0]["reasons"], ["tenant_name"])
 
     def test_a_deleted_tenant_still_blocks_and_says_so(self):
         self.collect(row(1, accountName="Gone Customer", isDeleted=True), row(2))
@@ -857,8 +875,8 @@ class ProductionDuplicateCheckRunnerTests(unittest.TestCase):
         self.assertEqual((stale["blocks"], stale["reason"]), (True, "inventory_snapshot_stale"))
 
     def test_name_primary_and_alternate_domain_matches_block_and_only_the_clone_is_read(self):
-        self._collect(row(1, accountName="brand  NEW customer"), row(2, accountDomain="BrandNew.example.com"),
-                      row(3, alternateDomains=["brandnew.example.com"]), row(4), now=datetime.now(timezone.utc))
+        self._collect(row(1, accountName="brand  NEW customer"), row(2, accountDomain="BrandNew.example.com", **PAID),
+                      row(3, alternateDomains=["brandnew.example.com"], **PAID), row(4), now=datetime.now(timezone.utc))
         with patch.object(inventory, "load_latest", wraps=inventory.load_latest) as load:
             report = runner.run_production_duplicate_check("CO-0801")
         self.assertEqual([call.args[1] for call in load.call_args_list], ["prod-clone"])  # never the DEV inventory

@@ -280,6 +280,20 @@ class DuplicateTests(unittest.TestCase):
             self.assertEqual(self.verdict(domain_reply=reply(rows)), "duplicate_in_production")
         self.assertEqual(self.verdict(domain_reply={"status": 200, "total": 3, "rows": []}), "duplicate_in_production")
 
+    def test_retired_rows_of_the_domain_search_do_not_refuse(self):
+        # Owner decision 2026-11-23 (CO-0857): renamed "deprecated", Trial / POV / Evaluation, disabled or deleted.
+        paid = dict(enabled=True, license_type="prepaid annual subscription")
+        retired = [row(name="Old - deprecated", domain=DOMAIN, **paid), row(name="X POV", domain=DOMAIN, enabled=True, license_type="POV"),
+                   row(domain=DOMAIN, enabled=True, license_type="Evaluation"), row(domain=DOMAIN, enabled=False),
+                   row(domain=DOMAIN, deleted=True)]
+        self.assertIsNone(self.verdict(domain_reply=reply(retired)))
+        self.assertIsNone(self.verdict(name_reply=reply(retired)))
+        for blocker in (row(domain=DOMAIN, **paid), row(domain=DOMAIN, enabled=True, license_type=None),
+                        row(domain=DOMAIN), row(name=NAME, domain=DOMAIN, enabled=False)):
+            with self.subTest(blocker=blocker):
+                self.assertEqual(self.verdict(domain_reply=reply([*retired, blocker])), "duplicate_in_production")
+        self.assertEqual(self.verdict(domain_reply=reply(retired, total=len(retired) + 1)), "duplicate_in_production")
+
     def test_demo_domain_refuses(self):
         self.assertEqual(self.verdict(demo={"status": 200, "hit": True, "count": 3}), "demo_domain_conflict")
 

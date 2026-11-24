@@ -262,21 +262,19 @@ class ProductionCheckTests(unittest.TestCase):
         self.assertIn("UUID check runs on the VM dashboard", chip["reason"])
         self.assertNotIn("UUID check", self.check("exists_matches", uuid_checked=True)["reason"])
 
-    def test_duplicate_inactive_when_all_candidates_have_no_schedule(self):
-        inactive = [{"live_paid": False, "scanning_interval": "NO_SCHEDULE"},
-                    {"live_paid": False, "scanning_interval": "NO_SCHEDULE"}]
-        chip = self.check("exists_matches", candidates=inactive)
-        self.assertEqual(chip["code"], "duplicate_inactive")
-        self.assertEqual(chip["css"], "chip-warn")
-        self.assertTrue(chip["blocked"])
-        self.assertIn("NO_SCHEDULE", chip["reason"])
-        self.assertIn("deprecated", chip["reason"])
+    def test_retired_only_match_is_duplicate_inactive_and_does_not_block(self):
+        chip = self.check("duplicate_inactive", reason="Only retired tenants match, by domain.")
+        self.assertEqual((chip["code"], chip["css"], chip["blocked"]), ("duplicate_inactive", "chip-warn", False))
+        self.assertEqual(chip["reason"], "Only retired tenants match, by domain.")
 
-    def test_duplicate_not_inactive_when_any_candidate_is_active(self):
-        mixed = [{"live_paid": False, "scanning_interval": "NO_SCHEDULE"},
-                 {"live_paid": False, "scanning_interval": "MONTHLY"}]
-        chip = self.check("exists_matches", candidates=mixed)
-        self.assertEqual(chip["code"], "duplicate")
+    def test_no_schedule_scanning_never_releases_a_duplicate(self):
+        # CE-only tenants are always NO_SCHEDULE: a scanning interval says nothing about a duplicate being retired.
+        inactive = [{"live_paid": True, "scanning_interval": "NO_SCHEDULE"}]
+        for status in ("exists_matches", "exists_differs", "exists_other"):
+            with self.subTest(status=status):
+                chip = self.check(status, candidates=inactive)
+                self.assertNotEqual(chip["code"], "duplicate_inactive")
+                self.assertTrue(chip["blocked"])
 
     def test_uuid_not_in_clone_and_not_checked_are_blocked_and_never_say_clone_unavailable(self):
         self.assertTrue(self.check("uuid_not_in_clone")["blocked"])

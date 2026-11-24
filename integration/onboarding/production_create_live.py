@@ -468,9 +468,11 @@ def live_duplicate_problem(name_reply: object, domain_reply: object, demo_reply:
                            primary_domain: str) -> str | None:
     """None only when the name search, the domain search and the demo list are all readable and clear; else a reason.
 
-    Stricter than the dry run on purpose: the DOMAIN search is a text search, so ANY row it returns (or any count other
-    than zero) refuses even when the row's own fields were not returned. A missing match is never a clearance: an
-    unreadable, partial, non-200 or odd reply is ``duplicate_check_unavailable`` / ``duplicate_ambiguous``.
+    Stricter than the dry run on purpose: the DOMAIN search is a text search, so any row it returns refuses even when
+    the row's own fields were not returned, unless that row is readable as retired (``production_dry_run.retired_row``,
+    owner decision 2026-11-23) and does not carry the target name; a partial page (count above the rows) refuses. A missing
+    match is never a clearance: an unreadable, partial, non-200 or odd reply is ``duplicate_check_unavailable`` /
+    ``duplicate_ambiguous``.
     """
     problem = production_dry_run.search_verdict(name_reply, tenant_name, (primary_domain,))
     if problem is not None:
@@ -482,8 +484,12 @@ def live_duplicate_problem(name_reply: object, domain_reply: object, demo_reply:
     total = domain_reply.get("total") if isinstance(domain_reply, Mapping) else None
     if status != 200 or not isinstance(rows, list) or type(total) is not int or total < 0:
         return "duplicate_check_unavailable"
-    if rows or total != 0:
+    if total != len(rows):
         return "duplicate_in_production"
+    target = _norm(tenant_name)
+    for row in rows:
+        if not isinstance(row, Mapping) or _norm(row.get("name")) == target or not production_dry_run.retired_row(row):
+            return "duplicate_in_production"
     return production_dry_run.demo_verdict(demo_reply)
 
 

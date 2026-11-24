@@ -277,7 +277,8 @@ def _name_key(value: Any) -> str:
     return " ".join(value.casefold().split()) if type(value) is str else ""
 
 
-def duplicate_precheck(payload: Mapping[str, Any], tenant_name: str, co_domains: Any) -> dict[str, Any]:
+def duplicate_precheck(payload: Mapping[str, Any], tenant_name: str, co_domains: Any, *,
+                       skip_retired: bool = False) -> dict[str, Any]:
     """Would this CO duplicate a tenant already in the inventory? (informational; it can only block)
 
     A tenant matches on (A) the live check's rules: the same tenant name or
@@ -297,6 +298,8 @@ def duplicate_precheck(payload: Mapping[str, Any], tenant_name: str, co_domains:
             reasons.append("primary_domain")
         if wanted & set(tenant.get("alternate_domains") or ()):
             reasons.append("alternate_domain")
+        if skip_retired and reasons and "tenant_name" not in reasons and retired_clone_tenant(tenant):
+            continue
         if reasons:
             matches.append({"id": tenant.get("id"), "account_name": tenant.get("account_name"),
                             "is_deleted": tenant.get("is_deleted") is True, "created": tenant.get("created"),
@@ -322,7 +325,7 @@ def production_duplicate_gate(root: Path, tenant_name: str, co_domains: Any, *, 
         payload = load_latest(root, "prod-clone", max_age=max_age, now=now)
     except InventoryError as error:
         return {"result": "production_clone_unavailable", "blocks": True, "reason": error.reason, "matches": []}
-    found = duplicate_precheck(payload, tenant_name, co_domains)
+    found = duplicate_precheck(payload, tenant_name, co_domains, skip_retired=True)
     gate = {"matches": found["matches"], "tenants_checked": found["tenants_checked"],
             "captured_at": payload.get("captured_at"), "environment_label": payload.get("environment_label")}
     if found["result"] == "inventory_match":
@@ -348,6 +351,26 @@ def is_live_paid_tenant(tenant: Any) -> bool:
     lic = tenant.get("license")
     kind = lic.get("type") if isinstance(lic, dict) else None
     return isinstance(kind, str) and re.sub(r"[^a-z0-9]", "", kind.casefold()) in PAID_LICENSE_TYPES
+
+
+# Owner decision 2026-11-23 (CO-0857): a tenant that matches a new CO only by DOMAIN does not block the create when it was
+# renamed "deprecated", is Trial / POV / Evaluation, disabled or deleted. A same-name tenant always blocks, and an unknown
+# value never counts as retired (fail closed).
+NON_PAID_LICENSE_TYPES = frozenset({"trial", "pov", "evaluation"})
+
+
+def retired_tenant(name: Any, license_type: Any, enabled: Any, deleted: Any) -> bool:
+    if deleted is True or enabled is False:
+        return True
+    if isinstance(name, str) and "deprecated" in name.casefold():
+        return True
+    return isinstance(license_type, str) and re.sub(r"[^a-z0-9]", "", license_type.casefold()) in NON_PAID_LICENSE_TYPES
+
+
+def retired_clone_tenant(tenant: Mapping[str, Any]) -> bool:
+    lic = tenant.get("license")
+    return retired_tenant(tenant.get("account_name"), lic.get("type") if isinstance(lic, dict) else None,
+                          tenant.get("enabled"), tenant.get("is_deleted"))
 
 
 def renewal_domain_gate(root: Path, target_names: Any, target_domain: str, new_domains: Any, *, now: datetime,

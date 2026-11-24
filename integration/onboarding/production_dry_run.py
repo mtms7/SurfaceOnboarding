@@ -40,7 +40,8 @@ def _strings(value: object) -> list[str]:
 def search_reply(status: object, body: object) -> dict[str, Any]:
     """Reduce the page's OWN table reply (HTTP status, parsed JSON body) to {status, total, rows}.
 
-    ``rows`` keep only name, domain, alternate and email domain lists and the deleted flag. A missing status is status 0;
+    ``rows`` keep only name, domain, alternate and email domain lists, the deleted and enabled flags and the licence type
+    (``None`` when not a bool / string). A missing status is status 0;
     a non-200 status carries no rows; a 200 with an unexpected schema (any row that is not an object, a missing or
     non-integer total) has ``total``/``rows`` None, which every verdict treats as unavailable.
     """
@@ -57,7 +58,22 @@ def search_reply(status: object, body: object) -> dict[str, Any]:
         {"name": x["accountName"] if isinstance(x.get("accountName"), str) else None,
          "domain": x["accountDomain"] if isinstance(x.get("accountDomain"), str) else None,
          "alternates": _strings(x.get("alternateDomains")), "emails": _strings(x.get("userEmailDomains")),
-         "deleted": x.get("isDeleted") is True} for x in rows[:200]]}
+         "deleted": x.get("isDeleted") is True,
+         "enabled": x["enabled"] if isinstance(x.get("enabled"), bool) else None,
+         "license_type": _license_type(x)} for x in rows[:200]]}
+
+
+def _license_type(row: Mapping[str, Any]) -> str | None:
+    lic = row.get("accountLicense")
+    kind = lic.get("licenseType") if isinstance(lic, Mapping) else None
+    return kind if isinstance(kind, str) else None
+
+
+def retired_row(row: Mapping[str, Any]) -> bool:
+    """A reduced search row the owner's retired rule releases (``leonardo_inventory.retired_tenant``)."""
+    from .leonardo_inventory import retired_tenant
+
+    return retired_tenant(row.get("name"), row.get("license_type"), row.get("enabled"), row.get("deleted"))
 
 
 def demo_reply(status: object, body: object, domains: Any) -> dict[str, Any]:
@@ -603,7 +619,8 @@ def _norm_domain(value: object) -> str:
 
 
 def search_verdict(reply: object, tenant_name: str, domains: tuple[str, ...]) -> str | None:
-    """None when one table search found no tenant with the exact name or any of the domains; else the reason code."""
+    """None when one table search found no tenant with the exact name or any of the domains (a retired tenant matching only
+    by domain does not count, see ``retired_row``); else the reason code."""
     status = _status(reply)
     if status in (401, 403):
         return "production_session_expired"
@@ -622,7 +639,7 @@ def search_verdict(reply: object, tenant_name: str, domains: tuple[str, ...]) ->
             return "duplicate_check_unavailable"
         theirs = {_norm_domain(row.get("domain")), *map(_norm_domain, row.get("alternates") or ()),
                   *map(_norm_domain, row.get("emails") or ())}
-        if _norm_name(row.get("name")) == name or wanted & theirs:
+        if _norm_name(row.get("name")) == name or (wanted & theirs and not retired_row(row)):
             return "duplicate_in_production"
     return None
 

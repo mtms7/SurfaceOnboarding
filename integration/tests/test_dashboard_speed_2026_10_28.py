@@ -311,7 +311,7 @@ class UuidNotInCloneRuleTests(unittest.TestCase):
     def test_production_match(self):
         old = tenant("Acme", "acme.example", deleted=True)
         self.assertEqual(pm.production_match(CO, PLAN, snapshot(old), account_uuid=OTHER)["status"], "uuid_not_in_clone")
-        self.assertEqual(pm.production_match(CO, PLAN, snapshot(old))["status"], "duplicate_inactive")
+        self.assertEqual(pm.production_match(CO, PLAN, snapshot(old))["status"], "exists_other")
 
 
 if __name__ == "__main__":

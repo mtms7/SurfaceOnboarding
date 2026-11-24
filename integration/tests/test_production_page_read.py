@@ -232,10 +232,12 @@ class GuardBodyTests(unittest.TestCase):
 class ReducerTests(unittest.TestCase):
     def test_search_reply_keeps_only_the_non_secret_row_fields(self):
         row = {"accountName": "N", "accountDomain": "d.example", "alternateDomains": ["a.example", 7],
-               "userEmailDomains": ["e.example"], "isDeleted": True, "token": fake.SECRET, "primaryUser": {"email": fake.SECRET}}
+               "userEmailDomains": ["e.example"], "isDeleted": True, "token": fake.SECRET, "primaryUser": {"email": fake.SECRET},
+               "enabled": True, "accountLicense": {"licenseType": "Trial", "assetsNumber": 9}}
         out = pdr.search_reply(200, {"pagination_response": {"total_count": 1, "table_data": [row]}})
         self.assertEqual(out, {"status": 200, "total": 1, "rows": [{"name": "N", "domain": "d.example", "alternates": ["a.example"],
-                                                                      "emails": ["e.example"], "deleted": True}]})
+                                                                      "emails": ["e.example"], "deleted": True, "enabled": True,
+                                                                      "license_type": "Trial"}]})
         self.assertNotIn(fake.SECRET, json.dumps(out))
 
     def test_full_rows_without_a_projection_feed_the_duplicate_verdicts(self):
@@ -253,7 +255,7 @@ class ReducerTests(unittest.TestCase):
 
         target, domains, demo = "Acme - CE Only", ("acme.example", "mail.acme.example"), {"status": 200, "hit": False, "count": 1}
         clear = reduced(full())
-        self.assertEqual(set(clear["rows"][0]), {"name", "domain", "alternates", "emails", "deleted"})
+        self.assertEqual(set(clear["rows"][0]), {"name", "domain", "alternates", "emails", "deleted", "enabled", "license_type"})
         self.assertNotIn(fake.SECRET, json.dumps(clear))
         self.assertLess(len(json.dumps(clear)), 400)  # the large unrelated row content is never retained
         self.assertIsNone(pdr.duplicate_verdict([clear, clear], demo, target, domains))
@@ -264,6 +266,21 @@ class ReducerTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(pdr.duplicate_verdict([reduced(row)], demo, target, domains), "duplicate_in_production")
         self.assertTrue(reduced(full(isDeleted=True))["rows"][0]["deleted"])
+        # Owner decision 2026-11-23: a retired tenant on the domain under another name does not count; the same name does.
+        paid = {"assetsNumber": 1, "licenseType": "prepaid annual subscription"}
+        for label, row in (("deprecated", full(accountName="Acme - deprecated", accountDomain="acme.example", enabled=True,
+                                                accountLicense=paid)),
+                           ("pov", full(accountName="Acme - POV", accountDomain="acme.example", enabled=True,
+                                         accountLicense={"licenseType": "POV"})),
+                           ("disabled", full(accountDomain="acme.example", enabled=False, accountLicense=paid)),
+                           ("deleted", full(accountDomain="acme.example", isDeleted=True))):
+            with self.subTest(retired=label):
+                self.assertIsNone(pdr.duplicate_verdict([reduced(row)], demo, target, domains))
+        for label, row in (("paid", full(accountDomain="acme.example", enabled=True, accountLicense=paid)),
+                           ("unknown_licence", full(accountDomain="acme.example", enabled=True)),
+                           ("same_name_trial", full(accountName=target, enabled=True, accountLicense={"licenseType": "Trial"}))):
+            with self.subTest(blocks=label):
+                self.assertEqual(pdr.duplicate_verdict([reduced(row)], demo, target, domains), "duplicate_in_production")
         self.assertEqual(pdr.duplicate_verdict([reduced(full(), full(), full(), full())], demo, target, domains), None)
         big = pdr.search_reply(200, {"pagination_response": {"total_count": 100, "table_data": [full() for _ in range(100)]}})
         self.assertEqual((len(big["rows"]), big["total"]), (100, 100))
@@ -277,7 +294,8 @@ class ReducerTests(unittest.TestCase):
         r = reader(page)
         replies = [r.search(v) for v in ("Held Co", "held.example", "Target Co", "target.example")]
         self.assertEqual(replies[3]["rows"], [{"name": "Held Co", "domain": "held.example", "alternates": ["Target.example"],
-                                               "emails": ["mail.example"], "deleted": False}])
+                                               "emails": ["mail.example"], "deleted": False, "enabled": None,
+                                               "license_type": None}])
         self.assertEqual(live.checked_duplicate_problem({"name": "Held Co", "domain": "held.example"}, (replies[0], replies[1]),
                                                         replies[3], replies[2], {"status": 200, "hit": False, "count": 1},
                                                         "Target Co", "target.example"), "duplicate_in_production")  # via the ALTERNATE domain of a full row
