@@ -89,7 +89,8 @@ class StateMachineTests(unittest.TestCase):
 
     def test_a_live_paid_tenant_with_another_name_does_not_count_as_the_target(self):
         found = match(tenant("Acme Holdings", "acme.example", ("alt.acme.example",)))  # same domain, different name
-        self.assertEqual(found["status"], "exists_other")
+        # Domain-only live-paid match → duplicate_inactive (yellow); a different name is not an exact duplicate.
+        self.assertEqual(found["status"], "duplicate_inactive")
 
     def test_two_live_paid_tenants_with_the_exact_name_is_ambiguous(self):
         found = match(tenant(ident="one", **GOOD), tenant(ident="two", **GOOD))

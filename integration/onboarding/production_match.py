@@ -458,12 +458,12 @@ def production_match(co_source: Mapping[str, Any] | None, plan: Mapping[str, Any
     exact = [tenant for tenant in candidates if is_live_paid_tenant(tenant) and _name_key(tenant.get("account_name")) in keys]
     if not exact:
         if _all_non_live(listed):
-            return _result("duplicate_inactive",
-                           "All matching tenants have NO_SCHEDULE scanning. "
-                           "Rename the old tenant (e.g. append ' – deprecated') before onboarding.",
-                           candidates=listed, **base)
-        return _result("exists_other", "Only trial, evaluation, POV, disabled or deleted tenants match; migration is blocked "
-                       "until the owner resolves it.", candidates=listed, **base)
+            reason = ("All matching tenants are non-live-paid (Trial, POV, Evaluation, disabled or deleted). "
+                      "Rename the old tenant (e.g. append ‘ – deprecated’) before onboarding.")
+        else:
+            reason = ("A live, paid tenant matches by domain under a different name. "
+                      "Confirm it has been renamed or disabled before onboarding.")
+        return _result("duplicate_inactive", reason, candidates=listed, **base)
     if len(exact) > 1:
         return _result("ambiguous", str(len(exact)) + " live, paid tenants have the exact name.", candidates=listed, **base)
     fields = compare_fields(exact[0], plan, names)

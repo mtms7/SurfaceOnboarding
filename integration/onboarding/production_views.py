@@ -390,7 +390,8 @@ def production_check(match: dict[str, Any] | None) -> dict[str, Any]:
     if status == "duplicate_inactive":
         return {**base, "code": "duplicate_inactive", "css": "chip-warn",
                 "label": "Duplicate – inactive",
-                "reason": reason or ("All matching tenants have NO_SCHEDULE scanning. "
+                "blocked": False,
+                "reason": reason or ("Matching tenants are non-live-paid or domain-only matches. "
                                      "Rename the old tenant (e.g. append ‘ – deprecated’) before onboarding.")}
     if status in ("exists_matches", "exists_differs", "exists_other", "ambiguous"):
         if live > 1:
@@ -634,7 +635,7 @@ def onboard_checklist(*, vm: bool, locked: bool, lock_reason: str | None, clone:
     elif check["code"] == "uuid_not_in_clone":
         items.append(_item("duplicate", "blocked", "UUID set but tenant not found in clone (the clone may be older than the create)."))
     elif check["code"] == "duplicate_inactive":
-        items.append(_item("duplicate", "blocked", check["label"] + " in the production clone. "
+        items.append(_item("duplicate", "ok", check["label"] + " in the production clone. "
                            + (check.get("reason") or "")))
     elif check["code"] in ("duplicate", "live_paid", "other_tenants", "ambiguous"):
         items.append(_item("duplicate", "blocked", check["label"] + " in the production clone."
@@ -791,6 +792,8 @@ def _sheet_eligibility(co: dict[str, Any], *, today: date, days_before: int, clo
         items.append(chip(label, "blocked", "Already onboarded: tenant found in production (UUID matches the CO)"))
     elif check["code"] == "uuid_not_in_clone":
         items.append(chip(label, "blocked", "UUID set but tenant not found in clone (the clone may be older than the create)"))
+    elif check["code"] == "duplicate_inactive":
+        items.append(chip(label, "ok", check["label"] + " in the production clone. " + (check.get("reason") or "")))
     elif check["code"] in ("duplicate", "live_paid", "other_tenants", "ambiguous"):
         items.append(chip(label, "blocked", check["label"] + " in the production clone"
                           + (". " + UUID_NOTE if (match or {}).get("uuid_checked") is False else "")))
